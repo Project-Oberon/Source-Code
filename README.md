@@ -4,4 +4,6 @@ Project Oberon Historical Material
 
 **Project Oberon**: Single user operating system developed by Niklaus Wirth and Jurg Gutknecht
 
-**Sources**: Source code
+**ROM**: Ceres Workstations ROM Images
+
+**Sources**: Project Oberon source code
