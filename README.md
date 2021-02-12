@@ -1,8 +1,6 @@
-# Project Oberon
+# Project Oberon Historical Material
 
-Project Oberon Historical Material
-
-**Project Oberon**: Single user operating system developed by Niklaus Wirth and Jurg Gutknecht
+Project Oberon is a single user operating system developed by Niklaus Wirth and Jurg Gutknecht. The Oberon operating system was originally developed as part of the NS32032-based Ceres workstation project. 
 
 **ROM**: Ceres Workstations ROM Images
 
