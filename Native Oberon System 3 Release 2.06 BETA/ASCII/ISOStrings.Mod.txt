@@ -1,0 +1,493 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+(*
+	Strings.Mod
+	geld@cs.sun.ac.za
+	15 Feb 95
+
+	Facilities for manipulating strings.
+	Coded on ISO Modula-2 specification. 
+*)
+
+MODULE ISOStrings;
+
+CONST
+	less* = -1;	equal* = 0;	greater* = 1;
+
+(*----------------------------------------------------------*)
+
+(* Returns the length of stringVal *)
+PROCEDURE Length* (
+	stringVal : ARRAY OF CHAR) : LONGINT;
+VAR
+	k : LONGINT;
+BEGIN
+	k := 0;
+	WHILE stringVal [k] # 0X DO
+		INC (k)
+	END;
+	RETURN k
+END Length;
+
+(*----------------------------------------------------------*)
+(*
+	The following seven procedures construct a string value, and attempt to
+	assign it to a variable parameter.  They all have the property that if the
+	length of the constructed string value exceeds the capacity of the variable
+	parameter, a truncated value is assigned, while if the length of the
+	constructed string value is less than the capacity of the variable
+	parameter, a string terminator is appended before assignment is
+	performed.
+*)
+
+(* Copies source to destination *)
+PROCEDURE Assign* (
+	source : ARRAY OF CHAR;
+	VAR destination : ARRAY OF CHAR);
+VAR
+	k : LONGINT;
+BEGIN
+	k := 0;
+	WHILE (source [k] # 0X) & (k < LEN (destination)) DO
+		destination [k] := source [k];
+		INC (k)
+	END;
+	IF k < LEN (destination) THEN
+		destination [k] := 0X
+	ELSE
+		destination [k - 1] := 0X
+	END
+END Assign;
+
+(*----------------------------------------------------------*)
+
+(* Copies at most numberToExtract characters from source to destination,
+	starting at position startIndex in source. *)
+PROCEDURE Extract* (
+	source : ARRAY OF CHAR;
+	startIndex, numberToExtract : LONGINT;
+	VAR destination : ARRAY OF CHAR);
+VAR
+	k, m : LONGINT;
+BEGIN
+	k := 0;
+	m := startIndex;
+	WHILE (source [m] # 0X) & (k < numberToExtract) &
+		(k < LEN (destination)) DO
+		destination [k] := source [m];
+		INC (k);
+		INC (m)
+	END;
+	IF k < LEN (destination) THEN
+		destination [k] := 0X
+	ELSE
+		destination [k - 1] := 0X
+	END
+END Extract;
+
+(*----------------------------------------------------------*)
+
+(* Deletes at most numberToDelete characters from stringVar, starting at
+	position startIndex. *)
+PROCEDURE Delete* (
+	VAR stringVar : ARRAY OF CHAR;
+	startIndex, numberToDelete : LONGINT);
+VAR
+	k, m : LONGINT;
+BEGIN
+	k := startIndex;
+	m := startIndex + numberToDelete;
+	WHILE (m < LEN (stringVar)) & (stringVar [m] # 0X) &
+		(stringVar [k] # 0X) DO
+		stringVar [k] := stringVar [m];
+		INC (k);
+		INC (m)
+	END;
+	IF stringVar [k] = 0X THEN
+		stringVar [startIndex] := 0X
+	ELSE
+		stringVar [k] := 0X
+	END
+END Delete;
+
+(*----------------------------------------------------------*)
+
+(* Inserts source into destination at position startIndex *)
+PROCEDURE Insert* (
+	source : ARRAY OF CHAR;
+	startIndex : LONGINT;
+	VAR destination : ARRAY OF CHAR);
+VAR
+	dLen, sLen : LONGINT;
+	k, m : LONGINT;
+BEGIN
+	dLen := Length (destination);
+	IF dLen < startIndex THEN
+		RETURN
+	END;
+
+	sLen := Length (source);
+	IF sLen + startIndex + 1 < LEN (destination) THEN
+		k := dLen;
+		m := dLen + sLen;
+		IF m >= LEN (destination) THEN
+			DEC (k, m - LEN (destination) + 1);
+			DEC (m, m - LEN (destination) + 1)
+		END;
+		WHILE k >= startIndex DO
+			destination [m] := destination [k];
+			DEC (k);
+			DEC (m)
+		END
+	END;
+	k := 0;
+	WHILE (startIndex < LEN (destination)) & (source [k] # 0X) DO
+		destination [startIndex] := source [k];
+		INC (k);
+		INC (startIndex)
+	END;
+	IF sLen + dLen < LEN (destination) THEN
+		destination [sLen + dLen] := 0X
+	ELSE
+		destination [LEN (destination) - 1] := 0X
+	END
+END Insert;
+
+(*----------------------------------------------------------*)
+
+(* Copies source into destination, starting at position startIndex. Copying
+	stops when all of source has been copied, or when the last character of
+	the string value in destination has been replaced. *)
+PROCEDURE Replace* (
+	source : ARRAY OF CHAR;
+	startIndex : LONGINT;
+	VAR destination : ARRAY OF CHAR);
+VAR
+	flag : BOOLEAN;
+	k, m : LONGINT;
+BEGIN
+	IF Length (destination) < startIndex THEN
+		RETURN
+	END;
+
+	flag := FALSE;
+	k := 0;
+	m := startIndex;
+	WHILE (source [k] # 0X) & (m < LEN (destination)) DO
+		IF destination [m] = 0X THEN
+			flag := TRUE
+		END;
+		destination [m] := source [k];
+		INC (k);
+		INC (m)
+	END;
+	IF flag THEN
+		IF m < LEN (destination) THEN
+			destination [m] := 0X
+		ELSE
+			destination [m - 1] := 0X
+		END
+	END
+END Replace;
+
+(*----------------------------------------------------------*)
+
+(* Appends source to destination. *)
+PROCEDURE Append* (
+	source : ARRAY OF CHAR;
+	VAR destination : ARRAY OF CHAR);
+VAR
+	k, m : LONGINT;
+BEGIN
+	k := 0;
+	m := Length (destination);
+	WHILE (source [k] # 0X) & (m < LEN (destination)) DO
+		destination [m] := source [k];
+		INC (k);
+		INC (m)
+	END;
+	IF m < LEN (destination) THEN
+		destination [m] := 0X
+	ELSE
+		destination [m - 1] := 0X
+	END
+END Append;
+
+(*----------------------------------------------------------*)
+
+(* Concatenates source2 onto source1 and copies the result into
+	destination. *)
+PROCEDURE Concat* (
+	source1, source2 : ARRAY OF CHAR;
+	VAR destination : ARRAY OF CHAR);
+BEGIN
+	Assign (source1, destination);
+	Append (source2, destination)
+END Concat;
+
+(*----------------------------------------------------------*)
+(*
+	The following predicates provide for pre-testing of the
+	operation-completion conditions for the procedures above.
+*)
+
+(* Returns TRUE if a number of characters, indicated by sourceLength, will
+	fit into destination; otherwise returns FALSE. *)
+PROCEDURE CanAssignAll* (
+	sourceLength : LONGINT;
+	VAR destination : ARRAY OF CHAR) : BOOLEAN;
+BEGIN
+	RETURN LEN (destination) > sourceLength
+END CanAssignAll;
+
+(*----------------------------------------------------------*)
+
+(* Returns TRUE if there are numberToExtract characters starting at
+	startIndex and within the sourceLength of some string, and if the
+	capacity of destination is sufficient to hold numberToExtract characters;
+	otherwise returns FALSE. *)
+PROCEDURE CanExtractAll* (
+	sourceLength, startIndex, numberToExtract : LONGINT;
+	VAR destination : ARRAY OF CHAR) : BOOLEAN;
+BEGIN
+	IF startIndex + numberToExtract < sourceLength THEN
+		RETURN LEN (destination) > numberToExtract
+	ELSE
+		RETURN LEN (destination) > sourceLength - startIndex
+	END
+END CanExtractAll;
+
+(*----------------------------------------------------------*)
+
+(* Returns TRUE if there are numberToDelete characters starting at
+	startIndex and within the stringLength of some string; otherwise returns
+	FALSE. *)
+PROCEDURE CanDeleteAll* (
+	stringLength, startIndex, numberToDelete : LONGINT) : BOOLEAN;
+BEGIN
+	RETURN startIndex + numberToDelete < stringLength
+END CanDeleteAll;
+
+(*----------------------------------------------------------*)
+
+(* Returns TRUE if there is room for the insertion of sourceLength characters
+	from some string into destination starting at startIndex; otherwise returns
+	FALSE. *)
+PROCEDURE CanInsertAll* (
+	sourceLength, startIndex : LONGINT;
+	VAR destination : ARRAY OF CHAR) : BOOLEAN;
+BEGIN
+	RETURN LEN (destination) > sourceLength + Length (destination)
+END CanInsertAll;
+
+(*----------------------------------------------------------*)
+
+(* Returns TRUE if there is room for the replacement of sourceLength
+	characters in destination starting at startIndex; otherwise returns FALSE. *)
+PROCEDURE CanReplaceAll* (
+	sourceLength, startIndex : LONGINT;
+	VAR destination : ARRAY OF CHAR ): BOOLEAN;
+BEGIN
+	RETURN LEN (destination) > sourceLength + startIndex
+END CanReplaceAll;
+
+(*----------------------------------------------------------*)
+
+(* Returns TRUE if there is sufficient room in destination to append a string
+	of length sourceLength to the string in destination; otherwise returns
+	FALSE. *)
+PROCEDURE CanAppendAll* (
+	sourceLength : LONGINT;
+	VAR destination : ARRAY OF CHAR) : BOOLEAN;
+BEGIN
+	RETURN LEN (destination) > sourceLength + Length (destination)
+END CanAppendAll;
+
+(*----------------------------------------------------------*)
+
+(* Returns TRUE if there is sufficient room in destination for a two strings of
+	lengths source1Length and source2Length; otherwise returns FALSE. *)
+PROCEDURE CanConcatAll* (
+	source1Length, source2Length : LONGINT;
+	VAR destination : ARRAY OF CHAR) : BOOLEAN;
+BEGIN
+	RETURN LEN (destination) > source1Length + source2Length
+END CanConcatAll;
+
+(*----------------------------------------------------------*)
+(*
+	The following type and procedures provide for the comparison of string
+	values, and for the location of substrings within strings.
+*)
+
+(* Returns less, equal, or greater, according as stringVal1 is lexically less
+	than, equal to, or greater than stringVal2. *)
+PROCEDURE Compare* (
+	stringVal1, stringVal2 : ARRAY OF CHAR) : LONGINT;
+VAR
+	k : LONGINT;
+BEGIN
+	k := 0;
+	WHILE stringVal1 [k] = stringVal2 [k] DO
+		IF stringVal1 [k] = 0X THEN
+			RETURN equal
+		END;
+		INC (k)
+	END;
+	IF stringVal1 [k] < stringVal2 [k] THEN
+		RETURN less
+	ELSE
+		RETURN greater
+	END
+END Compare;
+
+(*----------------------------------------------------------*)
+
+(* Returns Strings.Compare(stringVal1, stringVal2) = Strings.equal *)
+PROCEDURE Equal* (
+	stringVal1, stringVal2 : ARRAY OF CHAR) : BOOLEAN;
+VAR
+	k : LONGINT;
+BEGIN
+	k := 0;
+	WHILE stringVal1 [k] = stringVal2 [k] DO
+		IF stringVal1 [k] = 0X THEN
+			RETURN TRUE
+		END;
+		INC (k)
+	END;
+	RETURN FALSE
+END Equal;
+
+(*----------------------------------------------------------*)
+
+(* Looks forward for next occurrence of pattern in stringToSearch, starting
+	the search at position startIndex. If startIndex < LENGTH(stringToSearch)
+	and pattern is found, patternFound is returned as TRUE, and posOfPattern
+	contains the start position in stringToSearch of pattern. Otherwise
+	patternFound is returned as FALSE, and posOfPattern is unchanged. *)
+PROCEDURE FindNext* (
+	pattern, stringToSearch : ARRAY OF CHAR;
+	startIndex : LONGINT;
+	VAR patternFound : BOOLEAN;
+	VAR posOfPattern : LONGINT);
+VAR
+	k : LONGINT;
+BEGIN
+	patternFound := FALSE;
+	WHILE stringToSearch [startIndex] # 0X DO
+		IF stringToSearch [startIndex] = pattern [0] THEN
+			k := 1;
+			INC (startIndex);
+			WHILE (stringToSearch [startIndex] = pattern [k]) &
+				(pattern [k] # 0X) DO
+				INC (k);
+				INC (startIndex)
+			END;
+			IF pattern [k] = 0X THEN
+				patternFound := TRUE;
+				posOfPattern := startIndex - k;
+				RETURN
+			END;
+			DEC (startIndex, k)
+		END;
+		INC (startIndex)
+	END;
+	RETURN
+END FindNext;
+
+(*----------------------------------------------------------*)
+
+(* Looks backward for the previous occurrence of pattern in stringToSearch
+	and returns the position of the first character of the pattern if found. The
+	search for the pattern begins at startIndex. If pattern is found,
+	patternFound is returned as TRUE, and posOfPattern contains the start
+	position in stringToSearch of pattern in the range [0..startIndex].
+	Otherwise patternFound is returned as FALSE, and posOfPattern is
+	unchanged. *)
+PROCEDURE FindPrev* (
+	pattern, stringToSearch : ARRAY OF CHAR;
+	startIndex : LONGINT;
+	VAR patternFound : BOOLEAN;
+	VAR posOfPattern : LONGINT);
+VAR
+	k : LONGINT;
+BEGIN
+	patternFound := FALSE;
+	WHILE startIndex >= 0 DO
+		IF stringToSearch [startIndex] = pattern [0] THEN
+			k := 1;
+			INC (startIndex);
+			WHILE (stringToSearch [startIndex] = pattern [k]) &
+				(pattern [k] # 0X) DO
+				INC (k);
+				INC (startIndex)
+			END;
+			IF pattern [k] = 0X THEN
+				patternFound := TRUE;
+				posOfPattern := startIndex - k;
+				RETURN
+			END;
+			DEC (startIndex, k)
+		END;
+		DEC (startIndex)
+	END;
+	RETURN
+END FindPrev;
+
+(*----------------------------------------------------------*)
+
+(* Compares the string values in stringVal1 and stringVal2 for differences.
+	If they are equal, differenceFound is returned as FALSE, and TRUE
+	otherwise. If differenceFound is TRUE, posOfDifference is set to the
+	position of the first difference; otherwise posOfDifference is unchanged. *)
+PROCEDURE FindDiff* (
+	stringVal1, stringVal2 : ARRAY OF CHAR;
+	VAR differenceFound : BOOLEAN;
+	VAR posOfDifference : LONGINT);
+VAR
+	k : LONGINT;
+BEGIN
+	differenceFound := FALSE;
+	k := 0;
+	WHILE stringVal1 [k] = stringVal2 [k] DO
+		IF stringVal1 [k] = 0X THEN
+			RETURN
+		END;
+		INC (k)
+	END;
+	differenceFound := TRUE;
+	posOfDifference := k
+END FindDiff;
+
+(*----------------------------------------------------------*)
+
+(* Applies the function CAP to each character of the string value in
+	stringVar. *)
+PROCEDURE Capitalize* (
+	VAR stringVar : ARRAY OF CHAR);
+VAR
+	k : LONGINT;
+BEGIN
+	k := 0;
+	WHILE stringVar [k] # 0X DO
+		IF (stringVar [k] >= "a") & (stringVar [k] <= "z") THEN
+			stringVar [k] := CAP (stringVar [k])
+		END;
+		INC (k)
+	END
+END Capitalize;
+
+END ISOStrings.
+

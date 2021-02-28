@@ -1,0 +1,164 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Skeleton (*JM/ JG 26.7.94*);
+
+IMPORT Files, Display, Display3, Printer, Printer3, Effects, Objects, Gadgets, Oberon;
+
+CONST red = 1;
+
+TYPE
+	Frame* = POINTER TO FrameDesc;
+	FrameDesc* = RECORD (Gadgets.FrameDesc)
+		col*: INTEGER;
+	END;
+
+(*
+	To save memory we can use the framehandler to allocate the "Cmd" attribute
+	only when one exists. We have however to simulate an attribute if
+	none really exists (see the handling of "Cmd" in the "get" part below)
+*)
+PROCEDURE HandleAttributes (F: Frame; VAR M: Objects.AttrMsg);
+BEGIN
+	IF M.id = Objects.get THEN
+		IF M.name = "Gen" THEN
+			M.class := Objects.String; COPY("Skeleton.New", M.s); M.res := 0
+		ELSIF M.name = "Color" THEN
+			M.class := Objects.Int; M.i := F.col; M.res := 0 
+		ELSIF M.name = "Cmd" THEN
+			Gadgets.framehandle(F, M);
+			IF M.res < 0 THEN (* no such attribute, simulate one *)
+				M.class := Objects.String; M.s := ""; M.res := 0; 
+			END
+		ELSE Gadgets.framehandle(F, M)
+		END
+	ELSIF M.id = Objects.set THEN
+		IF M.name = "Color" THEN
+			IF M.class = Objects.Int THEN
+				F.col := SHORT(M.i); M.res := 0
+			END
+		ELSE Gadgets.framehandle(F, M);
+		END
+	ELSIF M.id = Objects.enum THEN
+		M.Enum("Color"); M.Enum("Cmd"); Gadgets.framehandle(F, M)
+	END
+END HandleAttributes;
+
+PROCEDURE Restore (F: Frame; Q: Display3.Mask; x, y, w, h: INTEGER);
+BEGIN
+	Display3.ReplConst(Q, F.col, x, y, w, h, Display.replace);
+	IF Gadgets.selected IN F.state THEN
+		Display3.FillPattern(Q, Display3.white, Display3.selectpat,
+			x, y, x, y, w, h, Display.paint)
+	END
+END Restore;
+
+PROCEDURE Print (F: Frame; VAR M: Display.PrintMsg);
+	VAR Q: Display3.Mask;
+
+	PROCEDURE P(x: INTEGER): INTEGER;
+	BEGIN RETURN SHORT(x * LONG(10000) DIV Printer.Unit)
+	END P;
+
+BEGIN
+	Gadgets.MakePrinterMask(F, M.x, M.y, M.dlink, Q);
+	Printer3.ReplConst(Q, F.col, M.x, M.y, P(F.W), P(F.H), Display.replace)
+END Print;
+
+PROCEDURE Copy* (VAR M: Objects.CopyMsg; from, to: Frame);
+BEGIN to.col := from.col; Gadgets.CopyFrame(M, from, to)
+END Copy;
+
+PROCEDURE Handle* (F: Objects.Object; VAR M: Objects.ObjMsg);
+	VAR x, y, w, h: INTEGER; F1: Frame; Q: Display3.Mask; keysum: SET;
+BEGIN
+	WITH F: Frame DO
+		IF M IS Display.FrameMsg THEN
+			WITH M: Display.FrameMsg DO
+				IF (M.F = NIL) OR (M.F = F) THEN (* message addressed to box *)
+					x := M.x + F.X; y := M.y + F.Y; w := F.W; h := F.H;
+					IF M IS Display.DisplayMsg THEN
+						WITH M: Display.DisplayMsg DO
+							IF (M.id = Display.frame) OR (M.F = NIL) THEN
+								Gadgets.MakeMask(F, x, y, M.dlink, Q);
+								Restore(F, Q, x, y, w, h)
+							ELSIF M.id = Display.area THEN
+								Gadgets.MakeMask(F, x, y, M.dlink, Q);
+								Display3.AdjustMask(Q, x + M.u, y + h - 1 + M.v, M.w, M.h);
+								Restore(F, Q, x, y, w, h)
+							END
+						END
+					ELSIF M IS Oberon.InputMsg THEN
+						WITH M: Oberon.InputMsg DO
+							IF (M.id = Oberon.track) & Gadgets.InActiveArea(F, M) & (M.keys = {1}) THEN
+								Gadgets.MakeMask(F, x, y, M.dlink, Q);
+								Oberon.RemoveMarks(x, y, w, h);
+								Display3.ReplConst(Q, Display3.FG, x, y, w, h, Display.invert);
+								keysum := M.keys;
+								REPEAT
+									Effects.TrackMouse(M.keys, M.X, M.Y, Effects.PointHand);
+									keysum := keysum + M.keys
+								UNTIL M.keys = {};
+								Oberon.RemoveMarks(x, y, w, h);
+								Display3.ReplConst(Q, Display3.FG, x, y, w, h, Display.invert);
+								IF keysum = {1} THEN
+									Gadgets.ExecuteAttr(F, "Cmd", M.dlink, NIL, NIL)
+								END;
+								M.res := 0
+							ELSE Gadgets.framehandle(F, M)
+							END
+						END
+					ELSIF M IS Display.ModifyMsg THEN Gadgets.framehandle(F, M)
+					ELSIF M IS Oberon.ControlMsg THEN Gadgets.framehandle(F, M)
+					ELSIF M IS Display.SelectMsg THEN Gadgets.framehandle(F, M)
+					ELSIF M IS Display.ConsumeMsg THEN Gadgets.framehandle(F, M)
+					ELSIF M IS Display.PrintMsg THEN Print(F, M(Display.PrintMsg))
+					ELSE Gadgets.framehandle(F, M)
+					END
+				END
+			END
+		ELSIF M IS Objects.AttrMsg THEN HandleAttributes(F, M(Objects.AttrMsg))
+		ELSIF M IS Objects.FileMsg THEN
+			WITH M: Objects.FileMsg DO
+				IF M.id = Objects.store THEN
+					Files.WriteInt(M.R, F.col); Gadgets.framehandle(F, M)
+				ELSIF M.id = Objects.load THEN
+					Files.ReadInt(M.R, F.col); Gadgets.framehandle(F, M)
+				END
+			END
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				IF M.stamp = F.stamp THEN M.obj := F.dlink (*non-first arrival*)
+				ELSE (*first arrival*)
+					NEW(F1); F.stamp := M.stamp; F.dlink := F1;
+					Copy(M, F, F1); M.obj := F1
+				END
+			END
+		ELSE Gadgets.framehandle(F, M)
+		END
+	END
+END Handle;
+
+PROCEDURE Init* (F: Frame);
+BEGIN F.W := 50; F.H := 50; F.col := red; F.handle := Handle
+END Init;
+
+PROCEDURE New*;
+VAR F: Frame;
+BEGIN NEW(F); Init(F); Objects.NewObj := F
+END New;
+
+END Skeleton.
+
+System.Free Skeleton ~
+Gadgets.Insert Skeleton.New ~

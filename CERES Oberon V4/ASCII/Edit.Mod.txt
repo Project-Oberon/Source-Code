@@ -1,0 +1,557 @@
+MODULE Edit;	(** CAS/MH/HM 27.4.1994 / NW 15.11.94 **)
+	IMPORT
+		Modules, Oberon, Display, Viewers, MenuViewers, Fonts, Printer,
+		Texts, TextFrames, ParcElems, TextPrinter;
+
+	CONST
+		Menu = "^Edit.Menu.Text System.Close  System.Copy  System.Grow  Edit.Search  Edit.Replace  Edit.Parcs  Edit.Store ";
+		OptionChar = "/";
+
+		mm = TextFrames.mm; Unit = TextPrinter.Unit;
+		Scale = mm DIV 10;	(*unit of user setable attributes is 1/10 mm*)
+
+		headerX = 15 * mm DIV Unit;
+		headerW = 165 * mm DIV Unit;
+		bodyX = 15 * mm DIV Unit; bodyY = 15 * mm DIV Unit;
+		bodyW = 165 * mm DIV Unit;
+
+		MaxPat = 128;
+		CR = 0DX;
+
+	VAR
+		R: Texts.Reader;
+		W: Texts.Writer;
+		mnam: ARRAY 12*3 + 1 OF CHAR;
+
+		find: RECORD
+			time, len: LONGINT;
+			buf: ARRAY MaxPat OF CHAR
+		END;
+		repl: RECORD
+			time: LONGINT;
+			buf: Texts.Buffer
+		END;
+
+
+	PROCEDURE Ch (ch: CHAR);
+	BEGIN Texts.Write(W, ch); Texts.Append(Oberon.Log, W.buf)
+	END Ch;
+
+	PROCEDURE Str (s: ARRAY OF CHAR);
+	BEGIN Texts.WriteString(W, s); Texts.Append(Oberon.Log, W.buf)
+	END Str;
+
+	PROCEDURE Int (n: LONGINT);
+	BEGIN Texts.Write(W, " "); Texts.WriteInt(W, n, 0); Texts.Append(Oberon.Log, W.buf)
+	END Int;
+
+	PROCEDURE Ln;
+	BEGIN Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END Ln;
+
+
+	PROCEDURE Min (x, y: LONGINT): LONGINT;
+	BEGIN
+		IF x < y THEN RETURN x ELSE RETURN y END
+	END Min;
+
+
+	PROCEDURE AppendNum (VAR s: ARRAY OF CHAR; VAR i: INTEGER; n: LONGINT);
+		VAR j: INTEGER; digits: ARRAY 16 OF CHAR;
+	BEGIN j := 0;
+		REPEAT digits[j] := CHR(n MOD 10 + 30H); INC(j); n := n DIV 10 UNTIL n = 0;
+		REPEAT DEC(j); s[i] := digits[j]; INC(i) UNTIL j = 0;
+		s[i] := 0X
+	END AppendNum;
+
+	PROCEDURE AppendDate (VAR s: ARRAY OF CHAR);	(*s := s & "   (dd mmm yy)"*)
+		VAR time, date: LONGINT; i, j, k, m: INTEGER;
+	BEGIN Oberon.GetClock(time, date); i := 0;
+		WHILE s[i] # 0X DO INC(i) END;
+		s[i] := " "; s[i + 1] := " "; s[i + 2] := " "; s[i + 3] := "("; INC(i, 4);
+		AppendNum(s, i, date MOD 20H); s[i] := " "; INC(i);
+		m := SHORT((date DIV 20H) MOD 10H); k := m * 3; j := k - 3;
+		REPEAT s[i] := mnam[j]; INC(i); INC(j) UNTIL j = k;
+		s[i] := " "; INC(i); AppendNum(s, i, (date DIV 200H) MOD 100);
+		s[i] := ")"; s[i + 1] := 0X
+	END AppendDate;
+
+	PROCEDURE ShowAliens (t: Texts.Text);
+		VAR R: Texts.Reader; identify: Texts.IdentifyMsg;
+	BEGIN
+		Texts.OpenReader(R, t, 0); Texts.ReadElem(R);
+		WHILE ~R.eot DO identify.mod[31] := 0X; R.elem.handle(R.elem, identify);
+			IF identify.mod[31] = 1X THEN Ln; Str("pos"); Int(Texts.Pos(R) - 1);
+				Str("  unknown element allocator: "); Str(identify.mod); Ch("."); Str(identify.proc)
+			END;
+			Texts.ReadElem(R)
+		END;
+		IF W.buf.len > 0 THEN Ln; Texts.Append(Oberon.Log, W.buf) END
+	END ShowAliens;
+
+
+	(* view support *)
+
+	PROCEDURE ShowPos (F: TextFrames.Frame; pos: LONGINT);
+		VAR beg, end, delta: LONGINT;
+	BEGIN delta := 200;
+		LOOP beg := F.org; end := TextFrames.Pos(F, F.X + F.W, F.Y);
+			IF (beg <= pos) & (pos < end) OR (delta = 0) THEN EXIT END;
+			TextFrames.Show(F, pos - delta); delta := delta DIV 2
+		END
+	END ShowPos;
+
+	PROCEDURE SetCaret (F: TextFrames.Frame; pos: LONGINT);
+	BEGIN Oberon.PassFocus(Viewers.This(F.X, F.Y)); TextFrames.SetCaret(F, pos)
+	END SetCaret;
+
+	PROCEDURE NewView (name: ARRAY OF CHAR; class: INTEGER;
+			T: Texts.Text; org: LONGINT): TextFrames.Frame;
+		VAR V: MenuViewers.Viewer; F, M: TextFrames.Frame; i, x, y: INTEGER;
+	BEGIN
+		IF class = Texts.String THEN i := 0;
+			WHILE name[i] # 0X DO INC(i) END;
+			name[i] := 22X; INC(i); name[i] := 0X;
+			WHILE i >= 0 DO name[i+1] := name[i]; DEC(i) END;
+			name[0] := 22X
+		END;
+		F := TextFrames.NewText(T, org);
+		Oberon.AllocateUserViewer(Oberon.Mouse.X, x, y);
+		M := TextFrames.NewMenu(name, Menu);
+		V := MenuViewers.New(M, F, TextFrames.menuH, x, y);
+		ShowPos(F, org); RETURN F
+	END NewView;
+
+
+	(* search & replace *)
+
+	PROCEDURE Find (T: Texts.Text; beg: LONGINT; VAR end: LONGINT);
+		VAR i, j, b, e: INTEGER; ch: CHAR; ref: ARRAY MaxPat OF CHAR;	(*ref [b..e) is readback buffer*)
+	BEGIN
+		Texts.OpenReader(R, T, beg); Texts.Read(R, ch); i := 0; ref[0] := ch; j := 0; b := 0; e := 1;
+		WHILE ~R.eot & (i < find.len) DO
+			IF (find.buf[i] = ch)
+				OR (find.buf[i] = 0FFX)
+					& ((ch < "0") OR (ch > "9") & (ch < "A") OR (ch > "Z") & (ch < "a") OR (ch > "z"))
+						THEN INC(i); j := (j + 1) MOD MaxPat
+			ELSE i := 0; b := (b + 1) MOD MaxPat; j := b
+			END;
+			IF j # e THEN ch := ref[j]
+			ELSE Texts.Read(R, ch); ref[j] := ch; e := (e + 1) MOD MaxPat; INC(beg);
+			END
+		END;
+		IF i = find.len THEN end := beg ELSE end := -1 END
+	END Find;
+
+	PROCEDURE Check (T: Texts.Text; beg: LONGINT): BOOLEAN;
+		VAR ch: CHAR; i: INTEGER;
+	BEGIN i := 0;
+		IF (beg >= 0) & (find.len > 0) THEN Texts.OpenReader(R, T, beg); Texts.Read(R, ch);
+			WHILE ~R.eot & (i < find.len) & (ch = find.buf[i]) DO Texts.Read(R, ch); INC(i) END;
+		END;
+		RETURN i = find.len
+	END Check;
+
+	PROCEDURE SetReplBuf;
+		VAR T: Texts.Text; beg, end, time: LONGINT;
+	BEGIN Oberon.GetSelection(T, beg, end, time);
+		IF time > repl.time THEN repl.time := time;
+			Texts.OpenBuf(repl.buf); Texts.Save(T, beg, end, repl.buf)
+		END
+	END SetReplBuf;
+
+	PROCEDURE Subst (T: Texts.Text; beg: LONGINT; VAR end: LONGINT);
+	BEGIN Texts.Delete(T, beg, beg + find.len);
+		IF repl.buf.len > 0 THEN end := beg + repl.buf.len;
+			Texts.Insert(T, beg, repl.buf); Texts.Save(T, beg, end, repl.buf)
+		END
+	END Subst;
+
+
+	(* arguments *)
+
+	PROCEDURE MarkedFrame (): TextFrames.Frame;
+		VAR V: Viewers.Viewer;
+	BEGIN V := Oberon.MarkedViewer();
+		IF (V # NIL) & (V IS MenuViewers.Viewer) & (V.dsc.next IS TextFrames.Frame) THEN
+			RETURN V.dsc.next(TextFrames.Frame)
+		ELSE RETURN NIL
+		END
+	END MarkedFrame;
+
+	PROCEDURE FocusFrame (): TextFrames.Frame;
+		VAR V: Viewers.Viewer; f: Display.Frame;
+	BEGIN V := Oberon.FocusViewer;
+		IF (V # NIL) & (V IS MenuViewers.Viewer) & (V.dsc # NIL) THEN f := V.dsc.next;
+			IF (f # NIL) & (f IS TextFrames.Frame) THEN RETURN f(TextFrames.Frame) ELSE RETURN NIL END
+		ELSE RETURN NIL
+		END
+	END FocusFrame;
+
+	PROCEDURE TargetFrame (): TextFrames.Frame;	(*body frame or focus frame*)
+		VAR f: Display.Frame;
+	BEGIN
+		IF Oberon.Par.vwr.dsc = Oberon.Par.frame THEN f := Oberon.Par.frame.next;
+			IF (f # NIL) & (f IS TextFrames.Frame) THEN RETURN f(TextFrames.Frame) ELSE RETURN NIL END
+		ELSE RETURN FocusFrame()
+		END
+	END TargetFrame;
+
+	PROCEDURE GetMainArg (VAR S: Texts.Scanner; VAR end: LONGINT); (*takes recent selection if ^*)
+		VAR text: Texts.Text; beg, time: LONGINT;
+	BEGIN Texts.Scan(S); end := MAX(LONGINT);
+		IF (S.class = Texts.Char) & (S.c = "^") THEN Oberon.GetSelection(text, beg, end, time);
+			IF time >= 0 THEN Texts.OpenScanner(S, text, beg); Texts.Scan(S) END
+		END;
+		IF S.line # 0 THEN S.class := Texts.Inval END
+	END GetMainArg;
+
+	PROCEDURE GetArg (VAR S: Texts.Scanner);
+		(*takes selection in command frame if ^*)
+		VAR F: TextFrames.Frame;
+	BEGIN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "^") THEN F := Oberon.Par.frame(TextFrames.Frame);
+			IF F.hasSel THEN 
+				Texts.OpenScanner(S, F.text, F.selbeg.pos); Texts.Scan(S); F.time := 0;
+			END
+		END
+	END GetArg;
+
+	PROCEDURE Change (sel: SET);
+		VAR S: Texts.Scanner; fnt: Fonts.Font; text: Texts.Text; beg, end, time: LONGINT; col, off: SHORTINT;
+	BEGIN GetArg(S); Oberon.GetSelection(text, beg, end, time);
+		IF time >= 0 THEN
+			IF (sel = {0}) & (S.class = Texts.Name) THEN fnt := Fonts.This(S.s)
+			ELSIF (sel = {1}) & (S.class = Texts.Int) & (0 <= S.i) & (S.i < 16) THEN col := SHORT(SHORT(S.i))
+			ELSIF (sel = {2}) & (S.class = Texts.Int) & (-128 <= S.i) & (S.i < 128) THEN off := SHORT(SHORT(S.i))
+			ELSE sel := {}
+			END;
+			IF sel # {} THEN Texts.ChangeLooks(text, beg, end, sel, fnt, col, off) END
+		END
+	END Change;
+
+
+	(* commands *)
+
+	PROCEDURE Locate*;
+		VAR S: Texts.Scanner; F: TextFrames.Frame; text: Texts.Text; beg, end, time: LONGINT;
+	BEGIN F := MarkedFrame(); Oberon.GetSelection(text, beg, end, time);
+		IF time > 0 THEN Texts.OpenScanner(S, text, beg); Texts.Scan(S);
+			WHILE (S.class # Texts.Int) & (S.line = 0) & ~S.eot DO Texts.Scan(S) END;
+			IF (F # NIL) & (S.class = Texts.Int) & (S.line = 0) THEN ShowPos(F, S.i); SetCaret(F, S.i) END
+		END;
+	END Locate;
+
+	PROCEDURE Search*;
+		VAR F: TextFrames.Frame; T: Texts.Text; i, beg, end, time: LONGINT;
+	BEGIN Oberon.GetSelection(T, beg, end, time); F := TargetFrame();
+		IF time > find.time THEN find.time := time; find.len := Min(end - beg, MaxPat);
+			Texts.OpenReader(R, T, beg); i := 0;
+			REPEAT Texts.Read(R, find.buf[i]); INC(i) UNTIL i = find.len
+		END;
+		IF F # NIL THEN
+			IF F.hasCar THEN beg := F.carloc.pos ELSE beg := 0 END;
+			Find(F.text, beg, end);
+			IF end >= 0 THEN ShowPos(F, end); SetCaret(F, end)
+			ELSE TextFrames.RemoveCaret(F)
+			END;
+			TextFrames.RemoveSelection(F)
+		END
+	END Search;
+
+	PROCEDURE Show*;
+		VAR S: Texts.Scanner; F: TextFrames.Frame; text: Texts.Text;
+			i, j, beg, end, time: LONGINT;
+			name: ARRAY Modules.ModNameLen + 4 OF CHAR;
+	BEGIN text := Oberon.Par.text; beg := Oberon.Par.pos; end := Oberon.Par.text.len; time := Oberon.Time();
+		Texts.OpenScanner(S, text, beg); Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "^") OR (S.line > 0) THEN Oberon.GetSelection(text, beg, end, time);
+			IF time >= 0 THEN Texts.OpenScanner(S, text, beg); Texts.Scan(S) END
+		END;
+		IF (time >= 0) & (S.class = Texts.Name) THEN i := 0;
+			WHILE (S.s[i] # 0X) & (S.s[i] # ".") DO name[i] := S.s[i]; INC(i) END;
+			IF i < Modules.ModNameLen THEN
+				name[i] := "."; name[i+1] := "M"; name[i+2] := "o"; name[i+3] := "d"; name[i+4] := 0X;
+				find.len := 0; j := i + 1; 
+				WHILE S.s[j] # 0X DO find.buf[find.len] := S.s[j]; INC(find.len); INC(j) END;
+				find.buf[find.len] := 0FFX; INC(find.len);
+				find.time := time;
+				text := TextFrames.Text(name);
+				Find(text, 0, end); IF end < 0 THEN end := 0 END;
+				F := NewView(name, Texts.Name, text, end);
+				IF end > 0 THEN SetCaret(F, end) END
+			END
+		END
+	END Show;
+
+	PROCEDURE Recall*;
+		VAR B: Texts.Buffer; copyover: Oberon.CopyOverMsg;
+	BEGIN Texts.Recall(B);
+		IF B # NIL THEN copyover.beg := 0; copyover.end := B.len;
+			copyover.text := TextFrames.Text(""); Texts.Append(copyover.text, B);
+			Oberon.FocusViewer.handle(Oberon.FocusViewer, copyover)
+		END
+	END Recall;
+
+	PROCEDURE ClearReplaceBuffer*;
+	BEGIN Texts.OpenBuf(repl.buf)
+	END ClearReplaceBuffer;
+
+	PROCEDURE Replace*;
+		VAR F: TextFrames.Frame; T: Texts.Text; beg, end: LONGINT;
+	BEGIN F := TargetFrame(); SetReplBuf;
+		IF (F # NIL) & F.hasCar THEN T := F.text; end := F.carloc.pos; beg := end - find.len;
+			TextFrames.RemoveSelection(F);
+			IF Check(T, beg) THEN Subst(T, beg, end) END;
+			Find(T, end, beg);
+			IF beg >= 0 THEN ShowPos(F, beg); SetCaret(F, beg)
+			ELSE TextFrames.RemoveCaret(F)
+			END
+		END
+	END Replace;
+
+	PROCEDURE ReplaceAll*;
+		VAR F: TextFrames.Frame; T: Texts.Text; beg, end: LONGINT;
+	BEGIN F := TargetFrame(); SetReplBuf;
+		IF (F # NIL) & F.hasCar THEN T := F.text; end := F.carloc.pos; beg := end - find.len;
+			TextFrames.RemoveSelection(F);
+			IF Check(T, beg) THEN Subst(T, beg, end) END;
+			LOOP Find(T, end, beg);
+				IF beg < 0 THEN EXIT END;
+				Subst(T, beg - find.len, end)
+			END
+		END
+	END ReplaceAll;
+
+	PROCEDURE ChangeFont*;
+	BEGIN Change({0})
+	END ChangeFont;
+
+	PROCEDURE ChangeColor*;
+	BEGIN Change({1})
+	END ChangeColor;
+
+	PROCEDURE ChangeOffset*;
+	BEGIN Change({2})
+	END ChangeOffset;
+
+	PROCEDURE ChangeBackgroundColor*;
+		VAR F: TextFrames.Frame; m: MenuViewers.ModifyMsg; S: Texts.Scanner; H: INTEGER;
+	BEGIN F := MarkedFrame();
+		IF F # NIL THEN GetArg(S);
+			IF S.class = Texts.Int THEN
+				F.col := SHORT(SHORT(S.i)); m.id := MenuViewers.extend; m.Y := F.Y; H := F.H;
+				m.H := 0; F.handle(F, m); (*suspend*)
+				m.H := H; F.handle(F, m) (*extend*)
+			END
+		END
+	END ChangeBackgroundColor;
+
+
+	PROCEDURE InsertParc*;
+		VAR copy: Texts.CopyMsg; insert: TextFrames.InsertElemMsg;
+	BEGIN
+		TextFrames.defParc.handle(TextFrames.defParc, copy); insert.e := copy.e;
+		Oberon.FocusViewer.handle(Oberon.FocusViewer, insert)
+	END InsertParc;
+
+	PROCEDURE Parcs*;
+		VAR S: Texts.Scanner; V: Viewers.Viewer; F: TextFrames.Frame; um: TextFrames.UpdateMsg;
+			end: LONGINT; R: Texts.Reader;
+	BEGIN
+		IF Oberon.Par.frame # Oberon.Par.vwr.dsc THEN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+			Texts.Scan(S);
+			IF (S.class = Texts.Char) & (S.line = 0) & (S.c = "*") THEN V := Oberon.MarkedViewer() ELSE V := NIL END
+		ELSE V := Oberon.Par.vwr
+		END;
+		IF (V # NIL) & (V IS MenuViewers.Viewer) & (V.dsc.next IS TextFrames.Frame) THEN
+			F := V.dsc.next(TextFrames.Frame); F.showsParcs := ~ F.showsParcs;
+			Texts.OpenReader(R, F.text, F.org); Texts.ReadElem(R); end := TextFrames.Pos(F, F.X + F.W, F.Y);
+			WHILE (Texts.Pos(R) <= end) & (R.elem # NIL) & ~(R.elem IS TextFrames.Parc) DO Texts.ReadElem(R) END;
+			IF (R.elem # NIL) & (R.elem IS TextFrames.Parc) & (Texts.Pos(R) <= end) THEN
+				um.id := Texts.replace; um.text := F.text; um.end := end;
+				um.beg := Texts.Pos(R)-1;
+				F.handle(F, um)
+			END
+		END
+	END Parcs;
+
+	PROCEDURE Open*;
+		VAR S: Texts.Scanner; F: TextFrames.Frame; end: LONGINT;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); GetMainArg(S, end);
+		IF (S.class = Texts.Name) OR (S.class = Texts.String) THEN
+			F := NewView(S.s, S.class, TextFrames.Text(S.s), 0);
+			ShowAliens(F.text)
+		END
+	END Open;
+
+	PROCEDURE Store*;
+		VAR S: Texts.Scanner; R: Texts.Reader; V: Viewers.Viewer; T: Texts.Text; ch: CHAR;
+	BEGIN V := NIL;
+		IF Oberon.Par.frame = Oberon.Par.vwr.dsc THEN V := Oberon.Par.vwr
+		ELSIF Oberon.Pointer.on THEN  V := Oberon.MarkedViewer()
+		END;
+		IF (V # NIL) & (V IS MenuViewers.Viewer) & (V.dsc IS TextFrames.Frame) & (V.dsc.next IS TextFrames.Frame) THEN
+			Texts.OpenScanner(S, V.dsc(TextFrames.Frame).text, 0); Texts.Scan(S);
+			IF (S.class = Texts.Name) OR (S.class = Texts.String) THEN
+				Str("Edit.Store "); Str(S.s); T := V.dsc.next(TextFrames.Frame).text;
+				Texts.Close(T, S.s); Int(T.len); Ln;
+				T := V.dsc(TextFrames.Frame).text;
+				Texts.OpenReader(R, T, T.len - 1); Texts.Read(R, ch);
+				IF ch = "!" THEN Texts.Delete(T, T.len - 1, T.len) END
+			END
+		END
+	END Store;
+
+	PROCEDURE Set*;
+		VAR S: Texts.Scanner; R: Texts.Reader; text: Texts.Text; P: TextFrames.Parc;
+			msg: ParcElems.StateMsg; pos, beg, end, time: LONGINT;
+	BEGIN GetArg(S); Oberon.GetSelection(text, beg, end, time);
+		IF time >= 0 THEN Texts.OpenReader(R, text, beg); 
+			REPEAT Texts.ReadElem(R); pos := Texts.Pos(R);
+				IF ~R.eot & (pos <= end) & (R.elem IS TextFrames.Parc) THEN
+					msg.id := ParcElems.set; msg.pos := pos - 1; msg.frame := NIL; msg.par := S; msg.log := Oberon.Log;
+					P := R.elem(TextFrames.Parc); P.handle(P, msg);
+				END
+			UNTIL R.eot OR (pos > end)
+		ELSE Str("Edit.Set failed (no parc selected)"); Ln
+		END
+	END Set;
+
+	PROCEDURE Get*;
+		VAR S: Texts.Scanner; R: Texts.Reader; text: Texts.Text; P: TextFrames.Parc; pos, beg, end, time: LONGINT;
+			msg: ParcElems.StateMsg;
+	BEGIN GetArg(S); Oberon.GetSelection(text, beg, end, time);
+		IF time >= 0 THEN
+			Texts.OpenReader(R, text, beg); Texts.ReadElem(R); pos := Texts.Pos(R);
+			IF ~R.eot & (pos <= end) & (R.elem IS TextFrames.Parc) THEN
+				Str("Edit.Set ^ ");
+				msg.id := ParcElems.get; msg.pos := pos - 1; msg.frame := NIL; msg.par := S; msg.log := Oberon.Log;
+				P := R.elem(TextFrames.Parc); P.handle(P, msg)
+			ELSE Str("Edit.Get failed (no parc selected)")
+			END
+		ELSE Str("Edit.Get failed (no parc selected)")
+		END;
+		Ln
+	END Get;
+
+
+	PROCEDURE Print*;
+		VAR S, S1: Texts.Scanner; V: Viewers.Viewer; F: TextFrames.Frame; end: LONGINT; draft: BOOLEAN;
+
+		PROCEDURE PrintText(VAR S: Texts.Scanner; T: Texts.Text; name: ARRAY OF CHAR; draft: BOOLEAN);
+			CONST headerLen = 128;
+			VAR pos, len: LONGINT; ch: CHAR;
+				hx, hy, hw, bx, by, bw, bh, i, k: INTEGER;
+				nofcopies, pno, first, last, arab: INTEGER;
+				fnt: Fonts.Font; label, labelfirst, alt: BOOLEAN;
+				header: ARRAY headerLen OF CHAR;
+		BEGIN hx := headerX; hw := headerW;
+			hy := SHORT((LONG(Printer.PageHeight) * Unit - 17 * mm) DIV Unit);
+			bx := bodyX; by := bodyY; bw := bodyW;
+			bh := SHORT((LONG(Printer.PageHeight) * Unit - 37 * mm) DIV Unit);
+			nofcopies := 1; pno := 0; first := 0; last := 10000; arab := 1;
+			label := TRUE; labelfirst := TRUE; alt := FALSE;
+			header[0] := 0X; fnt := Fonts.Default;
+			Texts.Scan(S);
+			WHILE (S.class = Texts.Char) & (S.c = OptionChar) DO
+				Texts.Scan(S);
+				IF S.class = Texts.Name THEN ch := CAP(S.s[0]);
+					IF ch # "H" THEN Texts.Scan(S) END;
+					IF ch = "A" THEN alt := TRUE
+					ELSIF (ch = "C") & (S.class = Texts.Int) & (1 <= S.i) & (S.i < 10) THEN nofcopies := SHORT(S.i); Texts.Scan(S)
+					ELSIF (ch = "F") & (S.class = Texts.Name) THEN fnt := Fonts.This(S.s); Texts.Scan(S)
+					ELSIF ch = "H" THEN
+						REPEAT Texts.Read(S, ch) UNTIL (ch > " ") OR S.eot;
+						IF ch = 22X THEN i := 0; (* read string *)
+							REPEAT Texts.Read(S, ch); header[i] := ch; INC(i) UNTIL (ch = 22X) OR (ch = CR);
+							header[i-1] := 0X; Texts.Read(S, ch);
+							(*COPY(S.s, header); Texts.Scan(S)*)
+						ELSE COPY(name, header); AppendDate(header)
+						END;
+						S.nextCh := ch; Texts.Scan(S);
+					ELSIF ch = "M" THEN	(*margin options*)
+						IF S.class = Texts.Name THEN ch := CAP(S.s[0]); Texts.Scan(S); i := 0;
+							WHILE (S.class = Texts.Int) & (0 <= S.i) DO
+								k := SHORT(S.i * Scale DIV TextPrinter.Unit); INC(i); Texts.Scan(S);
+								IF ch = "H" THEN
+									IF i = 1 THEN hx := k ELSIF i = 2 THEN hy := k ELSIF i = 3 THEN hw := k END
+								ELSIF ch = "B" THEN
+									IF i = 1 THEN bx := k ELSIF i = 2 THEN by := k
+									ELSIF i = 3 THEN bw := k ELSIF i = 4 THEN bh := k
+									END
+								END
+							END
+						END
+					ELSIF ch = "P" THEN	(*page numbering options*)
+						IF (S.class = Texts.Int) & (0 <= S.i) THEN pno := SHORT(S.i); first := pno; Texts.Scan(S)
+						ELSIF S.class = Texts.Name THEN ch := CAP(S.s[0]); Texts.Scan(S);
+							IF ch = "F" THEN labelfirst := FALSE
+							ELSIF ch = "N" THEN label := FALSE
+							ELSIF ch = "R" THEN arab := -1;
+								IF first = 0 THEN pno := 1; first := 1 END
+							END
+						END
+					ELSIF (ch = "S") & (S.class = Texts.Int) & (0 <= S.i) THEN first := SHORT(S.i); Texts.Scan(S);
+						IF (S.class = Texts.Int) & (0 <= S.i) THEN last := SHORT(S.i); Texts.Scan(S) ELSE last := first END
+					END
+				END
+			END;
+			Ch(" "); Str(name); Int(nofcopies); Ch(" ");
+			IF draft THEN TextPrinter.PrintDraft(T, name, nofcopies)
+			ELSE pos := 0; len := T.len;
+				WHILE (pos < len) & (pno <= last) & (Printer.res = 0) DO
+					IF (first <= pno) & label & labelfirst THEN
+						TextPrinter.PlaceHeader(hx, hy, hw, arab*pno, fnt, header, alt)
+					END;
+					TextPrinter.PlaceBody(bx, by, bw, bh, T, pos, pno, (first <= pno) & (pno <= last));
+					IF first <= pno THEN Printer.Page(nofcopies); Ch(".") ELSE Ch("'") END;
+					INC(pno); labelfirst := TRUE
+				END
+			END;
+			Ln
+		END PrintText;
+
+	BEGIN Str("Edit.Print "); Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF ((S.class = Texts.Name) OR (S.class = Texts.String)) & (S.line = 0) THEN Str(S.s);
+			Printer.Open(S.s, Oberon.User, Oberon.Password); TextPrinter.InitFonts;
+			IF Printer.res = 0 THEN GetMainArg(S, end);
+				IF (S.class = Texts.Char) & (S.c = "%") THEN draft := TRUE; Texts.Scan(S) ELSE draft := FALSE END;
+				IF Oberon.Par.frame = Oberon.Par.vwr.dsc THEN
+					F := Oberon.Par.frame(TextFrames.Frame);
+					IF (F.next # NIL) & (F.next IS TextFrames.Frame) THEN
+						Texts.OpenScanner(S1, F.text, 0); Texts.Scan(S1);
+						PrintText(S, F.next(TextFrames.Frame).text, S1.s, draft)
+					END
+				ELSIF (S.class = Texts.Char) & (S.c = "*") THEN V := Oberon.MarkedViewer();
+					IF (V IS MenuViewers.Viewer) & (V.dsc.next IS TextFrames.Frame) THEN
+						Texts.OpenScanner(S1, V.dsc(TextFrames.Frame).text, 0); Texts.Scan(S1);
+						IF S1.class # Texts.Name THEN S1.s[0] := "*"; S1.s[1] := 0X END;
+						PrintText(S, V.dsc.next(TextFrames.Frame).text, S1.s, draft)
+					ELSE Str(" failed (bad * marker)"); Ln
+					END
+				ELSIF S.class = Texts.Name THEN
+					REPEAT PrintText(S, TextFrames.Text(S.s), S.s, draft)
+					UNTIL S.eot OR (S.class # Texts.Name) OR (Texts.Pos(S) > end)
+				ELSE Ln
+				END;
+				Printer.Close
+			ELSE Str(" failed (");
+				IF Printer.res = 1 THEN Str("no such printer)")
+				ELSIF Printer.res = 2 THEN Str("no link)")
+				ELSIF Printer.res = 3 THEN Str("printer not ready)")
+				ELSIF Printer.res = 4 THEN Str("no permission)")
+				ELSE Str("res ="); Int(Printer.res); Str(" ?)")
+				END;
+				Ln
+			END
+		ELSE Str("failed (no printer specified)"); Ln
+		END
+	END Print;
+
+BEGIN Texts.OpenWriter(W);
+	mnam := "JanFebMarAprMayJunJulAugSepOctNovDec";
+	find.time := -1; find.len := 0;
+	repl.time := -1; NEW(repl.buf); Texts.OpenBuf(repl.buf)
+END Edit.

@@ -1,0 +1,502 @@
+MODULE Printer;  (*JT 11.5.90*)  (* RC 2.6.91 *)
+
+  IMPORT SYSTEM, Files, Objects, V24, Oberon, Texts, Centronics, Fonts;
+
+  CONST 
+    Planes = 4;  (* HP 550C *)
+	ReleaseMem = FALSE;
+	C3 = TRUE; (* use only 3 colors for blocks *)
+	
+    CR = 0DX; LF = 0AX; xOn = 11X; xOff = 13X;
+
+	maxfonts = 24; 
+	PW = 2336; PH = 3281; PL = PW DIV 32;
+	ESC = 1BX; CH = PH DIV 4;
+	N = 40;
+	
+	(* not all constants used, but same interface as HPPrinter needed *)
+
+  TYPE
+		Bitmap = POINTER TO ARRAY CH, PL OF SET;
+		Pattern = ARRAY 16 OF SET;
+		Font = Fonts.Font; 
+		
+    RealVector = ARRAY N OF REAL;
+    Poly = RECORD a, b, c, d, t: REAL END ;
+    PolyVector = ARRAY N OF Poly;
+	
+  VAR
+    res*: INTEGER; (*0 = done, 1 = not done*)
+	Width*, Height*, Depth*: INTEGER;
+	FrameX*, FrameY*, FrameW*, FrameH*: INTEGER;
+	Unit*: LONGINT;
+    PrinterName, curFont, listFont: ARRAY 32 OF CHAR;
+    f: Files.File;
+    R: Files.Rider;
+    hex: ARRAY 16 OF CHAR;
+    pno, ppos: LONGINT;
+    p: PROCEDURE;
+    port: INTEGER;
+
+  PROCEDURE Ch(ch: CHAR);
+  BEGIN Files.Write(R, ch)
+  END Ch;
+
+  PROCEDURE Int(i: LONGINT);
+    VAR s: ARRAY 20 OF CHAR; i1, k: LONGINT;
+  BEGIN
+    i1 := ABS(i);
+    s[0] := CHR(i1 MOD 10 + ORD("0")); i1 := i1 DIV 10; k := 1;
+    WHILE i1 > 0 DO s[k] := CHR(i1 MOD 10 + ORD("0")); i1 := i1 DIV 10; INC(k) END ;
+    IF i < 0 THEN s[k] := "-"; INC(k) END ;
+    WHILE k > 0 DO DEC(k); Ch(s[k]) END ;
+    Ch(" ")
+  END Int;
+
+  PROCEDURE Str(s: ARRAY OF CHAR);
+    VAR i: INTEGER;
+  BEGIN i := 0;
+    WHILE s[i] # 0X DO Ch(s[i]); INC(i) END
+  END Str;
+
+  PROCEDURE Hex(i: INTEGER);
+  BEGIN
+    IF i < 10 THEN Ch(CHR(i+ORD("0")))
+    ELSE Ch(CHR(i+(ORD("a")-10)))
+    END
+  END Hex;
+
+  PROCEDURE Error(s0, s1: ARRAY OF CHAR);
+    VAR error, f: ARRAY 32 OF CHAR;
+  BEGIN COPY(s0, error); COPY(s1, f); HALT(99)
+  END Error;
+
+  PROCEDURE Open*(name, user: ARRAY OF CHAR; password: LONGINT);
+    VAR T0: Texts.Text; R0: Texts.Reader; ch: CHAR;
+  BEGIN res := 1; NEW(T0);
+    IF Files.Old("PSHeader.Text") # NIL THEN
+      FrameX := 94; FrameY := 177; FrameW := 2336; FrameH := 3280; Depth := 1;
+      Texts.Open(T0, "PSHeader.Text");
+      f := Files.New("Document.Print");
+      IF f # NIL THEN
+        Texts.OpenReader(R0, T0, 0); Files.Set(R, f, 0); Texts.Read(R0, ch);
+        WHILE ~R0.eot DO
+          IF ch = CR THEN ch := LF END ;
+          Files.Write(R, ch); Texts.Read(R0, ch)
+        END ;
+        COPY(name, PrinterName);
+        res := 0
+      END ;
+      curFont := ""; listFont := ""; ppos := Files.Pos(R); pno := 1;
+    ELSE Error("file not found", "PSHeader.Text")
+    END
+  END Open;
+  
+  PROCEDURE ReplConst*(x, y, w, h: INTEGER);
+  BEGIN
+    IF (w > 0) & (h > 0) THEN Int(x+1); Int(y); Int(w-1); Int(h-1); Ch("l"); Ch(LF) END
+  END ReplConst;
+    
+  PROCEDURE UseListFont*(VAR name: ARRAY OF CHAR);
+  BEGIN
+    COPY(name, listFont); curFont := ""
+  END UseListFont;
+
+  PROCEDURE Special(VAR s: ARRAY OF CHAR; fname: ARRAY OF CHAR);
+    CONST FontFileId = 0DBX;
+    TYPE
+      RunRec = RECORD beg, end: INTEGER END;
+      BoxRec = RECORD dx, x, y, w, h: INTEGER END;
+    VAR ch: CHAR; height, minX, maxX, minY, maxY, sindex, chno: INTEGER;
+      NofRuns, NofBoxes: INTEGER;
+      i, j, k, l, m, n, dx, x, y, w, h: INTEGER;
+      run: ARRAY 16 OF RunRec;
+      box: ARRAY 256 OF BoxRec;
+      pos: LONGINT;
+      f1: Files.File;
+      R1: Files.Rider;
+  BEGIN
+    f1 := Files.Old(fname);
+    IF f1 # NIL THEN
+      Files.Set(R1, f1, 0);
+      Files.Read(R1, ch);
+      IF ch = FontFileId THEN
+        Files.Read(R1, ch); (*abstraction*)
+        Files.Read(R1, ch); (*family*)
+        Files.Read(R1, ch); (*variant*)
+        Files.ReadInt(R1, height); (*line spacing*)
+        Files.ReadInt(R1, minX); Files.ReadInt(R1, maxX);
+        Files.ReadInt(R1, minY); Files.ReadInt(R1, maxY);
+        Files.ReadInt(R1, NofRuns);
+        NofBoxes := 0; k := 0;
+        WHILE k # NofRuns DO
+          Files.ReadInt(R1, run[k].beg); Files.ReadInt(R1, run[k].end);
+          NofBoxes := NofBoxes + run[k].end - run[k].beg;
+          INC(k)
+        END ;
+        l := 0;
+        WHILE l # NofBoxes DO
+          Files.ReadInt(R1, box[l].dx);
+          Files.ReadInt(R1, box[l].x); Files.ReadInt(R1, box[l].y);
+          Files.ReadInt(R1, box[l].w); Files.ReadInt(R1, box[l].h);
+          INC(l)
+        END ;
+        pos := Files.Pos(R1);
+        sindex := 0;
+        WHILE s[sindex] # 0X DO
+          chno := ORD(s[sindex]); INC(sindex);
+          Files.Set(R1, f1, pos);
+          k := 0; l := 0; m := 0;
+          LOOP
+            IF k >= NofRuns THEN EXIT END ;
+            m := run[k].beg;
+            WHILE m < run[k].end DO
+              dx := box[l].dx;
+              x := box[l].x;
+              y := box[l].y;
+              w := box[l].w;
+              h := box[l].h;
+              IF m = chno THEN Int(x); Int(y); Int(w + (-w) MOD 8); Int(h); Int(dx); Ch("k"); Ch(LF) END ;
+              n := (w + 7) DIV 8; i := 0;
+              WHILE i < h DO
+                j := 0;
+                WHILE j < n DO
+                  Files.Read(R1, ch); INC(j);
+                  IF m = chno THEN Ch(hex[ORD(ch) MOD 16]); Ch(hex[ORD(ch) DIV 16]) END ;
+                 END ;
+                INC(i);
+                IF m = chno THEN Ch(LF) END
+              END ;
+              IF m = chno THEN EXIT END ;
+              INC(l); INC(m)
+            END ;
+            INC(k)
+          END
+        END
+      ELSE Error("Printer font not found", fname)
+      END
+    ELSE Error("Printer font not found", fname)
+    END
+  END Special;
+  
+  PROCEDURE Hack(VAR s, fname: ARRAY OF CHAR);
+    VAR i, n: INTEGER; ch: CHAR; family: ARRAY 7 OF CHAR;
+    BEGIN
+    CASE fname[0] OF
+       "E": IF fname = "Electra.Scn.Fnt" THEN Special(s, "Electra.Pr3.Fnt"); RETURN
+          ELSIF fname = "Elektra.Scn.Fnt" THEN Special(s, "Elektra.Pr3.Fnt"); RETURN END
+    | "G": IF fname = "GreekSyntax10.Scn.Fnt" THEN Special(s, "GreekSyntax10.Pr3.Fnt"); RETURN
+          ELSIF fname = "GreekSyntax12.Scn.Fnt" THEN Special(s, "GreekSyntax12.Pr3.Fnt"); RETURN
+          ELSIF fname = "GreekSyntax14.Scn.Fnt" THEN Special(s, "GreekSyntax14.Pr3.Fnt"); RETURN
+          ELSIF fname = "GreekSyntax16.Scn.Fnt" THEN Special(s, "GreekSyntax16.Pr3.Fnt"); RETURN
+          ELSIF fname = "GreekSyntax20.Scn.Fnt" THEN Special(s, "GreekSyntax20.Pr3.Fnt"); RETURN
+          ELSIF fname = "GreekSyntax24.Scn.Fnt" THEN Special(s, "GreekSyntax24.Pr3.Fnt"); RETURN
+          END
+    | "L": IF fname = "LetterHead.Scn.Fnt" THEN Special(s, "LetterHead.Pr3.Fnt"); RETURN END
+    | "M": IF fname = "Math10.Scn.Fnt" THEN Special(s, "Math10.Pr3.Fnt"); RETURN
+          ELSIF fname = "Math12.Scn.Fnt" THEN Special(s, "Math12.Pr3.Fnt"); RETURN
+          ELSIF fname = "Math14.Scn.Fnt" THEN Special(s, "Math14.Pr3.Fnt"); RETURN
+          ELSIF fname = "Math16.Scn.Fnt" THEN Special(s, "Math16.Pr3.Fnt"); RETURN
+          ELSIF fname = "Math20.Scn.Fnt" THEN Special(s, "Math20.Pr3.Fnt"); RETURN
+          ELSIF fname = "Math24.Scn.Fnt" THEN Special(s, "Math24.Pr3.Fnt"); RETURN
+          END
+    | "S": IF fname = "Syndor10.Scn.Fnt" THEN Special(s, "Syndor10.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor12.Scn.Fnt" THEN Special(s, "Syndor12.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor14.Scn.Fnt" THEN Special(s, "Syndor14.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor16.Scn.Fnt" THEN Special(s, "Syndor16.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor10b.Scn.Fnt" THEN Special(s, "Syndor10b.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor12b.Scn.Fnt" THEN Special(s, "Syndor12b.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor14b.Scn.Fnt" THEN Special(s, "Syndor14b.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor16b.Scn.Fnt" THEN Special(s, "Syndor16b.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor10i.Scn.Fnt" THEN Special(s, "Syndor10i.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor12i.Scn.Fnt" THEN Special(s, "Syndor12i.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor14i.Scn.Fnt" THEN Special(s, "Syndor14i.Pr3.Fnt"); RETURN
+          ELSIF fname = "Syndor16i.Scn.Fnt" THEN Special(s, "Syndor16i.Pr3.Fnt"); RETURN
+		END
+    ELSE
+    END ;
+    IF fname # curFont THEN
+      COPY(fname, curFont);
+      Ch("(");
+      IF curFont = listFont THEN Str("Courier8.Scn.Fnt") ELSE Str(curFont) END ;
+      Str(") f ")
+    END ;
+    Ch("(");
+    i := 0; ch := s[0];
+    WHILE ch # 0X DO
+      CASE ch OF
+        "(", ")", "\": Ch("\"); Ch(ch)
+      | 9X: Str("  ")  (* or Str("\t") *)
+      | 80X..95X: Str("\2"); n := ORD(ch)-128; Ch(CHR(n DIV 8 + 48)); Ch(CHR(n MOD 8 + 48))
+      | 9FX: IF fname[0] = "C" THEN (*Courier*)  Ch(" ") ELSE Str("  ") END
+      | 0ABX: Str("\373")  (*germandbls*)
+      | 096X: Str("\373")  (*germandbls*)
+      | "_": COPY(curFont, family);
+      	IF family = "Syntax" THEN Str("- ") ELSE Ch(ch) END
+      | "-": COPY(curFont, family);
+      	IF family = "Syntax" THEN Str("\261") ELSE Ch(ch) END
+      ELSE Ch(ch)
+      END ;
+      INC(i); ch := s[i]
+    END ;
+    Str(") s"); Ch(LF)
+  END Hack;
+
+  PROCEDURE String*(x, y: INTEGER; VAR s, fname: ARRAY OF CHAR);
+  BEGIN Int(x); Int(y); Str("m "); Hack(s, fname)
+  END String;
+
+  PROCEDURE ContString*(VAR s, fname: ARRAY OF CHAR);
+  BEGIN Hack(s, fname)
+  END ContString;
+  
+  PROCEDURE ReplPattern*(x, y, w, h, col: INTEGER);
+  BEGIN Int(x+1); Int(y); Int(w-1); Int(h-1); Int(col); Ch("b"); Ch(LF)
+  END ReplPattern;
+
+  PROCEDURE Line*(x0, y0, x1, y1: INTEGER);
+  BEGIN Int(x0); Int(y0); Int(x1-x0); Int(y1-y0); Ch("x"); Ch(LF)
+  END Line;
+
+  PROCEDURE Circle*(x0, y0, r: INTEGER);
+  BEGIN Int(x0); Int(y0); Int(r); Int(r); Ch("c"); Ch(LF)
+  END Circle;
+
+  PROCEDURE Ellipse*(x0, y0, a, b: INTEGER);
+  BEGIN Int(x0); Int(y0); Int(a); Int(b); Ch("c"); Ch(LF)
+  END Ellipse;
+
+   PROCEDURE SolveTriDiag(VAR a, b, c, y: RealVector; n: INTEGER);
+    VAR i: INTEGER; help: REAL;
+  BEGIN (*a, b, c of tri-diag matrix T; solve Ty' = y for y', assign y' to y*)
+    i := 1;
+    WHILE i < n DO help := c[i-1]*y[i-1]; y[i] := y[i] - help; INC(i) END ;
+    i := n-1; y[i] := y[i]/a[i];
+    WHILE i > 0 DO DEC(i); help := y[i] - b[i]*y[i+1]; y[i] := help/a[i] END
+  END SolveTriDiag;
+
+  PROCEDURE OpenSpline(VAR x, y, d: RealVector; n: INTEGER);
+    VAR i: INTEGER; d1, d2: REAL;
+      a, b, c: RealVector;
+  BEGIN (*from x, y compute d = y'*)
+    b[0] := 1.0/(x[1] - x[0]); a[0] := 2.0*b[0]; c[0] := b[0];
+    d1 := (y[1] - y[0])*3.0*b[0]*b[0]; d[0] := d1; i := 1;
+    WHILE i < n-1 DO
+      b[i] := 1.0/(x[i+1] - x[i]);
+      a[i] := 2.0*(c[i-1] + b[i]);
+      c[i] := b[i];
+      d2 := (y[i+1] - y[i])*3.0*b[i]*b[i];
+      d[i] := d1 + d2; d1 := d2; INC(i)
+    END ;
+    a[i] := 2.0*b[i-1]; d[i] := d1; i := 0;
+    WHILE i < n-1 DO c[i] := c[i]/a[i]; a[i+1] := a[i+1] - c[i]*b[i]; INC(i) END ;
+    SolveTriDiag(a, b, c, d, n)
+  END OpenSpline;
+
+  PROCEDURE ClosedSpline(VAR x, y, d: RealVector; n: INTEGER);
+    VAR i: INTEGER; d1, d2, hn, dn, help: REAL;
+      a, b, c, w: RealVector;
+  BEGIN (*from x, y compute d = y'*)
+    hn := 1.0/(x[n-1] - x[n-2]);
+    dn := (y[n-1] - y[n-2])*3.0*hn*hn;
+    b[0] := 1.0/(x[1] - x[0]);
+    a[0] := 2.0*b[0] + hn;
+    c[0] := b[0];
+    d1 := (y[1] - y[0])*3.0*b[0]*b[0]; d[0] := dn + d1;
+    w[0] := 1.0; i := 1;
+    WHILE i < n-2 DO
+      b[i] := 1.0/(x[i+1] - x[i]);
+      a[i] := 2.0*(c[i-1] + b[i]);
+      c[i] := b[i];
+      d2 := (y[i+1] - y[i])*3.0*b[i]*b[i]; d[i] := d1 + d2; d1 := d2;
+      w[i] := 0; INC(i)
+    END ;
+    a[i] := 2.0*b[i-1] + hn; d[i] := d1 + dn;
+    w[i] := 1.0; i := 0;
+    WHILE i < n-2 DO c[i] := c[i]/a[i]; a[i+1] := a[i+1] - c[i]*b[i]; INC(i) END ;
+    SolveTriDiag(a, b, c, d, n-1); SolveTriDiag(a, b, c, w, n-1); 
+    help := (w[0] + w[i] + x[i+1] - x[i]);
+    d1 := (d[0] + d[i])/help; i := 0;
+    WHILE i < n-1 DO d[i] := d[i] - d1*w[i]; INC(i) END ;
+    d[i] := d[0]
+  END ClosedSpline;
+
+  PROCEDURE PrintPoly(VAR p, q: Poly; lim: REAL);
+    VAR x0, y0, x1, y1, x2, y2, x3, y3: REAL;
+  BEGIN
+    x0 := p.d;
+    y0 := q.d;
+    x1 := x0 + p.c*lim/3.0;
+    y1 := y0 + q.c*lim/3.0;
+    x2 := x1 + (p.c + p.b*lim)*lim/3.0;
+    y2 := y1 + (q.c + q.b*lim)*lim/3.0;
+    x3 := x0 + (p.c + (p.b + p.a*lim)*lim)*lim;
+    y3 := y0 + (q.c + (q.b + q.a*lim)*lim)*lim;
+    Int(ENTIER(x1)); Int(ENTIER(y1)); Int(ENTIER(x2)); Int(ENTIER(y2));
+    Int(ENTIER(x3)); Int(ENTIER(y3)); Int(ENTIER(x0)); Int(ENTIER(y0)); Ch("z"); Ch(LF)
+  END PrintPoly;
+
+  PROCEDURE Spline*(x0, y0, n, open: INTEGER; VAR X, Y: ARRAY OF INTEGER);
+    VAR i: INTEGER; dx, dy, ds: REAL;
+      x, xd, y, yd, s: RealVector;
+      p, q: PolyVector;
+  BEGIN (*from u, v compute x, y, s*)
+    x[0] := X[0] + x0; y[0] := Y[0] + y0; s[0] := 0; i := 1;
+    WHILE i < n DO
+      x[i] := X[i] + x0; dx := x[i] - x[i-1];
+      y[i] := Y[i] + y0; dy := y[i] - y[i-1];
+      s[i] := ABS(dx) + ABS(dy) + s[i-1]; INC(i)
+    END ;
+    IF open = 1 THEN OpenSpline(s, x, xd, n); OpenSpline(s, y, yd, n)
+    ELSE ClosedSpline(s, x, xd, n); ClosedSpline(s, y, yd, n)
+    END ;
+    (*compute coefficients from x, y, xd, yd, s*)  i := 0;
+    WHILE i < n-1 DO
+      ds := 1.0/(s[i+1] - s[i]);
+      dx := (x[i+1] - x[i])*ds;
+      p[i].a := ds*ds*(xd[i] + xd[i+1] - 2.0*dx);
+      p[i].b := ds*(3.0*dx - 2.0*xd[i] -xd[i+1]);
+      p[i].c := xd[i];
+      p[i].d := x[i];
+      p[i].t := s[i];
+      dy := ds*(y[i+1] - y[i]);
+      q[i].a := ds*ds*(yd[i] + yd[i+1] - 2.0*dy);
+      q[i].b := ds*(3.0*dy - 2.0*yd[i] - yd[i+1]);
+      q[i].c := yd[i];
+      q[i].d := y[i];
+      q[i].t := s[i]; INC(i)
+    END ;
+    p[i].t := s[i]; q[i].t := s[i];
+    (*print polynomials*)
+    i := 0;
+    WHILE i < n-1 DO PrintPoly(p[i], q[i], p[i+1].t - p[i].t); INC(i) END
+  END Spline;
+
+  PROCEDURE Picture*(x, y, w, h, mode: INTEGER; adr: LONGINT);
+    VAR n, i, v: INTEGER; ch: CHAR;
+  BEGIN
+    Int(x); Int(y); Int(w); Int(h); Int(mode); Ch("i");
+    n := (w + 7) DIV 8 * h; i := 0;
+    WHILE i < n DO
+      SYSTEM.GET(adr+i, ch);
+      IF i MOD 40 = 0 THEN Ch(LF) END ;
+      v := (-ORD(ch)-1) MOD 256;
+      Hex(v DIV 16); Hex(v MOD 16);
+      INC(i)
+    END ;
+    Ch(LF)
+  END Picture;
+
+  PROCEDURE Page*(nofcopies: INTEGER);
+  BEGIN Int(nofcopies); Ch("p"); Ch(LF); curFont := ""; INC(pno); ppos := Files.Pos(R); Str("%%Page: 0 "); Int(pno); Ch(LF)
+  END Page;
+
+  PROCEDURE Append(VAR s1: ARRAY OF CHAR; s2: ARRAY OF CHAR);
+    VAR i, j: INTEGER; ch: CHAR;
+  BEGIN i := 0; j := 0;
+    WHILE s1[i] # 0X DO INC(i) END ;
+    REPEAT ch := s2[j]; s1[i] := ch; INC(i); INC(j) UNTIL ch = 0X
+  END Append;
+  
+  PROCEDURE V24Write(ch: CHAR);
+  VAR dr: CHAR;
+  BEGIN
+    IF V24.Available(port) > 0 THEN 
+      V24.Receive(port, dr);
+      IF dr = xOff THEN
+        REPEAT IF V24.Available(port) > 0 THEN V24.Receive(port, dr) END UNTIL dr = xOn; 
+      END
+    END;
+    V24.Send(port, ch)
+  END V24Write;
+  
+  PROCEDURE Spool(me: Oberon.Task);
+  BEGIN END Spool;	(* Dummy *)
+
+	PROCEDURE StartSpool;
+	BEGIN 
+	END StartSpool;
+
+  PROCEDURE Close*;
+    VAR cmd: ARRAY 256 OF CHAR; i: INTEGER;
+        ch: CHAR;
+
+  BEGIN
+    Files.Set(R, f, ppos); (*overwrite last %%Page line*)
+    Str("%%Trailer         "); Ch(LF);
+    Files.Register(f);
+    IF (PrinterName = "COM1") OR (PrinterName = "COM2") THEN
+      IF PrinterName = "COM1" THEN port := V24.COM1 ELSE port := V24.COM2 END;
+      V24.Start(port, V24.WL8, V24.STOP1, V24.NOPAR, V24.BPS9600);
+      f := Files.Old("Document.Print");
+      Files.Set(R, f, 0); Files.Read(R, ch);
+      WHILE ch # "%" DO Files.Read(R, ch) END;
+      WHILE ~R.eof DO	
+        V24Write(ch); 
+        Files.Read(R, ch)
+      END; 
+      V24Write(4X);
+      REPEAT IF V24.Available(port) > 0 THEN V24.Receive(port, ch) END UNTIL ch = 4X;
+      V24.Stop(port);
+      Files.Close(f);
+    ELSIF (PrinterName = "LPT1") OR (PrinterName = "LPT2") OR (PrinterName = "LPT3") THEN
+      IF PrinterName = "LPT1" THEN port := Centronics.LPT1 
+      ELSIF PrinterName = "LPT2" THEN port := Centronics.LPT2
+      ELSE port := Centronics.LPT3 END;
+      Centronics.Start(port);
+      f := Files.Old("Document.Print");
+      Files.Set(R, f, 0); Files.Read(R, ch);
+      WHILE ch # "%" DO Files.Read(R, ch) END;
+      WHILE ~R.eof DO	
+        Centronics.Send(port, ch); Files.Read(R, ch)
+      END; 
+      Centronics.Send(port, 4X);
+      Files.Close(f);
+    END
+  END Close;
+
+  PROCEDURE Real(x : REAL);
+  VAR
+    n, i, xi: INTEGER;
+    d: ARRAY 4 OF CHAR;
+  BEGIN
+    Files.Write(R, " ");
+    xi := SHORT(ENTIER(x));
+    IF x = xi THEN Int(xi); RETURN END;
+    IF x < 0 THEN Files.Write(R, "-"); x := -x; xi := -xi END;
+    IF xi > 0 THEN Files.Write(R, CHR(xi+30H)) END; (* xi < 10 *)
+    Files.Write(R, "."); x := x-xi;
+    n := SHORT(ENTIER(x*1000));
+    i := 0;
+    REPEAT
+      d[i] := CHR(n MOD 10+30H); n := n DIV 10; INC(i)
+    UNTIL i = 3;
+    WHILE i > 0 DO DEC(i); Files.Write(R, d[i]) END;
+  END Real;
+
+  PROCEDURE UseColor*(red,green,blue: INTEGER);
+  BEGIN
+  	Real(red/255); Real(green/255); Real(blue/255);
+  	Str(" u ");
+  END UseColor;
+	
+BEGIN
+  hex[0] := "0";
+  hex[1] := "8";
+  hex[2] := "4";
+  hex[3] := "c";
+  hex[4] := "2";
+  hex[5] := "a";
+  hex[6] := "6";
+  hex[7] := "e";
+  hex[8] := "1";
+  hex[9] := "9";
+  hex[10] := "5";
+  hex[11] := "d";
+  hex[12] := "3";
+  hex[13] := "b";
+  hex[14] := "7";
+  hex[15] := "f";
+  Width := PW;
+  Height := PH;
+END Printer.

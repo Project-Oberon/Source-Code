@@ -1,0 +1,349 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaLetter;	(* uh, Thu, 23-Sep-1993 *)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaBox, LedaRules, LedaAdjust, LedaLines, LedaText;
+	
+CONST
+	ModName = "LedaLetter";
+	LetName = "lettering";
+	Anon = "anonymous";
+	NotDef = -1;
+	
+	DefW = 5 * LedaBase.CM;	DefH = 2 * LedaBase.CM;
+	StyleInd = 0;	FormatInd = 1;	(* used for LedaCtrl.TextBasics *)
+	
+	ColumnPat = LedaSys.Mark1;	ColumnClr = 13;	(* grey color *)
+
+	
+VAR
+	(*--- box type control ---*)
+	typeDoOp: LedaBase.CtrlProc;
+	loadConv: INTEGER;	(* for load conversion to unfiy format base [Load, TypeDoOp]*)
+	
+	PROCEDURE ChangeLettering(lB, ref: LedaLines.Box; typ: INTEGER);
+	(* changes the lettering lB according ref [lB has same type typ] *)
+		VAR ctrl: LedaBase.Control;	B: LedaCtrl.Buffer;	lBH: LedaBase.BoxHandler;
+			eX, eY: LONGINT;	P: LedaSys.Port;	m: LedaBox.PageMsg;
+	BEGIN	(* no marks in document, lB has type typ *)
+		IF lB = ref THEN RETURN END;	(*###*)
+		IF lB.anc = NIL THEN INCL(lB.flags, LedaBox.Structure) END;	(* no drawing [LedaBox.GetPort returns NIL] *)
+		LedaCtrl.TextBasics(ref.text, LedaCtrl.GetId, FormatInd, ctrl);	(* get basic formatting *)
+		LedaCtrl.TextBasics(lB.text, LedaCtrl.SetId, FormatInd, ctrl);	(* set basic formatting *)
+		IF lB.text.len > 0 THEN LedaCtrl.TextDelete(lB.text, lB.text.beg, lB.text.len + 1) END;	(* to delete all text *)
+		IF ref.text.len > 0 THEN
+			lBH := lB.do(LedaBase.BoxHandler); 
+			LedaCtrl.InitBuffer(B); LedaCtrl.SaveText(ref.text, ref.text.beg, ref.text.len + 1, B);	(* save all text *)
+			LedaBox.GetPort(lB, P); LedaBox.ExtRef(lB, eX, eY);
+			lBH.insert(lB, eX, eY, P, B)
+		END;
+		IF lB.anc = NIL THEN EXCL(lB.flags, LedaBox.Structure) END
+	END ChangeLettering;
+
+	PROCEDURE AdjustLettering(lB: LedaBase.Box; typ: INTEGER; all: BOOLEAN);
+	(* arranges that the lettering of the same type typ are adjusted according all [all or successors] *)
+		VAR m: LedaBox.PageMsg;	doc: LedaBase.Box;
+	BEGIN
+		IF lB.anc = NIL THEN RETURN END;	(*###*)
+		m.id := LedaBox.PgLettering; m.op := 0; m.typ := NotDef; m.box := lB;	(* ask lettering type of lB *)
+		lB.anc.do.handle(lB.anc, m);
+		IF m.typ = typ THEN
+			m.id := LedaBox.PgLettering; m.op := 3; m.box := lB; m.all := all;	(* adjust lettering according lB *)
+			doc := LedaBox.Root(lB);
+			doc.do.handle(doc, m)	(* doc carries out changes *)
+		END
+	END AdjustLettering;
+	
+	PROCEDURE Execute(lB: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; VAR res: INTEGER);
+	(* execute command according parameters *)
+		VAR s: LedaSys.String;
+	BEGIN
+		LedaBox.ParPopStr(s);
+		IF LedaSys.EqualStr("hea", s) THEN
+			res := LedaBase.Done; LedaBox.ParPopStr(s);
+			IF s = "set" THEN
+				LedaBox.ParPopStr(s); AdjustLettering(lB, LedaBox.PgHeading, s = "all")
+			END
+		ELSIF LedaSys.EqualStr("foo", s) THEN
+			res := LedaBase.Done; LedaBox.ParPopStr(s);
+			IF s = "set" THEN
+				LedaBox.ParPopStr(s); AdjustLettering(lB, LedaBox.PgFooter, s = "all")
+			END
+		ELSE LedaBox.ParReset(LedaBox.Str)
+		END
+	END Execute;
+	
+	PROCEDURE GetDocFormat(doc: LedaBase.Box): LedaBase.FormBase;
+	(* gets the document format [standard formatting] *)
+		VAR m: LedaBox.Msg;	fB: LedaBase.FormBase;	ctrl: LedaBase.Control;
+	BEGIN
+		m.id := LedaBox.TextId; m.op := 1; m.text := NIL; m.ctrl := NIL;	(* ask reference data of text *)
+		doc.do.handle(doc, m);	(* returns linked controls [format, style list] *)
+		IF (m.ctrl = NIL) OR ~ (m.ctrl IS LedaBase.FormBase) THEN fB := NIL
+		ELSE fB := m.ctrl(LedaBase.FormBase)
+		END;
+		WHILE m.ctrl # NIL DO ctrl := m.ctrl; m.ctrl := m.ctrl.link; ctrl.link := NIL END;	(* unlink controls *)
+		RETURN fB
+	END GetDocFormat;
+
+	PROCEDURE GetLetFormat(lB: LedaBase.Box; docFB: LedaBase.FormBase): LedaBase.FormBase;
+	(* gets the lettering format for box lB *)
+	(* the lettering format has an own setting for column [number, space] *)
+		VAR fB: LedaBase.FormBase;
+	BEGIN
+		IF lB.do.data # NIL THEN fB := lB.do.data(LedaBase.FormBase)	(* defined for instance [document] *)
+		ELSE
+			fB := LedaBase.NewFormBase(docFB);
+			fB.name := LetName;
+			fB.data.cols := "1"; fB.data.sCols := "1";
+			fB.data.colDX := LONG(LedaBase.MM DIV 2) * LedaRules.FontSize(fB.data.width);
+			fB.data.sDX := "o";
+			lB.do.data := fB	(* defined for instance [document] *)
+		END;
+		RETURN fB
+	END GetLetFormat;
+
+	PROCEDURE NewText(caller: LedaBase.Box; lB: LedaLines.Box): LedaCtrl.Text;
+		VAR text: LedaCtrl.Text;	ctrl: LedaBase.Control;	fB: LedaBase.FormBase;
+			list: LedaCtrl.List;	m: LedaBox.Msg;
+	BEGIN
+		m.id := LedaBox.TextId; m.op := 1; m.text := NIL; m.ctrl := NIL;	(* ask reference data of text *)
+		LedaBox.GetInfo(caller, m);	(* returns reference text or linked controls [format, style list] *)
+		IF m.text # NIL THEN	(* continue flow of reference text *)
+			LedaSys.Halt("Lettering: text flow error")
+		ELSE		(* create new text based on linked controls *)
+			fB := NIL; list := NIL;
+			text := LedaCtrl.NewText(lB, NIL);
+			IF m.ctrl # NIL THEN
+				ctrl := m.ctrl; m.ctrl := m.ctrl.link; ctrl.link := NIL;
+				IF ctrl IS LedaBase.FormBase THEN fB := ctrl(LedaBase.FormBase) END
+			END;		(* fB: format base to refer to *)
+			fB := GetLetFormat(lB, fB);
+			ctrl := fB; LedaCtrl.TextBasics(text, LedaCtrl.SetId, FormatInd, ctrl);	(* set basic formatting *)
+			IF m.ctrl # NIL THEN
+				ctrl := m.ctrl; m.ctrl := m.ctrl.link; ctrl.link := NIL;
+				IF ctrl IS LedaCtrl.List THEN list := ctrl(LedaCtrl.List) END
+			END;	(* list: list of styles [character, format, tabs] *)
+			IF list = NIL THEN list := LedaRules.DefStyleList("", fB, lB.W) END;
+			ctrl := list; LedaCtrl.TextBasics(text, LedaCtrl.SetId, StyleInd, ctrl);	(* set basic styles *)
+		END;
+		RETURN text
+	END NewText;
+	
+	PROCEDURE FormBaseNotify(lB: LedaBase.Box; fB: LedaBase.FormBase);
+	(* notifies the change of fromat base fB with a broadcast in the document *)
+	(* a format base style can not be in different documents [copy not possible] *)
+		VAR m: LedaBox.Msg;	P: LedaSys.Port;
+	BEGIN
+		LedaBox.GetPort(lB, P);
+		IF P # NIL THEN INCL(P.state, LedaSys.DrawFlag) END;	(* no drawing; redraw after change *)
+		m.id := LedaBox.FormId; m.op := 2; m.ctrl := fB;	(* 2 = notify the change of fB *)
+		LedaBox.Broadcast(LedaBox.Root(lB), {}, m)	(* broadcast in document *)
+	END FormBaseNotify;
+	
+	PROCEDURE GetAttributes(lB: LedaLines.Box; VAR M: LedaBox.AttributeMsg);
+	(* handles the attribute message M [M.id has to be correct] *)
+	(* sets M.nbr = 0 if the message is not processed *)
+		VAR ctrl: LedaBase.Control;
+	BEGIN	(* M.id:  LedaBox.GetValue or LedaBox.GetStyle *)
+		IF (lB.selLoc # NIL) & (lB.selLen = 0) THEN	(* box selection *)
+			LedaCtrl.TextBasics(lB.text, LedaCtrl.GetId, FormatInd, ctrl);	(* get format base *)
+			IF M.id = LedaBox.GetStyle THEN
+				LedaAdjust.FormGetStyle(ctrl(LedaBase.FormBase), M)
+			ELSE M.name := LetName; M.nbr := 0;
+				LedaAdjust.FormGetValue(LedaBox.Root(lB), ctrl(LedaBase.FormBase), M)
+			END
+		ELSE M.nbr := 0
+		END
+	END GetAttributes;
+	
+	PROCEDURE SetAttributes(lB: LedaLines.Box; VAR M: LedaBox.AttributeMsg);
+	(* handles the attribute message M [M.id has to be correct] *)
+	(* sets M.nbr = 0 if the message is successfully handled *)
+		VAR ctrl: LedaBase.Control;	fB: LedaBase.FormBase;	nbr: INTEGER;
+	BEGIN	(* M.id:  LedaBox.SetValue or LedaBox.SetStyle or LedaBox.NewStyle *)
+		IF (lB.selLoc # NIL) & (lB.selLen = 0) THEN	(* box selection *)
+			LedaCtrl.TextBasics(lB.text, LedaCtrl.GetId, FormatInd, ctrl);	(* get format base *)
+			fB := ctrl(LedaBase.FormBase);
+			IF M.id = LedaBox.SetValue THEN
+				IF M.name # LetName THEN fB := NIL
+				ELSE nbr := 0; LedaAdjust.FormSetValue(LedaBox.Root(lB), nbr, fB, M)
+				END
+			ELSE LedaAdjust.FormSetStyle(fB, M)
+			END;	(* M.id could have changed *)
+			IF fB # NIL THEN
+				IF M.id = LedaBox.SetStyle THEN FormBaseNotify(lB, fB)
+				ELSE ctrl := fB;
+					LedaCtrl.TextBasics(lB.text, LedaCtrl.SetId, FormatInd, ctrl);	(* set format base *)
+					LedaText.FormBaseValidate(lB);
+				END
+			END;
+			M.nbr := 0
+		END
+	END SetAttributes;
+
+(*--- procedures attached to boxType ---*)
+	
+	PROCEDURE New*(bT: LedaBase.BoxType; caller, ref: LedaBase.Box): LedaBase.Box;
+	(** ref = NIL: create default box;  ref # NIL: copy box ref *)
+		VAR lB, rB: LedaLines.Box;	len: LONGINT;	newFrm, mask: BOOLEAN;
+	BEGIN
+		NEW(lB); LedaText.InitBox(lB, bT, {LedaBox.NoFlow});
+		IF ref # NIL THEN
+			lB.W := ref.W; lB.H := ref.H; lB.flags := ref.flags; 
+			rB := ref(LedaLines.Box); lB.asr := rB.asr;
+			(* lB.lines, lB.colW, lB.colDX set in LedaLines.FormatText *)
+			lB.text := LedaText.CopyText(lB, rB)
+		ELSE
+			LedaBox.GetSize(caller, DefW, DefH, lB.W, lB.H);
+			lB.text := NewText(caller, lB);
+			LedaText.ValidateFormat(lB);
+			INCL(lB.flags, LedaBox.NoFlow)	(* text stream not shared *)
+		END;
+		lB.anc := caller;	(* to allow access to caller during formatting [example: to get page number] *)
+		mask := FALSE; LedaLines.FormatText(lB, len, newFrm, mask);	(* builds the block structure for the box lB *)
+		lB.anc := NIL;	(* to prevent call to lB because of unpoured text *)
+		LedaCtrl.TextChangeFlow(lB.text, len);
+			(* LedaCtrl.TextChangeFlow(...) can cause call to lB if there is unpoured text *)
+			(* however call is not processed because lB.anc = NIL *)
+			(* caller has to take care that all unpoured text will be poured *)
+		RETURN lB
+	END New;
+	
+	PROCEDURE Load*(VAR r: LedaBase.Rider; bT: LedaBase.BoxType; flags: SET; caller: LedaBase.Box): LedaBase.Box;
+		VAR box: LedaBase.Box;	fB: LedaBase.FormBase;
+	BEGIN
+		box := LedaText.Load(r, bT, flags, caller);
+		IF (bT.data = NIL) & (loadConv < 0) THEN	(* initiate conversion *)
+			fB := GetDocFormat(LedaBox.Root(caller));
+			fB := GetLetFormat(box, fB);	(* lettering format defined for instance [bT.data # NIL] *)
+			loadConv := 1
+		END;
+		IF (bT.data # NIL) & (loadConv > 0) THEN	(* convert -> unify format base *)
+			LedaCtrl.TextBasics(box(LedaLines.Box).text, LedaCtrl.SetId, FormatInd, bT.data)
+		END;
+		RETURN box
+	END Load;
+	
+	PROCEDURE Mouse*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port;
+											mX, mY: LONGINT; keys: SET; VAR res: INTEGER);
+	BEGIN	(* mX, mY within box *)
+		IF keys = {LedaSys.MX} THEN Execute(self, eX, eY, P, res)
+		ELSE LedaText.Mouse(self, eX, eY, P, mX, mY, keys, res)
+		END
+	END Mouse;
+	
+	PROCEDURE Handle*(self: LedaBase.Box; VAR m: LedaBase.Msg);
+		VAR handle: BOOLEAN;
+	BEGIN
+		handle := TRUE;
+		IF m IS LedaBox.PageMsg THEN
+			WITH m: LedaBox.PageMsg DO
+				IF (m.id = LedaBox.PgLettering) & (m.op = 3) THEN handle := FALSE;	(* adjust lettering according m.box *)
+					IF (m.box # NIL) & (m.box IS LedaLines.Box) THEN
+						ChangeLettering(self(LedaLines.Box), m.box(LedaLines.Box), m.typ)
+					END
+				END
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.TypeInstId THEN handle := FALSE;
+					IF (m.name = ModName) & (m.s = "DC") THEN	(* return box type instance *) 
+						m.ctrl := self.do; INCL(LedaBox.bcFlags, LedaBox.BcMsg)	(* stop broadcast *)
+					END
+				END
+			END
+		ELSIF m IS LedaBox.AttributeMsg THEN	(* lB has selection *)
+			WITH m: LedaBox.AttributeMsg DO
+				IF m.id IN {LedaBox.GetValue, LedaBox.GetStyle} THEN
+					GetAttributes(self(LedaLines.Box), m); handle := m.nbr = 0
+				ELSIF m.id IN {LedaBox.SetValue, LedaBox.SetStyle, LedaBox.NewStyle} THEN 
+					SetAttributes(self(LedaLines.Box), m); handle := m.nbr # 0
+				END
+			END
+		END;
+		IF handle THEN LedaText.Handle(self, m) END
+	END Handle;
+	
+(*--- box type control ---*)
+	
+	(*--- remark:
+		- because letterings are an extension of text boxes the box type
+			control of letterings should refer (point) to the box type control
+			of text boxes to be able to call the standard method for the
+			standard handling;
+		- for simplicity the box type control of lettrings calls the appropriate
+			procedures for standard handling directly in modul LedaText
+	---*)
+
+	PROCEDURE NewType(ctrl: LedaBase.Control): LedaBase.BoxHandler;
+	(* return new instance of box type *)
+	(* ctrl: lettering format for document *)
+		VAR nT: LedaBase.BoxHandler;
+	BEGIN
+		NEW(nT);
+		LedaBase.InitControl(nT, typeDoOp);
+		LedaBox.InitType(nT);
+		nT.handle := Handle;
+		nT.new := New;	(* <--- own *)
+		nT.load := Load;	(* <--- own *)
+		nT.store := LedaText.Store;
+		nT.draw := LedaText.Draw;
+		nT.mark := LedaText.Mark;
+		nT.mouse := Mouse;	(* <--- own *)
+		nT.key := LedaText.Key;
+		nT.insert := LedaText.Insert;
+		nT.size := LedaText.Size;
+		nT.data := ctrl;	(* data of box type control *)
+		RETURN nT
+	END NewType;
+	
+	PROCEDURE PutType(bT: LedaBase.BoxType; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		IF bT.data # NIL THEN cM.id := LedaBase.RegisterId; bT.data.doOp(bT.data, cM) END;
+		LedaBase.PutToList(bT, refId)
+	END PutType;
+	
+	PROCEDURE *TypeDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* implements the basic behaviour of the box type control: *)
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.RegisterId:  PutType(ctrl(LedaBase.BoxType), m.ctrlId)
+				| LedaBase.StoreId:  LedaBase.StoreCtrl(m.r, ctrl(LedaBase.BoxType).data)
+				| LedaBase.LoadId:  
+					IF LedaBase.version = 0X THEN ctrl := NIL ELSE LedaBase.LoadCtrl(m.r, ctrl) END;
+					loadConv := 0; IF ctrl = NIL THEN DEC(loadConv) END; m.ctrl := NewType(ctrl)
+				| LedaBase.StoreModCmd:  LedaBase.StoreStr(m.r, ModName); LedaBase.StoreStr(m.r, "DC")
+				ELSE
+				END
+			END
+		ELSIF m IS LedaLines.ColMarkMsg THEN
+			WITH m: LedaLines.ColMarkMsg DO m.pNr := ColumnPat; m.clr := ColumnClr END	(* specifies column mark *)
+		END
+	END TypeDoOp;
+	
+	PROCEDURE DC*;
+	(** deposits own box type in the module LedaCtrl *)
+	BEGIN
+		LedaBase.depositedCtrl := NewType(NIL)
+	END DC;
+	
+BEGIN
+	(*--- box type control ---*)
+	typeDoOp := TypeDoOp;
+	loadConv := 0
+		
+END LedaLetter.

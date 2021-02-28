@@ -1,0 +1,816 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE iOPV;	(* NM 12.12.93 / MH 26.1.94 / prk 27.4.96 *)
+(*
+	OPV - parse tree traverser (back end)
+	code generator for Intel i386, i387/ i486 - Diplomarbeit ETH-Zürich WS 92/93
+----------------------------------------------------------------------------	
+	Documentation on this module:
+		ETH diss. nr 10650, 1994; R. Crelier "Separate Compilation and Module Extension"
+		can be found at "http://www-cs.inf.ethz.ch/Dissertations.html"
+
+---------------------------------------------------------------------------		
+	Created by Niklaus Mannhart (March the 2nd 1993)
+	
+	code generator for Intel i386, i387/ i486 - Diplomarbeit ETH-Zürich WS 92/93
+	by Niklaus Mannhart, 87-913-117I
+	author's address: 	Himmelrich 22
+		6340 Baar, Switzerland
+		e-mail: mannhart@inf.ethz.ch	phone: +41 (0)42 31 40 33
+		
+	12.12.93
+		Release 1.0 
+		
+	12.1.94
+		Release 1.1 (fixed bugs in iOPL.LoadProc and floating point compare (iOPL.FloadCmp))
+		
+	30.3.94
+		fixed bug in iOPV.Dim
+		
+	08.12.95 (dVdW)
+		Fixed error in Designator(), in the case for Nderef, where the type is a dynamic
+		array. The offset calculated for dynamic array elements was inconsistent
+		 with how it is done in Kernel.NewArr()
+		 
+	23.6.94
+		Release 1.3 (fixed: bug in iOPL.Load, iOPC.SYSgetputReg, floating point problem in iOPL.PushRegs);
+		
+	9.1.96 (prk / reali@inf.ethz.ch)
+			Integrating SYSTEM.CLI, SYSTEM.STI, SYSTEM.PORTOUT, SYSTEM.PORTIN		(* New Functions *)
+			
+	5.2.96 (prk / reali@inf.ethz.ch)
+		Integration of the i80386 assembler	(* iASM *)
+	
+	N206 prk
+		functions with assembler code always trapped (trap 17)
+		
+	27.4.96 (prk / reali@inf.ethz.ch)
+		Intel common release (Native + Linux + Windows)
+
+			
+---------------------------------------------------------------------------			
+			
+*)
+
+	IMPORT OPS := iOPS, OPT := iOPT, OPL := iOPL, OPO := iOPO, OPC := iOPC, OPM := iOPM, 
+		Oberon, SYSTEM;
+	
+	CONST
+		(* intermediate code output *)
+		InitOPI = "iOPI.Init";
+		DumpCode = "iOPI.DumpCode";
+
+		(* object modes *)
+		Var = 1; VarPar = 2; Con = 3; Fld = 4; Typ = 5; LProc = 6; XProc = 7;
+		SProc = 8; CProc = 9; IProc = 10; Mod = 11; Head = 12; TProc = 13;
+		
+		(* item mode *)
+		Abs = OPO.Abs;
+
+		(* symbol values and ops *)
+		times = 1; slash = 2; div = 3; mod = 4;
+		and = 5; plus = 6; minus = 7; or = 8; eql = 9;
+		neq = 10; lss = 11; leq = 12; gtr = 13; geq = 14;
+		in = 15; is = 16; ash = 17; msk = 18; len = 19;
+		conv = 20; abs = 21; cap = 22; odd = 23; not = 33;
+		(*SYSTEM*)
+		adr = 24; cc = 25; bit = 26; lsh = 27; rot = 28; val = 29;
+
+		(* structure forms *)
+		Undef = 0; Byte = 1; Bool = 2; Char = 3; SInt = 4; Int = 5; LInt = 6;
+		Real = 7; LReal = 8; Set = 9; String = 10; NilTyp = 11; NoTyp = 12;
+		Pointer = 13; ProcTyp = 14; Comp = 15;
+		realSet = {Real, LReal};
+
+		(* composite structure forms *)
+		Basic = 1; Array = 2; DynArr = 3; Record = 4;
+
+		(* nodes classes *)
+		Nvar = 0; Nvarpar = 1; Nfield = 2; Nderef = 3; Nindex = 4; Nguard = 5; Neguard = 6;
+		Nconst = 7; Ntype = 8; Nproc = 9; Nupto = 10; Nmop = 11; Ndop = 12; Ncall = 13;
+		Ninittd = 14; Nif = 15; Ncaselse = 16; Ncasedo = 17; Nenter = 18; Nassign = 19;
+		Nifelse =20; Ncase = 21; Nwhile = 22; Nrepeat = 23; Nloop = 24; Nexit = 25;
+		Nreturn = 26; Nwith = 27; Ntrap = 28; Nassembler = 29;	(* iASM *)
+
+		(*function number*)
+		assign = 0; newfn = 1; incfn = 13; decfn = 14;
+		inclfn = 15; exclfn = 16; copyfn = 18; assertfn = 32;
+
+		(*SYSTEM function number*)
+		getfn = 24; putfn = 25; getrfn = 26; putrfn = 27; sysnewfn = 30; movefn = 31;
+		stifn = 33; clifn = 34; poutfn = 35; pinfn = 36;
+
+		(* module visibility of objects *)
+		internal = 0; external = 1; externalR = 2;
+
+		(* procedure flags (conval^.setval) *)
+		hasBody = 1; isRedef = 2; slNeeded = 3; asmProc = 7;
+
+	MaxAdr 	= OPM.MaxLInt;
+	MinAdr 	= OPM.MinLInt;
+	VarParSize 	= OPM.PointerSize;
+	RecVarParSize 	= 8; 	(* push ADR (rec); push TAG (reg) *)
+	LProcOffSL 	= 12; 	(* parameter offset with static link *)
+	LProcOff 	= 8; 	(* parameter offset without static link *)
+	ExtProcOff 	= 8; 	(* parameter offset of external procedures *)
+
+	VAR
+		dumpCode*: BOOLEAN; (* set by OP2 *)
+		ProcName*: OPS.Name; (* accessed by iOPI (read only) *)
+		EntryNr*: INTEGER; (* accessed by iOPI (read only) *)
+		ExitChain: OPC.Label;
+		assert, findpc: BOOLEAN; 
+	
+	PROCEDURE Init* (opt: SET; bpc: LONGINT);
+		CONST ass = 6; fpc = 7;
+		VAR res: INTEGER;
+	BEGIN
+		assert := ass IN opt; findpc := fpc IN opt;
+		IF findpc THEN OPM.breakpc := bpc ELSE OPM.breakpc := MAX(LONGINT) END;
+		IF dumpCode THEN Oberon.Call (InitOPI, Oberon.Par, FALSE, res) END
+	END Init;
+
+	PROCEDURE IncAdr(VAR adr: LONGINT; s: LONGINT);
+	BEGIN
+		IF (s >= 0) & (adr <= MaxAdr - s) OR (s < 0) & (adr >= MinAdr - s) THEN INC(adr, s)
+		ELSE OPM.err(242)
+		END
+	END IncAdr;
+	
+	PROCEDURE AlignFld(VAR offset: LONGINT; elemsize: LONGINT);
+	(* offset is initialized to base type size, 0 if none *)
+	BEGIN
+		IF elemsize >= 4 THEN IncAdr(offset, (-offset) MOD 4)
+		ELSIF elemsize = 2 THEN IncAdr(offset, offset MOD 2)
+		END
+	END AlignFld;
+	
+	PROCEDURE AllocFld(VAR offset, this: LONGINT; elemsize: LONGINT);
+	BEGIN
+		this := offset; IncAdr(offset, elemsize)
+	END AllocFld;
+	
+	PROCEDURE AlignRec(VAR size: LONGINT);
+	BEGIN 
+		IncAdr(size, (-size) MOD 4)
+	END AlignRec;
+	
+	PROCEDURE AlignPar(VAR elemsize: LONGINT);
+	BEGIN 
+		IncAdr(elemsize, (-elemsize) MOD 4)
+	END AlignPar;
+	
+	PROCEDURE AllocPar (VAR adr, this: LONGINT; elemsize: LONGINT);
+	BEGIN
+		IncAdr(adr, elemsize); this := adr
+	END AllocPar;
+
+	PROCEDURE AlignVar(VAR adr: LONGINT; elemsize: LONGINT);
+	BEGIN
+		IF elemsize >= 4 THEN IncAdr(adr, - (adr MOD 4))
+		ELSIF elemsize = 2 THEN IncAdr(adr, - (adr MOD 2))
+		END
+	END AlignVar;
+	
+	PROCEDURE AllocVar(VAR adr, this: LONGINT; elemsize: LONGINT);
+	BEGIN
+		IncAdr(adr, -elemsize); this := adr
+	END AllocVar;
+	
+	PROCEDURE AlignBlock(adr: LONGINT; VAR dsize: LONGINT);
+	BEGIN 
+		IncAdr(adr, - (adr MOD 4)); dsize := -adr
+	END AlignBlock;
+
+	PROCEDURE ^ParamAdr(VAR firstPar: OPT.Object; VAR psize, dsize: LONGINT);
+
+	PROCEDURE ^Traverse(obj: OPT.Object; exported: BOOLEAN);
+
+	PROCEDURE ^VisitTProcs(obj: OPT.Object);
+
+	PROCEDURE TypSize* (typ: OPT.Struct; allocDesc: BOOLEAN);
+		VAR f, c: INTEGER; offset, size, dummy: LONGINT;
+			fld: OPT.Object; btyp: OPT.Struct; sizeUndef, doAlloc: BOOLEAN;
+	BEGIN
+		IF typ = OPT.undftyp THEN OPM.err(58)		(* MH 26.1.94; bug fix RC 17.6.93 *)
+		ELSE
+			sizeUndef := typ^.size = -1;
+			doAlloc := allocDesc & (typ^.tdadr = OPM.TDAdrUndef) & (typ^.offset = OPM.TDAdrUndef);
+			IF sizeUndef OR doAlloc THEN
+				IF doAlloc THEN typ^.tdadr := -2 (* avoid cycles *) END ;
+				f := typ^.form; c := typ^.comp; btyp := typ^.BaseTyp;
+				IF c = Record THEN
+					IF btyp = NIL THEN offset := 0
+					ELSE TypSize(btyp, allocDesc); offset := btyp^.size
+					END ;
+					IF doAlloc THEN
+						IF btyp = NIL THEN typ^.n := 0 ELSE typ^.n := btyp^.n END ;
+						VisitTProcs(typ^.link)
+					END ;
+					fld := typ^.link;
+					WHILE (fld # NIL) & (fld^.mode = Fld) DO
+						btyp := fld^.typ; TypSize(btyp, allocDesc);
+						IF sizeUndef THEN size := btyp^.size;
+							WHILE btyp^.comp = Array DO btyp := btyp^.BaseTyp END ;
+							AlignFld(offset, btyp^.size);
+							AllocFld(offset, fld^.adr, size)
+						END ;
+						fld := fld^.link
+					END ;
+					IF sizeUndef THEN AlignRec(offset); typ^.size := offset END ;
+					IF doAlloc THEN
+						OPL.AllocTypDesc (typ); (* typ.tdadr = Entry number *)
+						Traverse(typ^.link, TRUE)
+					END
+				ELSIF c = Array THEN
+					TypSize(btyp, allocDesc);
+					IF sizeUndef THEN typ^.size := typ^.n * btyp^.size END ;
+				ELSIF f = Pointer THEN
+					typ^.size := OPM.PointerSize;
+					IF doAlloc THEN TypSize(btyp, allocDesc) END
+				ELSIF f = ProcTyp THEN
+					typ^.size := OPM.ProcSize;
+					IF doAlloc THEN 
+						TypSize(btyp, TRUE); size := ExtProcOff; ParamAdr(typ^.link, size, dummy)
+					END
+				ELSE (* (c = DynArr) & doAlloc *)
+					TypSize(btyp, allocDesc);
+					IF btyp^.comp = DynArr THEN typ^.size := btyp^.size + 4; typ^.offset := btyp^.offset + 4
+					ELSE typ^.size := 8; typ^.offset := 4
+					END
+				
+				END
+			END
+		END
+	END TypSize;
+
+
+	PROCEDURE ParamAdr (VAR firstPar: OPT.Object; VAR psize, dsize: LONGINT);
+		VAR par, parOld: OPT.Object; typ: OPT.Struct; adr, s: LONGINT; stop: BOOLEAN;
+	BEGIN 
+		adr := 0; 
+		par := firstPar;
+		WHILE par # NIL DO
+			typ := par^.typ; TypSize(typ, TRUE);
+			IF typ.comp = DynArr THEN s:= typ.size
+			ELSIF (par.mode = VarPar) OR ((typ.size > 4) & (typ.form # LReal)) THEN 
+					(* ValPar (RECORD), size > 4 are equal to VarPar *)
+				IF (typ.comp = Record) & (par.mode = VarPar) THEN s:= RecVarParSize
+				ELSE s:= VarParSize
+				END
+			ELSE s:= typ.size
+			END;
+			AlignPar(s);
+			AllocPar(adr, par^.adr, s); 
+			par := par.link
+		END;	
+		psize := psize + adr;
+		par := firstPar;
+		WHILE par # NIL DO
+			par^.adr := psize - par^.adr;
+			IF (par^.mode = Var) & (par^.typ.comp IN {Array, Record}) THEN
+				(* Value parameter of type ARRAY or RECORD will be copied by the callee *)
+				dsize:= dsize + par^.typ^.size;
+				par^.linkadr:= -dsize
+			ELSE par^.linkadr:= par.adr
+			END;
+			par := par.link;
+		END
+	END ParamAdr;
+
+	
+	PROCEDURE VarAdr(var: OPT.Object; VAR dsize: LONGINT);
+		VAR adr, s: LONGINT;
+	BEGIN 
+		adr := -dsize;
+		WHILE var # NIL DO
+			TypSize(var^.typ, TRUE); s := var^.typ^.size;
+			AlignVar(adr, s);
+			AllocVar(adr, var^.linkadr, s);
+			IF (var.mnolev = 0) & (var.vis IN {external, externalR}) THEN (* exported variable *)
+					OPL.NewVarEntry (var.linkadr, var.adr) (* var.adr = entry number *)
+			ELSE var.adr:= 0
+			END;
+			var := var^.link
+		END ;
+		AlignBlock(adr, dsize);
+	END VarAdr;
+
+	PROCEDURE ArgSize (par: OPT.Object): LONGINT;
+		VAR
+			size: LONGINT; comp: SHORTINT; typ: OPT.Struct;
+	BEGIN
+		size:= 0;
+		WHILE par # NIL DO
+			typ:= par.typ; comp:= typ.comp;
+			IF comp = DynArr THEN INC (size, typ.size)
+			ELSIF par.mode = VarPar THEN
+				IF comp = Record THEN INC (size, 8)
+				ELSE INC (size, 4)
+				END
+			ELSIF par.typ.form = LReal THEN INC (size, 8)
+			ELSE INC (size, 4)
+			END;
+			par:= par.link
+		END;
+		AlignPar (size);
+		RETURN size
+	END ArgSize;
+	
+	PROCEDURE ProcSize(obj: OPT.Object; firstpass: BOOLEAN);
+		VAR psize, oldPos, entryNr: LONGINT;
+	BEGIN
+		oldPos := OPM.errpos; OPM.errpos := obj^.scope^.adr;
+		IF ((obj^.vis # internal) = firstpass) OR (obj^.mode = TProc) THEN
+			IF obj^.mode = LProc THEN
+				IF slNeeded IN obj^.conval^.setval THEN psize := LProcOffSL ELSE psize := LProcOff END ;
+				obj^.adr := 0
+			ELSE psize := ExtProcOff
+			END ;
+			IF ~(obj^.mode IN {LProc, CProc}) THEN 
+				OPL.NewEntry (entryNr); INC (obj.adr, entryNr)
+			END;
+			TypSize(obj^.typ, TRUE);
+			ParamAdr(obj^.link, psize, obj^.conval^.intval2); obj^.conval^.intval := psize;
+			obj^.linkadr := OPM.LANotAlloc;
+		END ;
+		IF ~firstpass OR (obj^.mode = TProc) THEN
+			IF ~(hasBody IN obj^.conval^.setval) THEN OPM.err(129) END ;
+			VarAdr(obj^.scope^.scope, obj^.conval^.intval2);	(* local variables *)
+			Traverse(obj^.scope^.right, FALSE)
+		END;
+		OPM.errpos := oldPos
+	END ProcSize;
+
+	PROCEDURE VisitTProcs(obj: OPT.Object);	(* TProcs of base type already visited *)
+		VAR typ: OPT.Struct; redef: OPT.Object;
+	BEGIN
+		IF obj # NIL THEN
+			VisitTProcs(obj^.left);
+			IF obj^.mode = TProc THEN
+				typ := obj^.link^.typ;
+				IF typ^.form = Pointer THEN typ := typ^.BaseTyp END ;
+				OPT.FindField(obj^.name, typ^.BaseTyp, redef);
+				IF redef # NIL THEN
+					obj^.adr := 10000H*(redef^.adr DIV 10000H) (*mthno*) + obj^.adr (*entno*);
+					IF ~(isRedef IN obj^.conval^.setval) THEN OPM.err(119) END
+				ELSE 
+					INC(obj^.adr, 10000H * typ^.n); INC(typ^.n)
+				END
+			END;
+			VisitTProcs(obj^.right)
+		END
+	END VisitTProcs;
+
+	PROCEDURE Traverse(obj: OPT.Object; exported: BOOLEAN);
+		VAR i: LONGINT;
+	BEGIN
+		IF obj # NIL THEN
+			Traverse(obj^.left, exported);
+			IF (obj^.mode = Typ) & ((obj^.vis # internal) = exported) THEN TypSize(obj^.typ, TRUE)
+			ELSIF obj^.mode IN {LProc, XProc, TProc, CProc, IProc} THEN ProcSize(obj, exported)
+			END ;
+			Traverse(obj^.right, exported);
+		END
+	END Traverse;
+
+	PROCEDURE AdrAndSize* (topScope: OPT.Object);
+	BEGIN
+		OPM.errpos := topScope^.adr;	(* text position of scope used if error *)
+		Traverse(topScope^.right, TRUE);	(* first pass only on exported types and procedures  *)
+		VarAdr(topScope^.scope, OPO.dsize);	(* global variables *)
+		Traverse(topScope^.right, FALSE)	(* second pass *)
+	END AdrAndSize;
+	
+	PROCEDURE^ Expression(n: OPT.Node; VAR z: OPC.Item);
+
+	PROCEDURE Designator (n: OPT.Node; VAR x: OPC.Item);
+		VAR
+			obj: OPT.Object; 
+			y: OPC.Item;
+			index: LONGINT;
+			varRec: BOOLEAN;
+	BEGIN
+		CASE n.class OF
+			Nvar, Nvarpar:
+				obj := n.obj; 
+				x.node := n; x.mnolev := obj.mnolev; x.scale := OPO.noScale; x.inx := OPL.none;
+				IF obj.mnolev <= 0 THEN (* global or imported variable *)
+					x.mode := Abs;
+					IF obj.mnolev < 0 THEN (* imported variable *)
+						IF obj.adr DIV 10000H = 0 THEN (* no VarConsLink index yet *)
+							OPL.NewVarCons (-obj.mnolev, SHORT (obj.adr), index);
+							obj.adr := index * 10000H + obj.adr;	(* index entry *)
+						END;
+						x.adr := 0
+					ELSE x.adr := obj.linkadr
+					END
+				ELSE (* Var, VarPar *)
+					x.mode := obj.mode; x.adr := obj.linkadr
+				END;
+				x.offs := 0;
+				IF (obj.typ.comp IN {DynArr, Array}) & (x.mode  IN {Var, VarPar}) THEN
+					x.descReg := OPL.RiscFP; x.descOffs := x.adr
+				END;
+		  | Nfield:
+				Designator (n.left, x);
+				OPC.Field (x, n.obj.adr)
+		  | Nderef:
+				Designator (n.left, x); 
+				OPC.DeRef (x);
+				IF n.typ.comp = DynArr THEN
+					x.descReg := x.adr; x.descOffs := OPC.PtrToArrOffs;
+					(*x.offs := OPC.PtrToArrOffs +  4 + (n.typ.n + 1) * 4*)
+					x.offs := OPC.PtrToArrOffs + 8 + 8*((n.typ.n+1) DIV 2)	(* dVdW *)
+					(* x.descOffs = length descriptor start - 4 => same descriptor layout as for open array params *)
+				END
+		  | Nindex:
+				Designator (n.left, x); Expression (n.right, y); OPC.Index (x, y)
+		  | Nguard:
+				varRec := (n.left.class = Nvarpar) & (n.left.typ.comp = Record);
+				Designator (n.left, x);
+				OPC.TypeTest (x, n.typ, TRUE, FALSE, varRec)
+		  | Neguard:
+				varRec := (n.left.class = Nvarpar) & (n.left.typ.comp = Record);
+				Designator (n.left, x);
+				OPC.TypeTest (x, n.typ, TRUE, TRUE, varRec)
+		  | Nproc:
+				IF (n.obj.mode IN {XProc, TProc}) & (n.obj.conval.intval = -1) THEN
+					n.obj.conval.intval := ArgSize (n.obj.link) + (* 4 *) 8
+				END;
+				OPC.Procedure (x, n)
+		END;
+		x.typ := n.typ
+	END Designator;
+
+
+	PROCEDURE ActualPar (n: OPT.Node; fp: OPT.Object; VAR proc: OPC.Item);
+		VAR ap: OPC.Item; p, q: OPT.Node; formPar: OPT.Object;
+	BEGIN 
+		WHILE n # NIL DO										(* Calling convention *)
+			Expression (n, ap);
+			OPC.Parameter( ap, fp, n^.class = Nderef);
+			n := n.link; fp := fp.link
+		END
+	END ActualPar;
+
+
+	PROCEDURE Expression (n: OPT.Node; VAR z: OPC.Item);
+		VAR x, y, tag: OPC.Item; f: INTEGER; real: REAL; con: OPT.Const;
+		
+		PROCEDURE AllocConst (VAR bytes: ARRAY OF SYSTEM.BYTE; len, align: LONGINT);
+			VAR con1, con2: OPT.Const;
+		BEGIN
+			con1 := con;
+			IF n.obj = NIL THEN OPL.AllocConst (bytes, len, align, con1.intval)
+			ELSE
+				con2 := n.obj.conval;
+				IF con2.intval = OPM.ConstNotAlloc THEN OPL.AllocConst (bytes, len, align, con2.intval) END;
+				con1.intval := con2.intval
+			END
+		END AllocConst;
+		
+	BEGIN
+		z.node := NIL;
+		CASE n.class OF
+			Nconst:
+				z.typ := n.typ; z.mnolev := 0; z.node := NIL; (* constants have no node *)
+				con := n.conval;
+				CASE z.typ.form OF
+					Byte..LInt, NilTyp, Pointer:
+						z.mode := Con; z.adr := con.intval
+				  | Set:
+						z.mode := Con; z.adr := SYSTEM.VAL (LONGINT, con.setval)
+				  | String:
+						AllocConst (con.ext^, con.intval2, 4); 
+						z.mode := Abs; z.adr := con.intval; z.offs := con.intval2 (* length *); z.inx := OPL.none
+				  | Real:
+						real := SHORT (con.realval);
+						AllocConst (real, 4, 4); 
+						z.mode := Abs; z.adr := con.intval; z.inx := OPL.none
+				  | LReal:
+						AllocConst (con.realval, 8, 4);
+						z.mode := Abs; z.adr := con.intval; z.inx := OPL.none
+				END
+		  | Nupto:
+				Expression (n.left, x); Expression (n.right, y); OPC.SetRange (z, x, y)
+		  | Nmop:
+				IF n.subcl # is THEN Expression (n.left, x) END;
+				z := x;
+				CASE n.subcl OF
+					not:
+						OPC.Not (z, x)
+				  | minus:
+						OPC.Neg (z, x)
+				  | is:
+						Designator (n.left, z);
+						IF n.obj.typ.form = Pointer THEN OPC.TypeTest (z, n.obj.typ, FALSE, FALSE, FALSE)
+						ELSE OPC.TypeTest (z, n.obj.typ, FALSE, FALSE, TRUE)
+						END
+				  | conv:
+						IF n.typ.form = Set THEN OPC.SetElem (z, x)
+						ELSE
+							z := x; OPC.Convert (z, n.typ.form)
+						END
+				  | abs:
+						OPC.AbsVal (z, x)
+				  | cap:
+						OPC.Cap (z, x)
+				  | odd:
+						OPC.Odd (z, x)
+				  | adr, cc, val: (* Module SYSTEM *)
+						OPC.SYSmop (z, x, n.subcl, n.typ)
+				END;
+		  | Ndop:
+				Expression (n.left, x); f := x.typ.form; 
+				IF n.subcl = and THEN OPC.CondAnd (x)
+				ELSIF n.subcl = or THEN OPC.CondOr (x)
+				ELSIF (n.subcl >= eql) & (n.subcl <= geq) THEN OPC.Relation (x)
+				END;
+				Expression (n.right, y);
+				CASE n.subcl OF
+					times:
+						OPC.Mul (z, x, y, f)
+				  | slash, div:
+						OPC.Div (z, x, y, f)
+				  | mod:
+						OPC.Mod (z, x, y)
+				  | and:
+						OPC.And (z, x, y)
+ 				 | plus:
+						OPC.Add (z, x, y, f)
+				  | minus:
+						OPC.Sub (z, x, y, f)
+				  | or:
+						OPC.Or (z, x, y)
+				  | eql..geq:
+						OPC.Cmp (z, x, y, n.subcl)
+				  | in:
+						OPC.In (z, x, y)
+				  | ash:
+						OPC.Ash (z, x, y)
+				  | msk:
+						OPC.Msk (z,  x, y)
+				  | len:
+						OPC.Len (z, x, y)
+				  | (* SYSTEM *) bit, lsh, rot:
+						OPC.SYSdop (z, x, y, n.subcl)
+				END
+		  | Ncall:
+				OPC.PushRegs;
+				ActualPar (n.right, n.obj, z);
+				Designator (n.left, z);
+				IF n.left.class = Nproc THEN OPC.Call (z, n.left.obj, n)
+				ELSE OPC.Call (z, NIL, n)
+				END;
+				OPC.PopResult (n, z); (* pop register and put result into z *)
+		ELSE
+			Designator (n, z)
+		END;
+		z.typ := n.typ;
+	END Expression;
+	
+	PROCEDURE^ Statement (n: OPT.Node);
+
+	PROCEDURE IfStat (n: OPT.Node; VAR Lfix, Lcfix: OPC.Label; else: BOOLEAN);
+		VAR x: OPC.Item;
+	BEGIN
+		LOOP
+			OPM.errpos := n.conval.intval;
+			Expression (n.left, x);  OPC.Jncc (x, Lcfix, n); Statement (n.right);
+			IF n.link = NIL THEN EXIT END;
+			OPC.Jmp (Lfix, n); OPC.FixLink (Lcfix);
+			n := n.link
+		END;
+		IF else THEN OPC.Jmp (Lfix, n) END
+	END IfStat;
+	
+	PROCEDURE CaseStat (n: OPT.Node);
+		VAR 
+			case, interval: OPT.Node;
+			x: OPC.Item;
+			L, elseLabel, dummy: OPC.Label;
+			low, high, tab: LONGINT;
+	BEGIN
+		Expression (n.left, x); low := n.right.conval.intval; high := n.right.conval.intval2;
+		L := OPC.Nil;
+		OPC.Case (x, low, high, tab, elseLabel, n);
+		case := n.right.left;
+		WHILE case # NIL DO
+			OPC.DefLabel (dummy); (* label entry: used for common subexpression elimination *)
+			interval := case.left;
+			WHILE interval # NIL DO
+				OPL.CaseJump (OPC.pc, tab, interval.conval.intval - low, interval.conval.intval2 - low);
+				interval := interval.link
+			END;
+			Statement (case.right); OPC.Jmp (L, n);
+			case := case.link;
+		END;
+		OPC.FixLink (elseLabel); elseLabel := OPC.pc;
+		IF n.right.conval.setval # {} THEN Statement (n.right.right) (* ELSE part *)
+		ELSE OPC.Trap (OPL.CaseTrap, n)
+		END;
+		OPC.CaseFixup (tab, elseLabel, high - low + 1);
+		OPC.FixLink (L) 
+	END CaseStat;
+
+	PROCEDURE Dim (VAR z, nofelem: OPC.Item; n: OPT.Node; typ: OPT.Struct; nofdim: LONGINT);
+		VAR
+			nofArrElems: LONGINT;
+			len, cons: OPC.Item;
+			btyp: OPT.Struct;
+	BEGIN
+		Expression (n, len);
+		OPC.PushLen (len);
+		IF len.mode # Con THEN OPC.GenDimTrap (len) END;
+		IF nofdim = 1 THEN 
+			nofelem := len; nofelem.typ := OPT.linttyp
+		ELSE OPC.MulDim (nofelem, len)
+		END;
+		IF n.link # NIL THEN Dim (z, nofelem, n.link, typ.BaseTyp, nofdim + 1)
+		ELSE
+			btyp := typ.BaseTyp; nofArrElems := 1 (*0*) ;	(* <<< mh 30.3.1994 *)
+			WHILE btyp.comp = Array DO
+				nofArrElems := nofArrElems * btyp.n;
+				btyp := btyp.BaseTyp
+			END;
+			IF nofArrElems # 1 (*0*) THEN	(* <<< mh 30.3.1994 *)
+				cons.mode := Con; cons.typ := OPT.linttyp; cons.adr := nofArrElems; cons.node := NIL;
+				OPC.MulDim (nofelem, cons)
+			END;
+			OPC.NewArray (z, nofelem, nofdim, btyp, TRUE);
+			INC (z.offs, 4) (* z -> first len element *)
+		END;
+		OPC.PopLen (z); (* fill in each dimension size *)
+		INC (z.offs, 4)
+	END Dim;
+
+	PROCEDURE Statement (n: OPT.Node);
+		VAR 
+			x, z, times: OPC.Item; 
+			L, Lc, prevExitChain: OPC.Label;
+			proc, par: OPT.Object;
+			name: ARRAY 64 OF CHAR;
+			i, j: LONGINT;
+			ch: CHAR;
+			res: INTEGER;
+	BEGIN 
+		WHILE ~OPO.CodeErr & (n # NIL) DO 
+			OPC.NewStat (n.conval.intval); 
+			CASE n.class OF
+				Nenter:
+					IF n.obj = NIL THEN (* enter module *)
+						OPC.pc := 0; OPC.RiscCodeErr := FALSE;
+						OPC.Enter (NIL, 0, NIL);
+						Statement (n.right);
+						OPC.Exit (NIL);
+						IF dumpCode THEN
+							ProcName := "Body"; EntryNr := -1;
+							Oberon.Call (DumpCode, Oberon.Par, FALSE, res)
+						END;
+						IF ~OPC.RiscCodeErr THEN
+							OPL.GenCode (OPC.pc);
+							OPL.OutRefPoint (NIL); OPL.OutRefName ("$$"); OPL.OutRefs (OPT.topScope)
+						END;
+						INC (OPC.level); Statement (n.left); DEC (OPC.level)
+					ELSE (* procedure *)
+						proc := n.obj; par := proc.link;
+						INC (OPC.level); Statement (n.left); DEC (OPC.level);
+						OPC.pc := 0; OPC.RiscCodeErr := FALSE;
+						OPC.Enter (proc, proc.conval.intval2, n);
+						Statement (n.right);
+						IF (proc.typ # OPT.notyp) & ~(asmProc IN proc.conval.setval) THEN OPC.Trap (OPL.FuncTrap, n)
+						ELSE OPC.Exit (proc)
+						END;
+						OPL.OutRefPoint (proc);
+						IF proc.mode = TProc THEN
+							par := proc.link.typ.strobj;
+							name[0] := "(";
+							i := 1;
+							ch := par.name[0];
+							WHILE ch # 0X DO
+								name[i] := ch; ch := par.name[i];
+								INC (i)
+							END;
+							name[i] := ")"; INC (i);
+							j := 0;
+							ch := proc.name [0];
+							WHILE (ch # 0X) & (i < 63) DO
+								name[i] := ch; INC (i);
+								INC (j); ch := proc.name[j]
+							END;
+							name[i] := 0X
+						ELSE COPY (proc.name, name)
+						END;
+						OPL.OutRefName (name); OPL.OutRefs (proc.scope.right);
+						IF dumpCode THEN
+							ProcName := proc.name; 
+							IF proc.vis = external THEN EntryNr := SHORT (proc.adr MOD 10000H)
+							ELSE EntryNr := -1
+							END;
+							Oberon.Call (DumpCode, Oberon.Par, FALSE, res)
+						END;
+						IF ~OPC.RiscCodeErr THEN OPL.GenCode (OPC.pc) END
+					END
+			  | Ninittd: (* done by the loader *)
+			  | Nassign:
+			  	  IF (n.subcl = stifn) OR (n.subcl = clifn) THEN					(* New Functions *)
+			  	  	OPC.SYSinterrupt(n.subcl=clifn)
+			  	  ELSE
+						Expression (n.left, z);
+						IF n.subcl # newfn THEN Expression (n.right, x) END; 
+						IF n.subcl = movefn (* SYSTEM.Move *) THEN
+							Expression (n.right.link, times); OPC.SYSmove (z, x, times)
+						ELSE
+							CASE n.subcl OF
+								assign: OPC.Assign (z, x)
+							  | incfn, decfn: OPC.IncDec (z, x, n.subcl = incfn)
+							  | inclfn, exclfn: OPC.Include (z, x, n.subcl = inclfn)
+						 	 | getfn, putfn: OPC.SYSgetput (z, x, n.subcl = getfn)
+						  	| getrfn, putrfn: OPC.SYSgetputReg (z, x, n.subcl = getrfn)
+						  	| pinfn, poutfn: OPC.SYSportio (z, x, n.subcl = pinfn)					(* New Functions *)
+						  	| copyfn: OPC.Copy (z, x)
+						  	| sysnewfn: OPC.NewSys (z, x)
+						  	| newfn:
+									IF n.right = NIL THEN OPC.NewRec (z, z.typ.BaseTyp)
+									ELSE (* pointer to array *)
+										Dim (z, x, n.right, z.typ.BaseTyp, 1)
+									END
+							END (* CASE *)
+						END
+					END
+			  | Ncall:
+					OPC.PushRegs;
+					ActualPar (n.right, n.obj, x);
+					Designator (n.left, x);
+					IF n.left.class = Nproc THEN OPC.Call (x, n.left.obj, n)
+					ELSE OPC.Call (x, NIL, n)
+					END;
+					OPC.PopResult (NIL, x) (* only pop register *)
+			  | Nifelse:
+					IF (n.subcl # assertfn) OR assert THEN
+						L := OPC.Nil; Lc := OPC.Nil;
+						IfStat (n.left, L, Lc, n.right # NIL); (* L label for jump to END of if statment, Lc for the ELSE statement *)
+						OPC.FixLink (Lc);
+						IF n.right # NIL THEN Statement (n.right) END;
+						OPC.FixLink (L)
+					END
+			  | Ncase:
+					CaseStat (n)
+			  | Nwhile:
+					L := OPC.Nil; OPC.Jmp (L, n);
+					OPC.DefLabel (Lc); Statement (n.right);
+					OPC.FixLink (L); Expression (n.left, x);
+					OPC.Jcc (x, Lc, n)
+			  | Nrepeat:
+					OPC.DefLabel (L); Statement (n.left);
+					Expression (n.right, x);
+					OPC.Jncc (x, L, n)
+			  | Nloop:
+					prevExitChain := ExitChain; ExitChain := OPC.Nil;
+					OPC.DefLabel (L); Statement (n.left); OPC.Jmp (L, n);
+					OPC.FixLink (ExitChain); ExitChain := prevExitChain
+			  | Nexit:
+					OPC.Jmp (ExitChain, n)
+			  | Nreturn:
+					IF n.left # NIL THEN (* function *)
+						Expression (n.left, x);
+						OPC.Return (x, n.obj.typ.form)
+					END;
+					OPC.Exit (n.obj)
+			  | Nwith:
+					L := OPC.Nil; Lc := OPC.Nil;
+					IfStat (n.left, L, Lc, TRUE); (* L label for jump to END of if statement, Lc for the ELSE statement *)
+					OPC.FixLink (Lc);
+					IF n.subcl = 1 (*  # NIL *) THEN Statement (n.right)
+					ELSE OPC.Trap (OPL.WithTrap, n)
+					END;
+					OPC.FixLink (L)
+			  | Ntrap:
+					OPC.Trap (n.right.conval.intval, n)
+			  | Nassembler:
+			  	 OPC.GenAsm(n)		(* iASM *)
+			END;
+			n := n.link
+		END; 
+	END Statement;
+	
+	PROCEDURE Module* (prog: OPT.Node);
+	BEGIN
+		Statement (prog);
+		IF findpc & OPM.noerr THEN OPM.err (254) END
+	END Module;
+
+END iOPV.
+

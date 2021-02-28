@@ -1,0 +1,220 @@
+MODULE DebugD;
+
+(* Module: DebugD, access of dump file *)
+(* Author: Martin Buechi *)
+(* Language: Oberon(-1) including FOR loops *)
+(* System: Oberon System 3 DOS Release 1.5, Pharlap Release 1.5, Process System Release 2.0 *)
+(* Version: 1.0 *)
+(* Date of last change: 19.02.1995 *)
+
+	IMPORT
+		SYSTEM, Files, DebugT;
+		
+	CONST
+		nofCaches=5; (* number of blocks cached *)
+		
+	TYPE
+		CacheDesc=RECORD
+			blockno, lastaccess: LONGINT
+		END;
+			
+	VAR
+		F: Files.File;
+		R: Files.Rider;
+		open*: BOOLEAN; (* indicate whether dump file has been opened *)
+		(* dump file header information *)
+		error*: INTEGER; 
+		pc*, fp*, StackOrg*, sp*, BlockSize, ModAnchor*, MemSize*: LONGINT;
+		offsets: POINTER TO ARRAY DebugT.nofBlocks+2 OF LONGINT; (* offsets in dump file of memory blocks *)
+		readbuf, cache: DebugT.Mem; (* readbuffer and cache *)
+		cachecont: ARRAY nofCaches+1 OF CacheDesc; (* cache content and last access descriptor *)
+		time: LONGINT; (* time, counter used for LRU cache mechanism *)
+		
+	(* ______________________________ auxiliary functions ____________________________ *)		
+
+	PROCEDURE MarkUse(no: LONGINT);
+	(* mark use of cache block *)
+		VAR i: LONGINT;
+	BEGIN
+		IF time=MAX(LONGINT) THEN
+			FOR i:=0 TO nofCaches-1 DO cachecont[i].lastaccess:=MIN(LONGINT) END; time:=MIN(LONGINT)
+		END;
+		INC(time);
+		cachecont[no].lastaccess:=time
+	END MarkUse;
+	
+	PROCEDURE Load(cacheno, blockno: LONGINT);
+	(* load cache buffer *)
+		VAR
+			len, read, endread, write, i: LONGINT;
+			ch, rchar, cc: CHAR;
+	BEGIN
+		Files.Set(R, F, offsets[blockno]); len:=offsets[blockno+1]-offsets[blockno]; Files.ReadBytes(R, readbuf^, len);
+		read:=SYSTEM.VAL(LONGINT, readbuf); endread:=read+len;
+		write:=SYSTEM.VAL(LONGINT, cache)+cacheno*BlockSize;
+		REPEAT
+			SYSTEM.GET(read, ch); INC(read);	
+			IF ch=DebugT.RLEIndicator THEN
+				SYSTEM.GET(read, rchar); SYSTEM.GET(read+1, cc); INC(read, 2);
+				FOR i:=0 TO ORD(cc) DO SYSTEM.PUT(write, rchar); INC(write) END;
+			ELSE
+				SYSTEM.PUT(write, ch); INC(write);
+			END;
+		UNTIL read>=endread;
+		cachecont[cacheno].blockno:=blockno; MarkUse(cacheno)
+	END Load;
+	
+	PROCEDURE SetRider(adr: LONGINT; VAR map: LONGINT; size: LONGINT);
+	(* get memory block *)
+		VAR
+			blockno, minno, mintime, i: LONGINT;
+			nonoverlap: BOOLEAN;
+	BEGIN
+		IF (adr<MemSize) & (adr>0) THEN
+			blockno:=adr DIV BlockSize; nonoverlap:=((adr+size) DIV BlockSize)=blockno; mintime:=MAX(LONGINT);
+			FOR i:=0 TO nofCaches-1 DO
+				IF (cachecont[i].blockno=blockno) & (nonoverlap OR (cachecont[i+1].blockno=blockno+1)) THEN
+					MarkUse(i); IF ~nonoverlap THEN MarkUse(i+1) END;
+					map:=SYSTEM.VAL(LONGINT, cache)+i*BlockSize+(adr MOD BlockSize); RETURN (* cache hit *)
+				ELSIF cachecont[i].lastaccess<=mintime THEN mintime:=cachecont[i].lastaccess; minno:=i
+				END
+			END; (* cache miss *)
+			IF (offsets[blockno]#offsets[blockno+1]) & (nonoverlap OR (offsets[blockno+1]#offsets[blockno+2])) THEN
+				IF nonoverlap THEN
+					Load(minno, blockno)
+				ELSE
+					IF minno=nofCaches-1 THEN DEC(minno) END;
+					Load(minno, blockno); Load(minno+1, blockno+1)
+				END;
+				map:=SYSTEM.VAL(LONGINT, cache)+minno*BlockSize+(adr MOD BlockSize)
+			ELSE map:=0
+			END
+		ELSE map:=0
+		END
+	END SetRider;
+			
+	PROCEDURE Available*(adr, len: LONGINT): BOOLEAN;
+	(* check whether memory area has been included in dump *)
+		VAR i: LONGINT;
+	BEGIN
+		IF (adr<0) OR (adr>MAX(LONGINT)-len) OR (adr+len>MemSize) THEN RETURN FALSE END;
+		FOR i:=adr DIV BlockSize TO (adr+len) DIV BlockSize DO IF offsets[i]=offsets[i+1] THEN RETURN FALSE END END;
+		RETURN TRUE
+	END Available;
+	
+	
+	(* ______________________________ get values ____________________________ *)
+	
+	PROCEDURE GetLInt*(adr: LONGINT; VAR val: LONGINT; VAR res: BOOLEAN);
+	(* get longint at address *)
+		VAR map: LONGINT;
+	BEGIN
+		SetRider(adr, map, SIZE(LONGINT));
+		IF map#0 THEN SYSTEM.GET(map, val); res:=TRUE ELSE res:=FALSE END
+	END GetLInt;
+	
+	PROCEDURE GetInt*(adr: LONGINT; VAR val: INTEGER; VAR res: BOOLEAN);
+	(* get integer at address *)
+		VAR map: LONGINT;
+	BEGIN
+		SetRider(adr, map, SIZE(INTEGER));
+		IF map#0 THEN SYSTEM.GET(map, val); res:=TRUE ELSE res:=FALSE END
+	END GetInt;
+	
+	PROCEDURE GetSInt*(adr: LONGINT; VAR val: SHORTINT; VAR res: BOOLEAN);
+	(* get shortint at address *)
+		VAR map: LONGINT;
+	BEGIN
+		SetRider(adr, map, SIZE(SHORTINT));
+		IF map#0 THEN SYSTEM.GET(map, val); res:=TRUE ELSE res:=FALSE END
+	END GetSInt;
+	
+	PROCEDURE GetReal*(adr: LONGINT; VAR val: REAL; VAR res: BOOLEAN);
+	(* get real at address *)
+		VAR map: LONGINT;
+	BEGIN
+		SetRider(adr, map, SIZE(REAL));
+		IF map#0 THEN SYSTEM.GET(map, val); res:=TRUE ELSE res:=FALSE END
+	END GetReal;
+	
+	PROCEDURE GetLReal*(adr: LONGINT; VAR val: LONGREAL; VAR res: BOOLEAN);
+	(* get longreal at address *)
+		VAR map: LONGINT;
+	BEGIN
+		SetRider(adr, map, SIZE(LONGREAL));
+		IF map#0 THEN SYSTEM.GET(map, val); res:=TRUE ELSE res:=FALSE END
+	END GetLReal;
+	
+	PROCEDURE GetChar*(adr: LONGINT; VAR val: CHAR; VAR res: BOOLEAN);
+	(* get char at address *)
+		VAR map: LONGINT;
+	BEGIN
+		SetRider(adr, map, SIZE(CHAR));
+		IF map#0 THEN SYSTEM.GET(map, val); res:=TRUE ELSE res:=FALSE END
+	END GetChar;
+	
+	PROCEDURE GetSet*(adr: LONGINT; VAR val: SET; VAR res: BOOLEAN);
+	(* get set at address *)
+		VAR map: LONGINT;
+	BEGIN
+		SetRider(adr, map, SIZE(SET));
+		IF map#0 THEN SYSTEM.GET(map, val); res:=TRUE ELSE res:=FALSE END
+	END GetSet;
+	
+	PROCEDURE GetBool*(adr: LONGINT; VAR val: BOOLEAN; VAR res: BOOLEAN);
+	(* get boolean at address *)
+		VAR map: LONGINT;
+	BEGIN
+		SetRider(adr, map, SIZE(BOOLEAN));
+		IF map#0 THEN SYSTEM.GET(map, val); res:=TRUE ELSE res:=FALSE END
+	END GetBool;
+	
+	PROCEDURE GetBytes*(adr: LONGINT; VAR val: ARRAY OF SYSTEM.BYTE; n: LONGINT; VAR res: BOOLEAN);
+	(* get bytes at address *)
+		VAR map, i: LONGINT;
+	BEGIN
+		IF n<BlockSize THEN SetRider(adr, map, n);
+			IF map#0 THEN FOR i:=0 TO n-1 DO SYSTEM.GET(map+i, val[i]) END; res:=TRUE
+			ELSE res:=FALSE
+			END
+		ELSE res:=FALSE
+		END		
+	END GetBytes;
+	
+	(* ______________________________ open & close ____________________________ *)
+		
+	PROCEDURE OpenDump*(name: ARRAY OF CHAR);
+	(* open dump file and initialize dump mask *)
+		VAR
+			adr, i: LONGINT;
+			MagicNo, j: INTEGER;
+	BEGIN
+		open:=FALSE; F:=Files.Old(name);
+		IF F#NIL THEN
+			Files.Set(R, F, 0); Files.ReadInt(R, MagicNo);
+			IF MagicNo=DebugT.MagicNo THEN
+				Files.ReadInt(R, error); Files.ReadLInt(R, pc); Files.ReadLInt(R, fp);
+				Files.ReadLInt(R, StackOrg); Files.ReadLInt(R, sp); Files.ReadLInt(R, BlockSize);
+				Files.ReadLInt(R, MemSize); Files.ReadLInt(R, ModAnchor);
+				NEW(offsets); adr:=Files.Pos(R);
+				Files.Set(R, F, Files.Length(F)-DebugT.nofBlocks*SIZE(INTEGER));
+				FOR i:=0 TO DebugT.nofBlocks-1 DO
+					Files.ReadInt(R, j); offsets[i]:=adr; INC(adr, j)
+				END; offsets[DebugT.nofBlocks]:=adr; offsets[DebugT.nofBlocks+1]:=adr;
+				SYSTEM.NEW(readbuf, BlockSize*2); SYSTEM.NEW(cache, BlockSize*nofCaches); time:=MIN(LONGINT);
+				FOR i:=0 TO nofCaches DO cachecont[i].blockno:=-1; cachecont[i].lastaccess:=time END;
+				open:=TRUE
+			END
+		END
+	END OpenDump;
+	
+	PROCEDURE Close*;
+	(* close dump file *)
+	BEGIN
+		IF F#NIL THEN Files.Close(F) END;
+		offsets:=NIL; open:=FALSE; readbuf:=NIL; cache:=NIL
+	END Close;	
+		
+BEGIN
+	open:=FALSE; offsets:=NIL
+END DebugD.

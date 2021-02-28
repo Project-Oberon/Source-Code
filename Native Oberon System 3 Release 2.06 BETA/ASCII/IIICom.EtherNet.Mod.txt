@@ -1,0 +1,495 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE EtherNet;
+
+(* 3COM EtherLink III adapter driver - tested on ISA and EISA machines *)
+
+(* pjm 18.06.95, first implementation
+	pjm 08.02.96, ported to 2.05
+	pjm 24.04.96, treat AUI port same as twisted pair (fixed problem in student lab)
+	pjm 24.04.96, EtherLog.Log format now compatible with tcpdump -r
+	pjm 24.04.96, Cleanup procedure
+	pjm 25.04.96, removed Kernel.SetTimeout, use timer 2 for Delay during init *)
+
+IMPORT SYSTEM, Kernel, Files;
+
+CONST
+	AdrLen* = 6;
+	MaxPkt = 1514;
+	BufSize = 8192 DIV 4;	(* receive buffer size *)
+
+TYPE 
+	Adr* =  ARRAY 6 OF CHAR;	
+	
+	Header* = POINTER TO HeaderDesc;
+	HeaderDesc* = RECORD
+		dst*, src*: Adr;		(* 0, 6 *)
+		type*: INTEGER; 		(* 12 *)
+	END;
+	
+	Data* = POINTER TO DataDesc;
+	DataDesc* = RECORD
+		data*: ARRAY 1500 OF SYSTEM.BYTE	(* Note: SendPacket may access data[1500] & data[1501] *)
+	END;
+	
+VAR
+	bethadr*, ethadr*, anyadr*: Adr;
+	overruns, runts, badframes, badcrcs, oversizes, inerrors, pops, inttime1, ints, inttime2,
+	outerrors, resets, enables, sizeerrors, splits, nonsplits, timeouts, dropped: LONGINT;	(* stats *)
+	port, rxsize, txsize: INTEGER;
+	buf: ARRAY BufSize OF LONGINT;
+	head, tail: INTEGER;
+	temp: ARRAY MaxPkt+3 OF CHAR;
+	irq: SHORTINT;
+	logging: BOOLEAN;
+	log: Files.Rider;
+
+(* RepInDWord - Block port input instruction. *)
+
+PROCEDURE RepInDWord(port, buf, len: LONGINT);
+CODE
+	MOV EDX, port[EBP]
+	MOV EDI, buf[EBP]
+	MOV ECX, len[EBP]
+	CLD
+	REP INSD
+END RepInDWord;
+
+(* RepOut14 - Block port output instruction (14 bytes). *)
+
+PROCEDURE RepOut14(port, buf: LONGINT);
+CODE
+	MOV EDX, port[EBP]
+	MOV ESI, buf[EBP]
+	CLD
+	OUTSD
+	OUTSD
+	OUTSD
+	OUTSW
+END RepOut14;
+
+(* RepOut4n2 - Block port output instruction (4*n+2 bytes). *)
+
+PROCEDURE RepOut4n2(port, buf, n: LONGINT);
+CODE
+	MOV EDX, port[EBP]
+	MOV ESI, buf[EBP]
+	MOV ECX, n[EBP]
+	CLD
+	REP OUTSD
+	OUTSW
+END RepOut4n2;
+
+(** SendPacket - Send a packet.  Interrupts must be enabled. *)
+
+PROCEDURE SendPacket*(VAR h: Header; d: Data; len: INTEGER);
+VAR p, free: INTEGER;  s, u: SET;  t: LONGINT;
+BEGIN
+	IF (len < 0) OR (len > 1500) THEN INC(outerrors); RETURN END;	(* packet too big *)
+	h.src := ethadr;
+	LOOP
+		p := port+11;  SYSTEM.PORTIN(p, SYSTEM.VAL(CHAR, s));  p := port+14;
+		IF s * {4,5} # {} THEN	(* underrun or jabber error *)
+			INC(resets);  SYSTEM.CLI();
+			SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 5800H));	(* tx reset *)
+			REPEAT
+				SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, u))	(* get status *)
+			UNTIL ~(12 IN u);	(* wait until complete *)
+			SYSTEM.STI()
+		END;
+		IF s * {3..5} # {} THEN	(* any error *)
+			INC(enables);  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 4800H))	(* tx enable *)
+		END;
+		IF 7 IN s THEN	(* TX complete *)
+			INC(pops);  p := port+11;  SYSTEM.PORTOUT(p, 0X)	(* pop stack *)
+		ELSE
+			EXIT
+		END
+	END;
+	INC(len, 14);  t := Kernel.GetTimer();  p := port+12;	(* tx free *)
+	LOOP
+		SYSTEM.PORTIN(p, free);	(* from window 1, i.e. trunc'ed to dword boundary p. 6-21 *)
+		IF free >= len THEN EXIT END;
+		IF Kernel.GetTimer() - t > Kernel.TimeUnit DIV 2 THEN INC(timeouts); RETURN END;	(* 0.5s timeout *)
+	END;
+	SYSTEM.PORTOUT(port, len);  SYSTEM.PORTOUT(port, SYSTEM.VAL(INTEGER, 0));
+	RepOut14(port, SYSTEM.ADR(h.dst[0]));	(* output header *)
+	DEC(len, 14);  RepOut4n2(port, SYSTEM.ADR(d.data[0]), (len+1) DIV 4);	(* output data *)
+	IF logging THEN
+		t := Kernel.GetTimer();
+		Files.WriteLInt(log, t DIV Kernel.TimeUnit);  
+		Files.WriteLInt(log, ((t MOD Kernel.TimeUnit)*1000 DIV Kernel.TimeUnit)*1000+1);
+		Files.WriteLInt(log, len+14);  Files.WriteLInt(log, len+14);
+		Files.WriteBytes(log, h^, 14);  Files.WriteBytes(log, d.data, len)
+	END
+END SendPacket;
+
+(** Available - Return TRUE iff a packet is available *)
+
+PROCEDURE Available*(): BOOLEAN;
+BEGIN
+	RETURN head # tail
+END Available;
+
+(* CopyDWord - Copy len dwords from src to dst. *)
+
+PROCEDURE CopyDWord(src, dst, len: LONGINT);
+CODE
+	MOV ESI, src[EBP]
+	MOV EDI, dst[EBP]
+	MOV ECX, len[EBP]
+	CLD
+	REP MOVSD
+END CopyDWord;
+
+(* Copy - Copy size bytes from source to dest.  (No overlap allowed) *)
+
+PROCEDURE Copy(source, dest, size: LONGINT);
+CODE
+	MOV ESI, source[EBP]
+	MOV EDI, dest[EBP]
+	MOV ECX, size[EBP]
+	CLD
+	CMP ECX, 8
+	JB bytemove
+	XOR EAX, EAX
+	SHRD EAX, ESI, 2
+	JZ copyd
+	TEST EDI, 3
+	JZ copyd
+	SHRD EAX, EDI, 2
+	SHR EAX, 28
+	CMP AL, 10
+	JZ mov2
+	CMP AL, 5
+	JZ mov3
+	NOT AL
+	AND AL, 5
+	JNZ copyd
+	MOVSB
+	DEC ECX
+	JMP copyd
+mov3:
+	MOVSB
+	DEC ECX
+mov2:
+	MOVSW
+	SUB ECX, 2
+copyd:
+	SHRD EAX, ECX, 2
+	SHR ECX, 2
+	REP MOVSD
+	SHLD ECX, EAX, 2
+bytemove:
+	REP MOVSB
+END Copy;
+
+(** ReceivePacket - Remove a packet from the input buffer *)
+
+PROCEDURE ReceivePacket*(h: Header; d: Data; VAR l: INTEGER);
+VAR len, size, left, done: INTEGER;  t: LONGINT;
+BEGIN
+	IF head # tail THEN
+		SYSTEM.GET(SYSTEM.ADR(buf[head]), size);  SYSTEM.GET(SYSTEM.ADR(buf[head])+2, len);
+		SYSTEM.CLI();  INC(head);  IF head = BufSize THEN head := 0 END;  SYSTEM.STI();
+		left := BufSize - head;  l := len-14;
+		IF size > left THEN	(* split *)
+				(* first move to temp & unsplit *)
+			CopyDWord(SYSTEM.ADR(buf[head]), SYSTEM.ADR(temp[0]), left);
+			CopyDWord(SYSTEM.ADR(buf[0]), SYSTEM.ADR(temp[left*4]), (size-left));
+				(* then move to buffer & split *)
+			SYSTEM.MOVE(SYSTEM.ADR(temp[0]), SYSTEM.ADR(h.dst[0]), 14);
+			Copy(SYSTEM.ADR(temp[14]), SYSTEM.ADR(d.data[0]), l)
+		ELSE	(* ~split *)
+			SYSTEM.MOVE(SYSTEM.ADR(buf[head]), SYSTEM.ADR(h.dst[0]), 14);
+			Copy(SYSTEM.ADR(buf[head])+14, SYSTEM.ADR(d.data[0]), l)
+		END;
+		IF logging THEN
+			t := Kernel.GetTimer();
+			Files.WriteLInt(log, t DIV Kernel.TimeUnit);  
+			Files.WriteLInt(log, ((t MOD Kernel.TimeUnit)*1000 DIV Kernel.TimeUnit)*1000+1);
+			Files.WriteLInt(log, len);  Files.WriteLInt(log, len);
+			Files.WriteBytes(log, h^, 14);  Files.WriteBytes(log, d.data, l)
+		END;
+		SYSTEM.CLI();  head := (head+size) MOD BufSize;  SYSTEM.STI();
+	ELSE l := 0
+	END
+END ReceivePacket;
+
+(** SetMode - Set receive mode (1-6) *)
+
+PROCEDURE SetMode*(mode: INTEGER);
+VAR p: INTEGER;  v: LONGINT;  f: Files.File;
+BEGIN
+	CASE mode OF
+		1: mode := 0	(* no packets *)
+		|2: mode := 1	(* only packets to this interface *)
+		|3: mode := 5	(* mode 2 & broadcast *)
+		|4: mode := 7	(* mode 3 & limited multicast *)
+		|5: mode := 7	(* mode 3 and all multicast *)
+		|6: mode := 15	(* all packets *)
+		|-1:	(* logging on, flush *)
+			IF ~logging THEN
+				f := Files.New("EtherNet.Log");  Files.Set(log, f, 0);	(* tcpdump compatible log file *)
+				Files.WriteLInt(log, 0A1B2C3D4H);  Files.WriteInt(log, 2);
+				Files.WriteInt(log, 4);  Files.WriteLInt(log, 0);  Files.WriteLInt(log, 0);
+				Files.WriteLInt(log, 1514);  Files.WriteLInt(log, 1);
+				Files.Register(f);  logging := TRUE
+			ELSE
+				Files.Close(Files.Base(log))	(* flush *)
+			END
+		|-2:	(* logging off *)
+			IF logging THEN
+				logging := FALSE;  Files.Close(Files.Base(log));  Files.Set(log, NIL, 0)
+			END
+	END;
+	p := port+14;  v := mode+8000H;
+	SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, v))	(* set rx filter *)
+END SetMode;
+
+(* InterruptHandler - Handle interrupts *)
+
+PROCEDURE *InterruptHandler;
+VAR p, len, size, left, timer: INTEGER;  s: SET;
+BEGIN
+	p := port+10;  timer := 0;  SYSTEM.PORTIN(p, SYSTEM.VAL(CHAR, timer));
+	SYSTEM.STI();  INC(inttime1, LONG(timer));  INC(ints);
+	LOOP
+		p := port+14;  SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, s));	(* status *)
+		s := s - {8..15} + {11,13,14};
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, s));	(* ack *)
+		p := port+8;
+		IF 4 IN s THEN	(* recv complete *)
+			SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, s));	(* size *)
+			IF 14 IN s THEN	(* error *)
+				CASE SYSTEM.VAL(SHORTINT, SYSTEM.LSH(s, -11) * {0..2}) OF
+					0:  INC(overruns)
+					|3:  INC(runts)
+					|4:  INC(badframes)
+					|5:  INC(badcrcs)
+					|1:  INC(oversizes)
+					ELSE INC(inerrors)
+				END (* CASE *)
+			ELSE
+				len := SYSTEM.VAL(INTEGER, s * {0..10});	(* packet length *)
+				IF (len < 60) OR (len > MaxPkt) THEN	(* too small or big *)
+					INC(sizeerrors)
+				ELSE
+					size := (len+7) DIV 4;	(* 2 bytes for len, 2 bytes for size, 3 bytes for INSD padding *)
+					IF size < (head - tail - 1) MOD BufSize THEN	(* there is space *)
+						DEC(size); SYSTEM.PUT(SYSTEM.ADR(buf[tail]), size);  SYSTEM.PUT(SYSTEM.ADR(buf[tail])+2, len);
+						tail := (tail+1) MOD BufSize;   left := BufSize - tail;
+						IF size > left THEN	(* split *)
+							RepInDWord(port, SYSTEM.ADR(buf[tail]), left);  DEC(size, left);
+							RepInDWord(port, SYSTEM.ADR(buf[0]), size);  tail := size;
+							INC(splits)
+						ELSE	(* ~split *)
+							RepInDWord(port, SYSTEM.ADR(buf[tail]), size);  INC(tail, size);
+							IF tail = BufSize THEN tail := 0 END;
+							INC(nonsplits)
+						END
+					ELSE
+						INC(dropped)
+					END
+				END
+			END
+		ELSE
+			EXIT
+		END;
+		p := port+14;  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 4000H));	(* discard *)
+		REPEAT SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, s)) UNTIL ~(12 IN s)	(* wait for fin *)
+	END;
+	p := port+10;  SYSTEM.PORTIN(p, SYSTEM.VAL(CHAR, timer));  INC(inttime2, LONG(timer))
+END InterruptHandler;
+
+(* WriteID - Write the 3c509 ID pattern to the ID port *)
+
+PROCEDURE WriteID(id: INTEGER);
+VAR s: SET;  i: INTEGER;
+BEGIN
+	SYSTEM.PORTOUT(id, 0X);	(* select ID port *)
+	SYSTEM.PORTOUT(id, 0X);	(* reset hardware pattern generator *)
+	s := {0..7};
+	FOR i := 1 TO 255 DO
+		SYSTEM.PORTOUT(id, SYSTEM.VAL(CHAR, s));
+		s := SYSTEM.LSH(s, 1);
+		IF 8 IN s THEN s := s / {0..3,6,7} END
+	END
+END WriteID;
+
+(* Delay - Delay for the specified time *)
+
+PROCEDURE Delay(us: LONGINT);
+CONST Rate = 1193180;	(* 1.19318 MHz *)
+VAR s: SET;
+BEGIN
+	ASSERT(MAX(LONGINT) DIV us >= Rate);
+	us := us*Rate DIV 1000000;
+	ASSERT(us < 65536);
+	SYSTEM.CLI();
+	SYSTEM.PORTIN(61H, SYSTEM.VAL(CHAR, s));	(* disable timer 2 gate *)
+	SYSTEM.PORTOUT(61H, SYSTEM.VAL(CHAR, s - {0}));
+	SYSTEM.PORTOUT(43H, 0B0X);	(* timer 2, mode 0 *)
+	SYSTEM.PORTOUT(42H, CHR(us MOD 100H));
+	SYSTEM.PORTOUT(42H, CHR(us DIV 100H));
+	SYSTEM.PORTIN(61H, SYSTEM.VAL(CHAR, s));	(* enable timer 2 gate *)
+	SYSTEM.PORTOUT(61H, SYSTEM.VAL(CHAR, s + {0}));
+	SYSTEM.STI();
+	REPEAT SYSTEM.PORTIN(61H, SYSTEM.VAL(CHAR, s)) UNTIL 5 IN s
+END Delay;
+
+(* ReadEE - Read EEPROM register *)
+
+PROCEDURE ReadEE(id, reg: INTEGER): LONGINT;
+VAR i: SHORTINT;  b: CHAR;  s: SET;
+BEGIN
+	INC(reg, 80H);  SYSTEM.PORTOUT(id, CHR(reg));
+	Delay(400);
+	s := {};
+	FOR i := 15 TO 0 BY -1 DO
+		SYSTEM.PORTIN(id, b);
+		IF ODD(ORD(b)) THEN INCL(s, i) END
+	END;
+	RETURN SYSTEM.VAL(LONGINT, s)
+END ReadEE;
+
+(* ReadEE2 - Read EEPROM register (EISA) *)
+
+PROCEDURE ReadEE2(p, reg: INTEGER): LONGINT;
+VAR t: LONGINT;
+BEGIN
+	INC(reg, 80H);  SYSTEM.PORTOUT(p, CHR(reg));
+	Delay(170);
+	t := 0;  INC(p, 2);  SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, t));
+	RETURN t
+END ReadEE2;
+
+(* Cleanup - Clean up at module termination *)
+
+PROCEDURE *Cleanup;
+BEGIN
+	Kernel.RemoveIP(InterruptHandler, Kernel.IRQ+irq)
+END Cleanup;
+
+(* Init - Initialise the 3c509 card.  Can handle only one card. *)
+
+PROCEDURE Init(VAR adr: Adr);
+VAR slot, id, p: INTEGER;  t: LONGINT;  baseT: BOOLEAN;  s: SET;
+
+	PROCEDURE Swap(w: LONGINT): INTEGER;
+	VAR t: ARRAY 2 OF CHAR;
+	BEGIN
+		SYSTEM.GET(SYSTEM.ADR(w), t[1]);  SYSTEM.GET(SYSTEM.ADR(w)+1, t[0]);
+		RETURN SYSTEM.VAL(INTEGER, t)
+	END Swap;
+	
+BEGIN
+	port := MAX(INTEGER);  SYSTEM.GET(0FFFD9H, t);
+	IF t = 41534945H THEN	(* try eisa *)
+		slot := 1;  id := 9;
+		WHILE slot # id DO
+			p := SHORT(ASH(slot, 12) + 0C80H);
+			t := 0;  SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, t));
+			IF t = 6D50H THEN
+				INC(p, 2);  SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, t));
+				IF SYSTEM.VAL(SET, t) * {0..7,12..15} = {4,6,12,15} THEN	(* found 509 *)
+					id := slot;  port := SHORT(ASH(slot, 12));
+					INC(p, 4);  SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, t));
+					baseT := SYSTEM.VAL(SET, t) * {14,15} # {14,15};
+					INC(p, 2);  SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, t));
+					irq := SHORT(SHORT(ASH(t, -12)));
+					SYSTEM.CLI();  INC(p, 2);
+					SYSTEM.PUT(SYSTEM.ADR(adr[0]), Swap(ReadEE2(p, 10)));
+					SYSTEM.PUT(SYSTEM.ADR(adr[2]), Swap(ReadEE2(p, 11)));
+					SYSTEM.PUT(SYSTEM.ADR(adr[4]), Swap(ReadEE2(p, 12)));
+					SYSTEM.STI();
+					p := 110H;  SYSTEM.PORTOUT(p, 0FFX)	(* activate the adapter *)
+				ELSE
+					INC(slot)
+				END
+			ELSE
+				INC(slot)
+			END
+		END
+	END;
+	IF port = MAX(INTEGER) THEN	(* try isa *)
+		SYSTEM.CLI();  id := 110H;   WriteID(id);	(* ch. 7 & A *)
+		SYSTEM.PORTOUT(id, 0C0X);	(* reset to power-on state *)
+		SYSTEM.STI();
+		t := Kernel.GetTimer();  REPEAT UNTIL Kernel.GetTimer() - t > Kernel.TimeUnit DIV 10;	(* 100ms *)
+		SYSTEM.CLI();
+		WriteID(id);  SYSTEM.PORTOUT(id, 0D0X);	(* untag *)
+		IF ReadEE(id, 7) = 6D50H THEN
+			SYSTEM.PUT(SYSTEM.ADR(adr[0]), Swap(ReadEE(id, 10)));
+			SYSTEM.PUT(SYSTEM.ADR(adr[2]), Swap(ReadEE(id, 11)));
+			SYSTEM.PUT(SYSTEM.ADR(adr[4]), Swap(ReadEE(id, 12)));
+			t := ReadEE(id, 8);  baseT := SYSTEM.VAL(SET, t) * {14,15} # {14,15};
+			port := (SHORT(t) MOD 20H)*16 + 200H;
+			irq := SHORT(SHORT(ASH(ReadEE(id, 9), -12)));
+			t := ReadEE(id, 13);	(* software config (ignore) *)
+			SYSTEM.PORTOUT(id, 0FFX)	(* activate the adapter *)
+		END;
+		SYSTEM.STI()
+	END;
+	IF port # MAX(INTEGER) THEN
+		Kernel.WriteString("3com509 at ");  Kernel.WriteHex(port, 8);  Kernel.WriteString(", irq ");  Kernel.WriteInt(irq, 1);
+		Kernel.WriteString(", address ");  FOR p := 0 TO 5 DO Kernel.WriteChar(" ");  Kernel.WriteHex(ORD(adr[p]), -2) END;
+		IF baseT THEN Kernel.WriteString(" TP") END;
+		Kernel.WriteLn;
+		p := port+14;  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 0800H));	(* setup window *)
+		p := port+4;  SYSTEM.PORTOUT(p, 1X);	(* enable adapter *)
+		p := port+14;  SYSTEM.CLI();
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 5800H));	(* tx reset *)
+		REPEAT
+			SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, s))	(* get status *)
+		UNTIL ~(12 IN s);	(* wait until complete *)
+		SYSTEM.STI();
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 2800H));	(* rx reset *)
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 7010H));	(* enable rxcomplete interrupt *)
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 78FEH));	(* enable all status bits *)
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 8005H));	(* receive mine+broadcast *)
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 0802H));	(* station address window *)
+		FOR p := port TO port+5 DO SYSTEM.PORTOUT(p, adr[p-port]) END;	(* set address *)
+		p := port+14;  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 0803H));	(* FIFO window *)
+		p := port+10;  SYSTEM.PORTIN(p, rxsize);	(* get buffer sizes *)
+		p := port+12;  SYSTEM.PORTIN(p, txsize);
+		IF baseT THEN
+			p := port+14;  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 0804H));	(* diagnostics window *)
+			p := port+10;  SYSTEM.PORTIN(p, SYSTEM.VAL(INTEGER, s));	(* media status *)
+			s := s + {6,7};  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, s));	(* link beat & jabber enable *)
+			p := port+14;  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 0B800H));	(* stop internal transceiver *)
+			Delay(800)	(* p. 6-11 *)
+		ELSE
+			p := port+14;  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 1000H));	(* start internal transceiver *)
+			Delay(800)	(* p. 6-4 *)
+		END;
+		p := port+14;  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 0800H));	(* setup window *)
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 4800H));	(* tx enable *)
+		SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 2000H));	(* rx enable *)
+		p := port+14;  SYSTEM.PORTOUT(p, SYSTEM.VAL(INTEGER, 0801H));	(* operating window *)
+		Kernel.InstallIP(InterruptHandler, Kernel.IRQ+irq);
+		Kernel.InstallTermHandler(Cleanup)
+	ELSE (* port = MAX(INTEGER) will cause overflow in SendPacket *)
+	END
+END Init;
+
+BEGIN
+	bethadr[0] := 0FFX; bethadr[1] := 0FFX; bethadr[2] := 0FFX; bethadr[3] := 0FFX; bethadr[4] := 0FFX; bethadr[5] := 0FFX;
+	anyadr[0] := 0X; anyadr[1] := 0X; anyadr[2] := 0X; anyadr[3] := 0X; anyadr[4] := 0X; anyadr[5] := 0X;
+	inerrors := 0;  overruns := 0;  runts := 0;  badframes := 0;  badcrcs := 0;  oversizes := 0;  pops := 0;
+	outerrors := 0;  resets := 0;  enables := 0;  sizeerrors := 0;  splits := 0;  nonsplits := 0;  timeouts := 0;
+	dropped := 0;  inttime1 := 0;  inttime2 := 0;  ints := 0;
+	head := 0;  tail := 0;  logging := FALSE;
+	Init(ethadr)
+END EtherNet.

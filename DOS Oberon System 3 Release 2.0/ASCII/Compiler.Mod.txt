@@ -1,0 +1,1109 @@
+MODULE Compiler;   (*NW 7.6.87 / 16.3.91 // ARD 19.05.93 *)
+(* ARD 20.07.93, EntryLength = 128, MaxComs = 128 *)
+(* ARD 18.08.93, entry replaced through DOCH.entry *)
+
+	IMPORT Texts, Files, TextFrames, Viewers, Oberon, DOCS, DOCT, DOCC, DOCE, DOCH;
+
+	CONST NofCases = 128; MaxEntry = 128; ModNameLen = 20;
+		RecDescSize = 8; AdrSize = 4; ProcSize = 4; PtrSize = 4;
+		ParOrg = 8; LDataSize = 8000H;
+			
+		(*symbol values*)
+			times = 1; slash = 2; div = 3; mod = 4;
+			and = 5; plus = 6; minus = 7; or = 8; eql = 9;
+			neq = 10; lss = 11; leq = 12; gtr = 13; geq = 14;
+			in = 15; is = 16; arrow = 17; period = 18; comma = 19;
+			colon = 20; upto = 21; rparen = 22; rbrak = 23; rbrace = 24;
+			of = 25; then = 26; do = 27; to = 28; lparen = 29;
+			lbrak = 30; lbrace = 31; not = 32; becomes = 33; number = 34;
+			nil = 35; string = 36; ident = 37; semicolon = 38; bar = 39;
+			end = 40; else = 41; elsif = 42; until = 43; if = 44;
+			case = 45; while = 46; repeat = 47; loop = 48; with = 49;
+			exit = 50; return = 51; array = 52; record = 53; pointer = 54;
+			begin = 55; const = 56; type = 57; var = 58; procedure = 59;
+			import = 60; module = 61; for = 63; by = 64;  (* <-- ARD *)
+
+		(*object and item modes*)
+			Var   =  1; VarX  =  2; Ind = 3; IndX  =  4; RegI  =  5;
+			RegX  =  6; Abs   =  7; Con   =  8; Stk   =  9; Coc   = 10;
+			Reg   = 11; Fld   = 12; Typ   = 13; LProc = 14; XProc = 15;
+			SProc = 16; CProc = 17; IProc = 18; Mod   = 19; Head  = 20;
+
+		(*structure forms*)
+			Undef = 0; Char = 3; LInt = 6; LReal = 8; Pointer = 13; ProcTyp = 14; Array = 15; DynArr = 16; Record = 17;
+			intSet = {4 .. 6}; labeltyps = {3 .. 6}; realSet = {7, 8}; TbTyp = 18;
+			
+	VAR W: Texts.Writer;
+			sym, entno: INTEGER;
+			newSF, ovr, info: BOOLEAN;
+			LoopLevel, ExitNo: INTEGER;
+			LoopExit:  ARRAY 16 OF LONGINT;
+			assign: BOOLEAN;
+
+	PROCEDURE^ Type(VAR typ: DOCT.Struct);
+	PROCEDURE^ FormalType(VAR typ: DOCT.Struct);
+	PROCEDURE^ Expression(VAR x: DOCT.Item);
+	PROCEDURE^ Block(VAR dsize: LONGINT);
+	
+	PROCEDURE CheckSym(s: INTEGER);
+	BEGIN
+		IF sym = s THEN DOCS.Get(sym) ELSE DOCS.Mark(s) END
+	END CheckSym;
+
+	PROCEDURE Mark(n: INTEGER; pos : LONGINT);
+	BEGIN 
+		IF info THEN 	
+			Texts.WriteLn(W); Texts.WriteString(W, "  pos");
+			Texts.WriteInt(W, pos, 6);
+			IF n = -10 THEN Texts.WriteString(W, "  used, but not set");
+			ELSIF n = -11 THEN Texts.WriteString(W, "  declared, but not used") END;
+			Texts.Append(Oberon.Log, W.buf)
+		END;
+	END Mark;
+
+	PROCEDURE CheckItem(item : DOCT.Item); (* << KR *)
+	BEGIN
+		IF (item.obj # NIL)  & ~(0 IN item.obj.init) & (item.lev >= DOCC.level)  & (item.mode = Var) THEN
+			IF item.typ # NIL THEN
+				IF (item.typ.form = Pointer) OR (item.typ.form <= LReal) THEN  
+					IF (item.lev = 0) & (item.typ.form = Pointer) THEN
+					ELSE Mark(-10, Texts.Pos(DOCS.R)) END
+				END
+			END
+		END
+	END CheckItem;
+	
+	PROCEDURE CheckUsed(scope : DOCT.Object; err : INTEGER);
+		VAR o : DOCT.Object;  
+	BEGIN
+		o := scope.next; 
+		WHILE o # NIL  DO
+			IF ~o.marked & (o.used # MAX(LONGINT)) THEN Mark(err,o.used) END;
+			o := o.next;
+		END;
+	END CheckUsed;
+	
+	PROCEDURE qualident(VAR x: DOCT.Item);
+		VAR mnolev: LONGINT; obj: DOCT.Object;
+	BEGIN (*sym = ident*)
+		DOCT.Find(obj, mnolev); 
+		IF (obj # NIL) & assign THEN INCL(obj.init,0) END; (* << KR *)
+		DOCS.Get(sym);
+		IF (sym = period) & (obj # NIL) & (obj.mode = Mod) THEN
+			DOCS.Get(sym); mnolev := SHORT(-obj.a0);
+			IF (sym = ident) OR (sym = number) THEN
+				DOCT.FindImport(obj, obj); DOCS.Get(sym)
+			ELSE DOCS.Mark(10); obj := NIL
+			END
+		END;
+		x.lev := SHORT(mnolev); x.obj := obj;
+		IF obj # NIL THEN
+			x.mode := obj.mode; x.typ := obj.typ; x.a0 := obj.a0; x.a1 := obj.a1;
+		ELSE DOCS.Mark(0); x.mode := Var;
+			x.typ := DOCT.undftyp; x.a0 := 0; x.obj := NIL
+		END
+	END qualident;
+
+	PROCEDURE ConstExpression(VAR x: DOCT.Item);
+	BEGIN Expression(x);
+		IF x.mode # Con THEN
+			DOCS.Mark(50); x.mode := Con; x.typ := DOCT.inttyp; x.a0 := 1
+		END
+	END ConstExpression;
+
+	PROCEDURE NewStr(form: INTEGER): DOCT.Struct;
+		VAR typ: DOCT.Struct;
+	BEGIN NEW(typ);
+		typ.form := form; typ.mno := 0; typ.size := 4; typ.ref := 0;
+		typ.BaseTyp := DOCT.undftyp; typ.strobj := NIL; RETURN typ
+	END NewStr;
+
+	PROCEDURE CheckMark(VAR mk: BOOLEAN);
+	BEGIN DOCS.Get(sym);
+		IF sym = times THEN
+			IF DOCC.level = 0 THEN mk := TRUE ELSE mk := FALSE; DOCS.Mark(47) END;
+			DOCS.Get(sym)
+		ELSE mk := FALSE
+		END
+	END CheckMark;
+
+	PROCEDURE CheckUndefPointerTypes;
+		VAR obj: DOCT.Object;
+	BEGIN obj := DOCT.topScope.next;
+		WHILE obj # NIL DO
+			IF obj.mode = Undef THEN DOCS.Mark(48) END;
+			obj := obj.next
+		END
+	END CheckUndefPointerTypes;
+	
+	PROCEDURE FormalParameters(VAR resTyp: DOCT.Struct; VAR psize: LONGINT);
+		VAR mode: SHORTINT;
+				adr, size: LONGINT; res: DOCT.Item;
+				par, par1: DOCT.Object; typ: DOCT.Struct;
+				nofpara: INTEGER;		(* ARD *)
+	BEGIN par1 := DOCT.topScope; adr := 0; nofpara := 0;
+		IF (sym = ident) OR (sym = var) THEN
+			LOOP
+				IF sym = var THEN DOCS.Get(sym); mode := Ind ELSE mode := Var END;
+				LOOP
+					IF sym = ident THEN
+						DOCT.Insert(DOCS.name, par); 
+						INCL(par.init,0); (* << KR *)
+						DOCS.Get(sym); par.mode := mode; INC(nofpara)
+					ELSE DOCS.Mark(10) END;
+					IF sym = comma THEN DOCS.Get(sym)
+					ELSIF sym = ident THEN DOCS.Mark(19)
+					ELSIF sym = var THEN DOCS.Mark(19); DOCS.Get(sym)
+					ELSE EXIT END
+				END;
+				CheckSym(colon); FormalType(typ);
+				IF mode = Ind THEN (*VAR param*)
+					IF typ.form = Record THEN size := RecDescSize
+					ELSIF typ.form = DynArr THEN size := typ.size
+					ELSE size := AdrSize END;
+					IF ovr THEN DOCS.Mark(70) END;		(* ARD *)
+				ELSE size := (-typ.size) MOD 4 + typ.size END;
+				WHILE par1.next # NIL DO
+					par1 := par1.next; par1.typ := typ; DEC(adr, size); par1.a0 := adr
+				END;
+				IF sym = semicolon THEN DOCS.Get(sym)
+				ELSIF sym = ident THEN DOCS.Mark(38)
+				ELSE EXIT END
+			END
+		END;
+		IF (nofpara # 2) & ovr THEN DOCS.Mark(71) END;
+		psize := psize - adr; par := DOCT.topScope.next;
+		WHILE par # NIL DO INC(par.a0, psize); par := par.next END;
+		CheckSym(rparen);
+		IF sym = colon THEN
+			DOCS.Get(sym); resTyp := DOCT.undftyp;
+			IF sym = ident THEN qualident(res);
+				IF res.mode = Typ THEN
+					IF res.typ.form <= ProcTyp THEN resTyp := res.typ ELSE DOCS.Mark(54) END
+				ELSE DOCS.Mark(52) END
+			ELSE DOCS.Mark(10) END
+		ELSE resTyp := DOCT.notyp END
+	END FormalParameters;
+
+	PROCEDURE ProcType(VAR typ: DOCT.Struct);
+		VAR psize: LONGINT;
+	BEGIN typ := NewStr(ProcTyp); typ.size := ProcSize;
+		IF sym = lparen THEN
+			DOCS.Get(sym); DOCT.OpenScope(DOCC.level); psize := ParOrg;
+			FormalParameters(typ.BaseTyp, psize); typ.link := DOCT.topScope.next;
+			DOCT.CloseScope
+		ELSE typ.BaseTyp := DOCT.notyp; typ.link := NIL END
+	END ProcType;
+	
+	PROCEDURE RecordType(VAR typ: DOCT.Struct);
+		VAR adr, size: LONGINT;
+			fld, fld0, fld1: DOCT.Object;
+			ftyp, btyp: DOCT.Struct;
+			base: DOCT.Item;
+	BEGIN adr := 0; typ := NewStr(Record); typ.BaseTyp := NIL; typ.n := 0;
+		IF sym = lparen THEN
+			DOCS.Get(sym); (*record extension*)
+			IF sym = ident THEN
+				qualident(base);
+				IF (base.mode = Typ) & (base.typ.form = Record) THEN
+					typ.BaseTyp := base.typ; typ.n := base.typ.n + 1; adr := base.typ.size
+				ELSE DOCS.Mark(52) END
+			ELSE DOCS.Mark(10) END;
+			CheckSym(rparen);
+		END;
+		DOCT.OpenScope(0); fld := NIL; fld1 := DOCT.topScope;
+		LOOP 
+			IF sym = ident  THEN
+				LOOP
+					IF sym = ident THEN
+						IF typ.BaseTyp # NIL THEN
+							DOCT.FindField(typ.BaseTyp, fld0);
+							IF fld0 # NIL THEN DOCS.Mark(1) END
+						END;
+						DOCT.Insert(DOCS.name, fld); CheckMark(fld.marked); fld.mode := Fld
+					ELSE DOCS.Mark(10) END;
+					IF sym = comma THEN DOCS.Get(sym)
+					ELSIF sym = ident THEN DOCS.Mark(19)
+					ELSE EXIT END
+				END;
+				CheckSym(colon); Type(ftyp); 
+				IF ftyp.form = DynArr THEN DOCS.Mark(71) END;
+				size := ftyp.size; btyp := ftyp;
+				WHILE btyp.form = Array DO btyp := btyp.BaseTyp END;
+				IF btyp.size >= 4 THEN INC(adr, (-adr) MOD 4)
+				ELSIF btyp.size = 2 THEN INC(adr, adr MOD 2)
+				END;
+				WHILE fld1.next # NIL DO
+					fld1 := fld1.next; fld1.typ := ftyp; fld1.a0 := adr; INC(adr, size)
+				END
+			END;
+			IF sym = semicolon THEN DOCS.Get(sym)
+			ELSIF sym = ident THEN DOCS.Mark(38)
+			ELSE EXIT END
+		END;
+		typ.size := (-adr) MOD 4 + adr; typ.link := DOCT.topScope.next;
+		CheckUndefPointerTypes; DOCT.CloseScope
+	END RecordType;
+
+(*	PROCEDURE ArrayType(VAR typ: DOCT.Struct);
+		VAR x: DOCT.Item; f: INTEGER; n: LONGINT;
+	BEGIN typ := NewStr(Array); ConstExpression(x); f := x.typ.form;
+		IF f IN intSet THEN
+			IF (x.a0 > 0) THEN n := x.a0 ELSE n := 1; DOCS.Mark(63) END
+		ELSE DOCS.Mark(51); n := 1
+		END;
+		typ.n := n; DOCC.AllocArrayBounds(n-1, typ.adr);
+		IF sym = of THEN
+			DOCS.Get(sym); Type(typ.BaseTyp)
+		ELSIF sym = comma THEN
+			DOCS.Get(sym); ArrayType(typ.BaseTyp)
+		ELSE DOCS.Mark(34)
+		END; 
+		typ.size := typ.BaseTyp.size * n
+	END ArrayType;*)
+
+	PROCEDURE ArrayType(VAR typ: DOCT.Struct);
+	VAR x: DOCT.Item; n: INTEGER;
+	BEGIN Expression(x);
+		IF x.typ.form IN intSet THEN
+			IF x.mode = Con THEN
+				IF x.a0 <= 0 THEN x.a0 := 1; DOCS.Mark(63) END;
+				typ := NewStr(Array)
+			ELSE typ := NewStr(DynArr);
+				IF DOCC.level = 0 THEN DOCS.Mark(70) END;
+				IF x.typ.form = LInt THEN DOCE.load(x) ELSE DOCE.loadX(x) END;
+				typ.mno := SHORT(x.a0)  (*reg no*)
+			END
+		ELSE DOCS.Mark(51); x.a0 := 1
+		END ;
+		IF x.mode = Con THEN typ.n := x.a0; DOCC.AllocArrayBounds(x.a0-1, typ.adr) END;
+		IF sym = of THEN DOCS.Get(sym); Type(typ.BaseTyp)
+		ELSIF sym = comma THEN DOCS.Get(sym); ArrayType(typ.BaseTyp)
+		ELSE DOCS.Mark(34) END;
+		IF x.mode = Con THEN typ.size := x.a0 * typ.BaseTyp.size; 
+		ELSE
+			IF typ.BaseTyp.form = DynArr THEN typ.size := typ.BaseTyp.size+4; typ.adr := typ.size-4
+			ELSE typ.size := 8; typ.adr := 4 END
+		END
+	END ArrayType;
+
+	PROCEDURE HasPtr(typ: DOCT.Struct): BOOLEAN;
+		VAR fld: DOCT.Object;
+	BEGIN
+		IF typ.form = Pointer THEN RETURN TRUE
+		ELSIF typ.form = Array THEN RETURN HasPtr(typ.BaseTyp)
+		ELSIF typ.form = Record THEN
+			IF (typ.BaseTyp # NIL) & HasPtr(typ.BaseTyp) THEN RETURN TRUE END;
+			fld := typ.link;
+			WHILE fld # NIL DO
+				IF (fld.name = "") OR HasPtr(fld.typ) THEN RETURN TRUE END;
+				fld := fld.next
+			END
+		END;
+		RETURN FALSE
+	END HasPtr;
+
+	PROCEDURE SetPtrBase(ptyp, btyp: DOCT.Struct);
+	BEGIN
+		IF (btyp.form = Record) OR (btyp.form = Array) & ~HasPtr(btyp.BaseTyp) THEN
+			ptyp.BaseTyp := btyp
+		ELSE ptyp.BaseTyp := DOCT.undftyp; DOCS.Mark(57)
+		END
+	END SetPtrBase;
+
+	PROCEDURE Type(VAR typ: DOCT.Struct);
+		VAR lev: LONGINT; obj: DOCT.Object; x: DOCT.Item;
+	BEGIN typ := DOCT.undftyp;
+		IF sym < lparen THEN DOCS.Mark(12);
+			REPEAT DOCS.Get(sym) UNTIL sym >= lparen
+		END;
+		IF sym = ident THEN qualident(x);
+			IF x.mode = Typ THEN typ := x.typ;
+				IF typ = DOCT.notyp THEN DOCS.Mark(58) END
+			ELSE DOCS.Mark(52) END
+		ELSIF sym = array THEN DOCS.Get(sym); ArrayType(typ)
+		ELSIF sym = record THEN DOCS.Get(sym); RecordType(typ); DOCC.AllocTypDesc(typ); CheckSym(end)
+		ELSIF sym = pointer THEN
+			DOCS.Get(sym); typ := NewStr(Pointer); typ.link := NIL; typ.size := PtrSize;
+			CheckSym(to);
+			IF sym = ident THEN DOCT.Find(obj, lev);
+				IF obj = NIL THEN (*forward ref*)
+					DOCT.Insert(DOCS.name, obj); 
+					obj.used := MAX(LONGINT); (* << KR *)
+					typ.BaseTyp := DOCT.undftyp;
+					obj.mode := Undef; obj.typ := typ; DOCS.Get(sym)
+				ELSE qualident(x);
+					IF x.mode = Typ THEN SetPtrBase(typ, x.typ)
+					ELSE typ.BaseTyp := DOCT.undftyp; DOCS.Mark(52) END
+				END
+			ELSE Type(x.typ); SetPtrBase(typ, x.typ) END
+		ELSIF sym = procedure THEN DOCS.Get(sym); ProcType(typ);
+		ELSE DOCS.Mark(12) END;
+		IF (sym < semicolon) OR (else < sym) THEN DOCS.Mark(15);
+			WHILE (sym < ident) OR (else < sym) & (sym < begin) DO
+				DOCS.Get(sym)
+			END
+		END
+	END Type;
+
+	PROCEDURE FormalType(VAR typ: DOCT.Struct);
+		VAR x: DOCT.Item; typ0: DOCT.Struct; a, s: LONGINT;
+	BEGIN typ := DOCT.undftyp; a := 0;
+		WHILE sym = array DO
+			DOCS.Get(sym); CheckSym(of); INC(a, 4)
+		END;
+		IF sym = ident THEN qualident(x);
+			IF x.mode = Typ THEN typ := x.typ;
+				IF typ = DOCT.notyp THEN DOCS.Mark(58) END
+			ELSE DOCS.Mark(52) END
+		ELSIF sym = procedure THEN DOCS.Get(sym); ProcType(typ)
+		ELSE DOCS.Mark(10) END;
+		s := a + 8;
+		WHILE a > 0 DO
+			typ0 := NewStr(DynArr); typ0.BaseTyp := typ;
+			typ0.size := s-a; typ0.adr := typ0.size-4; typ0.mno := 0; typ := typ0; DEC(a, 4)
+		END
+	END FormalType;
+
+	PROCEDURE selector(VAR x: DOCT.Item);
+		VAR fld: DOCT.Object; y: DOCT.Item;
+	BEGIN
+		LOOP
+			IF sym = lbrak THEN DOCS.Get(sym);
+				LOOP
+					IF (x.typ # NIL) & (x.typ.form = Pointer) THEN DOCE.DeRef(x) END;
+					Expression(y); DOCE.Index(x, y); 
+					IF sym = comma THEN DOCS.Get(sym) ELSE EXIT END
+				END;
+				CheckSym(rbrak)
+			ELSIF sym = period THEN DOCS.Get(sym);
+				IF sym = ident THEN
+					IF x.typ # NIL THEN
+						IF x.typ.form = Pointer THEN DOCE.DeRef(x) END;
+						IF x.typ.form = Record THEN DOCT.FindField(x.typ, fld); DOCE.Field(x, fld)
+						ELSE DOCS.Mark(53) END
+					ELSE DOCS.Mark(52) END;
+					DOCS.Get(sym)
+				ELSE DOCS.Mark(10) END
+			ELSIF sym = arrow THEN
+				DOCS.Get(sym); DOCE.DeRef(x)
+			ELSIF (sym = lparen) & (x.mode < Typ) & (x.typ.form # ProcTyp) & (x.typ.form # TbTyp) THEN
+				DOCS.Get(sym);
+				IF sym = ident THEN
+					qualident(y);
+					IF y.mode = Typ THEN DOCE.TypTest(x, y, FALSE)
+					ELSE DOCS.Mark(52) END
+				ELSE DOCS.Mark(10) END;
+				CheckSym(rparen)
+			ELSE EXIT END
+		END
+	END selector;
+
+	PROCEDURE IsParam(obj: DOCT.Object): BOOLEAN;
+	BEGIN RETURN (obj # NIL) & (obj.mode <= Ind) & (obj.a0 > 0)
+	END IsParam;
+
+	PROCEDURE ActualParameters(VAR x: DOCT.Item; fpar: DOCT.Object);
+		VAR apar: DOCT.Item; R: SET;
+	BEGIN
+		IF sym # rparen THEN
+			R := DOCC.RegSet;
+			LOOP 
+				IF fpar # NIL THEN assign := fpar.mode = Ind; END;  (* << KR *)
+				Expression(apar);
+				assign := FALSE;  (* << KR *)
+				IF IsParam(fpar) THEN DOCH.Param(apar, fpar); fpar := fpar.next
+				ELSE DOCS.Mark(64) END;
+				DOCC.FreeRegs(R);
+				IF sym = comma THEN DOCS.Get(sym)
+				ELSIF (lparen <= sym) & (sym <= ident) THEN DOCS.Mark(19)
+				ELSE EXIT END
+			END
+		END;
+		IF IsParam(fpar) THEN DOCS.Mark(65) END
+	END ActualParameters;
+
+	PROCEDURE StandProcCall(VAR x: DOCT.Item);
+		VAR y: DOCT.Item; m, n: INTEGER;
+	BEGIN 
+		IF (x.a0 = 1) OR (x.a0 = 29) OR (x.a0 = 24)  OR (x.a0 = 9) THEN assign := TRUE END; (* << KR NEW,COPY *)
+		m := SHORT(x.a0); n := 0;
+		IF sym = lparen THEN DOCS.Get(sym);
+			IF sym # rparen THEN
+				LOOP
+					IF n = 0 THEN Expression(x); DOCE.StPar1(x, m); n := 1
+					ELSIF n = 1 THEN Expression(y); DOCE.StPar2(x, y, m); n := 2
+					ELSIF n = 2 THEN Expression(y); DOCE.StPar3(x, y, m); n := 3
+					ELSE DOCS.Mark(64); Expression(y) END;
+					IF sym = comma THEN DOCS.Get(sym)
+					ELSIF (lparen <= sym) & (sym <= ident) THEN DOCS.Mark(19)
+					ELSE EXIT END
+				END;
+				CheckSym(rparen)
+			ELSE DOCS.Get(sym) END;
+			DOCE.StFct(x, m, n)
+		ELSE DOCS.Mark(29) END;
+		assign := FALSE;
+	END StandProcCall;
+
+	PROCEDURE Element(VAR x: DOCT.Item);
+		VAR e1, e2: DOCT.Item;
+	BEGIN Expression(e1);
+		IF sym = upto THEN DOCS.Get(sym); Expression(e2); DOCE.Set1(x, e1, e2)
+		ELSE DOCE.Set0(x, e1) END;
+	END Element;
+
+	PROCEDURE Sets(VAR x: DOCT.Item);
+		VAR y: DOCT.Item;
+	BEGIN x.typ := DOCT.settyp; y.typ := DOCT.settyp;
+		IF sym # rbrace THEN
+			Element(x);
+			LOOP
+				IF sym = comma THEN DOCS.Get(sym)
+				ELSIF (lparen <= sym) & (sym <= ident) THEN DOCS.Mark(19)
+				ELSE EXIT END;
+				Element(y); DOCE.Op(plus, x, y)  (*x := x+y*)
+			END
+		ELSE x.mode := Con; x.a0 := 0 END;
+		CheckSym(rbrace)
+	END Sets;
+
+	PROCEDURE Factor(VAR x: DOCT.Item);
+		VAR fpar: DOCT.Object; gR: SET; fR: SHORTINT;
+	BEGIN
+		IF sym < lparen THEN DOCS.Mark(13);
+			REPEAT DOCS.Get(sym) UNTIL sym >= lparen
+		END;
+		IF sym = ident THEN
+			qualident(x); selector(x);
+			CheckItem(x);
+			IF x.mode = SProc THEN StandProcCall(x)
+			ELSIF sym = lparen THEN
+				DOCS.Get(sym); DOCH.PrepCall(x, fpar);
+				DOCC.SaveRegisters(gR, fR, x); ActualParameters(x, fpar);
+				DOCH.Call(x); DOCC.RestoreRegisters(gR, fR, x);
+				CheckSym(rparen)
+			END
+		ELSIF sym = number THEN
+			DOCS.Get(sym); x.mode := Con;
+			CASE DOCS.numtyp OF
+				1: x.typ := DOCT.chartyp; x.a0 := DOCS.intval
+			| 2: x.a0 := DOCS.intval; DOCE.SetIntType(x)
+			| 3: x.typ := DOCT.realtyp; DOCE.AssReal(x, DOCS.realval)
+			| 4: x.typ := DOCT.lrltyp; DOCE.AssLReal(x, DOCS.lrlval)
+			END
+		ELSIF sym = string THEN
+			x.typ := DOCT.stringtyp; x.mode := Con;
+			DOCC.AllocString(DOCS.name, x); DOCS.Get(sym)
+		ELSIF sym = nil THEN DOCS.Get(sym); x.typ := DOCT.niltyp; x.mode := Con; x.a0 := 0
+		ELSIF sym = lparen THEN DOCS.Get(sym); Expression(x); CheckSym(rparen)
+		ELSIF sym = lbrak THEN DOCS.Get(sym); DOCS.Mark(29); Expression(x); CheckSym(rparen)
+		ELSIF sym = lbrace THEN DOCS.Get(sym); Sets(x)
+		ELSIF sym = not THEN DOCS.Get(sym); Factor(x); DOCE.MOp(not, x)
+		ELSE DOCS.Mark(13); DOCS.Get(sym); x.typ := DOCT.undftyp; x.mode := Var; x.a0 := 0
+		END
+	END Factor;
+	
+	PROCEDURE CheckFree(x, y: DOCT.Item);		(* NEW *)
+	BEGIN
+		IF ((y.mode = Reg) OR (y.mode = RegI)) & ((x.mode # Reg) OR (y.a0 # x.a0)) & ~(y.typ.form IN realSet) THEN 
+			EXCL(DOCC.RegSet, y.a0) END;
+	END CheckFree;
+	
+	PROCEDURE OverrideProc(VAR x, y: DOCT.Item);
+	VAR z: DOCT.Item; fpar: DOCT.Object; gR: SET; fR: SHORTINT;
+	BEGIN
+		z.lev := SHORT(DOCE.level); z.obj := DOCE.ovrproc;
+		IF DOCE.ovrproc # NIL THEN z.mode := DOCE.ovrproc.mode; z.typ := DOCE.ovrproc.typ; 
+			z.a0 := DOCE.ovrproc.a0; z.a1 := DOCE.ovrproc.a1
+		ELSE DOCS.Mark(0); z.mode := Var; z.typ := DOCT.undftyp; z.a0 := 0; z.obj := NIL END;
+		DOCH.PrepCall(z, fpar); DOCC.SaveRegisters(gR, fR, x);
+		IF IsParam(fpar) THEN DOCH.Param(x, fpar); fpar := fpar.next;
+			IF IsParam(fpar) THEN DOCH.Param(y, fpar); fpar := fpar.next;
+			ELSE DOCS.Mark(64) END
+		ELSE DOCS.Mark(64) END;
+		IF IsParam(fpar) THEN DOCS.Mark(65) END;
+		DOCH.Call(z); 
+		DOCC.RestoreRegisters(gR, fR, x);
+		z := x; DOCC.GetGenReg(x); 
+		DOCC.PutORM(4, 8BH, x.a0, z); DOCC.FreeReg(z);
+		DOCE.ovrproc := NIL;
+	END OverrideProc;
+	
+	PROCEDURE Term(VAR x: DOCT.Item);
+		VAR y: DOCT.Item; mulop: INTEGER;
+	BEGIN Factor(x);
+		WHILE (times <= sym) & (sym <= and) DO
+			mulop := sym; DOCS.Get(sym);
+			IF mulop = and THEN DOCE.MOp(and, x) END;
+			Factor(y); DOCE.Op(mulop, x, y); 
+			IF DOCE.ovrproc # NIL THEN OverrideProc(x, y) END;
+			CheckFree(x, y);			(* <-- NEW *)
+		END
+	END Term;
+
+	PROCEDURE SimpleExpression(VAR x: DOCT.Item);
+		VAR y: DOCT.Item; addop: INTEGER;
+	BEGIN
+		IF sym = minus THEN DOCS.Get(sym); Term(x); DOCE.MOp(minus, x)
+		ELSIF sym = plus THEN DOCS.Get(sym); Term(x); DOCE.MOp(plus, x)
+		ELSE Term(x)
+		END;
+		WHILE (plus <= sym) & (sym <= or) DO
+			addop := sym; DOCS.Get(sym);
+			IF addop = or THEN DOCE.MOp(or, x) END;
+			Term(y); DOCE.Op(addop, x, y);
+			IF DOCE.ovrproc # NIL THEN OverrideProc(x, y) END;
+			CheckFree(x, y);			(* <-- NEW *)
+		END
+	END SimpleExpression;
+
+	PROCEDURE Expression(VAR x: DOCT.Item);
+		VAR y: DOCT.Item; relation: INTEGER;
+	BEGIN SimpleExpression(x);
+		IF (eql <= sym) & (sym <= geq) THEN
+			relation := sym; DOCS.Get(sym);
+			IF x.typ = DOCT.booltyp THEN DOCE.MOp(relation, x) END;
+			SimpleExpression(y); DOCE.Op(relation, x, y)
+		ELSIF sym = in THEN
+			DOCS.Get(sym); SimpleExpression(y); DOCE.In(x, y)
+		ELSIF sym = is THEN
+			IF x.mode >= Typ THEN DOCS.Mark(112) END;
+			DOCS.Get(sym);
+			IF sym = ident THEN
+				qualident(y);
+				IF y.mode = Typ THEN DOCE.TypTest(x, y, TRUE) ELSE DOCS.Mark(52) END
+			ELSE DOCS.Mark(10)
+			END
+		END
+	END Expression;
+
+	PROCEDURE ProcedureDeclaration;
+		VAR proc, proc1, par, field: DOCT.Object;
+			L1, i, j: LONGINT;
+			mode: SHORTINT; body, tb: BOOLEAN;
+			psize, dsize: LONGINT; c: CHAR;
+			name1, name2: ARRAY 32 OF CHAR;
+	BEGIN dsize := 0; proc := NIL; body := TRUE; DOCE.trapjmp := 0; DOCE.niltrap := 0; tb := FALSE;
+		IF (sym # ident) & (DOCC.level = 0) & (sym # number) THEN
+			IF sym = times THEN mode := XProc
+			ELSIF sym = arrow THEN (*forward*) mode := XProc; body := FALSE
+			ELSIF sym = plus THEN mode := IProc
+			ELSIF sym = minus THEN mode := CProc; body := FALSE
+			ELSE mode := LProc; DOCS.Mark(10) END;
+			DOCS.Get(sym)
+		ELSE mode := LProc END;
+		IF (sym = ident) (*OR (sym = number) *)THEN (* ARD *)
+			IF DOCC.level = 0 THEN DOCT.Find(proc1, L1) ELSE proc1 := NIL END;
+			IF (proc1 # NIL) & (proc1.mode = XProc) & (DOCC.Entry(SHORT(proc1.a0)) = 0) THEN
+				(*there exists a corresponding forward declaration*)
+				IF mode = LProc THEN mode := XProc END;
+				NEW(proc); CheckMark(proc.marked); proc.used := MAX(LONGINT); (* << KR *)
+			ELSE
+				IF proc1 # NIL THEN DOCS.Mark(1); proc1 := NIL END;
+				DOCT.Insert(DOCS.name, proc); CheckMark(proc.marked);
+				IF proc.marked & (mode = LProc) THEN mode := XProc END;
+				IF (mode = LProc) OR (mode = CProc) THEN proc.a0 := DOCC.pc;
+				ELSIF DOCH.entno < MaxEntry THEN proc.a0 := DOCH.entno; INC(DOCH.entno) 
+				ELSE proc.a0 := 1; DOCS.Mark(226) END
+			END;
+			proc.mode := mode; proc.typ := DOCT.notyp; proc.dsc := NIL; proc.a1 := 0;
+			INC(DOCC.level); DOCT.OpenScope(DOCC.level);
+			IF (mode = LProc) & (DOCC.level = 1) THEN psize := ParOrg 
+			ELSIF mode = LProc THEN psize := ParOrg+4					(* ARD: intermed.Procs *)
+			ELSE psize := ParOrg END;
+			IF sym = lparen THEN
+				DOCS.Get(sym); FormalParameters(proc.typ, psize); proc.dsc := DOCT.topScope.next
+			END; 
+			IF proc1 # NIL THEN  (*forward & tb*)
+				DOCH.CompareParLists(proc.dsc, proc1.dsc);
+				IF proc.typ # proc1.typ THEN DOCS.Mark(118) END;
+				proc := proc1; proc.dsc := DOCT.topScope.next;
+			END;
+			IF mode = CProc THEN 
+				IF proc.marked THEN DOCS.Mark(49) END;
+				WHILE sym = number DO DOCC.code[DOCC.pc] := CHR(DOCS.intval); INC(DOCC.pc); DOCS.Get(sym);
+					IF sym = comma THEN DOCS.Get(sym)
+					ELSIF sym # semicolon THEN DOCS.Mark(19) END
+				END;
+			END;
+			IF body THEN 
+				CheckSym(semicolon); DOCT.topScope.typ := proc.typ;
+				DOCT.topScope.a1 := mode*10000H + psize; (*for RETURN statements*)
+				DOCH.Enter(mode, proc.a0, L1); par := proc.dsc;
+				WHILE par # NIL DO
+					(*code for dynamic array value parameters*)
+					IF (par.typ.form = DynArr) & (par.mode = Var) THEN
+						DOCH.CopyDynArray(par.a0, par.typ)
+					END;
+					par := par.next
+				END;
+				Block(dsize); proc.dsc := DOCT.topScope.next;  (*update*)
+				IF proc.typ = DOCT.notyp THEN DOCH.Return(proc.mode, psize) ELSE DOCH.Trap(17) END;
+				IF dsize >= LDataSize THEN DOCS.Mark(209); dsize := 0 END;
+				DOCC.FixupWith(L1, dsize); proc.a2 := DOCC.pc;
+				IF (sym = ident) (*OR (sym = number)*) THEN	(* ARD *)
+					IF DOCS.name # proc.name THEN DOCS.Mark(4) END;
+					DOCS.Get(sym)
+				ELSE DOCS.Mark(10) END;
+				IF DOCE.trapjmp # 0 THEN DOCC.FixLink(DOCE.trapjmp); DOCH.Trap(7) END;
+				IF DOCE.niltrap # 0 THEN DOCC.FixLink(DOCE.niltrap); DOCH.Trap(2) END;
+				CheckUsed(DOCT.topScope,-11); (* << KR *)
+			END;
+			DEC(DOCC.level); DOCT.CloseScope
+		END
+	END ProcedureDeclaration;
+
+	PROCEDURE CaseLabelList(LabelForm: INTEGER; VAR n: LONGINT; VAR tab: ARRAY OF DOCH.LabelRange);
+	VAR x, y: DOCT.Item; i, f: LONGINT;
+	BEGIN
+		IF ~(LabelForm IN labeltyps) THEN DOCS.Mark(61) END;
+		LOOP ConstExpression(x); f := x.typ.form;
+			IF f IN intSet THEN
+				IF LabelForm < f THEN DOCS.Mark(60) END
+			ELSIF f # LabelForm THEN DOCS.Mark(60)
+			END;
+			IF sym = upto THEN
+				DOCS.Get(sym); ConstExpression(y);
+				IF (y.typ.form # f) & ~((f IN intSet) & (y.typ.form IN intSet)) THEN DOCS.Mark(60) END;
+				IF y.a0 < x.a0 THEN DOCS.Mark(63); y.a0 := x.a0 END
+			ELSE y := x
+			END;
+			(*enter label range into ordered table*)  i := n;
+			IF i < NofCases THEN
+				LOOP
+					IF i = 0 THEN EXIT END;
+					IF tab[i-1].low <= y.a0 THEN
+						IF tab[i-1].high >= x.a0 THEN DOCS.Mark(62) END;
+						EXIT
+					END;
+					tab[i] := tab[i-1]; DEC(i)
+				END;
+				tab[i].low := SHORT(x.a0); tab[i].high := SHORT(y.a0);
+				tab[i].label := DOCC.pc; INC(n)
+			ELSE DOCS.Mark(213)
+			END;
+			IF sym = comma THEN DOCS.Get(sym)
+			ELSIF (sym = number) OR (sym = ident) THEN DOCS.Mark(19)
+			ELSE EXIT
+			END
+		END
+	END CaseLabelList;
+
+	PROCEDURE StatSeq;
+	VAR fpar: DOCT.Object; xtyp: DOCT.Struct; w, x, y, z: DOCT.Item; L0, L1, ExitIndex: LONGINT; gR: SET; fR: SHORTINT;
+
+		PROCEDURE CasePart;
+		VAR x: DOCT.Item; n, L0, L1, L2, L3: LONGINT; tab: ARRAY NofCases OF DOCH.LabelRange;
+		BEGIN n := 0; L3 := 0;
+			Expression(x); DOCH.CaseIn(x, L0, L1); DOCC.FreeRegs({});
+			CheckSym(of);
+			LOOP
+				IF sym < bar THEN
+					CaseLabelList(x.typ.form, n, tab);
+					CheckSym(colon); StatSeq; DOCH.FJ(L3)
+				END;
+				IF sym = bar THEN DOCS.Get(sym) ELSE EXIT END
+			END;
+			L2 := DOCC.pc;
+			IF sym = else THEN
+				DOCS.Get(sym); StatSeq; DOCH.FJ(L3)
+			ELSE DOCH.Trap(16) END;
+			DOCH.CaseOut(L0, L1, L2, L3, n, tab)
+		END CasePart;
+
+	BEGIN
+		LOOP
+			IF sym < ident THEN DOCS.Mark(14);
+				REPEAT DOCS.Get(sym) UNTIL sym >= ident
+			END;
+			IF sym = ident THEN
+				qualident(x); selector(x);
+				IF sym = becomes THEN 
+					IF x.typ.form = 2 (* BOOL *) THEN DOCE.boolset := DOCC.RegSet END;
+					IF x.obj # NIL THEN INCL(x.obj.init,0); END; (* << KR *)
+					DOCS.Get(sym); Expression(y); DOCH.Assign(x, y, FALSE)
+				ELSIF sym = eql THEN
+					DOCS.Mark(33); DOCS.Get(sym); Expression(y); DOCH.Assign(x, y, FALSE)
+				ELSIF x.mode = SProc THEN
+					StandProcCall(x);
+					IF x.typ # DOCT.notyp THEN DOCS.Mark(55) END
+				ELSE DOCH.PrepCall(x, fpar); DOCE.boolset := DOCC.RegSet;
+					IF sym = lparen THEN DOCS.Get(sym); ActualParameters(x, fpar); CheckSym(rparen)
+					ELSIF IsParam(fpar) THEN DOCS.Mark(65) END;
+					DOCH.Call(x);
+					IF x.typ # DOCT.notyp THEN DOCS.Mark(55) END
+				END
+			ELSIF sym = if THEN
+				DOCS.Get(sym); Expression(x); DOCH.CFJ(x, L0); DOCC.FreeRegs({});
+				CheckSym(then); StatSeq; L1 := 0;
+				WHILE sym = elsif DO
+					DOCS.Get(sym); DOCH.FJ(L1); DOCC.FixLink(L0);
+					Expression(x); DOCH.CFJ(x, L0); DOCC.FreeRegs({});
+					CheckSym(then); StatSeq
+				END;
+				IF sym = else THEN
+					DOCS.Get(sym); DOCH.FJ(L1); DOCC.FixLink(L0); StatSeq
+				ELSE DOCC.FixLink(L0) END;
+				DOCC.FixLink(L1); CheckSym(end)
+			ELSIF sym = case THEN
+				DOCS.Get(sym); CasePart; CheckSym(end)
+			ELSIF sym = while THEN
+				DOCS.Get(sym); L1 := DOCC.pc;
+				Expression(x); DOCH.CFJ(x, L0); DOCC.FreeRegs({});
+				CheckSym(do); StatSeq; DOCH.BJ(L1); DOCC.FixLink(L0);
+				CheckSym(end)
+			ELSIF sym = repeat THEN
+				DOCS.Get(sym); L0 := DOCC.pc; StatSeq;
+				IF sym = until THEN
+					DOCS.Get(sym); Expression(x); DOCH.CBJ(x, L0)
+				ELSE DOCS.Mark(43) END
+			ELSIF sym = loop THEN
+				DOCS.Get(sym); ExitIndex := ExitNo; INC(LoopLevel);
+				L0 := DOCC.pc; StatSeq; DOCH.BJ(L0); DEC(LoopLevel);
+				WHILE ExitNo > ExitIndex DO
+					DEC(ExitNo); DOCC.fixup(LoopExit[ExitNo])
+				END;
+				CheckSym(end)
+			ELSIF sym = with THEN
+				DOCS.Get(sym); x.obj := NIL; xtyp := NIL;
+				IF sym = ident THEN
+					qualident(x); CheckSym(colon);
+					IF sym = ident THEN qualident(y);
+						IF y.mode = Typ THEN
+							IF x.obj # NIL THEN
+								xtyp := x.typ; DOCE.TypTest(x, y, FALSE); x.obj.typ := x.typ
+							ELSE DOCS.Mark(130) END
+						ELSE DOCS.Mark(52) END
+					ELSE DOCS.Mark(10) END
+				ELSE DOCS.Mark(10) END;
+				CheckSym(do); DOCC.FreeRegs({}); StatSeq; CheckSym(end);
+				IF xtyp# NIL THEN x.obj.typ := xtyp END
+			ELSIF sym = exit THEN
+				DOCS.Get(sym); DOCH.FJ(L0);
+				IF LoopLevel = 0 THEN DOCS.Mark(45)
+				ELSIF ExitNo < 16 THEN LoopExit[ExitNo] := L0; INC(ExitNo)
+				ELSE DOCS.Mark(214) END
+			ELSIF sym = return THEN DOCS.Get(sym);
+				IF DOCC.level > 0 THEN
+					IF sym < semicolon THEN
+						Expression(x); DOCH.Result(x, DOCT.topScope.typ)
+					ELSIF DOCT.topScope.typ # DOCT.notyp THEN DOCS.Mark(124)
+					END;
+					DOCH.Return(SHORT(DOCT.topScope.a1 DIV 10000H), SHORT(DOCT.topScope.a1))
+				ELSE (*return from module body*)
+					IF sym < semicolon THEN Expression(x); DOCS.Mark(124) END;
+					DOCH.Return(XProc, ParOrg)
+				END
+			ELSIF sym = for THEN DOCS.Get(sym);		(* <-- ARD *)
+				IF sym = ident THEN qualident(x); w := x; INCL(x.obj.init, 0);
+					IF x.typ.form = Char THEN DOCS.Mark(111) END;
+					IF (sym = becomes) OR (sym = eql) THEN 
+						CheckSym(becomes);
+						SimpleExpression(y); DOCH.Assign(x, y, FALSE);
+						CheckSym(to);
+						SimpleExpression(y);
+						IF sym = by THEN DOCS.Get(sym); ConstExpression(z) ELSE z.mode := Con; z.a0 := 1 END;
+						L1:= DOCC.pc; 
+						IF z.a0 >= 0 THEN DOCE.Op(leq, x, y) ELSE DOCE.Op(geq, x, y) END;
+						DOCH.CFJ(x, L0); CheckSym(do); 
+						IF y.mode IN {RegX, IndX, VarX} THEN DOCC.Push(SHORT(y.a2)) END;
+						IF y.mode IN {Reg, RegI, RegX} THEN DOCC.Push(SHORT(y.a0)) END;
+						DOCC.FreeRegs({}); StatSeq; 
+						IF y.mode IN {Reg, RegI, RegX} THEN DOCC.Pop(SHORT(y.a0)) END;
+						IF y.mode IN {RegX, IndX, VarX} THEN DOCC.Pop(SHORT(y.a2)) END;
+						DOCH.Counter(w, z); DOCH.BJ(L1); DOCC.FixLink(L0); 
+						CheckSym(end)
+					ELSE DOCS.Mark(9) END
+				ELSE DOCS.Mark(10) END
+			END;
+			DOCC.FreeRegs({});
+			IF sym = semicolon THEN DOCS.Get(sym)
+			ELSIF (sym <= ident) OR (if <= sym) & (sym <= return) THEN DOCS.Mark(38)
+			ELSE EXIT
+			END
+		END
+	END StatSeq;
+
+	PROCEDURE Block(VAR dsize: LONGINT);
+		VAR typ, forward: DOCT.Struct;
+			obj, first: DOCT.Object;
+			x: DOCT.Item;
+			L0: LONGINT;
+			adr, size: LONGINT;
+			mk: BOOLEAN;
+			id0: ARRAY 32 OF CHAR;
+			sizeReg: INTEGER;
+
+	BEGIN adr := -dsize; obj := DOCT.topScope;
+		WHILE obj.next # NIL DO obj := obj.next END;
+		LOOP
+			IF sym = const THEN
+				DOCS.Get(sym);
+				WHILE sym = ident DO
+					COPY(DOCS.name, id0); CheckMark(mk);
+					IF sym = eql THEN DOCS.Get(sym); ConstExpression(x)
+					ELSIF sym = becomes THEN DOCS.Mark(9); DOCS.Get(sym); ConstExpression(x)
+					ELSE DOCS.Mark(9)
+					END;
+					DOCT.Insert(id0, obj); obj.mode := SHORT(x.mode);
+					obj.typ := x.typ; obj.a0 := x.a0; obj.a1 := x.a1; obj.marked := mk;
+					CheckSym(semicolon)
+				END
+			END;
+			IF sym = type THEN
+				DOCS.Get(sym);
+				WHILE sym = ident DO
+					typ := DOCT.undftyp; DOCT.Insert(DOCS.name, obj); forward := obj.typ;						
+					obj.mode := Typ; obj.typ := DOCT.notyp; CheckMark(obj.marked);
+					IF sym = eql THEN DOCS.Get(sym); Type(typ)
+					ELSIF (sym = becomes) OR (sym = colon) THEN DOCS.Mark(9); DOCS.Get(sym); Type(typ)
+					ELSE DOCS.Mark(9)
+					END;
+					obj.typ := typ;
+					IF typ.strobj = NIL THEN typ.strobj := obj END;
+					IF forward # NIL THEN (*fixup*) SetPtrBase(forward, typ) END;
+					CheckSym(semicolon)
+				END
+			END;
+			IF sym = var THEN
+				DOCS.Get(sym);
+				WHILE sym = ident DO
+					DOCT.Insert(DOCS.name, obj); first := obj; CheckMark(obj.marked); obj.mode := Var; obj.typ := DOCT.undftyp;
+					LOOP
+						IF sym = comma THEN DOCS.Get(sym)
+						ELSIF sym = ident THEN DOCS.Mark(19)
+						ELSE EXIT
+						END;
+						IF sym = ident THEN
+							DOCT.Insert(DOCS.name, obj); CheckMark(obj.marked); obj.mode := Var; obj.typ := DOCT.undftyp
+						ELSE DOCS.Mark(10)
+						END
+					END;
+					CheckSym(colon); Type(typ); size := typ.size;
+					IF size >= 4 THEN DEC(adr, adr MOD 4)
+					ELSIF size = 2 THEN DEC(adr, adr MOD 2)
+					END;
+					IF typ.form # DynArr THEN
+						WHILE first # NIL DO
+							first.typ := typ; DEC(adr, size); first.a0 := adr; first := first.next
+						END;
+					ELSE DOCH.DynArrSize(typ, sizeReg);
+						WHILE first # NIL DO
+							first.typ := typ; DEC(adr, size); first.a0 := adr; DOCH.DynArrDesc(first, typ, sizeReg); first := first.next
+						END;
+						DOCC.FreeRegs({})
+					END;
+					CheckSym(semicolon)
+				END
+			END;
+			IF (sym < const) OR (sym > var) THEN EXIT END;
+		END;
+
+		CheckUndefPointerTypes;
+		DOCH.FJ(L0);
+		WHILE sym = procedure DO
+			DOCS.Get(sym); ProcedureDeclaration; CheckSym(semicolon)
+		END;
+		IF DOCC.level = 0 THEN DOCC.fixupL(L0); DOCC.InitTypDescs ELSE DOCC.fixupL(L0) END;
+		DOCE.trapjmp := 0; DOCE.niltrap := 0; 
+		IF sym = begin THEN DOCS.Get(sym); DOCC.FreeRegs({}); StatSeq END;
+		dsize := (adr MOD 4) - adr; CheckSym(end);
+	END Block;
+
+	PROCEDURE CompilationUnit*(source: Texts.Text; pos: LONGINT; Debug: BOOLEAN; PcList: DOCC.StopList): DOCT.Object;
+		VAR L0: LONGINT; ch: CHAR;
+				time, date, key, dsize, link: LONGINT;
+				modid, impid, FName: ARRAY 32 OF CHAR;
+				SymbolTable: DOCT.Object;
+
+		PROCEDURE MakeFileName(VAR name, FName: ARRAY OF CHAR; ext: ARRAY OF CHAR);
+			VAR i, j: INTEGER; ch: CHAR;
+		BEGIN i := 0;
+			LOOP ch := name[i];
+				IF ch = 0X THEN EXIT END;
+				FName[i] := ch; INC(i)
+			END;
+			j := 0;
+			REPEAT ch := ext[j]; FName[i] := ch; INC(i); INC(j)
+			UNTIL ch = 0X
+		END MakeFileName;
+
+	BEGIN DOCH.entno := 1; dsize := 0; LoopLevel := 0; ExitNo := 0; DOCE.newlink := 0; DOCE.sysnewlink := 0;	(* <--ARD *)
+		DOCC.Init(PcList); DOCT.Init; DOCS.Init(source, pos); DOCS.MarkErrors := ~Debug;
+		DOCS.Get(sym);
+		IF ~Debug THEN Texts.WriteString(W, "  compiling ") END;
+		IF sym = module THEN DOCS.Get(sym) ELSE DOCS.Mark(16) END;
+		IF sym = ident THEN
+			IF ~Debug THEN Texts.WriteString(W, DOCS.name); Texts.Append(Oberon.Log, W.buf) END;
+			L0 := 0; ch := DOCS.name[0];
+			WHILE (ch # 0X) & (L0 < ModNameLen-1) DO modid[L0] := ch; INC(L0); ch := DOCS.name[L0] END;
+			modid[L0] := 0X;
+			IF ch # 0X THEN DOCS.Mark(228) END;
+			DOCT.OpenScope(0); DOCS.Get(sym);
+			SymbolTable := DOCT.topScope;
+			CheckSym(semicolon); DOCH.Enter(Mod, 0, L0);
+			IF sym = import THEN
+				DOCS.Get(sym);
+				LOOP
+					IF sym = ident THEN
+						COPY(DOCS.name, impid); DOCS.Get(sym);
+						MakeFileName(impid, FName, ".Sym");
+						IF sym = becomes THEN DOCS.Get(sym);
+							IF sym = ident THEN MakeFileName(DOCS.name, FName, ".Sym"); DOCS.Get(sym)
+							ELSE DOCS.Mark(10) END
+						END;
+						DOCT.Import(impid, modid, FName)
+					ELSE DOCS.Mark(10) END;
+					IF sym = comma THEN DOCS.Get(sym)
+					ELSIF sym = ident THEN DOCS.Mark(19)
+					ELSE EXIT END
+				END;
+				CheckSym(semicolon)
+			END;
+			IF ~DOCS.scanerr THEN
+				DOCC.SetLinkTable(DOCT.nofGmod+1);
+				Block(dsize); DOCH.Return(XProc, 8);
+				IF dsize > MAX(INTEGER) THEN DOCS.Mark(209) END;
+				IF DOCE.newlink # 0 THEN link := DOCC.LinkAdr(0FFH, 0); DOCC.link[link].link := DOCE.newlink END;
+				IF DOCE.sysnewlink # 0 THEN link := DOCC.LinkAdr(0FFH, 1); DOCC.link[link].link := DOCE.sysnewlink END;
+				IF DOCE.trapjmp # 0 THEN DOCC.FixLink(DOCE.trapjmp); DOCH.Trap(7) END;
+				IF DOCE.niltrap # 0 THEN DOCC.FixLink(DOCE.niltrap); DOCH.Trap(2) END;
+				IF sym = ident THEN
+					IF DOCS.name # modid THEN DOCS.Mark(4) END;
+					DOCS.Get(sym)
+				ELSE DOCS.Mark(10) END;
+				IF sym # period THEN DOCS.Mark(18) END;
+				IF ~DOCS.scanerr & ~Debug THEN
+					Oberon.GetClock(time, date); key := (date MOD 4000H) * 20000H + time;
+					MakeFileName(modid, FName, ".Sym");
+					DOCT.Export(modid, FName, newSF, key);
+					IF newSF THEN Texts.WriteString(W, " new symbol file") END;
+					IF ~DOCS.scanerr THEN
+						MakeFileName(modid, FName, ".Obj");
+						DOCC.OutCode(FName, modid, key, DOCH.entno, dsize);
+						IF ~Debug THEN Texts.WriteInt(W, DOCC.pc, 6); Texts.WriteInt(W, dsize, 8) END;
+					END
+				END
+			END;
+			CheckUsed(DOCT.topScope,-11); (* << KR *)
+			DOCT.CloseScope
+		ELSE DOCS.Mark(10)
+		END;
+		IF ~Debug THEN DOCC.Close; DOCT.Close END;
+		IF (DOCC.endPos < source.len) & (DOCC.endPos > 0) THEN (* << KR *)
+			Texts.WriteLn(W); Texts.WriteString(W, "  pos "); Texts.WriteInt(W, DOCC.endPos, 5); Texts.WriteString(W, "  trap ")
+		END;
+		IF ~Debug THEN Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf) END;
+		RETURN SymbolTable
+	END CompilationUnit;
+
+	PROCEDURE Options*(s: ARRAY OF CHAR);
+		VAR ch: CHAR; i: INTEGER; S: Texts.Scanner; beg, end, time: LONGINT;
+	BEGIN
+		DOCC.endPc := MAX(LONGINT); DOCC.endPos := MAX(LONGINT); (* << KR *)
+		i := 0;
+		WHILE s[i] # 0X DO ch := s[i];
+			IF ch = "x" THEN DOCE.inxchk := FALSE
+			ELSIF ch = "t" THEN DOCC.typchk := FALSE
+			ELSIF ch = "s" THEN newSF := TRUE
+			ELSIF ch = "o" THEN DOCE.ovflchk := TRUE
+			ELSIF ch = "n" THEN DOCE.nilcheck := TRUE
+			ELSIF ch = "i" THEN info := TRUE
+			ELSIF ch = "l" THEN DOCC.low := TRUE
+			ELSIF ch = "c" THEN DOCH.stackchk := TRUE
+			END;
+			INC(i);
+		END
+	END Options;
+	
+	PROCEDURE Compile*;
+		VAR beg, end, time: LONGINT;
+			T: Texts.Text;
+			S: Texts.Scanner;
+			v: Viewers.Viewer;
+			SymbolTable: DOCT.Object;
+
+		PROCEDURE Options;
+			VAR ch: CHAR;
+		BEGIN
+			DOCC.endPc := MAX(LONGINT); DOCC.endPos := MAX(LONGINT); (* << KR *)
+			IF (S.nextCh = "/") OR (S.nextCh = "%") THEN
+				LOOP Texts.Read(S, ch);
+					IF ch = "x" THEN DOCE.inxchk := FALSE
+					ELSIF ch = "t" THEN DOCC.typchk := FALSE
+					ELSIF ch = "s" THEN newSF := TRUE
+					ELSIF ch = "o" THEN DOCE.ovflchk := TRUE
+					ELSIF ch = "n" THEN DOCE.nilcheck := TRUE
+					ELSIF ch = "i" THEN info := TRUE
+					ELSIF ch = "l" THEN DOCC.low := TRUE
+					ELSIF ch = "c" THEN DOCH.stackchk := TRUE
+					ELSIF ch = "d" THEN (* KR *)
+						Oberon.GetSelection(T,beg,end,time); 
+						IF time > 0 THEN Texts.OpenScanner(S,T,beg); Texts.Scan(S);
+							WHILE ~S.eot & (S.line = 0) & (S.s # "PC") DO Texts.Scan(S) END;
+							IF ~S.eot THEN
+								Texts.Scan(S);Texts.Scan(S); 
+								IF S.class = Texts.Int THEN DOCC.endPc := S.i END
+							END
+						END
+					ELSE S.nextCh := ch; EXIT
+					END
+				END
+			END
+		END Options;
+
+		PROCEDURE ClearOptions;
+		BEGIN
+			DOCE.nilcheck := FALSE; DOCE.inxchk := TRUE; DOCC.typchk := TRUE; newSF := FALSE; DOCE.ovflchk := FALSE;
+			DOCE.ovrproc := NIL; info := FALSE; DOCC.low := FALSE; DOCH.stackchk := FALSE;
+		END ClearOptions;
+
+	BEGIN ClearOptions;
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF S.class = Texts.Char THEN
+			IF S.c = "*" THEN
+				v := Oberon.MarkedViewer();
+				IF (v.dsc # NIL) & (v.dsc.next IS TextFrames.Frame) THEN
+					Options; SymbolTable := CompilationUnit(v.dsc.next(TextFrames.Frame).text, 0, FALSE, NIL);
+					IF (DOCC.endPos < v.dsc.next(TextFrames.Frame).text.len) & (DOCC.endPos > 0) THEN 
+						TextFrames.Neutralize(v.dsc.next(TextFrames.Frame));
+						Oberon.RemoveMarks(v.X, v.Y, v.W, v.H);
+						TextFrames.Show(v.dsc.next(TextFrames.Frame),DOCC.endPos-200);
+						TextFrames.SetCaret(v.dsc.next(TextFrames.Frame),DOCC.endPos);
+					END
+				END
+			ELSIF S.c = "^" THEN
+				Oberon.GetSelection(T, beg, end, time);
+				IF time >= 0 THEN
+					Texts.OpenScanner(S, T, beg); Texts.Scan(S);
+					IF S.class = Texts.Name THEN
+						Options; Texts.WriteString(W, S.s); NEW(T); Texts.Open(T, S.s);
+						IF T.len # 0 THEN SymbolTable := CompilationUnit(T, 0, FALSE, NIL)
+						ELSE Texts.WriteString(W, " not found");
+							Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+						END
+					END
+				END
+			ELSIF S.c = "@" THEN
+				Oberon.GetSelection(T, beg, end, time);
+				IF time >= 0 THEN Options; SymbolTable := CompilationUnit(T, beg, FALSE, NIL) END
+			END
+		ELSE NEW(T);
+			WHILE S.class = Texts.Name DO
+				ClearOptions; Options; Texts.WriteString(W, S.s); Texts.Open(T, S.s);
+				IF T.len # 0 THEN SymbolTable := CompilationUnit(T, 0, FALSE, NIL)
+				ELSE Texts.WriteString(W, " not found");
+					Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+				END;
+				Texts.Scan(S)
+			END
+		END;
+		Oberon.Collect
+	END Compile;
+
+BEGIN 
+	Texts.OpenWriter(W);
+	Texts.WriteString(W, "Compiler  NW 1.8.91 / ARD 8. 95"); Texts.WriteLn(W);
+	Texts.Append(Oberon.Log, W.buf)
+END Compiler.

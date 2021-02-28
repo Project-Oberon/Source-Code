@@ -1,0 +1,40 @@
+MODULE Kernel;  (*NW  11.4.86 / 24.8.92*)
+
+	TYPE Sector* = RECORD END ;
+
+	VAR ModList*: LONGINT;
+			NofPages*, NofSectors*, allocated*: LONGINT;
+			StackOrg*, HeapLimit*: LONGINT;
+			FileRoot*, FontRoot*: LONGINT;
+			SectNo*, PrAdr*: LONGINT;
+
+			pc*, fp*, eia*, err*: LONGINT; (*status upon trap*)
+
+(* Block storage management*)
+
+	PROCEDURE- AllocBlock*(VAR adr: LONGINT; size: LONGINT) 2;
+	PROCEDURE- FreeBlock*(adr: LONGINT) 3;
+
+(* Block storage management - garbage collector*)
+
+	PROCEDURE- GC* 4;
+
+(* Disk storage management*)
+
+	PROCEDURE- AllocSector*(hint: LONGINT; VAR sec: LONGINT) 5;
+	PROCEDURE- MarkSector*(sec: LONGINT) 6;
+	PROCEDURE- FreeSector*(sec: LONGINT) 7;
+	PROCEDURE- GetSector*(src: LONGINT; VAR dest: Sector) 8;
+	PROCEDURE- PutSector*(dest: LONGINT; VAR src: Sector) 9;
+	PROCEDURE- ResetDisk* 10;
+
+(* Miscellaneous procedures*)
+
+	PROCEDURE- InstallIP*(P: PROCEDURE; chan: INTEGER) 11;
+	PROCEDURE- InstallTrap*(P: PROCEDURE) 12;
+	PROCEDURE- SetICU*(n: CHAR) 13;
+	PROCEDURE- GetClock*(VAR time, date: LONGINT) 14;
+	PROCEDURE- SetClock*(time, date: LONGINT) 15;
+	PROCEDURE- MovePage*(src, dst, n: LONGINT) 16;
+
+END Kernel.

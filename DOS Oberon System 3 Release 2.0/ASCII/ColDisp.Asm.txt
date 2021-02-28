@@ -1,0 +1,3329 @@
+MODULE ColorDisplay
+* Name		DOSColDisp.Asm
+* Purpose Raster-operations for DOS-Oberon (VGA-Card Mode 12H)
+*	(To assemble with Ass386 (written by Peter Harry))
+* Date	1.3.92 - 30. 3. 92
+* Author Ott Hans-Werner
+* Changes 20.3.92	Scroll up,down implemented	HWO
+*	24.3.92	Get / SetColor implemented	HWO	(not tested)
+*	24.3.92	Faster CopyBlock implemented HWO
+*	30.3.92	Error in CopyPat Replacemode
+*	eliminated	HWO 
+*	31.3.92	Clipping on all Procedures	HWO 
+	
+ReplaceMode	EQU	$0
+PaintMode	EQU	$1
+InvertMode	EQU	$2
+
+XORbits	EQU	$18	00011000b
+Replacebits	EQU	$00	00000000b
+ANDbits	EQU	$08	00001000b
+ORbits	EQU	$10	00010000b
+
+GC	EQU	$03CE	graphic-controller port
+SQ	EQU	$03C4	sequencer port
+
+mask SBYTE $0, $80, $C0, $E0, $F0, $F8, $FC, $FE, $FF
+imask SBYTE $FF, $7F, $3F, $1F, $0F, $07, $03, $01, $0
+
+rev SBYTE $0, $80, $40, $C0, $20, $A0, $60, $E0, $10, $90, $50, $D0, $30, $B0, $70, $F0 
+ SBYTE $08, $88, $48, $C8, $28, $A8, $68, $E8, $18, $98, $58, $D8, $38, $B8, $78, $F8
+ SBYTE $04, $84, $44, $C4, $24, $A4, $64, $E4, $14, $94, $54, $D4, $34, $B4, $74, $F4
+ SBYTE $0C, $8C, $4C, $CC, $2C, $AC, $6C, $EC, $1C, $9C, $5C, $DC, $3C, $BC, $7C, $FC 
+ SBYTE $02, $82, $42, $C2, $22, $A2, $62, $E2, $12, $92, $52, $D2, $32, $B2, $72, $F2
+ SBYTE $0A, $8A, $4A, $CA, $2A, $AA, $6A, $EA, $1A, $9A, $5A, $DA, $3A, $BA, $7A, $FA
+ SBYTE $06, $86, $46, $C6, $26, $A6, $66, $E6, $16, $96, $56, $D6, $36, $B6, $76, $F6
+ SBYTE $0E, $8E, $4E, $CE, $2E, $AE, $6E, $EE, $1E, $9E, $5E, $DE, $3E, $BE, $7E, $FE
+ SBYTE $01, $81, $41, $C1, $21, $A1, $61, $E1, $11, $91, $51, $D1, $31, $B1, $71, $F1 
+ SBYTE $09, $89, $49, $C9, $29, $A9, $69, $E9, $19, $99, $59, $D9, $39, $B9, $79, $F9
+ SBYTE $05, $85, $45, $C5, $25, $A5, $65, $E5, $15, $95, $55, $D5, $35, $B5, $75, $F5
+ SBYTE $0D, $8D, $4D, $CD, $2D, $AD, $6D, $ED, $1D, $9D, $5D, $DD, $3D, $BD, $7D, $FD
+ SBYTE $03, $83, $43, $C3, $23, $A3, $63, $E3, $13, $93, $53, $D3, $33, $B3, $73, $F3
+ SBYTE $0B, $8B, $4B, $CB, $2B, $AB, $6B, $EB, $1B, $9B, $5B, $DB, $3B, $BB, $7B, $FB
+ SBYTE $07, $87, $47, $C7, $27, $A7, $67, $E7, $17, $97, $57, $D7, $37, $B7, $77, $F7 
+ SBYTE $0F, $8F, $4F, $CF, $2F, $AF, $6F, $EF, $1F, $9F, $5F, $DF, $3F, $BF, $7F, $FF
+
+width	SBLKD 1
+width3	SBLKD 1	; bytes per line	
+height	SBLKD 1
+base	SBLKD 1
+help	SBLKD 1	; helpvars : it`s faster to move Double-Register into
+help1	SBLKD 1	; a variable than to push and pop
+help2	SBLKD 1
+start	SBLKD 1
+end	SBLKD 1
+flag	SBLKB 1
+x1	SBLKD 1
+x2	SBLKD 1
+x3	SBLKD 1
+x4	SBLKD 1
+x5	SBLKD 1
+x6	SBLKD 1
+x7	SBLKD 1
+x8	SBLKD 1
+leftmask	SBLKB 1
+rightmask	SBLKB 1
+count	SBLKB 1
+dcount	SBLKD 1
+color	SBLKB 1
+topleft	SBLKD 1	; adr of top left corner in replpat
+plane	SBLKB 1
+diff	SBLKD 1
+
+; clipping
+clipx	SBLKW 1	; horicontal border left
+clipxw	SBLKW 1	; horicontal border right
+clipy	SBLKW 1	; vertical border bottom
+clipyh	SBLKW 1	; vertical border top
+clipw	SBLKW 1	; clip width
+cliph	SBLKW 1	; clip height 
+
+; clipping copypat
+buf	SBLKW 256
+cpX	SBLKW 1
+cpY	SBLKW 1
+cpW	SBLKB 1
+cpH	SBLKB 1
+cpsw	SBLKB 1
+cpw	SBLKB 1
+cph	SBLKB 1
+
+help3	SBLKB 1
+
+*Main 
+	RET 0
+	
+*PROCEDURE Resetclip*;
+Resetclip	ENTER 0,0
+	MOV	clipx,0 : word
+	MOV	clipy,0 : word
+	MOV	EAX,width
+	MOV	clipw,AX
+	DEC	AX
+	MOV	clipxw,AX
+	MOV	EAX,height
+	MOV	cliph,AX
+	DEC	AX
+	MOV	clipyh,AX
+	LEAVE
+	RET	0
+
+*PROCEDURE Setclip*(x,y,w,h : INTEGER);
+Setclip	ENTER 0,0
+	MOV	AX,20[EBP]
+	MOV	clipx,AX
+	MOV	BX,12[EBP]
+	MOV	clipw,BX
+	ADD	AX,BX
+	DEC	AX
+	MOV	clipxw,AX
+	MOV	AX,16[EBP]
+	MOV	clipy,AX
+	MOV	BX,8[EBP]
+	MOV	cliph,BX
+	ADD	AX,BX
+	DEC	AX
+	MOV	clipyh,AX
+	LEAVE
+	RET	16
+	
+*PROCEDURE Getclip*(VAR x,y,w,h : INTEGER);	
+Getclip	ENTER 0,0
+	MOV	AX,cliph
+	MOV	ESI,8[EBP]
+	MOV	[ESI],AX
+	MOV	AX,clipw
+	MOV	ESI,12[EBP]
+	MOV	[ESI],AX
+	MOV	AX,clipy
+	MOV	ESI,16[EBP]
+	MOV	[ESI],AX
+	MOV	AX,clipx
+	MOV	ESI,20[EBP]
+	MOV	[ESI],AX
+	LEAVE
+	RET	16
+	
+*PROCEDURE Init*(base: LONGINT; height, width: INTEGER);
+Init	ENTER 0, 0
+	MOV	EAX,8[EBP]	; get width
+	MOV	width,EAX
+	SHR	EAX,3
+	MOV	width3,EAX
+	MOV	EAX,12[EBP]	; get height
+	DEC	EAX
+	MOV	height,EAX
+	MOV	EAX,16[EBP]
+	MOV	base,EAX
+	MOV	clipx,0 : word
+	MOV	clipy,0 : word
+	MOV	EAX,width
+	MOV	clipw,AX
+	DEC	AX
+	MOV	clipxw,AX
+	MOV	EAX,12[EBP]
+	MOV	cliph,AX
+	DEC	AX
+	MOV	clipyh,AX	
+	LEAVE
+	RET	12
+
+
+*PROCEDURE Dot*(col, x, y, mode: INTEGER);
+* always call over ColDisplay !
+Dot	POP	EAX
+
+; Clipping
+	MOV	EAX ,12[EBP]
+	CMP	AX,clipy
+	JL	endDot
+	CMP	AX,clipyh
+	JG	endDot
+	MOV	EAX,16[EBP]
+	CMP	AX,clipx
+	JL	endDot
+	CMP	AX,clipxw
+	JG	endDot
+; End Clipping	
+	MOV	EAX,8[EBP]	; get mode and set local AH
+	CMP	AX,ReplaceMode
+	JNE	Inv1
+	MOV	AH,Replacebits
+	JMP	setGC1
+Inv1	CMP	AX,InvertMode
+	JNE	Paint1
+	MOV	AH,XORbits
+	JMP	setGC1
+Paint1	MOV	AH,ORbits	; with wrong mode =>
+;		; automatically paint mode
+; Set graphic-controller-registers
+setGC1	MOV	DX,GC	; Graphic-Controller
+	MOV	AL,3	; AL = Data/Rotate / AH = Modus
+	OUT	DX,AX
+	MOV	AX,$0205	; AL = Read-Mode = 0
+;			; Write-Mode = 2 (bits 0,1)
+	OUT	DX,AX	; Set
+; Get params x,y
+
+getxy	MOV	EAX,height
+	SUB	EAX,12[EBP]	; (0,0) in bottom left corner
+;			; AX := y
+	MOV	EBX,16[EBP]	; BX := x
+
+; determine address of pixel
+	MOV	ECX,EBX
+	SHR	EBX,3
+	AND	ECX,7
+	MOV	ESI,width3
+	IMUL	ESI,EAX
+	ADD	ESI,base 
+	ADD	ESI,EBX
+	MOV	AH,128
+	SHR	AH,CL
+
+; Set Graphics Controller Bit-Mask-Register
+	MOV	AL,8	; al := Bit-Mask-Register-Number
+	OUT	DX,AX
+
+; Set Pixel-Value
+	MOV	AX, $1C
+	MOV	GS, AX
+	MOV	AL,GS:[ESI]	; latch one byte from each bitplane
+	MOV	AL,20[EBP]	; get Color
+	MOV	GS:[ESI],AL	; update bitplanes
+ 
+; Restore default values of graphic-controller-register
+	MOV	AX,$0FF08	; default bit mask
+	OUT	DX,AX
+	MOV	AX,$0005	; default mode-reg
+	OUT	DX,AX
+	MOV	AX,$0003	; default function
+	OUT	DX,AX
+endDot	PUSH DS
+	POP GS
+	LEAVE
+	RET 16
+	
+*PROCEDURE CopyPattern*(col: INTEGER; pat: Display.Pattern; X, Y, mode: INTEGER);
+*always call over ColDisplay 
+CopyPattern	POP	EAX
+; Set GS register
+	MOV	AX, $1C
+	MOV	GS, AX
+
+; Clipping
+	MOVSX	EAX,16[EBP]:word	; x
+	MOVSX	EBX,12[EBP]:word	; y
+	MOV	ESI,20[EBP]	; adr pat
+	XOR	ECX,ECX
+	XOR	EDX,EDX
+	MOV	CL,[ESI]	; cx := p.w
+	MOV	DL,1[ESI]	; dx := p.h
+	ADD	ECX,EAX
+	DEC	ECX
+	ADD	EDX,EBX
+	DEC	EDX
+	CMP	AX,clipx
+	JGE	l1cp
+	MOVSX	EAX,clipx	
+l1cp	CMP	BX,clipy
+	JGE	l2cp
+	MOVSX	EBX,clipy
+l2cp	CMP	CX,clipxw
+	JLE	l3cp
+	MOVSX	ECX,clipxw
+l3cp	CMP	DX,clipyh
+	JLE	l4cp
+	MOVSX	EDX,clipyh
+l4cp	SUB	ECX,EAX
+	INC	ECX
+	SUB	EDX,EBX
+	INC	EDX
+	CMP	ECX,0
+	JLE	endCP
+	CMP	EDX,0
+	JLE	endCP
+	CMP	[ESI],CL
+	JNE	l5cp
+	CMP	1[ESI],DL
+	JNE	l5cp
+	JMP	mode
+; endclip
+
+l5cp	MOV	DI,AX
+	SUB	AX,16[EBP]	; AX := Difference Pixels in old/new x-Pos
+	MOV	16[EBP],DI	; clipped x 
+	MOV	DI,BX
+	SUB	BX,12[EBP]	; BX ;= Difference old / newlines
+	MOV	12[EBP],DI	; clipped y
+	MOV	cpW,CL
+	MOV	cpH,DL
+	MOV	cpX,AX
+	MOV	cpY,BX
+	MOVSX	BX,cpW
+	ADD	BX,7
+	SHR	BX,3
+	MOV	cpw,BL	; cpw := cpW DIV 8
+	MOV	ESI,20[EBP]
+	XOR	EAX,EAX
+	MOV	AL,[ESI]
+	MOV	cpsw,AL
+	ADD	AX,7
+	SHR	AX,3
+	MOV	cpsw,AL	; cpsw := p.w DIV 8
+	LEA	EDI,buf
+	MOV	AL,cpW
+	MOV	[EDI],AL	; new p.w
+	INC	EDI
+	MOV	AL,cpH	; new p.h
+	MOV	[EDI],AL
+	INC	EDI
+	MOVSX	BX,cpsw
+	MOV	AX,cpY
+	IMUL	AX,BX
+	MOVSX	EAX,AX
+	ADD	ESI,EAX
+	MOV	CX,cpX
+	SHR	CX,3
+	MOVSX	ECX,CX
+	ADD	ESI,ECX
+	ADD	ESI,2	; ESI := Sourcepos for Copyloop
+	MOV	cph,0	; init loop variables
+	MOV	DL,cph
+	MOV	CX,cpX
+	AND	CX,7	; cpX MOD 8 
+	DEC	cpW	
+loopcp	CMP	cpH,DL
+	JLE	l7cp	; height reached ?
+	MOV	EAX,[ESI]
+	SHR	EAX,CL	; in proper position
+	PUSH CX
+	MOV	EBX,-2
+	MOVSX	CX,cpW
+	SHL	EBX,CL
+	NOT	EBX
+	AND	EAX,EBX
+	POP	CX
+	MOV	[EDI],EAX	; copy for a new pattern
+	MOVSX	EAX,cpsw
+	ADD	ESI,EAX	; one line in source up
+	MOVSX	EAX,cpw
+	ADD	EDI,EAX	; one line at destination up
+	INC	DL
+	JMP	loopcp
+l7cp	LEA	EDI,buf
+	MOV	20[EBP],EDI
+	
+mode	MOV	EAX,8[EBP]	; get mode and set local AH
+	CMP	AX,ReplaceMode
+	JNE	Inv2
+	MOV	AH,Replacebits
+	JMP	setGC2
+Inv2	CMP	AX,InvertMode
+	JNE	Paint2
+	MOV	AH,XORbits
+	JMP	setGC2
+Paint2	MOV	AH,ANDbits	; with wrong mode =>
+;			; automatically paint mode
+; Set graphic-controller-registers
+
+setGC2	MOV	DX,GC	; Graphic-Controller
+	MOV	AL,3	; AL = Data/Rotate / AH = Modus
+	OUT	DX,AX
+	MOV	AX,$0005	; AL = Read-Mode = 0
+;			; Write-Mode = 0 (bits 0,1)
+	OUT	DX,AX	; Set
+; Get params x,y
+getxy2	MOV	EAX,height
+	SUB	AX,12[EBP]	; (0,0) in bottom left corner
+;			; EAX := y
+	AND	EAX, $FFFF
+	MOV	12[EBP],EAX	; y:= height -1 - y
+	MOV	EAX,20[EBP]	; adress of pattern
+	CMP	1[EAX],0 : byte	; p.h>=0 ? problems with "space"-pattern
+	JLE	resetgrafCP
+	MOV	AL,[EAX]	; p.w -> EAX 
+	AND	EAX,$FF
+	MOVSX	EBX,16[EBP]:word	; EBX := x
+	MOV	ECX,EBX
+	MOV	EDX,EBX
+	MOV	ESI,EBX
+	SHR	EBX,3	; EBX := X DIV 8
+	ADD	EDX,EAX	; EDX := x + p.w
+	DEC	EDX	; EDX := x + (p.w-1) w=1..8 instead of
+;			w=0..7
+	SHR	EDX,3	; EDX := (x + p.w-1) DIV 8
+	AND	ECX,7	; ECX := x mod 8
+	ADD	ESI,EAX
+	DEC	ESI
+	AND	ESI,7	; ESI := (x+p.w-1) MOD 8
+	MOV	help,ESI
+	MOV	EDI,width3
+	IMUL	EDI,12[EBP]
+	ADD	EDI,base	
+	ADD	EDI,EBX	; EDI := START-Adr
+	MOV	flag,0
+	CMP	EBX,EDX
+	JL	next
+; p.w <= 8, 1 byte
+	XOR	EBX,EBX
+	MOV	AH,24[EBP]	; get color
+	CMP	8[EBP],0:word	; replacemode ?
+	JE	replace1
+; New implementation of paintmode
+	CMP	8[EBP],2:word	; invertmode ?
+	JE	invert1
+
+	MOV	ESI,20[EBP]	; adr pattern
+cploopp1	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	XOR	EAX,EAX
+	MOV	DL,2[ESI+EBX*1]	; fetch one byte from pattern
+	SHL	DL,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	DH,GS:[EDI]	; latch bytes
+	NOT	DL	; negate DL
+	MOV	GS:[EDI],DL	; clear pattern
+	NOT	DL	; negate DL
+	MOV	help2, EDX	; save DX
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,24[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	MOV	EDX, help2	; restore DX
+	MOV	DH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploopp1
+	JMP	resetgrafCP
+; End of new implementation of paintmode
+
+invert1	MOV	ESI,20[EBP]	; adr pattern
+	MOV	DX,SQ
+	MOV	AL,2
+	OUT	DX,AX	; set color/sequencer planemap
+	XOR	EAX,EAX
+cploop1	MOV	DL,2[ESI+EBX*1]	; fetch one byte from pattern
+	SHL	DL,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	DH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploop1
+	JMP	resetgrafCP
+replace1	MOV	color,AH
+	MOV	AH,imask[ECX] 
+	INC	ESI	; rightmask must be 1 bit larger
+	AND	AH,mask[ESI] 
+	MOV	ESI,20[EBP]	
+	MOV	DX,GC
+	MOV	AL,8
+	OUT	DX,AX	; set bitmask
+	CMP color, 15:byte
+	JE qr1
+repl1loop	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	AL,GS:[EDI]	; latch
+	MOV	GS:[EDI]:byte,0	; clear all planes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	XOR	EAX,EAX
+	MOV	DL,2[ESI+EBX*1]	; fetch one byte from pattern
+	SHL	DL,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	DH, GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	repl1loop
+	JMP	resetgrafCP
+qr1	MOV	DX,SQ
+	MOV	AX,$0F02	; get color
+	OUT	DX,AX	; set sequencer planemap
+	XOR	EAX,EAX
+qr11	MOV	DL,2[ESI+EBX*1]	; fetch one byte from pattern
+	SHL	DL,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	DH, GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	qr11
+	JMP	resetgrafCP
+next	CMP	AX,8
+	JG	next1	; p.w <= 8 , 2 byte
+	XOR	EBX,EBX
+	MOV	AH,24[EBP]	; get color
+	CMP	8[EBP],0 : byte	; replacemode ?
+	JE	replace2
+; New implementation of paintmode
+	CMP	8[EBP],2:word	; invertmode ?
+	JE	invert2
+
+	MOV	ESI,20[EBP]	; adr pattern
+cploopp2	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	XOR	EAX,EAX
+	XOR	EDX,EDX
+	MOV	DL,2[ESI+EBX*1]	; fetch one byte from pattern
+	SHL	DX,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	AL,DH
+	MOV	DH,rev[EAX]
+	MOV	AL,GS:[EDI]	; latch bytes
+	NOT	DL	; negate DL
+	MOV	GS:[EDI],DL	; clear pattern
+	NOT	DL	; negate DL
+	MOV	AL,GS:1[EDI]	; latch bytes
+	NOT	DH	; negate DH
+	MOV	GS:1[EDI],DH	; clear pattern
+	NOT	DH	; negate DH
+	MOV	help2, EDX	; save DX
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,24[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	MOV	EDX, help2	; restore DX
+	MOV	AL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	AL,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; set with color and mode
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploopp2
+	JMP	resetgrafCP
+; End of new implementation of paintmode
+
+invert2	MOV	ESI,20[EBP]	; adr pattern
+	MOV	DX,SQ
+	MOV	AL,2
+	OUT	DX,AX	; set color/sequencer planemap
+cploop2	XOR	EAX,EAX
+	XOR	EDX,EDX
+	MOV	DL,2[ESI+EBX*1]	; fetch one byte from pattern
+	SHL	DX,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	AL,DH
+	MOV	DH,rev[EAX]	
+	MOV	AL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	AL,GS:1[EDI]	; latch
+	MOV	GS:1[EDI],DH	; set with color and mode
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploop2
+	JMP	resetgrafCP
+replace2	MOV	color,AH
+	INC	ESI
+	MOV	AH,mask[ESI]	
+	MOV	rightmask,AH
+	MOV	AH,imask[ECX]	
+	MOV	leftmask,AH
+	MOV	ESI,20[EBP]
+	MOV	DX,GC
+	MOV	AL,8
+	OUT	DX,AX	; set left bitmask
+	CMP color, 15:byte
+	JE qr2
+repl2loop	XOR	EDX,EDX
+	XOR	EAX,EAX
+	MOV	DL,2[ESI+EBX*1]	; fetch one byte from pattern
+	SHL	DX,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	AL,DH
+	MOV	DH,rev[EAX]	
+	MOV	help1,EDX	; save values
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	AL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],0 : byte	; clear all planes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	help1,EDX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	AL,GS:1[EDI]	; latch
+	MOV	GS:1[EDI],0 : byte	; clear all bitplanes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; left again
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	repl2loop
+	JMP	resetgrafCP
+qr2	MOV	DX,SQ
+	MOV	AX,$0F02	; get color
+	OUT	DX,AX	; set sequencer planemap
+qr22	XOR	EDX,EDX
+	XOR	EAX,EAX
+	MOV	DL,2[ESI+EBX*1]	; fetch one byte from pattern
+	SHL	DX,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	AL,DH
+	MOV	DH,rev[EAX]	
+	MOV	CH, GS:[EDI]	
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	help1,EDX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	EDX,help1
+	MOV	CH, GS:1[EDI]
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; left again
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	qr22
+	JMP	resetgrafCP
+next1	CMP	AX,16	; p.w <= 16, 2 Byte
+	JG	next2
+	SUB	EDX,EBX
+	CMP	EDX,1
+	JNE	byte316
+	XOR	EBX,EBX
+	MOV	AH,24[EBP]	; get color
+	CMP	8[EBP],0 : word	; replacemode ?
+	JE	replace3
+; New implementation of paintmode
+	CMP	8[EBP],2:word	; invertmode ?
+	JE	invert3
+
+	MOV	ESI,20[EBP]	; adr pattern
+cploopp3	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	XOR	EAX,EAX
+	XOR	EDX,EDX
+	MOV	DX,2[ESI+EBX*2]	; fetch one byte from pattern
+	SHL	DX,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	AL,DH
+	MOV	DH,rev[EAX]
+	NOT	DX	; negate DX
+	MOV	AL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; clear pattern
+	MOV	AL,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; clear pattern
+	NOT	DX	; negate DX
+	MOV	help2, EDX	; save DX
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,24[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	MOV	EDX, help2	; restore DX
+	MOV	AL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	AL,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; set with color and mode
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploopp3
+	JMP	resetgrafCP
+; End of new implementation of paintmode
+
+invert3	MOV	ESI,20[EBP]	; adr pattern
+	MOV	DX,SQ
+	MOV	AL,2
+	OUT	DX,AX	; set color/sequencer planemap
+cploop3	XOR	EAX,EAX
+	XOR	EDX,EDX
+	MOV	DX,2[ESI+EBX*2]	; fetch one word from pattern
+	SHL	DX,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	AL,DH
+	MOV	DH,rev[EAX]	
+	MOV	AL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set left byte with color
+	MOV	AL,GS:1[EDI]	; latch
+	MOV	GS:1[EDI],DH	; set with color and mode
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploop3
+	JMP	resetgrafCP
+replace3	MOV	color,AH
+	INC	ESI
+	MOV	AH,mask[ESI]	
+	MOV	rightmask,AH
+	MOV	AH,imask[ECX]	
+	MOV	leftmask,AH
+	MOV	ESI,20[EBP]
+	MOV	DX,GC
+	MOV	AL,8
+	OUT	DX,AX	; set left bitmask
+	CMP color, 15:byte
+	JE qr3
+repl3loop	XOR	EDX,EDX
+	XOR	EAX,EAX
+	MOV	DX,2[ESI+EBX*2]	; fetch one word from pattern
+	SHL	DX,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	AL,DH
+	MOV	DH,rev[EAX]	
+	MOV	help1,EDX	; save values
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	AL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],0 : byte	; clear all planes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	help1,EDX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	AL,GS:1[EDI]	; latch
+	MOV	GS:1[EDI],0 : byte	; clear all bitplanes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; left again
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	repl3loop
+	JMP	resetgrafCP
+qr3	MOV	DX,SQ
+	MOV	AX,$0F02	; get color
+	OUT	DX,AX	; set sequencer planemap
+qr33	XOR	EDX,EDX
+	XOR	EAX,EAX
+	MOV	DX,2[ESI+EBX*2]	; fetch one word from pattern
+	SHL	DX,CL
+	MOV	AL,DL
+	MOV	DL,rev[EAX]	
+	MOV	AL,DH
+	MOV	DH,rev[EAX]	
+	MOV	help1,EDX	; save values
+	MOV	CH, GS:[EDI]
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	help1,EDX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	EDX,help1
+	MOV	CH, GS:1[EDI]
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; left again
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	qr33
+	JMP	resetgrafCP
+
+byte316	XOR	EBX,EBX	; p.w <= 16 , 3 bytes
+	MOV	AH,24[EBP]	; get color
+	CMP	8[EBP],0 : word	; replacemode ?
+	JE	replace4
+; New implementation of paintmode
+	CMP	8[EBP],2:word	; invertmode ?
+	JE	invert4
+
+	MOV	ESI,20[EBP]	; adr pattern
+cploopp4	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	XOR	EDX,EDX
+	MOV	DX,2[ESI+EBX*2]	; fetch one byte from pattern
+	MOV	dcount, EBX
+	SHL	EDX,CL
+	MOV	EAX, EDX
+	SHR	EAX, 16
+	AND	EDX, $FFFF
+	XOR	EBX, EBX
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]
+	MOV	BL, AL
+	MOV	AL,rev[EBX]
+	NOT	DX	; negate DX
+	MOV	AH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; clear pattern
+	MOV	AH,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; clear pattern
+	NOT	DX	; negate DX
+	MOV	AH,GS:2[EDI]	; latch bytes
+	NOT	AL	; negate AL
+	MOV	GS:2[EDI],AL	; clear pattern
+	NOT	AL	; negate AL
+	MOV	help2, EDX	; save DX
+	MOV	help1, EAX	; save AX
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,24[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	MOV	EDX, help2	; restore DX
+	MOV	EAX, help1	; restore AX
+	MOV	AH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	AH,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	AH,GS:2[EDI]	; latch bytes
+	MOV	GS:2[EDI],AL	; set with color and mode
+	MOV	EBX, dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploopp4
+	JMP	resetgrafCP
+; End of new implementation of paintmode
+
+invert4	MOV	ESI,20[EBP]	; adr pattern
+	MOV	DX,SQ
+	MOV	AL,2
+	OUT	DX,AX	; set color/sequencer planemap
+cploop4	XOR	EAX,EAX
+	XOR	EDX,EDX
+	MOV	DX,2[ESI+EBX*2]	; fetch one word from pattern
+	MOV	dcount,EBX	; save counter
+	SHL	EDX,CL
+	MOV	EAX,EDX
+	SHR	EAX,16
+	AND	EDX,$FFFF
+	XOR	EBX,EBX
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]	
+	MOV	BL,AL
+	MOV	AL,rev[EBX]	
+	MOV	AH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set left byte with color & mode
+	MOV	AH,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; set middle byte with color & mode
+	MOV	AH,GS:2[EDI]	; latch
+	MOV	GS:2[EDI],AL	; set left byte with color and mode
+	MOV	EBX,dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploop4
+	JMP	resetgrafCP
+replace4	MOV	color,AH
+	INC	ESI
+	MOV	AH,mask[ESI]	
+	MOV	rightmask,AH
+	MOV	AH,imask[ECX]	
+	MOV	leftmask,AH
+	MOV	ESI,20[EBP]
+	MOV	DX,GC
+	MOV	AL,8
+	OUT	DX,AX	; set left bitmask
+	CMP color, 15:byte
+	JE qr4
+repl4loop	XOR	EDX,EDX
+	XOR	EAX,EAX
+	MOV	DX,2[ESI+EBX*2]	; fetch one word from pattern
+	MOV	dcount,EBX	; save counter
+	SHL	EDX,CL
+	MOV	EAX,EDX
+	SHR	EAX,16
+	AND	EDX,$FFFF
+	XOR	EBX,EBX
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]	
+	MOV	BL,AL
+	MOV	AL,rev[EBX]	
+	MOV	help1,EDX	; save values
+	MOV	help2,EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	AH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],0 : byte	; clear all planes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	help1,EDX	; save it again
+	MOV	DX,GC
+	MOV	AX,$FF08
+	OUT	DX,AX	; mask all bits
+	MOV	DX,SQ
+	MOV	AX,$0F02	; all planes
+	OUT	DX,AX	; set sequencer planemap
+	MOV	AH, GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],0 : byte	; clear all planes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	AH,GS:2[EDI]	; latch
+	MOV	GS:2[EDI],0 : byte	; clear all bitplanes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EAX,help2
+	MOV	GS:2[EDI],AL	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; left again
+	MOV	EBX,dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	repl4loop
+	JMP	resetgrafCP
+qr4	MOV	DX,SQ
+	MOV	AX,$0F02	; get color
+	OUT	DX,AX	; set sequencer planemap
+qr44	XOR	EDX,EDX
+	XOR	EAX,EAX
+	MOV	DX,2[ESI+EBX*2]	; fetch one word from pattern
+	MOV	dcount,EBX	; save counter
+	SHL	EDX,CL
+	MOV	EAX,EDX
+	SHR	EAX,16
+	AND	EDX,$FFFF
+	XOR	EBX,EBX
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]	
+	MOV	BL,AL
+	MOV	AL,rev[EBX]	
+	MOV	help1,EDX	; save values
+	MOV	help2,EAX
+	MOV	CH, GS:[EDI]
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	DX,GC
+	MOV	AX,$FF08
+	OUT	DX,AX	; mask all bits
+	MOV	EDX,help1
+	MOV	CH, GS:1[EDI]
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	EAX,help2
+	MOV	CH, GS:2[EDI]
+	MOV	GS:2[EDI],AL	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; left again
+	MOV	EBX,dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	qr44
+	JMP	resetgrafCP
+
+next2	CMP	AX,24
+	JG	next3
+	MOV	AH,24[EBP]	; p.w <= 24 3 & 4 bytes / get color
+	CMP	8[EBP],0 : word	; replacemode ?
+	JE	replace5
+; New implementation of paintmode
+	CMP	8[EBP],2:word	; invertmode ?
+	JE	invert5
+
+	MOV	ESI,20[EBP]	; adr pattern
+	
+	XOR	EBX, EBX
+	MOV	dcount, EBX
+
+cploopp5	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	EBX,dcount
+	MOV	EDX, EBX
+	IMUL	EDX, 3
+	ADD	EDX, ESI
+	MOV	EDX, 2[EDX]
+	AND	EDX, $FFFFFF
+	SHL	EDX,CL
+	MOV	EAX, EDX
+	SHR	EAX, 16
+	XOR	EBX, EBX
+	AND	EDX, $FFFF
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]
+	MOV	BL, AL
+	MOV	AL,rev[EBX]
+	MOV	BL, AH
+	MOV	AH,rev[EBX]
+	MOV	CH,GS:[EDI]	; latch bytes
+	NOT	DL	; negate DL
+	MOV	GS:[EDI],DL	; clear pattern
+	NOT	DL	; negate DL
+	MOV	CH,GS:1[EDI]	; latch bytes
+	NOT	DH	; negate DH
+	MOV	GS:1[EDI],DH	; clear pattern
+	NOT	DH	; negate DH
+	MOV	CH,GS:2[EDI]	; latch bytes
+	NOT	AL	; negate AL
+	MOV	GS:2[EDI],AL	; clear pattern
+	NOT	AL	; negate AL
+	MOV	CH,GS:3[EDI]	; latch bytes
+	NOT	AH	; negate AH
+	MOV	GS:3[EDI],AH	; clear pattern
+	NOT	AH	; negate AH
+	MOV	help2, EDX	; save DX
+	MOV	help1, EAX	; save AX
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,24[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	MOV	EDX, help2	; restore DX
+	MOV	EAX, help1	; restore AX
+	MOV	CH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	CH,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	CH,GS:2[EDI]	; latch bytes
+	MOV	GS:2[EDI],AL	; set with color and mode
+	MOV	CH,GS:3[EDI]	; latch bytes
+	MOV	GS:3[EDI],AH	; set with color and mode
+	MOV	EBX, dcount
+	INC	EBX
+	MOV	dcount, EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploopp5
+	JMP	resetgrafCP
+; End of new implementation of paintmode
+
+
+invert5	MOV	ESI,20[EBP]	; adr pattern	
+	XOR	EBX,EBX
+	MOV	DX,SQ
+	MOV	AL,2
+	OUT	DX,AX	; set color/sequencer planemap
+cploop5	XOR	EAX,EAX
+	MOV	EDX,EBX
+	IMUL	EDX,3
+	ADD	EDX,ESI
+	MOV	EDX,2[EDX]	
+	AND	EDX,$FFFFFF
+	SHL	EDX,CL
+	MOV	dcount,EBX
+	XOR	EBX,EBX
+	MOV	EAX,EDX
+	SHR	EAX,16
+	AND	EDX,$FFFF
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]	
+	MOV	BL,AL
+	MOV	AL,rev[EBX]	
+	MOV	BL,AH
+	MOV	AH,rev[EBX]	
+	MOV	CH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set left byte with color
+	MOV	CH,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; set middle byte with color
+	MOV	CH,GS:2[EDI]	; latch
+	MOV	GS:2[EDI],AL	; set with color and mode
+	MOV	CH,GS:3[EDI]	; latch
+	MOV	GS:3[EDI],AH	; set with color and mode
+	MOV	EBX,dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploop5
+	JMP	resetgrafCP
+replace5	MOV	color,AH
+	INC	ESI
+	MOV	AH,mask[ESI]	
+	MOV	rightmask,AH
+	MOV	AH,imask[ECX]	
+	MOV	leftmask,AH
+	MOV	ESI,20[EBP]
+	SUB	EDX,EBX	; Difference in bytes (start end)
+	CMP	EDX,2	; in 3 bytes => flag = 1
+	SETE flag
+	MOV	DX,GC
+	MOV	AL,8
+	OUT	DX,AX	; set left bitmask
+	XOR	EBX,EBX
+	CMP color, 15:byte
+	JE qr5
+repl5loop	MOV	EDX,EBX
+	IMUL	EDX,3
+	ADD	EDX,ESI
+	MOV	EDX,2[EDX]	
+	AND	EDX,$FFFFFF
+	SHL	EDX,CL
+	MOV	dcount,EBX
+	XOR	EBX,EBX
+	MOV	EAX,EDX
+	SHR	EAX,16
+	AND	EDX,$FFFF
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]	
+	MOV	BL,AL
+	MOV	AL,rev[EBX]	
+	MOV	BL,AH
+	MOV	AH,rev[EBX]	
+	MOV	help1,EDX	; save values
+	MOV	help2,EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	CH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],0 : byte	; clear all planes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	DX,GC
+	MOV	AX,$0FF08
+	OUT	DX,AX	; mask all bits
+	MOV	DX,SQ
+	MOV	AX,$0F02	; all planes
+	OUT	DX,AX	; set sequencer planemap
+	MOV	CH, GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],0 : byte	; clear all planes
+	CMP	flag,0	; 4 bytes ?
+	JNE	repl5h	; no goto repl5h
+	MOV	CH,GS:2[EDI]	; latch bytes
+	MOV	GS:2[EDI],0 : byte	; clear all planes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	EAX,help2
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	GS:2[EDI],AL	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	CH,GS:3[EDI]	; latch
+	MOV	GS:3[EDI],0 : byte	; clear all bitplanes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EAX,help2
+	MOV	GS:3[EDI],AH	; set with color and mode
+	JMP	repl5h1
+repl5h	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EDX,help1
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	DX,SQ
+	MOV	AX,$0F02	; sequencer all maps
+	OUT	DX,AX
+	MOV	AH,GS:2[EDI]	; latch
+	MOV	GS:2[EDI],0 : byte	; clear all bitplanes
+	MOV	AH,color	; get color
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer planemap
+	MOV	EAX,help2
+	MOV	GS:2[EDI],AL	; set with color and mode
+repl5h1	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; left again
+	MOV	EBX,dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	repl5loop
+	JMP	resetgrafCP
+qr5	MOV	DX,SQ
+	MOV	AX,$0F02	; get color
+	OUT	DX,AX	; set sequencer planemap
+qr55	MOV	EDX,EBX
+	IMUL	EDX,3
+	ADD	EDX,ESI
+	MOV	EDX,2[EDX]	
+	AND	EDX,$FFFFFF
+	SHL	EDX,CL
+	MOV	dcount,EBX
+	XOR	EBX,EBX
+	MOV	EAX,EDX
+	SHR	EAX,16
+	AND	EDX,$FFFF
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]	
+	MOV	BL,AL
+	MOV	AL,rev[EBX]	
+	MOV	BL,AH
+	MOV	AH,rev[EBX]	
+	MOV	help1,EDX	; save values
+	MOV	help2,EAX
+	MOV	CH, GS:[EDI]
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	DX,GC
+	MOV	AX,$0FF08
+	OUT	DX,AX	; mask all bits
+	CMP	flag,0	; 4 bytes ?
+	JNE	qr52	; no goto qr52
+	MOV	EDX,help1
+	MOV	EAX,help2
+	MOV	CH, GS:1[EDI]
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	CH, GS:2[EDI]
+	MOV	GS:2[EDI],AL	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	DX,SQ
+	MOV	EAX,help2
+	MOV	CH, GS:3[EDI]
+	MOV	GS:3[EDI],AH	; set with color and mode
+	JMP	qr51
+qr52	MOV	EDX,help1
+	MOV	CH, GS:1[EDI]
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; right bit mask
+	MOV	EAX,help2
+	MOV	CH, GS:2[EDI]
+	MOV	GS:2[EDI],AL	; set with color and mode
+qr51	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; left again
+	MOV	EBX,dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	qr55
+	JMP	resetgrafCP
+
+next3	XOR	EBX,EBX	; p.w >= 24 , 5 bytes
+	MOV	AH,imask[ECX]	
+	MOV	leftmask,AH
+	MOV	AH,24[EBP]	; get color
+; New implementation of paintmode
+	CMP	8[EBP],2:word	; invertmode ?
+	JE	invert6
+
+	MOV	ESI,20[EBP]	; adr pattern
+cploopp6	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	XOR	EAX,EAX
+	MOV	EDX, 2[ESI+EBX*4]
+	MOV	dcount, EBX
+	MOV	help2, ESI
+	XOR	ESI, ESI
+	SHLD	ESI, EDX, CL
+	SHL	EDX, CL
+	XOR	EBX, EBX
+	MOV	EAX, EDX
+	SHR	EAX, 16
+	AND	EDX, $FFFF
+	
+	MOV	BL, DL
+	MOV	DL,rev[EBX]	
+	MOV	BL, DH
+	MOV	DH,rev[EBX]
+	MOV	BL, AL
+	MOV	AL,rev[EBX]
+	MOV	BL, AH
+	MOV	AH,rev[EBX]
+	MOV	BL,rev[ESI]
+	MOV	ESI, help2
+	
+	MOV	BH,GS:[EDI]	; latch bytes
+	AND	DL, leftmask
+	NOT	DL	; negate DL
+	MOV	GS:[EDI],DL	; clear pattern
+	NOT	DL	; negate DL
+	MOV	BH,GS:1[EDI]	; latch bytes
+	NOT	DH	; negate DH
+	MOV	GS:1[EDI],DH	; clear pattern
+	NOT	DH	; negate DH
+	MOV	BH,GS:2[EDI]	; latch bytes
+	NOT	AL	; negate AL
+	MOV	GS:2[EDI],AL	; clear pattern
+	NOT	AL	; negate AL
+	MOV	BH,GS:3[EDI]	; latch bytes
+	NOT	AH	; negate AH
+	MOV	GS:3[EDI],AH	; clear pattern
+	NOT	AH	; negate AH
+	MOV	BH,GS:4[EDI]	; latch bytes
+	NOT	BL	; negate BL
+	MOV	GS:4[EDI],BL	; clear pattern
+	NOT	BL	; negate BL
+	MOV	help2, EDX	; save DX
+	MOV	help1, EAX	; save AX
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,24[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	MOV	EDX, help2	; restore DX
+	MOV	EAX, help1	; restore AX
+	MOV	BH,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],DL	; set with color and mode
+	MOV	BH,GS:1[EDI]	; latch bytes
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	BH,GS:2[EDI]	; latch bytes
+	MOV	GS:2[EDI],AL	; set with color and mode
+	MOV	BH,GS:3[EDI]	; latch bytes
+	MOV	GS:3[EDI],AH	; set with color and mode
+	MOV	BH,GS:4[EDI]	; latch bytes
+	MOV	GS:4[EDI],BL	; set with color and mode
+	MOV	EBX, dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploopp6
+	JMP	resetgrafCP
+; End of new implementation of paintmode
+
+invert6	MOV	ESI,20[EBP]	; adr pattern
+	MOV	DX,SQ
+	MOV	AL,2
+	OUT	DX,AX	; set color/sequencer planemap
+cploop6	XOR	EAX,EAX
+	MOV	EDX,2[ESI+EBX*4]	; fetch one dword from pattern
+	MOV	dcount,EBX
+	MOV	help2,ESI
+	XOR	ESI,ESI
+	SHLD	ESI,EDX,CL
+	SHL	EDX,CL
+	XOR	EBX,EBX
+	MOV	EAX,EDX
+	SHR	EAX,16
+	AND	EDX,$FFFF
+	MOV	BL,DL
+	MOV	DL,rev[EBX]	
+	MOV	BL,DH
+	MOV	DH,rev[EBX]	
+	MOV	BL,AL
+	MOV	AL,rev[EBX]	
+	MOV	BL,AH
+	MOV	AH,rev[EBX]	
+	MOV	BL,rev[ESI]	
+	MOV	ESI,help2
+	MOV	BH,GS:[EDI]	; latch bytes
+	AND	DL,leftmask
+	MOV	GS:[EDI],DL	; set left byte with color
+	MOV	BH,GS:1[EDI]	; latch
+	MOV	GS:1[EDI],DH	; set with color and mode
+	MOV	BH,GS:2[EDI]	; latch bytes
+	MOV	GS:2[EDI],AL	; set left byte with color
+	MOV	BH,GS:3[EDI]	; latch
+	MOV	GS:3[EDI],AH	; set with color and mode
+	MOV	BH,GS:4[EDI]	; latch
+	MOV	GS:4[EDI],BL	; set with color and mode
+	MOV	EBX,dcount
+	INC	EBX
+	SUB	EDI,width3
+	CMP	BL,1[ESI]	; height reached ?
+	JNE	cploop6
+replace6	JMP	resetgrafCP
+resetgrafCP	MOV	DX,SQ
+	MOV	AX,$0F02	; default map mask
+	OUT	DX,AX
+	MOV	DX,GC
+	MOV	AX,$0FF08	; default bit mask
+	OUT	DX,AX
+	MOV	AX,$0003	; default function
+	OUT	DX,AX
+endCP	PUSH DS
+	POP GS
+	LEAVE
+	RET 20
+	
+*PROCEDURE ReplConst*(col, X, Y, W, H, mode: INTEGER);
+* always call over ColDisplay 
+ReplConst	POP	EAX
+; Set GS register
+	MOV	AX, $1C
+	MOV	GS, AX
+
+; Clipping
+	MOVSX	EAX,24[EBP]:word
+	MOVSX	EBX,20[EBP]:word
+	MOVSX	ECX,16[EBP]:word
+	ADD	ECX,EAX
+	DEC	ECX
+	MOVSX	EDX,12[EBP]:word
+	ADD	EDX,EBX
+	DEC	EDX
+	CMP	AX,clipx
+	JGE	l1rc
+	MOVSX	EAX,clipx
+	MOV	24[EBP],EAX	; clipped x
+l1rc	CMP	BX,clipy
+	JGE	l2rc
+	MOVSX	EBX,clipy
+	MOV	20[EBP],EBX	; clipped y
+l2rc	CMP	CX,clipxw
+	JLE	l3rc
+	MOVSX	ECX,clipxw
+l3rc	CMP	DX,clipyh
+	JLE	l4rc
+	MOVSX	EDX,clipyh
+l4rc	SUB	ECX,EAX
+	INC	ECX
+	MOV	16[EBP],ECX	; new w
+	SUB	EDX,EBX
+	INC	EDX
+	MOV	12[EBP],EDX	; new h
+; endclip
+
+	CMP	12[EBP], 0 : word
+	JLE	endRC
+	CMP	16[EBP], 0 : word
+	JLE	endRC
+
+	MOV	EAX,8[EBP]	; get mode and set local AH
+	CMP	AX,ReplaceMode
+	JNE	Inv3
+	MOV	AH,Replacebits
+	JMP	setGC3
+Inv3	CMP	AX,InvertMode
+	JNE	Paint3
+	MOV	AH,XORbits
+	JMP	setGC3
+Paint3	MOV	AH,ORbits	; with wrong mode =>
+;			automatically paint mode
+; Set graphic-controller-registers
+
+setGC3	MOV	DX,GC	; Graphic-Controller
+	MOV	AL,3	; AL = Data/Rotate / AH = Modus
+	OUT	DX,AX
+	MOV	AX,$0205	; AL = Read-Mode = 0
+;			Write-Mode = 2 (bits 0,1)
+	OUT	DX,AX	; Set
+	MOV	DX,SQ	; ARD
+	MOV	AH,$0F	; ARD	set bitplanemask
+	MOV	AL,2	; ARD
+	OUT	DX,AX	; ARD	set sequencer
+; get params x y
+	MOV	ESI, height
+	SUB	ESI, 20[EBP]
+	IMUL	ESI, width3
+	ADD	ESI, base 
+	MOV	EAX, 24[EBP]	; EAX := x
+	MOV	EBX, EAX
+	MOV	ECX, EAX
+	MOV	EDX, EAX
+	SHR	EAX, 3	; EAX := x DIV 8
+	AND	ECX, 7	; ECX := x MOD 8
+	ADD	EBX, 16[EBP]
+	ADD	EDX, 16[EBP]
+	SHR	EBX, 3	; EBX := (x + w) DIV 8
+	AND	EDX, 7	; EDX := (x + w) MOD 8
+	ADD	ESI, EAX	; ESI = byte-begin rectangle
+	CMP	EAX, EBX	; in one byte ?
+	JNE	long1
+	MOV	EDI, 12[EBP]	; EDI = h
+RCloop1	MOV	AH, imask[ECX]
+	AND	AH, mask[EDX]	
+	MOV	DX,GC
+	MOV	AL,8
+	OUT	DX,AX	; Set Bit Mask
+	MOV	AH,28[EBP]	; Set color
+RClooph	MOV	AL,GS:[ESI]	; latch bytes;
+	MOV	GS:[ESI],AH	; set with color
+	SUB	ESI, width3
+	DEC	EDI
+	JG	RClooph
+	JMP	resetgrafRC
+long1	MOV	EDI, 12[EBP]	; EDI := h
+	SUB	EBX, EAX	; Byte difference
+	MOV	help, EBX
+; generate masks
+RCloop2	MOV	AH,mask[EDX]	
+	MOV	rightmask,AH
+	MOV	AH,imask[ECX]	
+	MOV	leftmask,AH
+	MOV	DX,GC
+; prepare left margin
+RCmyloop	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; Set Bit Mask
+	MOV	AL,GS:[ESI]	; latch bytes;
+	MOV	AH,28[EBP]	; set color
+	MOV	GS:[ESI],AH	; set masked bits
+; prepare middle bytes
+	MOV	AX,$FF08
+	OUT	DX,AX	; Set Bit Mask 11111111b
+	MOV	ECX, ESI
+	INC	ECX
+	MOV	AH,28[EBP]	; set color
+l13	CMP	EBX, 1	; are there unfilled BYTES ?
+	JLE	l12
+	MOV	AL,GS:[ECX]	; latch bytes;
+	MOV	GS:[ECX],AH	; set bits with color
+	DEC	EBX
+	INC	ECX
+	JMP	l13
+l12	MOV	AH,rightmask
+; prepare rightmask
+	MOV	AL,8
+	OUT	DX,AX	; Set Bit Mask
+	MOV	AL,GS:[ECX]	; latch bytes;
+	MOV	AH,28[EBP]	; color
+	MOV	GS:[ECX],AH	
+	SUB	ESI, width3	; next line
+	MOV	EBX, help
+	DEC	EDI
+	JG	RCmyloop	; height reached ?
+; Fill VGA-registers with default values
+resetgrafRC	MOV	DX,GC
+	MOV	AX,$FF08	; default bitmask
+	OUT	DX,AX
+	MOV	AX,$0005	; default mode-reg
+	OUT	DX,AX
+	MOV	AX,$0003	; default Function-Select
+	OUT	DX,AX
+	MOV	DX,SQ	; default map mask
+	MOV	AX,$0F02
+	OUT	DX,AX
+endRC	PUSH DS
+	POP GS
+	LEAVE
+	RET 24
+
+*PROCEDURE CopyBlock*(SX, SY, W, H, DX, DY, mode: INTEGER);
+*always call over ColDisplay 
+CopyBlock	POP	EAX
+; Set GS register
+	MOV	AX, $1C
+	MOV	GS, AX
+
+; Clipping
+	MOV	EAX,16[EBP]	; dx
+	MOV	EBX,12[EBP]	; dy
+	MOV	ECX,24[EBP]	; w
+	ADD	ECX,EAX
+	DEC	ECX
+	MOV	EDX,20[EBP]	; h
+	ADD	EDX,EBX
+	DEC	EDX
+	CMP	AX,clipx
+	JGE	l1cb
+	MOVSX	EAX,clipx
+	MOV	16[EBP],EAX	; new dx
+l1cb	CMP	BX,clipy
+	JGE	l2cb
+	MOVSX	EBX,clipy
+	MOV	12[EBP],EBX	; new dy
+l2cb	CMP	CX,clipxw
+	JLE	l3cb
+	MOVSX	ECX,clipxw
+l3cb	CMP	DX,clipyh
+	JLE	l4cb
+	MOVSX	EDX,clipyh
+l4cb	SUB	ECX,EAX
+	INC	ECX
+	MOV	24[EBP],ECX	; new w
+	SUB	EDX,EBX
+	INC	EDX
+	MOV	20[EBP],EDX	; new h
+; endclip
+
+	CMP	24[EBP], 0 : word
+	JLE	endCB
+	CMP	20[EBP], 0 : word
+	JLE	endCB
+	MOV	EAX, height
+	MOV	EBX, EAX
+	SUB	EAX, 28[EBP]	; EAX := height - sy
+	MOV	28[EBP], EAX
+	SUB	EBX, 12[EBP]	; EBX := height - dy
+	MOV	12[EBP], EBX
+	MOV	EAX, 32[EBP]	; EAX := sx
+	MOV	ECX, EAX
+	MOV	EBX, EAX
+	MOV	EDX, EAX
+	SHR	EAX, 3	; EAX := sx DIV 8
+	AND	ECX, 7	; ECX := sx MOD 8
+	ADD	EBX, 24[EBP]
+	ADD	EDX, 24[EBP]
+	SHR	EBX, 3	; EBX := (sx+w) DIV 8
+	AND	EDX, 7	; EDX := (sx+w) MOD 8
+	MOV	x1, EAX	; x1 := sx DIV 8
+	MOV	x2, EBX	; x2 := (sx+w) DIV 8
+	MOV	x3, ECX	; x3 := sx MOD 8
+	INC	EDX
+	MOV	x4, EDX	; x4 := (sx+w) MOD 8 (+1)
+	MOV	EAX, 16[EBP]	; EAX := dx
+	MOV	ECX, EAX
+	MOV	EBX, EAX
+	MOV	EDX, EAX
+	SHR	EAX, 3	; EAX := dx DIV 8
+	AND	ECX, 7	; ECX := dx MOD 8
+	ADD	EBX, 24[EBP]	; EBX := dx +w
+	ADD	EDX, 24[EBP]
+	SHR	EBX, 3	; EBX := (dx+w) DIV 8
+	AND	EDX, 7	; EDX := (dx+w) MOD 8
+	MOV	x5, EAX	; x5 := dx DIV 8
+	MOV	x6, EBX	; x6 := (dx+w) DIV 8
+	MOV	x7, ECX	; x7 := dx MOD 8
+	INC	EDX
+	MOV	x8, EDX	; x8 := (dx+w) MOD 8
+	MOV	ESI, 28[EBP]
+	IMUL	ESI, width3
+	ADD	ESI, base
+	ADD	ESI, x1	; ESI := startbyte source bottomleft
+	MOV	EDI, 12[EBP]
+	IMUL	EDI, width3
+	ADD	EDI, base
+	ADD	EDI, EAX
+	MOV	start, ESI	; starbyte source bottom left
+	MOV	end, EDI	; startbyte dest bottom left
+	MOV	DX,GC
+	MOV	AX,0005
+	OUT	DX,AX	; read/writemode = 0
+	MOV	AX,0001
+	OUT	DX,AX	; enable/reset = 0000b
+	MOV	AH,Replacebits
+	MOV	AL,3
+	OUT	DX,AX	; replacemode
+	MOV	EBX,x8
+	DEC	EBX
+	MOV	AH,mask[EBX]
+	MOV	rightmask,AH
+	MOV	EBX,x7
+	MOV	AH,imask[EBX]
+	MOV	leftmask,AH
+	MOV	EBX, x6
+	SUB	EBX, x5	; EBX := difference in bytes dx/dx+w
+	DEC	EBX
+	MOV	diff,EBX
+	JGE	inmorebytes
+	MOV	DH,rightmask	; EBX = 0 /only one byte
+	AND	DH,leftmask
+	MOV	leftmask,DH
+	MOV rightmask,DH
+inmorebytes	MOV	EDX, 20[EBP]	; EDX := h
+	MOV	EAX, 32[EBP]	; EAX := sx
+	MOV	EBX, 28[EBP]	; EBX := sy
+	CMP	EAX, 16[EBP]	; sx < dx ?
+	JGE	CB1	; no -> goto CB1
+	MOV	ECX, x8	; sx < dx !
+	SUB	ECX, x4	; ECX := differnce between s/dest x
+	ADD	ECX, 32
+	AND	CL, $1F	; CL := rotate shift count
+	CMP	EBX,12[EBP]	; sy < dy ?
+	JL	CB10	; yes goto CB10
+	JMP	CB13	; else goto CB13
+	
+CB1	SUB	ECX, x3	; sx >= dx
+	ADD	ECX, 32
+	AND	CL, $1F	; CL:= rotate shift count
+	CMP	BX, 12[EBP]	; sy >= dy?
+	JGE	CB12	; yes goto CB12
+CB11	MOV	help,EDX	; (sx >= dx) & (sy < dy) / save linecounter
+	MOV	EBX,diff
+	CMP	EBX,1
+	JLE	byte11	; in 1 Byte => normal CopyBlock
+	CMP	CL,0	; rotateoffset = 0 ?
+	JE	qCB11	; QuickCopy
+byte11	MOV	count,3	; there are 4 Bitplanes
+	MOV	plane,8	; begin with plane 4
+CB11h	MOV	DX,GC
+	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX	; select plane to read
+	MOV	AH,leftmask	; bitmask select
+	MOV	AL,8
+	OUT	DX,AX	; set mask at destination
+	MOV	DX,SQ
+	MOV	AH,plane	; set bitplanemask
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer
+	XOR	EAX,EAX
+	MOV	AH,GS:[ESI]
+	MOV	AL,GS:1[ESI]
+	ADD	ESI, 2
+	ROR	EAX, CL
+	CMP	EBX,0	; in one byte ?
+	JL	cbl31
+cbl6i	MOV	DL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],AH
+	INC	EDI
+	ROL	EAX,8
+	CMP	EBX,0	; in 2 bytes ?
+	JE	cbl3 ;**
+	MOV	help1,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08	; all maskbits
+	OUT	DX,AX
+	MOV	EAX,help1
+cbl6	ROL	EAX,CL
+	MOV	AL,GS:[ESI]
+	INC	ESI
+	ROR	EAX,CL
+	MOV	GS:[EDI],AH
+	INC	EDI
+	ROL	EAX, 8
+	DEC	BX
+	JG	cbl6
+cbl3	MOV	EBX, x6
+	SUB	EBX, x5
+	MOV	help2, EBX
+	MOV	EBX, x2
+	SUB	EBX,x1
+	CMP	EBX,help2
+	JE	cbl31
+	ROL	EAX,CL
+	MOV	AL,GS:[ESI]
+	ROR	EAX,CL
+cbl31	PUSH	AX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; set right dest bitmask
+	POP	AX
+	MOV	DL,GS:[EDI]
+	MOV	GS:[EDI],AH
+	MOV	ESI, start
+	MOV	EDI, end
+	SHR	plane,1
+	MOV	EBX,diff
+	DEC	count
+	JGE	CB11h
+	MOV	EDX,help	; next line / get linecounter
+	SUB	start, 80
+	SUB	end, 80
+	MOV	ESI, start
+	MOV	EDI, end
+	MOV	count,3
+	MOV	plane,8
+	DEC	EDX
+	MOV	help,EDX	; save new linecounter
+	CMP	EDX, 0
+	JG	CB11h
+	JMP	resetgrafCB
+CB12	MOV	EAX, 20[EBP]	; (sx >= dx) & (sy >= dy)
+	DEC	EAX
+	IMUL	EAX, width3
+	SUB	ESI, EAX
+	SUB	EDI, EAX
+	MOV	start, ESI
+	MOV	end, EDI
+	MOV	help,EDX	; save linecounter
+	MOV	EBX,diff
+	CMP	EBX,1 
+	JLE	byte12
+	CMP	CL,0	; rotate shift = 0 ?
+	JE	qCB12	; quick CopyBlock
+byte12	MOV	count,3	; there are 4 Bitplanes
+	MOV	plane,8
+cbl1	MOV	DX,GC
+	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX	; select plane to read
+	MOV	AH,leftmask	; bitmask select
+	MOV	AL,8
+	OUT	DX,AX	; set mask at destination
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer
+	XOR	EAX, EAX
+	MOV	AH,GS:[ESI]
+	MOV	AL,GS:1[ESI]
+	ADD	ESI, 2
+	ROR	EAX, CL
+	CMP	EBX,0
+	JL	cbl41
+cbl7i	MOV	DL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI],AH
+	INC	EDI
+	ROL	EAX,8	; ready for new out
+	CMP	EBX,0	; in 2 bytes ?
+	JE	cbl4 ;**
+	MOV	help1,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08	; all maskbits
+	OUT	DX,AX
+	MOV	EAX,help1
+cbl7	ROL	EAX,CL
+	MOV	AL,GS:[ESI]
+	INC	ESI
+	ROR	EAX,CL
+	MOV	GS:[EDI],AH
+	INC	EDI
+	ROL	EAX, 8
+	DEC	BX
+	JG	cbl7
+cbl4	MOV	EBX, x6
+	SUB	EBX, x5
+	MOV	help2, EBX
+	MOV	EBX, x2
+	SUB	EBX,x1
+	CMP	EBX,help2
+	JE	cbl41
+	ROL	EAX,CL
+	MOV	AL,GS:[ESI]
+	ROR	EAX,CL
+cbl41	PUSH	AX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; set right dest bitmask
+	POP	AX
+	MOV	DL,GS:[EDI]
+	MOV	GS:[EDI], AH
+	MOV	ESI, start
+	MOV	EDI, end
+	SHR	plane,1
+	MOV	EBX,diff
+	DEC	count
+	JGE	cbl1
+	MOV	EDX,help	; next line / get linecounter
+	ADD	start, 80
+	ADD	end, 80
+	MOV	ESI, start
+	MOV	EDI, end
+	MOV	plane,8
+	MOV	count,3
+	DEC	EDX
+	MOV	help,EDX	; save new linecounter
+	CMP	EDX, 0
+	JG	cbl1
+	JMP	resetgrafCB
+CB10	MOV	EAX, x2	; (sx < dx) & (sy < dy)
+	SUB	EAX, x1
+	ADD	ESI, EAX
+	MOV	EAX, x6
+	SUB	EAX, x5
+	ADD	EDI, EAX
+	MOV	start, ESI	; startbyte source bottom right
+	MOV	end, EDI	; starbyte dest bottom right
+	MOV	help,EDX	; save linecounter
+	MOV	EBX,diff
+	CMP	EBX,1
+	JLE	byte10
+	CMP	CL,0
+	JE	qCB10	; Quick CopyBlock
+byte10	MOV	count,3	; there are 4 Bitplanes
+	MOV	plane,8
+cbl10	MOV	DX,GC
+	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX	; select plane to read
+	MOV	AH,rightmask	; bitmask select
+	MOV	AL,8
+	OUT	DX,AX	; set mask at destination
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer
+	XOR	EAX, EAX
+	MOV	AL,GS:[ESI]
+	MOV	AH,GS:-1[ESI]
+	SUB	ESI, 2
+	ROR	EAX, CL
+	CMP	EBX,0	; in one byte ?
+	JGE	cbl11i
+	MOV	DL,rightmask	; xchg masks
+	MOV	leftmask,DL
+	JMP	cbl121
+cbl11i	MOV	DL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI], AL
+	DEC	EDI
+	ROR	EAX,8
+	CMP	EBX,0
+	JE	cbl12 ;**
+	MOV	help1,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08	; all maskbits
+	OUT	DX,AX
+	MOV	EAX,help1
+cbl11	ROL	EAX,CL
+	MOV	AH,GS:[ESI]
+	DEC	ESI
+	ROR	EAX,CL
+	MOV	GS:[EDI],AL
+	DEC	EDI
+	ROR	EAX, 8
+	DEC	BX
+	JG	cbl11
+cbl12	MOV	EBX, x6
+	SUB	EBX, x5
+	MOV	help2, EBX
+	MOV	EBX, x2
+	SUB	EBX,x1
+	CMP	EBX,help2
+	JE	cbl121
+	ROL	EAX,CL
+	MOV	AH,GS:[ESI]
+	ROR	EAX,CL
+cbl121	PUSH	AX
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; set left dest bitmask
+	POP	AX
+	MOV	DL,GS:[EDI]
+	MOV	GS:[EDI], AL
+	MOV	ESI, start
+	MOV	EDI, end
+	SHR	plane,1
+	MOV	EBX,diff
+	DEC	count
+	JGE	cbl10
+	MOV	EDX,help	; next line / get linecounter
+	SUB	start, 80
+	SUB	end, 80
+	MOV	ESI, start
+	MOV	EDI, end
+	MOV	plane,8
+	MOV	count,3
+	DEC	EDX
+	MOV	help,EDX	; save new linecounter
+	CMP	EDX, 0
+	JG	cbl10
+	JMP	resetgrafCB
+CB13	MOV	EAX, 20[EBP]	; (sx < dx) & (sy >= dy)
+	DEC	EAX
+	IMUL	EAX, width3
+	SUB	ESI, EAX
+	SUB	EDI, EAX
+	MOV	EAX, x2
+	SUB	EAX, x1
+	ADD	ESI, EAX
+	MOV	EAX, x6
+	SUB	EAX, x5
+	ADD	EDI, EAX
+	MOV	start, ESI
+	MOV	end, EDI
+	MOV	help,EDX	; save linecounter
+	MOV	EBX,diff
+	CMP	EBX,1
+	JLE	byte13
+	CMP	CL,0
+	JE	qCB13
+byte13	MOV	count,3	; there are 4 Bitplanes
+	MOV	plane,8
+cbl13	MOV	DX,GC
+	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX	; select plane to read
+	MOV	AH,rightmask	; bitmask select
+	MOV	AL,8
+	OUT	DX,AX	; set mask at destination
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX	; set sequencer
+	XOR	EAX, EAX
+	MOV	AL,GS:[ESI]
+	MOV	AH,GS:-1[ESI]
+	SUB	ESI,2
+	ROR	EAX, CL
+	CMP	EBX,0
+	JGE	cbl14i
+	MOV	DL,rightmask
+	MOV	leftmask,DL
+	JMP	cbl151
+cbl14i	MOV	DL,GS:[EDI]	; latch bytes
+	MOV	GS:[EDI], AL
+	DEC	EDI
+	ROR	EAX,8
+	CMP	EBX,0	; in 2 bytes ?
+	JE	cbl15 ;**
+	MOV	help1,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08	; all maskbits
+	OUT	DX,AX
+	MOV	EAX,help1
+cbl14	ROL	EAX,CL
+	MOV	AH,GS:[ESI]
+	DEC	ESI
+	ROR	EAX,CL
+	MOV	GS:[EDI],AL
+	DEC	EDI
+	ROR	EAX, 8
+	DEC	BX
+	JG	cbl14
+cbl15	MOV	EBX, x6
+	SUB	EBX, x5
+	MOV	help2, EBX
+	MOV	EBX, x2
+	SUB	EBX,x1
+	CMP	EBX,help2
+	JE	cbl151
+	ROL	EAX,CL
+	MOV	AH,GS:[ESI]
+	ROR	EAX,CL
+cbl151	PUSH	AX
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; set left dest bitmask
+	POP	AX
+	MOV	DL,GS:[EDI]
+	MOV	GS:[EDI],AL
+	MOV	ESI, start
+	MOV	EDI, end
+	SHR	plane,1
+	MOV	EBX,diff
+	DEC	count
+	JGE	cbl13
+	MOV	EDX,help	; next line / get linecounter
+	ADD	start, 80
+	ADD	end, 80
+	MOV	ESI, start
+	MOV	EDI, end
+	MOV	count,3
+	MOV	plane,8
+	DEC	EDX
+	MOV	help,EDX	; save new linecounter
+	CMP	EDX, 0
+	JG	cbl13
+	
+	JMP	resetgrafCB
+qCB12	MOV	DX,GC	; Quick CopyBlock begin
+	MOV	AH,leftmask	; bitmask select
+	MOV	AL,8
+	OUT	DX,AX	; set mask at destination
+	MOV	count,3
+	MOV	plane,8
+q12lloop	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX
+	MOV	CL,GS:[ESI]	; fetch source
+	MOV	AL,GS:[EDI]	; latch at destiation
+	MOV	GS:[EDI],CL	; set source
+	MOV	DX,GC
+	SHR	plane,1
+	DEC	count
+	JGE	q12lloop	; next plane
+	MOV	DX,SQ
+	MOV	AH,$0F
+	MOV	AL,2
+	OUT	DX,AX	; all planes again
+	MOV	DX,GC
+	INC	ESI
+	INC	EDI
+	MOV	AX,$0105	; writemode 1
+	OUT	DX,AX
+qcbl1	MOV	AL,GS:[ESI]
+	INC	ESI
+	MOV	GS:[EDI],AH
+	INC	EDI
+	DEC	BX
+	JG	qcbl1
+qcbl7	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; set right dest bitmask
+	MOV	AX,0005	; writemode 0
+	OUT	DX,AX
+	MOV	count,3
+	MOV	plane,8
+q12rloop	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX
+	MOV	CL,GS:[ESI]	; fetch source
+	MOV	AL,GS:[EDI]	; latch at destiation
+	MOV	GS:[EDI],CL	; set source
+	MOV	DX,GC
+	SHR	plane,1
+	DEC	count
+	JGE	q12rloop	; next plane
+	MOV	EBX,diff
+	ADD	start, 80
+	ADD	end, 80
+	MOV	ESI, start
+	MOV	EDI, end
+	DEC	help	; dec linecounter
+	JG	qCB12
+	JMP	resetgrafCB
+qCB11	MOV	DX,GC
+	MOV	AH,leftmask	; bitmask select
+	MOV	AL,8
+	OUT	DX,AX	; set mask at destination
+	MOV	count,3
+	MOV	plane,8
+q11lloop	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX
+	MOV	CL,GS:[ESI]	; fetch source
+	MOV	AL,GS:[EDI]	; latch at destiation
+	MOV	GS:[EDI],CL	; set source
+	MOV	DX,GC
+	SHR	plane,1
+	DEC	count
+	JGE	q11lloop	; next plane
+	MOV	DX,SQ
+	MOV	AH,$0F
+	MOV	AL,2
+	OUT	DX,AX	; all panes again
+	MOV	DX,GC
+	INC	ESI
+	INC	EDI
+	MOV	AX,$0105	; writemode 1
+	OUT	DX,AX
+qcbl6	MOV	AL,GS:[ESI]
+	INC	ESI
+	MOV	GS:[EDI],AH
+	INC	EDI
+	DEC	BX
+	JG	qcbl6
+qcbl3	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX	; set right dest bitmask
+	MOV	AX,0005	; writemode 0
+	OUT	DX,AX
+	MOV	count,3
+	MOV	plane,8
+q11rloop	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX
+	MOV	CL,GS:[ESI]	; fetch source
+	MOV	AL,GS:[EDI]	; latch at destiation
+	MOV	GS:[EDI],CL	; set source
+	MOV	DX,GC
+	SHR	plane,1
+	DEC	count
+	JGE	q11rloop	; next plane
+	MOV	EBX,diff
+	SUB	start, 80
+	SUB	end, 80
+	MOV	ESI, start
+	MOV	EDI, end
+	DEC	help	; dec linecounter
+	JG	qCB11
+	JMP	resetgrafCB
+qCB10	MOV	DX,GC
+	MOV	AH,rightmask	; bitmask select
+	MOV	AL,8
+	OUT	DX,AX	; set mask at destination
+	MOV	count,3
+	MOV	plane,8
+q10rloop	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX
+	MOV	CL,GS:[ESI]	; fetch source
+	MOV	AL,GS:[EDI]	; latch at destiation
+	MOV	GS:[EDI],CL	; set source
+	MOV	DX,GC
+	SHR	plane,1
+	DEC	count
+	JGE	q10rloop	; next plane
+	MOV	DX,SQ
+	MOV	AH,$0F
+	MOV	AL,2
+	OUT	DX,AX	; all panes again
+	MOV	DX,GC
+	DEC	ESI
+	DEC	EDI
+	MOV	AX,$0105	; writemode 1
+	OUT	DX,AX
+qcbl10	MOV	AL,GS:[ESI]
+	DEC	ESI
+	MOV	GS:[EDI],AH
+	DEC	EDI
+	DEC	BX
+	JG	qcbl10
+qcbl12	MOV	AX,0005	; writemode 0
+	OUT	DX,AX
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; set left dest bitmask
+	MOV	count,3
+	MOV	plane,8
+q10lloop	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX
+	MOV	CL,GS:[ESI]	; fetch source
+	MOV	AL,GS:[EDI]	; latch at destiation
+	MOV	GS:[EDI],CL	; set source
+	MOV	DX,GC
+	SHR	plane,1
+	DEC	count
+	JGE	q10lloop	; next plane
+	MOV	EBX,diff
+	SUB	start, 80
+	SUB	end, 80
+	MOV	ESI, start
+	MOV	EDI, end
+	DEC	help	; dec linecounter
+	JG	qCB10
+	JMP	resetgrafCB
+qCB13	MOV	DX,GC
+	MOV	AH,rightmask	; bitmask select
+	MOV	AL,8
+	OUT	DX,AX	; set mask at destination
+	MOV	AH,Replacebits
+	MOV	AL,3
+	OUT	DX,AX
+	MOV	count,3
+	MOV	plane,8
+q13rloop	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX
+	MOV	CL,GS:[ESI]	; fetch source
+	MOV	AL,GS:[EDI]	; latch at destiation
+	MOV	GS:[EDI],CL	; set source
+	MOV	DX,GC
+	SHR	plane,1
+	DEC	count
+	JGE	q13rloop	; next plane
+	MOV	DX,SQ
+	MOV	AH,$0F
+	MOV	AL,2
+	OUT	DX,AX	; all panes again
+	MOV	DX,GC
+	DEC	ESI
+	DEC	EDI
+	MOV	AX,$0105	; writemode 1
+	OUT	DX,AX
+qcbl13	MOV	AL,GS:[ESI]
+	DEC	ESI
+	MOV	GS:[EDI],AH
+	DEC	EDI
+	DEC	BX
+	JG	qcbl13
+qcbl14	MOV	AX,0005	; writemode 0
+	OUT	DX,AX
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX	; set left dest bitmask
+	MOV	count,3
+	MOV	plane,8
+q13lloop	MOV	AH,count
+	MOV	AL,4
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,plane
+	MOV	AL,2
+	OUT	DX,AX
+	MOV	CL,GS:[ESI]	; fetch source
+	MOV	AL,GS:[EDI]	; latch at destiation
+	MOV	GS:[EDI],CL	; set source
+	MOV	DX,GC
+	SHR	plane,1
+	DEC	count
+	JGE	q13lloop	; next plane
+	MOV	EBX,diff
+	ADD	start, 80
+	ADD	end, 80
+	MOV	ESI, start
+	MOV	EDI, end
+	DEC	help	; dec linecounter
+	JG	qCB13
+	JMP	resetgrafCB
+resetgrafCB	MOV	DX,GC
+	MOV	AX,$0FF08	; default bitmask
+	OUT	DX,AX
+	MOV	AX,0005	; default mode-reg
+	MOV	DX,AX
+	MOV	AX,0003	; default Function-Select
+	OUT	DX,AX
+	MOV	AX,0001	; default enable set/reset
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; default map mask
+	OUT	DX,AX
+endCB	PUSH DS
+	POP GS
+	LEAVE
+	RET	28
+	
+* PROCEDURE ReplPattern*(col: INTEGER; pat: Pattern; X0, Y0, X, Y, W, H, mode: INTEGER);
+* always call over ColDisplay !
+ReplPattern	POP	EAX
+; Set GS register
+	MOV	AX, $1C
+	MOV	GS, AX
+
+; Clipping
+	MOV	EAX,24[EBP]	; x
+	MOV	EBX,20[EBP]	; y
+	MOV	ECX,16[EBP]	; w
+	ADD	ECX,EAX
+	DEC	ECX
+	MOV	EDX,12[EBP]	; h
+	ADD	EDX,EBX
+	DEC	EDX
+	CMP	AX,clipx
+	JGE	l1rp
+	MOVSX	EAX,clipx
+	MOV	24[EBP],EAX	; clipped x
+l1rp	CMP	BX,clipy
+	JGE	l2rp
+	MOVSX	EBX,clipy
+	MOV	20[EBP],EBX	; clipped y
+l2rp	CMP	CX,clipxw
+	JLE	l3rp
+	MOVSX	ECX,clipxw
+l3rp	CMP	DX,clipyh
+	JLE	l4rp
+	MOVSX	EDX,clipyh
+l4rp	SUB	ECX,EAX
+	INC	ECX
+	MOV	16[EBP],ECX	; new w
+	SUB	EDX,EBX
+	INC	EDX
+	MOV	12[EBP],EDX	; new h
+; endclip
+
+	CMP	12[EBP], 0 : word
+	JLE	endRP
+	CMP	16[EBP], 0 : word
+	JLE	endRP
+	MOV	EAX,8[EBP]	; get mode and set local AH
+	CMP	AX,ReplaceMode
+	JNE	Inv4
+	MOV	AH,Replacebits
+	JMP	setGC4
+Inv4	CMP	AX,InvertMode
+	JNE	Paint4
+	MOV	AH,XORbits
+	JMP	setGC4
+Paint4	MOV	AH,ORbits	; with wrong mode =>
+;			; automatically paint mode
+; Set graphic-controller-registers
+
+setGC4	MOV	DX,GC	; Graphic-Controller
+	MOV	AL,3	; AL = Data/Rotate / AH = Modus
+	OUT	DX,AX
+	MOV	AX,$0005	; AL = Read-Mode = 0
+;			; Write-Mode = 0 (bits 0,1)
+	OUT	DX,AX	; Set
+; Get params x,y
+getxy4	MOV	EBX,height
+	SUB	EBX,20[EBP]	; (0,0) in bottom left corner
+	MOV	EAX, 20[EBP]
+	MOV	20[EBP],EBX	; y:= height -1 - y
+	XOR	EDX, EDX
+	SUB	EAX, 28[EBP]
+	MOV	ECX, 36[EBP]
+	MOVSX	ECX, 1[ECX]:byte
+	IDIV	ECX
+	MOV	help2, EDX
+	MOV	EBX,24[EBP]	; EBX := x
+	MOV	ECX,EBX
+	MOV	EDX,EBX
+	MOV	ESI,EBX
+	SHR	EBX,3	; EBX := X DIV 8
+	ADD	EDX,16[EBP]	; EDX := x + w
+	DEC	EDX
+	SHR	EDX,3	; EDX := (x + w-1) DIV 8
+	AND	ECX,7	; ECX := x mod 8
+	ADD	ESI,16[EBP]
+	DEC	ESI
+	AND	ESI,7	; ESI := (x+w-1) MOD 8
+	MOV	AL,imask[ECX]
+	MOV	leftmask,AL
+	INC	ESI	; *$*
+	MOV	AL,mask[ESI]
+	MOV	rightmask,AL
+
+	MOV	EDI,width3
+	IMUL	EDI,20[EBP]
+	ADD	EDI,base
+	ADD	EDI,EBX	; EDI := START-Adr
+	SUB	EDX,EBX	; Diff in bytes
+	MOV	help,EDX
+	MOV	help1,EDI
+	MOV	EBX,12[EBP]
+	IMUL	EBX,width3
+	SUB	EDI,EBX
+	MOV	topleft,EDI : double
+	MOV	EDI,help1
+	MOV	ESI,36[EBP]	; get addr of pat
+	MOVSX	EAX,24[EBP]:word	; EAX := x
+	XOR	EDX, EDX
+	MOVSX	EBX, [ESI]:byte
+	IDIV	EBX
+	MOV	help3, DL	;help3 := x MOD p.w
+	MOV	DX,GC
+	MOV	AH,leftmask
+	MOV	AL,8
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AH,40[EBP]
+	MOV	AL,2
+	OUT	DX,AX
+	
+	MOV	EBX, help2
+	MOV	flag,0
+	MOV	EDX,help
+	CMP	EDX,0	; in one byte ?
+	JE	onebyte
+	CMP	[ESI],16 : byte	; width = 16 ?
+	JNE	RP32
+RP16	CMP	8[EBP],0 : byte	; replacemode ?
+	JE	R16
+	CMP	8[EBP],1 : byte	; paintmode ?
+	JE	P16left
+IP16left	MOV	AX,2[ESI+EBX*2]	; invert/paint p.w = 16
+	CMP	help3, 8:byte
+	JGE	label
+	ROR	AX, 8
+label	MOV	CL, 32[EBP]
+	ROL	AX,CL
+	XOR	EDX,EDX
+	MOV	DL,AL
+	MOV	AL,rev[EDX] 
+	MOV	DL,AH
+	MOV	AH,rev[EDX]
+	MOV	CH,GS:[EDI]	; latch
+	MOV	GS:[EDI],AH
+	ROL	AX,8
+	MOV	EDX,1
+	CMP	EDX,help
+	JE	IP16right
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08
+	OUT	DX,AX
+	MOV	EAX,help2
+	MOV	EDX,1
+IP16mid	MOV	CH,GS:[EDI+EDX*1]	; latch
+	MOV	GS:[EDI+EDX*1],AH
+	ROL	AX,8
+	INC	EDX
+	CMP	EDX,help
+	JL	IP16mid
+IP16right	MOV	help1,EDX
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX
+	MOV	EAX,help2
+	MOV	EDX,help1
+	MOV	CH,GS:[EDI+EDX*1]
+	MOV	GS:[EDI+EDX*1],AH
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	MOV	DX,GC
+	MOV	AH,leftmask	; prepare rightmask again
+	MOV	AL,8
+	OUT	DX,AX
+	XOR	EDX,EDX
+	INC	EBX
+	CMP	BL,1[ESI]	; height of pattern reached?
+	JNE	IP16left
+	XOR	EBX,EBX	; yes, then reset counter
+	JMP	IP16left
+	
+P16left	MOV	AX,2[ESI+EBX*2]	; invert/paint p.w = 16
+	CMP	help3, 8:byte
+	JGE	plabel
+	ROR	AX, 8
+plabel	MOV	CL, 32[EBP]
+	ROL	AX,CL
+	XOR	EDX,EDX
+	MOV	DL,AL
+	MOV	AL,rev[EDX] 
+	MOV	DL,AH
+	MOV	AH,rev[EDX]
+	MOV	CH,GS:[EDI]	; latch
+	
+	PUSH	EDX
+	PUSH	EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	
+	POP	EAX
+	NOT	AH	; negate AH
+	MOV	GS:[EDI],AH	; clear pattern
+	NOT	AH	; negate AH
+	PUSH	EAX
+
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,40[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	POP	EAX
+	POP	EDX
+
+	MOV	GS:[EDI],AH
+	ROL	AX,8
+	MOV	EDX,1
+	CMP	EDX,help
+	JE	P16right
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08
+	OUT	DX,AX
+	MOV	EAX,help2
+	MOV	EDX,1
+P16mid	MOV	CH,GS:[EDI+EDX*1]	; latch
+
+	PUSH	EDX
+	PUSH	EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	
+	POP	EAX
+	POP	EDX
+	NOT	AH	; negate AH
+	MOV	GS:[EDI+EDX*1],AH	; clear pattern
+	NOT	AH	; negate AH
+	PUSH	EDX
+	PUSH	EAX
+
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,40[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	POP	EAX
+	POP	EDX
+	
+	MOV	GS:[EDI+EDX*1],AH
+	ROL	AX,8
+	INC	EDX
+	CMP	EDX,help
+	JL	P16mid
+P16right	MOV	help1,EDX
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX
+	MOV	EAX,help2
+	MOV	EDX,help1
+	MOV	CH,GS:[EDI+EDX*1]
+	
+	PUSH	EDX
+	PUSH	EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	
+	POP	EAX
+	POP	EDX
+	NOT	AH	; negate AH
+	MOV	GS:[EDI+EDX*1],AH	; clear pattern
+	NOT	AH	; negate AH
+	PUSH	EDX
+	PUSH	EAX
+
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,40[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	POP	EAX
+	POP	EDX
+	
+	MOV	GS:[EDI+EDX*1],AH
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	MOV	DX,GC
+	MOV	AH,leftmask	; prepare rightmask again
+	MOV	AL,8
+	OUT	DX,AX
+	XOR	EDX,EDX
+	INC	EBX
+	CMP	BL,1[ESI]	; height of pattern reached?
+	JNE	P16left
+	XOR	EBX,EBX	; yes, then reset counter
+	JMP	P16left
+	
+R16	MOV	AH,40[EBP]
+	MOV	color,AH
+R16left	MOV	AX,2[ESI+EBX*2]	; replace p.w = 16
+	CMP	help3, 8:byte
+	JGE	label1
+	ROR	AX, 8
+label1	MOV	CL, 32[EBP]
+	ROL	AX,CL
+	XOR	DX,DX
+	MOV	DL,AL
+	MOV	AL,rev[EDX]
+	MOV	DL,AH
+	MOV	AH,rev[EDX]
+	MOV	help2,EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02
+	OUT	DX,AX
+	MOV	CH,GS:[EDI]	; latch
+	MOV	GS:[EDI],0 : byte
+	MOV	AH,color
+	MOV	AL,2
+	OUT	DX,AX	; set color
+	MOV	EAX,help2
+	MOV	GS:[EDI],AH
+	ROL	AX,8
+	MOV	EDX,1
+	CMP	EDX,help
+	JE	R16right
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08
+	OUT	DX,AX
+	MOV	EDX,1
+	MOV	EAX,help2
+R16mid	MOV	help1,EDX
+	MOV	help2,EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02
+	OUT	DX,AX
+	XCHG	help1,EDX
+	MOV	GS:[EDI+EDX*1],0 : byte
+	XCHG	help1,EDX
+	MOV	AH,color
+	MOV	AL,2
+	OUT	DX,AX	; set color
+	XCHG	help1,EDX
+	XCHG	help2,EAX
+	MOV	GS:[EDI+EDX*1],AH
+	ROL	AX,8
+	INC	EDX
+	CMP	EDX,help
+	JL	R16mid
+R16right	MOV	help1,EDX
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AX,$0F02
+	OUT	DX,AX
+	XCHG	help1,EDX
+	MOV	CH,GS:[EDI+EDX*1]	; latch
+	MOV	GS:[EDI+EDX*1],0 : byte
+	XCHG	help1,EDX
+	MOV	AH,color
+	MOV	AL,2
+	OUT	DX,AX	; set color
+	MOV	EAX,help2
+	MOV	EDX,help1
+	MOV	GS:[EDI+EDX*1],AH
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	MOV	DX,GC
+	MOV	AH,leftmask	; prepare rightmask again
+	MOV	AL,8
+	OUT	DX,AX
+	XOR	EDX,EDX
+	INC	EBX
+	CMP	BL,1[ESI]	; height of pattern reached?
+	JNE	R16left
+	XOR	EBX,EBX	; yes, then reset counter
+	JMP	R16left
+onebyte	CMP	[ESI],16 : byte	; width = 16 ?
+	SETE	flag	; flag = 1 if p.w=16
+	CMP	8[EBP],0 : byte	; replace ?
+	JE	onebyteR
+	CMP	8[EBP],1 : byte	; paint ?
+	JE	onebyteP
+IPonebyte	CMP	flag,1
+	JNE	p32
+	MOV	AX,2[ESI+EBX*2]	; p.w = 16
+	CMP	help3, 8:byte
+	JGE	label2
+	ROR	AX, 8
+label2	MOV	CL, 32[EBP]
+	ROL	AX, CL
+	JMP	down
+p32	MOV	EAX,2[ESI+EBX*4]	; p.w = 32
+	CMP	help3, 24:byte
+	JL	labela
+	ROR	EAX, 24
+	JMP	labelc
+labela	CMP	help3, 16:byte	
+	JL	labelb
+	ROR	EAX, 16
+	JMP	labelc
+labelb	CMP	help3, 8:byte 
+	JL	labelc
+	ROR	EAX, 8
+labelc	MOV	CL, 32[EBP]
+	ROL	EAX,CL
+down	XOR	DX,DX
+	MOV	DL,AL
+	MOV	DL,rev[EDX]
+	AND	AL,rightmask
+	MOV	CH,GS:[EDI]	; latch
+	MOV	GS:[EDI],AL
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	INC	EBX
+	CMP	BL,1[ESI]
+	JNE	IPonebyte
+	XOR	EBX,EBX
+	JMP	IPonebyte
+	
+onebyteP	CMP	flag,1
+	JNE	pp32
+	MOV	AX,2[ESI+EBX*2]	; p.w = 16
+	CMP	help3, 8:byte
+	JGE	plabel2
+	ROR	AX, 8
+plabel2	MOV	CL, 32[EBP]
+	ROL	AX, CL
+	JMP	pdown
+pp32	MOV	EAX,2[ESI+EBX*4]	; p.w = 32
+	CMP	help3, 24:byte
+	JL	plabela
+	ROR	EAX, 24
+	JMP	plabelc
+plabela	CMP	help3, 16:byte	
+	JL	plabelb
+	ROR	EAX, 16
+	JMP	plabelc
+plabelb	CMP	help3, 8:byte 
+	JL	plabelc
+	ROR	EAX, 8
+plabelc	MOV	CL, 32[EBP]
+	ROL	EAX,CL
+pdown	XOR	DX,DX
+	MOV	DL,AL
+	MOV	DL,rev[EDX]
+	AND	AL,rightmask
+	MOV	CH,GS:[EDI]	; latch
+
+	PUSH	EDX
+	PUSH	EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	
+	POP	EAX
+	NOT	AL	; negate AL
+	MOV	GS:[EDI],AL	; clear pattern
+	NOT	AL	; negate AL
+	PUSH	EAX
+
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,40[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	POP	EAX
+	POP	EDX
+
+	MOV	GS:[EDI],AL
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	INC	EBX
+	CMP	BL,1[ESI]
+	JNE	onebyteP
+	XOR	EBX,EBX
+	JMP	onebyteP
+	
+onebyteR	MOV	AH,40[EBP]	; replace in 1 byte
+	MOV	color,AH
+Ronebyte	CMP	flag,1
+	JNE	p32r
+	MOV	AX,2[ESI+EBX*2]	; p.w = 16
+	CMP	help3, 8:byte
+	JGE	label3
+	ROR	AX, 8
+label3	MOV	CL, 32[EBP]
+	ROL	AX, CL
+	JMP	downr
+p32r	MOV	EAX,2[ESI+EBX*4]	; p.w = 32
+	CMP	help3, 24:byte
+	JL	labelc1
+	ROR	EAX, 24
+	JMP	labelc1
+labela1	CMP	help3, 16:byte	
+	JL	labelb1
+	ROR	EAX, 16
+	JMP	labelc1
+labelb1	CMP	help3, 8:byte 
+	JL	labelc1
+	ROR	EAX, 8
+labelc1	MOV	CL, 32[EBP]
+	ROL	EAX,CL
+downr	XOR	EDX,EDX
+	MOV	DL,AL
+	MOV	AL,rev[EDX]
+	MOV	help1,EAX
+	MOV	AH,leftmask
+	AND	AH,rightmask
+	MOV	DX,GC
+	MOV	AL,8
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AX,$0F02
+	OUT	DX,AX
+	MOV	CH,GS:[EDI]	; latch
+	MOV	GS:[EDI],0 : byte
+	MOV	AH,color
+	MOV	AL,2
+	OUT	DX,AX	; set color
+	MOV	EAX,help1
+	MOV	GS:[EDI],AL
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	INC	EBX
+	CMP	BL,1[ESI]
+	JNE	Ronebyte
+	XOR	EBX,EBX
+	JMP	Ronebyte
+RP32	CMP	[ESI],32 : byte	; p.w = 32 ?
+	JNE	endRP	; only p.w = 16 OR 32 allowed
+	CMP	8[EBP],0 : byte
+	JE	R32
+	CMP	8[EBP],1 : byte
+	JE	P32left
+
+IP32left	MOV	EAX,2[ESI+EBX*4]	;invert/paint p.w = 32
+	CMP	help3, 24:byte
+	JL	labela2
+	ROR	EAX, 24
+	JMP	labelc2
+labela2	CMP	help3, 16:byte	
+	JL	labelb2
+	ROR	EAX, 16
+	JMP	labelc2
+labelb2	CMP	help3, 8:byte 
+	JL	labelc2
+	ROR	EAX, 8
+labelc2	MOV	CL, 32[EBP]
+	ROL	EAX,CL
+	XOR	EDX,EDX
+	PUSH	CX
+	MOV	CX,4
+iloop	MOV	DL,AL
+	MOV	AL,rev[EDX]
+	ROR	EAX,8
+	LOOP	iloop
+	POP	CX
+	MOV	CH,GS:[EDI]	; latch
+	MOV	GS:[EDI],AL
+	ROR	EAX,8
+	MOV	EDX,1
+	CMP	EDX,help
+	JE	IP32right
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08
+	OUT	DX,AX
+	MOV	EAX,help2
+	MOV	EDX,1
+IP32mid	MOV	CH,GS:[EDI+EDX*1]	; latch
+	MOV	GS:[EDI+EDX*1],AL
+	ROR	EAX,8
+	INC	EDX
+	CMP	EDX,help
+	JL	IP32mid
+IP32right	MOV	help2,EAX
+	MOV	help1,EDX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX
+	MOV	EAX,help2
+	MOV	EDX,help1
+	MOV	CH,GS:[EDI+EDX*1]
+	MOV	GS:[EDI+EDX*1],AL
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	MOV	DX,GC
+	MOV	AH,leftmask	; prepare leftmask again
+	MOV	AL,8
+	OUT	DX,AX
+	XOR	EDX,EDX
+	INC	EBX
+	CMP	BL,1[ESI]	; height of pattern reached?
+	JNE	IP32left
+	XOR	EBX,EBX	; yes, then reset counter
+	JMP	IP32left
+
+P32left	MOV	EAX,2[ESI+EBX*4]	;invert/paint p.w = 32
+	CMP	help3, 24:byte
+	JL	plabela2
+	ROR	EAX, 24
+	JMP	plabelc2
+plabela2	CMP	help3, 16:byte	
+	JL	plabelb2
+	ROR	EAX, 16
+	JMP	plabelc2
+plabelb2	CMP	help3, 8:byte 
+	JL	plabelc2
+	ROR	EAX, 8
+plabelc2	MOV	CL, 32[EBP]
+	ROL	EAX,CL
+	XOR	EDX,EDX
+	PUSH	CX
+	MOV	CX,4
+piloop	MOV	DL,AL
+	MOV	AL,rev[EDX]
+	ROR	EAX,8
+	LOOP	piloop
+	POP	CX
+	MOV	CH,GS:[EDI]	; latch
+
+	PUSH	EDX
+	PUSH	EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	
+	POP	EAX
+	NOT	AL	; negate AL
+	MOV	GS:[EDI],AL	; clear pattern
+	NOT	AL	; negate AL
+	PUSH	EAX
+
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,40[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	POP	EAX
+	POP	EDX
+
+	MOV	GS:[EDI],AL
+	ROR	EAX,8
+	MOV	EDX,1
+	CMP	EDX,help
+	JE	P32right
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08
+	OUT	DX,AX
+	MOV	EAX,help2
+	MOV	EDX,1
+P32mid	MOV	CH,GS:[EDI+EDX*1]	; latch
+
+	PUSH	EDX
+	PUSH	EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	
+	POP	EAX
+	POP	EDX
+	NOT	AL	; negate AL
+	MOV	GS:[EDI+EDX*1],AL	; clear pattern
+	NOT	AL	; negate AL
+	PUSH	EDX
+	PUSH	EAX
+
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,40[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	POP	EAX
+	POP	EDX
+
+	MOV	GS:[EDI+EDX*1],AL
+	ROR	EAX,8
+	INC	EDX
+	CMP	EDX,help
+	JL	P32mid
+P32right	MOV	help2,EAX
+	MOV	help1,EDX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX
+	MOV	EAX,help2
+	MOV	EDX,help1
+	MOV	CH,GS:[EDI+EDX*1]
+
+	PUSH	EDX
+	PUSH	EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; set all planes
+	OUT	DX,AX	; set color/sequencer planemap
+	MOV	AH, ANDbits	; set mode to AND
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	
+	POP	EAX
+	POP	EDX
+	NOT	AL	; negate AL
+	MOV	GS:[EDI+EDX*1],AL	; clear pattern
+	NOT	AL	; negate AL
+	PUSH	EDX
+	PUSH	EAX
+
+	MOV	AH, ORbits	; set mode to OR
+	MOV	AL, 3
+	MOV	DX, GC
+	OUT	DX, AX
+	MOV	AH,40[EBP]	; get color and set bitplanes
+	MOV	AL, 2
+	MOV	DX, SQ
+	OUT	DX, AX
+	POP	EAX
+	POP	EDX
+
+	MOV	GS:[EDI+EDX*1],AL
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	MOV	DX,GC
+	MOV	AH,leftmask	; prepare leftmask again
+	MOV	AL,8
+	OUT	DX,AX
+	XOR	EDX,EDX
+	INC	EBX
+	CMP	BL,1[ESI]	; height of pattern reached?
+	JNE	IP32left
+	XOR	EBX,EBX	; yes, then reset counter
+	JMP	P32left
+
+R32	MOV	AH,40[EBP]
+	MOV	color,AH
+R32left	MOV	EAX,2[ESI+EBX*4]	; replace p.w = 32
+	CMP	help3, 24:byte
+	JL	labela3
+	ROR	EAX, 24
+	JMP	labelc3
+labela3	CMP	help3, 16:byte	
+	JL	labelb3
+	ROR	EAX, 16
+	JMP	labelc3
+labelb3	CMP	help3, 8:byte 
+	JL	labelc3
+	ROR	EAX, 8
+labelc3	MOV	CL, 32[EBP]
+	ROL	EAX,CL
+	XOR	EDX,EDX
+	PUSH	CX
+	MOV	CX,4
+i2loop	MOV	DL,AL
+	MOV	AL,rev[EDX]
+	ROR	EAX,8
+	LOOP	i2loop
+	POP	CX
+	MOV	help2,EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02
+	OUT	DX,AX
+	MOV	CH,GS:[EDI]	; latch
+	MOV	GS:[EDI],0 : byte
+	MOV	AH,color
+	MOV	AL,2
+	OUT	DX,AX	; set color
+	MOV	EAX,help2
+	MOV	GS:[EDI],AL
+	ROR	EAX,8
+	MOV	EDX,1
+	CMP	EDX,help
+	JE	R32right
+	MOV	help2,EAX
+	MOV	DX,GC
+	MOV	AX,$FF08
+	OUT	DX,AX
+	MOV	EDX,1
+	MOV	EAX,help2
+R32mid	MOV	help1,EDX
+	MOV	help2,EAX
+	MOV	DX,SQ
+	MOV	AX,$0F02
+	OUT	DX,AX
+	XCHG	help1,EDX
+	MOV	GS:[EDI+EDX*1],0 : byte
+	XCHG	help1,EDX
+	MOV	AH,color
+	MOV	AL,2
+	OUT	DX,AX	; set color
+	XCHG	help1,EDX
+	XCHG	help2,EAX
+	MOV	GS:[EDI+EDX*1],AL
+	ROR	EAX,8
+	INC	EDX
+	CMP	EDX,help
+	JL	R32mid
+R32right	MOV	help2,EAX
+	MOV	help1,EDX
+	MOV	DX,GC
+	MOV	AH,rightmask
+	MOV	AL,8
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AX,$0F02
+	OUT	DX,AX
+	XCHG	help1,EDX
+	MOV	CH,GS:[EDI+EDX*1]	; latch
+	MOV	GS:[EDI+EDX*1],0 : byte
+	XCHG	help1,EDX
+	MOV	AH,color
+	MOV	AL,2
+	OUT	DX,AX	; set color
+	MOV	EAX,help2
+	MOV	EDX,help1
+	MOV	GS:[EDI+EDX*1],AL
+	SUB	EDI,width3
+	CMP	EDI,topleft
+	JLE	resetgrafRP
+	MOV	DX,GC
+	MOV	AH,leftmask	; prepare leftmask again
+	MOV	AL,8
+	OUT	DX,AX
+	XOR	EDX,EDX
+	INC	EBX
+	CMP	BL,1[ESI]	; height of pattern reached?
+	JNE	R32left
+	XOR	EBX,EBX	; yes, then reset counter
+	JMP	R32left
+	JMP	endRP
+resetgrafRP	MOV	DX,GC
+	MOV	AX,$FF08	; default bit mask
+	OUT	DX,AX
+	MOV	AX,0005	; default mode-reg
+	OUT	DX,AX
+	MOV	AX,0003	; default function
+	OUT	DX,AX
+	MOV	DX,SQ
+	MOV	AX,$0F02	; default map mask
+	OUT	DX,AX
+endRP	PUSH DS
+	POP GS
+	LEAVE
+	RET	36
+

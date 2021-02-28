@@ -1,0 +1,353 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE GIF;
+
+	IMPORT BIT, Display, Files, Pictures, Objects;
+
+	TYPE
+		ScrDscType = RECORD
+			width, height: INTEGER;
+			globalcolmap: BOOLEAN;
+			colresolution, pixel: INTEGER;
+			bgcolor: INTEGER;
+		END;
+		RGBType = RECORD R, G, B: INTEGER END;
+		ImgDscType = RECORD
+			left, top, width, height: INTEGER;
+			localcolmap: BOOLEAN;
+			sequential: BOOLEAN;
+			pixel: INTEGER;
+		END;
+
+	VAR
+		ScrDsc: ScrDscType;
+		ColMap: ARRAY 256 OF RGBType; (* Max. Color-Map-Size *)
+		ImgDsc: ImgDscType;
+		pixel: INTEGER; (* bits per pixel. *)
+		Table: ARRAY 4096 OF RECORD c,ref : INTEGER; END; (* LZW Decompression *)
+		colTrans: ARRAY 256 OF INTEGER;
+
+(* Gif-File support / tk 20.5.95  *)
+
+	(** Check if GIF87a or GIF89a file format *)
+	PROCEDURE CheckGifFile(F: Files.File): BOOLEAN;
+		VAR R: Files.Rider; signature: ARRAY 7 OF CHAR;
+	BEGIN	Files.Set(R, F, 0);
+		Files.ReadBytes(R, signature, 6); (* die signatur ist 6 zeichen lang und sollte GIF87a/GIF89a heissen. *)
+		signature[6] := 0X; RETURN (signature = "GIF87a") OR (signature = "GIF89a")
+	END CheckGifFile;
+
+	(* GIF
+		original code from D. Bauer
+		RS, Wed, 16-Jul-1994: added GIF89a
+		RS, Wed, 17-Aug-1994: added transparent gif's
+		RS, Sat, 3-Sep-1994: faster, no log
+		jm, 2.3.95 support for Windows
+	*)
+
+	PROCEDURE ScanScrDsc(VAR R : Files.Rider);
+		VAR c : CHAR; i : INTEGER;
+	BEGIN
+		Files.ReadInt(R,ScrDsc.width); Files.ReadInt(R,ScrDsc.height);
+		Files.Read(R,c); i:=ORD(c); ScrDsc.pixel:=(i MOD 8)+1; i:=i DIV 16; (* ! *)	(*GCCC 0PPP*)
+		ScrDsc.colresolution:=(i MOD 8)+1; i:=i DIV 8;
+		ScrDsc.globalcolmap:=i#0;
+		Files.Read(R,c); ScrDsc.bgcolor:=ORD(c); Files.Read(R,c);
+		(* IF c#0X THEN error := "screen-descriptor"; HALT(99); END; *)
+	END ScanScrDsc;
+
+	PROCEDURE ScanCol(VAR R : Files.Rider; pixel : INTEGER);
+		VAR c : CHAR; i,j : INTEGER;
+	BEGIN
+		i:=0; j:=1; WHILE (i<pixel) DO	INC(j,j); INC(i); END;
+		i:=0; WHILE (i<j) DO
+			Files.Read(R,c);ColMap[i].R:=ORD(c); 
+			Files.Read(R,c);ColMap[i].G:=ORD(c);
+			Files.Read(R,c);ColMap[i].B:=ORD(c);
+			INC(i);
+		END;
+	END ScanCol;
+
+	PROCEDURE ScanImgDsc(VAR R: Files.Rider);
+		VAR error: ARRAY 32 OF CHAR; c : CHAR; i : INTEGER;
+	BEGIN
+		Files.ReadInt(R,ImgDsc.left); Files.ReadInt(R,ImgDsc.top);
+		Files.ReadInt(R,ImgDsc.width); Files.ReadInt(R,ImgDsc.height);
+		Files.Read(R,c); i:=ORD(c); ImgDsc.pixel:=(i MOD 8)+1; i:=i DIV 64; (* ! *)	(*LS00 0PPP*)
+		ImgDsc.sequential:=(i MOD 2)=0; i:=i DIV 2;
+		ImgDsc.localcolmap:=i=1;
+		IF ImgDsc.localcolmap=ScrDsc.globalcolmap THEN error := "image-descriptor"; HALT(99) END;
+	END ScanImgDsc;
+
+	PROCEDURE LZWDecompression(VAR R: Files.Rider; P: Pictures.Picture);
+	(* -> Terry A. Welch, "A Technique for High Performance Data Compression",
+				IEEE Computer, vol 17, June 1984, Page 8-19 *)
+		VAR error: ARRAY 32 OF CHAR;
+			codesize,startcodesize : INTEGER; c : CHAR;
+			buf : INTEGER; buffer : ARRAY 256 OF CHAR; inbuf,bufpos : INTEGER;
+			bitsleft,clearcode,endcode : INTEGER;
+			code,oldcode,incode,intab,instack,codestart,k,fin : INTEGER;
+			stack : ARRAY 1024 OF INTEGER;
+			n: INTEGER; x, y, w: INTEGER;
+			dots: POINTER TO ARRAY OF INTEGER; 
+
+		PROCEDURE Dot(col: INTEGER);
+		BEGIN
+			dots[x] := colTrans[col MOD 256];
+			INC(x); DEC(w); 
+			IF w = 0 THEN 
+				w := P.width; x := 0;
+				Pictures.PutLine(P, dots^, x, y, P.width);
+				IF ImgDsc.sequential THEN DEC(y)
+				ELSE
+					IF n >= 8 THEN DEC(y, 2*4) ELSE DEC(y, 2*n) END;
+					IF y < 0 THEN n := n DIV 2; y := P.height - 1 - n END	(*interlace*)
+				END
+			END
+		END Dot;
+
+		PROCEDURE ReadNext(VAR i : INTEGER) : BOOLEAN;
+		(* produce next code until end. *)
+			CONST bitsin=8; (* CHAR has 8 bits. *)
+			VAR a,b,d,bitsneed,newbits : INTEGER; c : CHAR;
+		BEGIN
+			IF bitsleft<codesize THEN
+				(* fewer bits than needed... *)
+				bitsneed:=codesize-bitsleft; b:=0;
+				WHILE (bitsneed>0) DO
+					IF bufpos=inbuf THEN (* Read next block *)
+						Files.Read(R,c);
+						inbuf:=ORD(c); bufpos:=0;
+						Files.ReadBytes(R, buffer, inbuf)
+					END;
+					IF inbuf=0 THEN i:=0; RETURN(FALSE) END;
+					a:=ORD(buffer[bufpos]); INC(bufpos);
+					IF bitsneed<bitsin THEN
+						b:=BIT.ILSH(a, SHORT(-bitsneed));
+						DEC(a, BIT.ILSH(b, SHORT(bitsneed)));
+						newbits:=bitsneed
+					ELSE newbits:=bitsin;
+					END;
+					INC(buf, BIT.ILSH(a, SHORT(bitsleft)));
+					INC(bitsleft,bitsin); DEC(bitsneed,newbits);
+				END;
+				i:=buf; DEC(bitsleft,codesize); buf:=b;
+			ELSE
+				(* enough bits *)
+				d:=BIT.ILSH(buf, SHORT(-codesize)); d:=BIT.ILSH(d, SHORT(codesize));
+				a:=buf-d;
+				buf:=BIT.ILSH(buf, SHORT(-codesize));
+				DEC(bitsleft, codesize);
+				i:=a;
+			END;
+			RETURN(TRUE);
+		END ReadNext;
+
+	BEGIN
+		Files.Read(R,c); codesize:=ORD(c); 
+		clearcode:=BIT.ILSH(1, SHORT(codesize));
+		endcode:=clearcode+1;
+		INC(codesize); startcodesize:=codesize; (* effective codesize *)
+		bitsleft:=0; buf:=0; incode:=0; inbuf:=0; bufpos:=0;
+		intab:=0; instack:=-1; codestart:=clearcode+2;
+		IF ~ReadNext(code) THEN error := "Decompress1"; HALT(99) END;
+		IF code=clearcode THEN (* Table already cleared. *)
+			IF ~ReadNext(code) THEN error := "Decompress2"; HALT(99) END;
+		END;
+		x := 0; y := P.height-1;
+		w := P.width; NEW(dots, w);
+		IF ~ImgDsc.sequential THEN n := 1;
+			WHILE n < P.height DO INC(n, n) END;
+			IF n > 8 THEN n := 8 END
+		END;
+		oldcode:=code;
+		k:=code; fin:=k; Dot(code);
+		incode:=code;
+		WHILE ReadNext(code) DO
+			IF code=endcode THEN RETURN; END;	(* exit seen. *)
+			IF code=clearcode THEN (* clear table *)
+				intab:=0; codesize:=startcodesize;
+				IF ~ReadNext(code) THEN error := "Decompress3"; HALT(99) END;
+				oldcode:=code;
+				k:=code; fin:=k; Dot(code);
+				incode:=code
+			ELSE
+				incode:=code;
+				IF (code>=intab+codestart) THEN	(* abnormal case : unknown code ! *)
+					INC(instack); stack[instack]:=fin;
+					code:=oldcode; incode:=codestart+intab
+				END;
+				WHILE (code>=codestart) DO	(* recursive develop code *)
+					k:=Table[code-codestart].c;
+					INC(instack); stack[instack]:=k;
+					code:=Table[code-codestart].ref
+				END;
+				k:=code; fin:=k; Dot(code);
+				WHILE (instack>=0) DO
+					Dot(stack[instack]); DEC(instack)
+				END;
+				Table[intab].c:=k; Table[intab].ref:=oldcode; INC(intab);
+				IF intab+codestart=BIT.ILSH(1, SHORT(codesize)) THEN (* new codesize *)
+					INC(codesize);
+					IF codesize=13 THEN codesize:=12 END
+				END;
+				oldcode:=incode
+			END;
+		END; 
+	END LZWDecompression;
+
+	(*
+		Fx {len {byte}*len} 0X
+		FE {len {byte}*len} 0X	text
+		F9 04 01 00 00 2B	color 2B is transparent
+		--
+		F9: Graphic Control Label
+		04: len
+		01: transparent index
+		00 00: delay time (?)
+		2B: index of "transparent" color
+	*)
+	PROCEDURE ExtBlock(VAR R: Files.Rider; VAR tx: INTEGER);
+		VAR n: INTEGER; t, x, y: CHAR; pos: LONGINT;
+	BEGIN
+		Files.Read(R, t); Files.Read(R, x); pos := Files.Pos(R);	(*label len*)
+		IF t = 0F9X THEN Files.Read(R, y);
+			IF y = 1X THEN	(*transparent*)
+				Files.Read(R, y); Files.Read(R, y);	(*delay time*)
+				Files.Read(R, y); tx := ORD(y)	(*index*)
+			END;
+			Files.Set(R, Files.Base(R), pos+ORD(x));
+			Files.Read(R, x)
+		END;
+		WHILE x # 0X DO
+			n := ORD(x); WHILE n > 0 DO Files.Read(R, x); DEC(n) END;
+			Files.Read(R, x)
+		END
+	END ExtBlock;
+
+	PROCEDURE PickNearestColors(colorConversion: BOOLEAN);
+	VAR r, g, b: ARRAY 256 OF INTEGER; i, j, minj, red, green, blue, x, y, z, C: INTEGER; min, d: LONGINT;
+	BEGIN
+		C := SHORT(ASH(1, Display.Depth(0)));
+		IF C > 256 THEN
+			C := 256
+		END;
+		i := 0;
+		WHILE i < C DO
+			colTrans[i] := i; Display.GetColor(i,r[i],g[i],b[i]); 
+			INC(i);
+		END;
+		IF colorConversion THEN
+			i := 0;
+			WHILE i < C DO
+				red := ColMap[i].R; green := ColMap[i].G; blue := ColMap[i].B;
+				j := 0; min := MAX(LONGINT);
+				WHILE j < C DO
+					x := ABS(red - r[j]); y := ABS(green - g[j]); z := ABS(blue - b[j]);
+					d := x;
+					IF y > d THEN d := y END;
+					IF z > d THEN d := z END;
+					d := d*d + (LONG(x) * x + LONG(y)* y + LONG(z) * z);
+					IF d < min THEN min := d; minj := j END;
+					INC(j)
+				END;
+				colTrans[i] := minj;
+				INC(i);
+			END
+		END;
+	END PickNearestColors;
+	
+	PROCEDURE ^ Handle* (obj: Objects.Object; VAR msg: Objects.ObjMsg);
+	
+	(** Read GIF file. transparentCol is the color index to be used as background color. colorConversion indicates
+	if the GIF file palette and contents should be converted to the current physical palette. Color matching
+	is done by euclidean distance *)
+	
+	PROCEDURE LoadGif(VAR R: Files.Rider; transparentCol: INTEGER; colorConversion: BOOLEAN; pict: Pictures.Picture);
+	VAR signature: ARRAY 7 OF CHAR; i, tx: INTEGER; c: CHAR;
+	BEGIN
+		Files.ReadBytes(R, signature, 6); (* die signatur ist 6 zeichen lang und sollte GIF87a heissen. *)
+		signature[6] := 0X;
+		IF (signature # "GIF87a") & (signature # "GIF89a") THEN Files.Set(R, Files.Base(R), Files.Pos(R)-6); RETURN END;
+		ScanScrDsc(R);
+		IF ScrDsc.globalcolmap THEN
+			ScanCol(R,ScrDsc.pixel); pixel:=ScrDsc.pixel;
+			PickNearestColors(colorConversion);
+		END;
+		Files.Read(R,c); (* image-seperator-character *)
+		tx := -1;
+        WHILE ~R.eof & (c = "!") DO
+        	ExtBlock(R, tx); Files.Read(R,c)
+        END;
+		WHILE (c=",") DO
+			ScanImgDsc(R);
+			IF ImgDsc.localcolmap THEN ScanCol(R,ImgDsc.pixel); pixel:=ImgDsc.pixel END;
+			Pictures.Create(pict,ImgDsc.width,ImgDsc.height,8); (* Bild mit den richtigen Dimensionen erzeugen. *)
+			IF pict.depth = 0 THEN RETURN ELSE pict.handle := Handle END; (* not enough memory *)
+			IF tx >= 0 THEN Display.GetColor(transparentCol, ColMap[tx].R,ColMap[tx].G,ColMap[tx].B) END;	(*transparent*)
+			IF colorConversion THEN
+				i:=0;
+				WHILE (i < 256) DO
+					Display.GetColor(i, ColMap[i].R, ColMap[i].G, ColMap[i].B);
+					INC(i)
+				END
+			END;
+			i:=0;
+			WHILE (i < 256) DO
+				Pictures.SetColor(pict, i, ColMap[i].R, ColMap[i].G, ColMap[i].B); INC(i)
+			END;
+			LZWDecompression(R, pict);
+			Files.Read(R, c) (* image-seperator-character *)
+		END
+	END LoadGif;
+
+	PROCEDURE Handle* (obj: Objects.Object; VAR msg: Objects.ObjMsg);
+		VAR R: Files.Rider;
+	BEGIN
+		WITH obj: Pictures.Picture DO
+			IF msg IS Objects.AttrMsg THEN
+				WITH msg: Objects.AttrMsg DO 
+					IF (msg.id = Objects.get) & (msg.name = "Gen") THEN 
+						msg.class := Objects.String; COPY("GIF.NewPicture", msg.s); msg.res:=0 
+					END;
+				END;
+			ELSIF msg IS Objects.FileMsg THEN
+				WITH msg: Objects.FileMsg DO
+					IF (msg.id = Objects.load) THEN
+						R := msg.R; LoadGif(msg.R, 14, TRUE, obj); msg.len := Files.Pos(msg.R) - Files.Pos(R)
+					ELSE
+						Pictures.Handle(obj, msg)
+					END;
+				END
+			ELSE 
+				Pictures.Handle(obj, msg)
+			END
+		END
+	END Handle;
+
+
+	(** Called from Pictures.Open to try and load a GIF picture. The picture descriptor is pre-allocated by Pictures in
+	Objects.NewObj. InitPicture overwrites the handler of the picture with a new handler that will load the GIF picture
+	when a FileMsg is received (variant load). *)
+	PROCEDURE InitPicture*;
+	BEGIN
+		Objects.NewObj.handle := Handle;
+	END InitPicture;
+	
+	PROCEDURE NewPicture*;
+		VAR P: Pictures.Picture;
+	BEGIN NEW(P); P.handle := Handle; Objects.NewObj := P
+	END NewPicture;
+
+END GIF.

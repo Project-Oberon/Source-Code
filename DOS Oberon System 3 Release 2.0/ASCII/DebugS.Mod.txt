@@ -1,0 +1,1129 @@
+MODULE DebugS;
+
+(* Module: DebugS, handling of data structures *)
+(* Author: Martin Buechi *)
+(* Language: Oberon(-1) including FOR loops *)
+(* System: Oberon System 3 DOS Release 1.5, Pharlap Release 1.5, Process System Release 2.0 *)
+(* Version: 1.0 *)
+(* Date of last change: 19.02.1995 *)
+
+	IMPORT
+		SYSTEM, Modules, Files, Texts, DOCS, DOCT, DOCC, Compiler,
+		DebugT, DebugD;
+		
+	CONST
+		maxImps=24; (* max number of imported modules, as in DOCT *)
+		(* object modes, as in DOCT, DOCC, Compiler *)
+		mVar*=1; mInd*=3; mFld*=12; mTyp*=13; mLProc*=14; mXProc*=15; mIProc*=18;
+		(* forms, as in DOCT, Compiler *)
+		fByte*=1; fBool*=2; fChar*=3; fSInt*=4; fInt*=5; fLInt*=6; fReal*=7; fLReal*=8; fSet*=9; fString*=10;
+		fNoTyp*=12; fPointer*=13; fProcTyp*=14; fArray*=15; fDynArr*=16; fRecord*=17;
+		(* states of modules *)
+		notchecked*=0; sourceavailable*=1; symbolavailable*=2; objectavailable*=3;
+		(* results of find *)
+		found*=0; nil*=1; invalid*=2; notd*=3; nofollowfield*=4; notenoughmem*=5; typenotfound*=6; cycle*=7; notfound*=8;
+		(* symbols, as in DOCS, Compiler *)
+		eql*=9; neq*=10; lss*=11; leq*=12; gtr*=13; geq*=14; sIN*=15; sIS*=16; number*=34; string*=36; ident*=37; set*=-1;
+		(* number types as in DOCS *)
+		char*=1; integer*=2; real*=3; longreal*=4;
+		ProcTag*=0F8X; (* procedure tag in reference block of object files *)
+		MainRefTag="$";
+		nlen=128; (* length of DOCS.name *)
+		Alloc=32; (* pointers are allocated at addresses which are multiples of this *)
+		MaxFollows*=32; (* nof follow fields in find *)
+		MaxPathLen=4096; (* find history length *)
+		MaxDepth=32768; (* stack size for find *)
+		Sext=".Mod"; SFext=".Sym"; OFext=".Obj";
+	
+	TYPE	
+		PTROff*=POINTER TO PTROffDesc; (* pointer offsets in type descriptor, used for records without defining source code *)
+		PTROffDesc*=RECORD
+			offset*: LONGINT;
+			next*: PTROff
+		END;
+		myModule*=POINTER TO myModuleDesc; (* dumped modules *)
+		Proc*=POINTER TO ProcDesc;
+		TD*=POINTER TO TDDesc; (* type descriptors *)
+		TDDesc*=RECORD
+			typ*: DOCT.Struct; (* record type *)
+			ptr*: DOCT.Object; (* (first) pointer referencing record, used for displaying actual type *)
+			adr: LONGINT; 
+			ptroffs*: PTROff;
+			next: TD;
+			mod*, ptrmod*: myModule (* module where record, pointer has been defined *)
+		END;
+		myModuleDesc*=RECORD (Modules.ModuleDesc)
+			adr: LONGINT; (* address of module descriptor (link is pointer type and must be NIL because of garbage collector) *)
+			SymbolTable*: DOCT.Object;
+			pcList: DOCC.StopList; (* list of pc's and corresponding source positions of procedures on stack *)
+			RecTab: TD;
+			state*: SHORTINT;
+			nofGmod: INTEGER;
+			GlbMod*: ARRAY maxImps OF myModule;
+			procedures: Proc;
+			next*: myModule
+		END;
+		ItemMsg*=RECORD
+		END;
+		Item*=POINTER TO ItemDesc;
+		Handle*=PROCEDURE (item: Item; VAR M: ItemMsg);
+		ItemDesc*=RECORD
+			no*: LONGINT;
+			mod*: myModule;
+			handle*: Handle;
+			next: Item
+		END;
+		Unit*=POINTER TO UnitDesc; (* unit is either Proc or Mod *)
+		UnitDesc*=RECORD (ItemDesc)
+			stacklink*: Unit;
+			pc*: LONGINT; (* absolute PC *)
+			desc*: DOCC.StopList; (* to get corresponding source position *)
+		END;
+		ProcDesc*=RECORD (UnitDesc)
+			name*: DebugT.Name;
+			refpos*, fp*: LONGINT; (* start of reference information in reference block of object file, fp *)
+			link: Proc
+		END;
+		Mod*=POINTER TO ModDesc;
+		ModDesc=RECORD (UnitDesc)
+		END;
+		Var*=POINTER TO VarDesc;
+		VarDesc*=RECORD (ItemDesc)
+			typ*: DOCT.Struct;
+			base*: LONGINT; (* address of variable *)
+		END;
+		Array*=POINTER TO ArrayDesc;
+		ArrayDesc*=RECORD (VarDesc)
+		END;
+		DynArray*=POINTER TO DynArrayDesc; (* open array parameters *)
+		DynArrayDesc*=RECORD (ArrayDesc)
+			sizeadr*: LONGINT; (* address of size information *)
+		END;
+		Record*=POINTER TO RecordDesc;
+		RecordDesc*=RECORD (VarDesc)
+			td*: TD
+		END;
+		Pointer*=POINTER TO PointerDesc;
+		PointerDesc*=RECORD (VarDesc)
+			td*: TD;
+		END;
+		Address*=POINTER TO AddressDesc; (* pointer without type descriptor *)
+		AddressDesc*=RECORD (VarDesc)
+		END;
+		Reference=RECORD (* entry in reference block of object file *)
+			mode: CHAR;
+			form: SHORTINT;
+			offset:  LONGINT;
+			name: DebugT.Name
+		END;
+		Follow*=RECORD (* field to follow in find *)
+			field*: ARRAY MaxFollows OF DebugT.Name;
+			nof*: LONGINT
+		END;
+		Chain*=POINTER TO ChainDesc; (* list of already found matching items *)
+		ChainDesc=RECORD
+			adr: LONGINT;
+			next: Chain;
+		END;
+		SearchCriteria*=RECORD (* search criteria for find *)
+			sym*, numtyp*: INTEGER;
+			intval*: LONGINT;
+			realval*: REAL;
+			lrlval*: LONGREAL;
+			name*: ARRAY nlen OF CHAR;
+			set*: SET;
+			modname*, typename*, condfield*: DebugT.Name;
+			op*: INTEGER;
+			neg*: BOOLEAN;
+			ptr*, res*: Pointer;
+			follow*: Follow;
+			given*: Chain;
+			handle*: Handle;
+		END;
+		visitmark=POINTER TO ARRAY (MAX(LONGINT) DIV SIZE(SET)) OF SET; (* already visited objects to detect cycles *)
+		PathItem*=RECORD (* path to item *)
+			no*, noffollowed*: LONGINT (* field no, and number of times followed *)
+		END;
+		Path*=POINTER TO ARRAY MaxPathLen OF PathItem;
+		
+	VAR
+		CurDumpName: DebugT.Name;
+		nofItems: LONGINT;
+		ModuleList*: myModule;
+		ItemList: Item;
+		nlmod: myModule; (* no module, used as sentinel *)
+		pointertyp*: DOCT.Struct; (* anonymous pointer type *)
+		stack*: Unit;
+	
+	(* ______________________________ forward declarations ____________________________ *)	
+		
+	PROCEDURE ^ Recompile*(mod: myModule);
+	
+	PROCEDURE ^ GetImportedType*(VAR t: DOCT.Struct; VAR mod: myModule);
+	
+	PROCEDURE ^ CreateST(mod: myModule);
+	
+	PROCEDURE ^ Unique(mod: myModule; VAR name: DebugT.Name): BOOLEAN;
+	
+		
+	(* ______________________________ auxiliary ____________________________ *)
+	
+	PROCEDURE MakeName*(basename, extension: ARRAY OF CHAR; VAR name: ARRAY OF CHAR);
+	(* name:= basename + extension *)
+		VAR i, j: LONGINT;
+	BEGIN
+		i:=0; WHILE basename[i]#0X DO name[i]:=basename[i]; INC(i) END;
+		j:=-1; REPEAT INC(j); name[i+j]:=extension[j] UNTIL extension[j]=0X
+	END MakeName;
+
+		
+	(* ______________________________ type descriptors ____________________________ *)
+		
+	PROCEDURE FixPtrs(mod: myModule; o: DOCT.Object);
+	(* associate pointer types to type descriptors *)
+		VAR
+			td: TD;
+			i, tdadr: LONGINT;
+			res: BOOLEAN;
+			typ: DOCT.Struct;
+			m: myModule;
+	BEGIN
+		WHILE o#NIL DO
+			IF (o.mode=mTyp) & (o.typ.form=fPointer) THEN
+				typ:=o.typ.BaseTyp; m:=mod;
+				IF typ.mno#0 THEN GetImportedType(typ, m); Recompile(m) END;
+				IF m#NIL THEN td:=m.RecTab ELSE td:=NIL END;
+				i:=0;
+				LOOP
+					IF td=NIL THEN EXIT END;
+					DebugD.GetLInt(m.tdescs+i, tdadr, res);
+					IF res & (tdadr=typ.adr) THEN 
+						IF td.ptr=NIL THEN td.ptr:=o; td.ptrmod:=mod END; EXIT
+					END;
+					INC(i, 4); td:=td.next
+				END
+			ELSIF o.mode IN {mLProc, mXProc, mLProc} THEN FixPtrs(mod, o.dsc) (* traverse procedure scope *)
+			END;
+			o:=o.next
+		END
+	END FixPtrs;
+		
+	PROCEDURE FixTDs(mod: myModule);
+	(* associate record types to type descriptors *)
+		VAR
+			td: TD;
+			i: LONGINT;		
+	BEGIN
+		td:=mod.RecTab; i:=0;
+		WHILE (td#NIL) & (DOCC.RecTab[i]#NIL) DO td.typ:=DOCC.RecTab[i]; td:=td.next; INC(i) END;
+		FixPtrs(mod, mod.SymbolTable)
+	END FixTDs;
+	
+	PROCEDURE RetrieveTypeDesc(mod: myModule);
+	(* get type descriptor information *)
+		VAR
+			td, tdanchor: TD;
+			res: BOOLEAN;
+			ptroffadr, offset, i, tdadr: LONGINT;
+			ptroff, ptroffanchor: PTROff;
+	BEGIN
+		NEW(tdanchor); td:=tdanchor;
+		FOR i:=0 TO mod.nofrecs-1 DO
+			NEW(td.next); td:=td.next;
+			td.mod:=mod; td.typ:=NIL; td.ptr:=NIL; td.typ:=NIL; td.ptroffs:=NIL;
+			DebugD.GetLInt(mod.tdescs+4*i, tdadr, res);
+			DebugD.GetLInt(mod.SB+tdadr, td.adr, res);
+			ptroffadr:=td.adr+4;
+			DebugD.GetLInt(ptroffadr, offset, res); NEW(ptroffanchor); ptroff:=ptroffanchor;
+			WHILE offset>=0 DO
+				NEW(ptroff.next); ptroff:=ptroff.next;
+				ptroff.offset:=offset; INC(ptroffadr, 4); DebugD.GetLInt(ptroffadr, offset, res);
+			END;
+			td.ptroffs:=ptroffanchor.next
+		END;
+		mod.RecTab:=tdanchor.next
+	END RetrieveTypeDesc;
+
+	
+	(* ______________________________ source and symbol file ____________________________ *)
+
+	PROCEDURE FixGmod(mod: myModule);
+	(* update global module references: DOCT.GlbMod -> pointer to myModule *)
+		VAR
+			i: LONGINT;
+			m: myModule;
+	BEGIN
+		mod.nofGmod:=DOCT.nofGmod;
+		FOR i:=0 TO mod.nofGmod-1 DO
+			m:=ModuleList;
+			WHILE (m#NIL) & (DOCT.GlbMod[i].name#m.name) DO m:=m.next END;
+			IF m#NIL THEN
+				mod.GlbMod[i]:=m
+			ELSE
+				mod:=nlmod
+			END
+		END
+	END FixGmod;
+	
+	PROCEDURE FixTypes(o: DOCT.Object; mod: myModule);
+	(* change mno of types in symbol files (mno=1 -> mno=0), associate record types to type descriptors *)
+		VAR
+			t: DOCT.Struct;
+			i, tdadr: LONGINT;
+			td: TD;
+			res: BOOLEAN;
+	BEGIN
+		WHILE o#NIL DO
+			IF (o.mode=mTyp) & (o.typ.form=fRecord) & (o.typ.mno IN {0, 1}) THEN (* associate record type *)
+				td:=mod.RecTab; i:=0;
+				LOOP
+					IF td=NIL THEN EXIT END;
+					DebugD.GetLInt(mod.tdescs+i, tdadr, res);
+					IF res & (tdadr=o.typ.adr) & (td.typ=NIL) THEN td.typ:=o.typ; EXIT END;
+					INC(i, 4); td:=td.next
+				END
+			END;
+			IF o.mode IN {mVar, mInd, mTyp} THEN (* change mno *)
+				t:=o.typ;
+				WHILE t#NIL DO
+					IF t.mno=1 THEN t.mno:=0 END; t:=t.BaseTyp
+				END
+			ELSIF o.mode IN {mLProc, mXProc, mLProc} THEN
+				FixTypes(o.dsc, mod)
+			END;
+			o:=o.next
+		END
+	END FixTypes;
+	
+	PROCEDURE GetObject(VAR name: ARRAY OF CHAR; o: DOCT.Object; kind: SET): DOCT.Object;
+	(* get object with given name and mode *)
+	BEGIN
+		WHILE (o#NIL) & ~((o.name=name) & (o.mode IN kind)) DO o:=o.next END; RETURN o
+	END GetObject;
+	
+	PROCEDURE Merge(obj, sf: DOCT.Object): DOCT.Object;
+	(* merge 2 symbol tables *)
+		VAR cur, anchor: DOCT.Object;
+	BEGIN
+		NEW(anchor); cur:=anchor;
+		WHILE (obj#NIL) OR (sf#NIL) DO
+			IF obj#NIL THEN
+				IF sf#NIL THEN
+					IF (obj.a0>sf.a0) & (obj.a0<0) THEN cur.next:=obj; cur:=obj; obj:=obj.next
+					ELSIF obj.a0=sf.a0 THEN cur.next:=sf; cur:=sf; sf:=sf.next; obj:=obj.next
+					ELSE cur.next:=sf; cur:=sf; sf:=sf.next
+					END
+				ELSE cur.next:=obj; cur:=obj; obj:=obj.next
+				END
+			ELSE cur.next:=sf; cur:=sf; sf:=sf.next
+			END
+		END;
+		RETURN anchor.next
+	END Merge;
+	
+	PROCEDURE RetrieveSymbolFile(mod: myModule);
+	(* get symbol file information *)
+		VAR
+			last: LONGINT;
+			name, self: DebugT.Name;
+			o, lastscope: DOCT.Object;
+			proc: Proc;
+	BEGIN
+		CreateST(mod);
+		DOCT.nofGmod:=0;
+		MakeName(mod.name, SFext, name);
+		self:=""; (* used to detect cyclic imports in compiler, not needed here *)
+		DOCS.MarkErrors:=FALSE; DOCT.Import(mod.name, self, name);
+		IF DOCT.nofGmod>0 THEN
+			mod.state:=symbolavailable; o:=DOCT.GlbMod[0];
+			FixTypes(o, mod); FixGmod(mod); FixPtrs(mod, o); 
+			mod.SymbolTable:=Merge(mod.SymbolTable, o); DOCT.Close;
+			proc:=mod.procedures; last:=-1;
+			WHILE proc#NIL DO
+				IF proc.refpos=last THEN proc.desc.scope:=lastscope
+				ELSIF Unique(mod, proc.name) THEN
+					o:=GetObject(proc.name, mod.SymbolTable, {mLProc..mIProc});
+					IF o#NIL THEN o.dsc:=Merge(proc.desc.scope, o.dsc); proc.desc.scope:=o.dsc END
+				END;
+				lastscope:=proc.desc.scope; last:=proc.refpos; proc:=proc.link
+			END
+		END
+	END RetrieveSymbolFile;
+	
+	PROCEDURE Recompile*(mod: myModule);
+	(* get source file information *)
+		VAR
+			name: DebugT.Name;
+			T: Texts.Text;
+	BEGIN
+		IF (mod#NIL) & (mod.state=notchecked) THEN
+			mod.state:=objectavailable; RetrieveTypeDesc(mod);
+			MakeName(mod.name, Sext, name);
+			NEW(T); Texts.Open(T, name); 
+			IF T.len>0 THEN
+				DOCC.endPc:=MAX(LONGINT); Compiler.info:=FALSE;
+				mod.SymbolTable:=Compiler.CompilationUnit(T, 0, TRUE, mod.pcList);
+				IF ~DOCS.scanerr THEN
+					FixGmod(mod); FixTDs(mod); DOCC.Close; DOCT.Close;
+					mod.state:=sourceavailable;
+				ELSE mod.SymbolTable:=NIL; RetrieveSymbolFile(mod)
+				END
+			ELSE
+				RetrieveSymbolFile(mod)
+			END
+		END
+	END Recompile;
+	
+	
+	(* ______________________________ reference block of object file ____________________________ *)
+	
+	PROCEDURE OpenRefFile(mod: Modules.Module): Files.File;
+	(* open object file *)
+		VAR name: DebugT.Name; 
+	BEGIN
+		MakeName(mod.name, OFext, name); RETURN Files.Old(name);
+	END OpenRefFile;
+	
+	PROCEDURE PosRefBlk(RefFile: Files.File; VAR RR: Files.Rider);
+	(* positions the rider at the beginning of the reference block *)
+		VAR refpos: LONGINT;
+	BEGIN
+		Files.Set(RR, RefFile, 1); Files.ReadLInt(RR, refpos); Files.Set(RR, RefFile, refpos+1);
+	END PosRefBlk;
+	
+	PROCEDURE GetEntry(VAR RR: Files.Rider; VAR entry: Reference);
+	(* get the next entry from the reference block *)
+		VAR procoffset: INTEGER;
+	BEGIN
+		Files.Read(RR, entry.mode);
+		IF RR.eof THEN entry.mode:=0X
+		ELSIF entry.mode=ProcTag THEN
+			Files.ReadInt(RR, procoffset); entry.offset:=procoffset; Files.ReadString(RR, entry.name)
+		ELSE (* variable *)
+			Files.Read(RR, entry.form); Files.ReadLInt(RR, entry.offset); Files.ReadString(RR, entry.name)
+		END		
+	END GetEntry;
+	
+	PROCEDURE MainRef(VAR RR: Files.Rider);
+	(* position the rider at the beginning of the reference part of the global variables *)
+		VAR entry: Reference;
+	BEGIN
+		REPEAT GetEntry(RR, entry)
+		UNTIL ((entry.mode=ProcTag) & (entry.name[0]=MainRefTag)) OR (entry.mode=0X)
+	END MainRef;
+			
+	PROCEDURE GetProcName*(mod: Modules.Module; adr: LONGINT; VAR name: ARRAY OF CHAR;
+		VAR refstart: LONGINT; VAR res: BOOLEAN);
+	(* get name and start of reference information of procedure at adr *)
+		VAR
+			RefFile: Files.File;
+			RR: Files.Rider;
+			entry: Reference;
+			procend: LONGINT;
+	BEGIN
+		res:=FALSE; procend:=MAX(LONGINT); RefFile:=OpenRefFile(mod);
+		IF RefFile#NIL THEN
+			PosRefBlk(RefFile, RR);
+			GetEntry(RR, entry);
+			WHILE entry.mode#0X DO
+				IF (entry.mode=ProcTag) & (adr<entry.offset) & (entry.offset<procend) THEN
+					procend:=entry.offset; COPY(entry.name, name); refstart:=Files.Pos(RR); res:=TRUE
+				END;
+				GetEntry(RR, entry)	
+			END
+		END
+	END GetProcName;
+			
+	PROCEDURE Unique(mod: myModule; VAR name: DebugT.Name): BOOLEAN;
+	(* tests whether another procedure has the same name as the given procedure *)
+		VAR
+			RefFile: Files.File;
+			RR: Files.Rider;
+			no: LONGINT;
+			entry: Reference;
+	BEGIN
+		RefFile:=OpenRefFile(mod);
+		IF RefFile#NIL THEN
+			PosRefBlk(RefFile, RR); GetEntry(RR, entry); no:=0;
+			WHILE entry.mode#0X DO
+				IF (entry.mode=ProcTag) & (entry.name=name) THEN INC(no) END;
+				GetEntry(RR, entry)
+			END;
+			RETURN no<=1
+		ELSE RETURN FALSE (* not decidable *)
+		END
+	END Unique;
+		
+	PROCEDURE ReadObjects(RR: Files.Rider): DOCT.Object;
+	(* read information of one procedure *)
+		VAR
+			st, anchor: DOCT.Object;
+			entry: Reference;
+	BEGIN
+		NEW(anchor); st:=anchor; GetEntry(RR, entry);
+		WHILE (entry.mode#0X) & (entry.mode#ProcTag) DO
+			NEW(st.next); st:=st.next; st.mode:=SHORT(ORD(entry.mode)); 
+			CASE entry.form OF
+			| fByte: st.typ:=DOCT.bytetyp
+			| fBool: st.typ:=DOCT.booltyp
+			| fChar: st.typ:=DOCT.chartyp
+			| fSInt: st.typ:=DOCT.sinttyp
+			| fInt: st.typ:=DOCT.inttyp
+			| fLInt: st.typ:=DOCT.linttyp
+			| fReal: st.typ:=DOCT.realtyp
+			| fLReal: st.typ:=DOCT.lrltyp
+			| fSet: st.typ:=DOCT.settyp
+			| fPointer: st.typ:=pointertyp;
+			ELSE st.typ:=DOCT.stringtyp
+			END;
+			st.a0:=entry.offset; COPY(entry.name, st.name); GetEntry(RR, entry)						
+		END;
+		RETURN anchor.next
+	END ReadObjects;
+	
+	PROCEDURE CreateST(mod: myModule);
+	(* build symbol table from reference block of object file *)
+		VAR 
+			RefFile: Files.File;
+			RR: Files.Rider;
+			proc: Proc;
+			last: LONGINT;
+			lastscope: DOCT.Object;
+	BEGIN
+		RefFile:=OpenRefFile(mod);
+		IF RefFile#NIL THEN
+			PosRefBlk(RefFile, RR); MainRef(RR);
+			IF ~RR.eof THEN mod.SymbolTable:=ReadObjects(RR) END;
+			proc:=mod.procedures; last:=-1;
+			WHILE proc#NIL DO
+				IF proc.refpos=last THEN proc.desc.scope:=lastscope
+				ELSE
+					Files.Set(RR, RefFile, proc.refpos); proc.desc.scope:=ReadObjects(RR);
+					last:=proc.refpos; lastscope:=proc.desc.scope
+				END;
+				proc:=proc.link
+			END								
+		END
+	END CreateST;
+
+	
+	(* ______________________________ get type information ____________________________ *)
+	
+	PROCEDURE GetType*(modname, typename: ARRAY OF CHAR; VAR mod: myModule; VAR t: DOCT.Struct);
+	(* get type by name *)
+		
+		PROCEDURE FindType(o: DOCT.Object);
+		(* find (first) type with given name in this or a nested scope (depth first search) *)
+		BEGIN
+			WHILE (t=NIL) & (o#NIL) DO
+				IF (o.mode=mTyp) & (o.name=typename) THEN t:=o.typ
+				ELSIF o.mode IN {mLProc, mXProc, mLProc} THEN FindType(o.dsc) (* traverse procedure scope *)
+				END;
+				o:=o.next;
+			END
+		END FindType;
+		
+	BEGIN
+		mod:=ModuleList; t:=NIL;
+		WHILE (mod#NIL) & (mod.name#modname) DO mod:=mod.next END;
+		IF (mod#NIL) THEN
+			Recompile(mod); FindType(mod.SymbolTable)
+		ELSIF typename="" THEN (* basic type *)
+			mod:=NIL; COPY(modname, typename); DOCT.Init; FindType(DOCT.topScope)
+		ELSE t:=NIL
+		END
+	END GetType;
+	
+	PROCEDURE GetImportedType*(VAR t: DOCT.Struct; VAR mod: myModule);
+	(* get exporting module and exported type from imported type *)
+		VAR
+			o: DOCT.Object;
+			imod: myModule;
+	BEGIN
+		IF t.strobj#NIL THEN
+			imod:=mod.GlbMod[t.mno-1]; Recompile(imod);
+			IF (imod#NIL) & (imod.SymbolTable#NIL) THEN
+				o:=imod.SymbolTable;
+				WHILE (o#NIL) & (o.name#t.strobj.name) DO o:=o.next END;
+				IF o#NIL THEN mod:=imod; t:=o.typ END
+			END
+		END
+	END GetImportedType;
+	
+	PROCEDURE GetField*(typ: DOCT.Struct; curmod: myModule; VAR fieldname: ARRAY OF CHAR): DOCT.Object;
+	(* get record field *)
+		VAR o: DOCT.Object;
+	BEGIN
+		WHILE typ#NIL DO
+			IF typ.mno#0 THEN GetImportedType(typ, curmod) END;
+			IF typ#NIL THEN o:=typ.link ELSE o:=NIL END;
+			WHILE o#NIL DO
+				IF o.name=fieldname THEN RETURN o END; o:=o.next
+			END;
+			typ:=typ.BaseTyp
+		END;
+		RETURN NIL
+	END GetField;
+	
+	PROCEDURE GetTD(val: LONGINT): TD;
+	(* get type descriptor of pointer *)
+		VAR
+			adr, mdadr, tdadr: LONGINT;
+			td: TD;
+			mod: myModule;
+			res: BOOLEAN;
+	BEGIN
+		DebugD.GetLInt(val-4, tdadr, res); DebugD.GetLInt(tdadr-4, adr, res); DebugD.GetLInt(adr+48, mdadr, res);
+		mod:=ModuleList;
+		WHILE (mod#NIL) & (mdadr#mod.adr) DO mod:=mod.next END;
+		IF mod#NIL THEN
+			Recompile(mod);
+			td:=mod.RecTab;
+			WHILE (td#NIL) & (td.adr#tdadr) DO td:=td.next END;
+			RETURN td
+		ELSE (* module has been unloaded/not yet fully loaded *)
+			RETURN NIL
+		END	
+	END GetTD;
+	
+	PROCEDURE PtrArrLen*(ptr: Pointer): LONGINT;
+	(* get actual length of dereferenced array for pointer to array *)
+		VAR
+			x: LONGINT;
+			res: BOOLEAN;
+	BEGIN
+		DebugD.GetLInt(ptr.base-24, x, res);
+		x:=(x-24) DIV ptr.td.typ.BaseTyp.size;
+		IF (x<ptr.td.typ.n) OR (ptr.td.typ.n<0) THEN RETURN x ELSE RETURN ptr.td.typ.n END
+	END PtrArrLen;
+		
+	PROCEDURE Is(t1, t2: DOCT.Struct; m1, m2: myModule): BOOLEAN;
+	(* tests whether t1 is an extension of t2 (both records, not pointers), using symbol information and not tags *)
+	BEGIN
+		IF (t1=NIL) OR (t2=NIL) THEN RETURN FALSE
+		ELSE
+			IF t2.mno#0 THEN GetImportedType(t2, m2) END;
+			WHILE t1#NIL DO
+				IF t1.mno#0 THEN GetImportedType(t1, m1) END;
+				IF t1=t2 THEN RETURN TRUE END;
+				t1:=t1.BaseTyp
+			END;
+			RETURN FALSE
+		END		
+	END Is;
+	
+		
+	(* ______________________________ items ____________________________ *)
+	
+	PROCEDURE GetItem*(no: LONGINT): Item;
+	(* get item by number *)
+		VAR x: Item;
+	BEGIN
+		IF (0<=no) & (no<nofItems) THEN
+			x:= ItemList;
+			WHILE x.no#no DO x:=x.next END;
+			IF x IS Unit THEN Recompile(x(Unit).mod) END;
+			RETURN x
+		ELSE RETURN NIL
+		END
+	END GetItem;
+	
+	PROCEDURE InsertItem(item: Item; dummyno: BOOLEAN);
+	BEGIN
+		IF dummyno THEN item.no:=-1 ELSE item.no:=nofItems; INC(nofItems) END;
+		item.next:=ItemList; ItemList:=item
+	END InsertItem; 	
+	
+	PROCEDURE ValidPtr*(adr: LONGINT; typ: DOCT.Struct): BOOLEAN;
+	(* verify validity of pointer *)
+		VAR
+			td1, td2, tds1, tds2, md, n: LONGINT;
+			res: BOOLEAN;
+	BEGIN
+		DebugD.GetLInt(adr-4, td1, res);
+		IF ~res THEN RETURN FALSE END;
+		IF (typ#NIL) & (typ.form=fArray) THEN (* pointer to array (SysBlk, not ArrayBlk) *)
+			DebugD.GetLInt(td1-4, td2, res);
+			IF ~res OR (td1#td2) THEN RETURN FALSE END;
+			DebugD.GetLInt(td1+4, n, res);
+			RETURN res & (n=-4)
+		ELSE (* pointer to record *)
+			DebugD.GetLInt(td1-4, tds1, res); 
+			IF ~res THEN RETURN FALSE END;
+			DebugD.GetLInt(tds1-4, tds2, res);
+			tds2:=(tds2 DIV 2)*2; (* mask out mask bit (set in type descriptors allocated by loader in some implementations) *)
+			IF ~res OR (tds1#tds2) THEN RETURN FALSE END;
+			DebugD.GetLInt(tds1+4, n, res);
+			IF ~res OR (n#-4) THEN RETURN FALSE END;
+			DebugD.GetLInt(tds1+8, td2, res);
+			IF ~res OR (td1#td2) THEN RETURN FALSE END;
+			DebugD.GetLInt(tds1+48, md, res);
+			RETURN res & (md#0)
+		END
+	END ValidPtr;
+	
+	PROCEDURE InsertPointer*(val: LONGINT; typ: DOCT.Struct; mod: myModule; handle: Handle; VAR ptr: Pointer; VAR new: BOOLEAN);
+	(* insert pointer in item list *)
+		VAR
+			l: Item;
+			td: TD;
+	BEGIN
+		IF ValidPtr(val, typ) THEN
+			l:=ItemList;
+			WHILE (l#NIL) & ~((l IS Pointer) & (l(Pointer).base=val)) DO l:=l.next END;
+			IF l#NIL THEN new:=FALSE; ptr:=l(Pointer)
+			ELSE
+				NEW(ptr); ptr.handle:=handle; ptr.typ:=NIL; ptr.base:=val; ptr.base:=val;
+				IF (typ#NIL) & (typ.form=fArray) THEN (* pointer to array *)
+					NEW(td); td.typ:=typ; td.mod:=mod; ptr.td:=td
+				ELSE (* pointer to record *)
+					ptr.td:=GetTD(val);
+					IF ptr.td=NIL THEN ptr:=NIL; RETURN END;
+				END;
+				ptr.mod:=ptr.td.mod; InsertItem(ptr, FALSE); new:=TRUE
+			END
+		ELSE ptr:=NIL
+		END
+	END InsertPointer;
+	
+	PROCEDURE InsertAddress*(val: LONGINT; handle: Handle; VAR a: Address; VAR new: BOOLEAN);
+	(* insert address in item list *)
+		VAR
+			l: Item;
+			res: BOOLEAN;
+			x: LONGINT;
+	BEGIN
+		DebugD.GetLInt(val, x, res);
+		IF res THEN
+			l:=ItemList;
+			WHILE (l#NIL) & ~((l IS Address) & (l(Address).base=val)) DO l:=l.next END;
+			IF l#NIL THEN
+				a:=l(Address); new:=FALSE
+			ELSE
+				NEW(a); a.handle:=handle; a.typ:=NIL; a.mod:=NIL; a.base:=val; InsertItem(a, FALSE); new:=TRUE
+			END
+		ELSE a:=NIL
+		END
+	END InsertAddress;
+	
+	PROCEDURE InsertArray*(adr: LONGINT; typ: DOCT.Struct; mod: myModule; handle: Handle; VAR arr: Array; VAR new: BOOLEAN);
+	(* insert array in item list *)
+		VAR l: Item;
+	BEGIN
+		l:=ItemList;
+		WHILE (l#NIL) & ~((l IS Array) & (l(Array).base=adr) & (l(Array).typ=typ)) DO l:=l.next END;
+		IF l#NIL THEN
+			arr:=l(Array); new:=FALSE
+		ELSE
+			NEW(arr); arr.handle:=handle; arr.base:=adr; arr.typ:=typ; arr.mod:=mod;
+			InsertItem(arr, FALSE); new:=TRUE
+		END
+	END InsertArray;
+	
+	PROCEDURE InsertDynArray*(adr: LONGINT; typ: DOCT.Struct; sizeadr, adrN: LONGINT;
+					mod: myModule; handle: Handle; VAR openarr: DynArray; VAR new: BOOLEAN);
+	(* insert open array in item list *)
+		VAR
+			l: Item;
+			i: LONGINT;
+			t: DOCT.Struct;
+	BEGIN
+		l:=ItemList;
+		WHILE (l#NIL) & ~((l IS DynArray) & (l(DynArray).base=adr) & (l(DynArray).typ=typ)) DO l:=l.next END;
+		IF l#NIL THEN
+			openarr:=l(DynArray); new:=FALSE
+		ELSE
+			NEW(openarr); openarr.handle:=handle; openarr.base:=adr; openarr.typ:=typ; openarr.mod:=mod;
+			InsertItem(openarr, FALSE); new:=TRUE;
+			IF sizeadr#-1 THEN openarr.sizeadr:=sizeadr (* not first dimension *)
+			ELSE (* first dimension, adrN is address of n'th array dimension *)
+				i:=adrN; t:=typ; WHILE t.form=fDynArr DO t:=t.BaseTyp; INC(i, 4) END; openarr.sizeadr:=i
+			END
+		END
+	END InsertDynArray;
+	
+	PROCEDURE InsertRecord*(adr: LONGINT; typ: DOCT.Struct; mod: myModule; VarPar: BOOLEAN; handle: Handle; VAR rec: Record; VAR new: BOOLEAN);
+	(* insert record in item list *)
+		VAR
+			l: Item;
+			td: TD;
+			res: BOOLEAN;
+	BEGIN
+		td:=NIL;
+		IF VarPar THEN
+			td:=GetTD(adr+8);
+			IF td#NIL THEN typ:=td.typ ELSE typ:=NIL END;
+			DebugD.GetLInt(adr, adr, res)
+		END;
+		l:=ItemList;
+		WHILE (l#NIL) & ~((l IS Record) & (l(Record).base=adr) & (l(Record).typ=typ)) DO l:=l.next END;
+		IF l#NIL THEN
+			rec:=l(Record); new:=FALSE
+		ELSE
+			NEW(rec); rec.handle:=handle; rec.base:=adr; rec.typ:=typ; rec.mod:=mod; rec.td:=td;
+			InsertItem(rec, FALSE); new:=TRUE
+		END
+	END InsertRecord;
+	
+	PROCEDURE InsertMod*(mod: myModule; handle: Handle; VAR m: Mod);
+	(* insert module in item list *)
+		VAR l: Item;
+	BEGIN
+		l:=ItemList;
+		WHILE (l#NIL) & ~((l IS Mod) & (l.mod=mod)) DO l:=l.next END;
+		IF l#NIL THEN m:=l(Mod)
+		ELSE
+			NEW(m); m.handle:=handle; m.mod:=mod; InsertItem(m, TRUE)
+		END
+	END InsertMod;
+	
+	PROCEDURE InsertpcList(VAR l: DOCC.StopList; pc: LONGINT): DOCC.StopList;
+	(* insert procedure pc in list of corresponding module to get source position during recompilation *)
+		VAR s: DOCC.StopList;
+	BEGIN
+		IF (l#NIL) & (pc>l.pc) THEN RETURN InsertpcList(l.next, pc)
+		ELSIF (l=NIL) OR (pc<l.pc) THEN NEW(s); s.next:=l; l:=s; s.pc:=pc; RETURN s
+		ELSE RETURN l (* pc=l.pc *)
+		END
+	END InsertpcList;
+
+	PROCEDURE InsertProc*(mod: myModule; pc, refstart, fp: LONGINT; name: ARRAY OF CHAR;
+		prochandle, modhandle: Handle; VAR unit: Unit);
+	(* insert procedure in item list *)
+		VAR
+			l: Item;
+			proc: Proc;
+			m: Mod;
+	BEGIN
+		IF name[0]=MainRefTag THEN (* module body -> insert module *)
+			InsertMod(mod, modhandle, m); m.pc:=pc; m.desc:=InsertpcList(mod.pcList, pc); unit:=m
+		ELSE (* regular procedure *)
+			l:=ItemList;
+			WHILE (l#NIL) & ~((l IS Proc) & (l(Proc).fp=fp)) DO l:=l.next END;
+			IF l#NIL THEN unit:=l(Proc)
+			ELSE
+				NEW(proc); proc.handle:=prochandle; proc.desc:=InsertpcList(mod.pcList, pc); proc.mod:=mod;
+				proc.refpos:=refstart; proc.fp:=fp; COPY(name, proc.name); InsertItem(proc, TRUE);
+				proc.link:=mod.procedures; mod.procedures:=proc; proc.pc:=pc; unit:=proc
+			END
+		END
+	END InsertProc;
+	
+	PROCEDURE ActivateItem*(item: Item; VAR new: BOOLEAN);
+	(* activate item *)
+	BEGIN
+		IF item.no<0 THEN item.no:=nofItems; INC(nofItems); new:=TRUE ELSE new:=FALSE END
+	END ActivateItem;
+		
+	
+	(* ______________________________ search ____________________________ *)
+	
+	PROCEDURE SearchCount*(VAR x: SearchCriteria; count: LONGINT;
+			VAR history: Path; VAR vlast, result: LONGINT; VAR new: BOOLEAN);
+	(* find count'th item in list *)
+		VAR
+			td: TD;
+			fld: DOCT.Object;
+			res: BOOLEAN;
+			i, last, adr: LONGINT;
+	BEGIN
+		i:=0; adr:=x.ptr.base; last:=0; vlast:=0; NEW(history); history[0].no:=0;
+		LOOP
+			IF ~ValidPtr(adr, NIL) THEN
+				IF adr=0 THEN result:=nil ELSE vlast:=adr; result:=invalid END; history[0].noffollowed:=i-1; EXIT
+			END;
+			IF i>=count THEN
+				InsertPointer(adr, NIL, NIL, x.handle, x.res, new); result:=found; history[0].noffollowed:=i; EXIT
+			END;
+			td:=GetTD(adr);
+			IF td=NIL THEN
+				result:=notd; history[0].noffollowed:=i; EXIT
+			END;
+			fld:=GetField(td.typ, td.mod, x.follow.field[0]);
+			IF fld=NIL THEN
+				result:=nofollowfield; history[0].noffollowed:=i; EXIT
+			END;
+			vlast:=last; last:=adr+fld.a0; DebugD.GetLInt(last, adr, res); INC(i)
+		END;
+	END SearchCount;
+	
+	PROCEDURE Already(chain: Chain; adr: LONGINT): BOOLEAN;
+	(* check whether item has been given as result of previous find *)
+	BEGIN
+		WHILE chain#NIL DO
+			IF adr=chain.adr THEN RETURN TRUE END;
+			chain:=chain.next
+		END;
+		RETURN FALSE
+	END Already;
+	
+	PROCEDURE SearchCond*(VAR x: SearchCriteria;  VAR history: Path; VAR hd, vlast, result: LONGINT; VAR new: BOOLEAN);
+	(* find item that satisfies predicate, depth first search *)
+		VAR
+			res: BOOLEAN;
+			td: TD;
+			fld: DOCT.Object;
+			size, depth, i, p, adr: LONGINT;
+			put: BOOLEAN; (* put element on virtual stack and follow path *)
+			visited: visitmark;
+			t: DOCT.Struct;
+			mod: myModule;
+			recadr: POINTER TO ARRAY MaxDepth OF LONGINT;
+			recno: POINTER TO ARRAY MaxDepth OF SHORTINT;
+			chain: Chain;
+			
+		PROCEDURE CheckCondition(): BOOLEAN;
+		(* check whether item satisfies condition *)
+			VAR
+				sval: SHORTINT;
+				ival: INTEGER;
+				val, fadr: LONGINT;
+				rval: REAL;
+				lrval: LONGREAL;
+				ch: CHAR;
+				name: ARRAY nlen OF CHAR;
+				s: SET;
+				ok, res: BOOLEAN;
+				td0: TD;
+				
+			PROCEDURE CompInt(a: LONGINT): BOOLEAN;
+			(* compare integers *)
+			BEGIN
+				CASE x.op OF
+				| eql, neq: RETURN a=x.intval
+				| lss, geq: RETURN a<x.intval
+				| leq, gtr: RETURN a<=x.intval 
+				| sIN: RETURN a IN x.set;
+				END;
+			END CompInt;
+			
+		BEGIN
+			IF x.op=sIS THEN
+				IF x.condfield="" THEN
+					ok:=Is(td.typ, t, td.mod, mod)
+				ELSE
+					DebugD.GetLInt(adr+fld.a0, fadr, res); td0:=GetTD(fadr);
+					IF td0#NIL THEN ok:=Is(td0.typ, t, td0.mod, mod) ELSE ok:=FALSE END;
+				END;
+			ELSIF x.condfield="" THEN
+				ok:=CompInt(adr);
+			ELSE
+				CASE fld.typ.form OF (* no type test *)
+				| fByte, fBool, fChar:
+					DebugD.GetChar(adr+fld.a0, ch, res); ok:=CompInt(ORD(ch))
+				| fSInt:
+					DebugD.GetSInt(adr+fld.a0, sval, res); ok:=CompInt(sval)
+				| fInt:
+					DebugD.GetInt(adr+fld.a0, ival, res); ok:=CompInt(ival)
+				| fLInt, fNoTyp, fPointer:
+					DebugD.GetLInt(adr+fld.a0, val, res); ok:=CompInt(val)
+				| fReal:
+					DebugD.GetReal(adr+fld.a0, rval, res);
+					CASE x.op OF
+					| eql, neq: ok:=rval=x.realval;
+					| lss, geq: ok:=rval<x.realval;
+					| leq, gtr: ok:=rval<=x.realval;
+					ELSE
+					END;
+				| fLReal:
+					DebugD.GetLReal(adr+fld.a0, lrval, res);
+					CASE x.op OF
+					| eql, neq: ok:=lrval=x.lrlval;
+					| lss, geq: ok:=lrval<x.lrlval;
+					| leq, gtr: ok:=lrval<=x.lrlval;
+					ELSE
+					END;
+				| fSet:
+					DebugD.GetSet(adr+fld.a0, s, res);
+					IF x.op IN {eql, neq} THEN ok:=s=x.set
+					ELSE ok:=FALSE
+					END;
+				| fArray:
+				 	IF fld.typ.BaseTyp.form=fChar THEN (* string *)
+				 		DebugD.GetBytes(adr+fld.a0, name, nlen, res);
+				 		CASE x.op OF
+						| eql, neq: ok:=name=x.name;
+						| lss, geq: ok:=name<x.name;
+						| leq, gtr: ok:=name<=x.name;
+						ELSE
+						END;
+					ELSE ok:=FALSE
+					END;
+				ELSE ok:=FALSE
+				END
+			END;
+			IF x.op IN {neq, geq, gtr} THEN ok:=~ok END;
+			IF x.neg THEN ok:=~ok END;
+			RETURN ok
+		END CheckCondition;
+			
+	BEGIN (* SearchCond *)
+		NEW(history); NEW(recadr); NEW(recno);
+		size:=DebugD.MemSize DIV Alloc DIV DebugT.WordLen * SIZE(SET);
+		SYSTEM.NEW(visited, size);
+		IF visited=NIL THEN
+			result:=notenoughmem
+		ELSE
+			i:=0; p:=x.ptr.base; vlast:=0; depth:=-1; hd:=-1; result:=notfound;
+			IF x.op=sIS THEN
+				GetType(x.modname, x.typename, mod, t);
+				IF t=NIL THEN result:=typenotfound; RETURN END;
+				t:=t.BaseTyp;
+			END;
+			LOOP
+				td:=GetTD(p);
+				IF i=0 THEN (* first path => check whether item satisfies condition *)
+					fld:=GetField(td.typ, td.mod, x.condfield);
+					IF (fld#NIL) OR (x.condfield="")  THEN (* skip elements without condfield *)
+						adr:=p;
+						IF ~Already(x.given, adr) & CheckCondition() THEN
+							InsertPointer(adr, NIL, NIL, x.handle, x.res, new); NEW(chain); chain.adr:=adr; chain.next:=x.given;
+							x.given:=chain; result:=found; EXIT
+						END
+					END;
+				END;
+				put:=FALSE;
+				fld:=GetField(td.typ, td.mod, x.follow.field[i]);
+				IF fld#NIL THEN
+					DebugD.GetLInt(p+fld.a0, adr, res);
+					IF ValidPtr(adr, NIL) THEN vlast:=p+fld.a0;
+						IF ~((adr DIV Alloc) MOD DebugT.WordLen IN visited[adr DIV Alloc DIV DebugT.WordLen]) THEN
+							INCL(visited[adr DIV Alloc DIV DebugT.WordLen], (adr DIV Alloc) MOD DebugT.WordLen);
+							td:=GetTD(adr);
+							IF td#NIL THEN
+								IF (hd>=0) & (history[hd].no=i) THEN INC(history[hd].noffollowed)
+								ELSIF hd<MaxPathLen-1 THEN
+									INC(hd); history[hd].no:=i; history[hd].noffollowed:=1
+								ELSE result:=notenoughmem; EXIT
+								END;
+								put:=TRUE											
+							ELSIF x.follow.nof=1 THEN result:=notd; EXIT (* x.follow.nof=1 => list *)
+							END
+						ELSIF x.follow.nof=1 THEN result:=cycle; EXIT
+						END	
+					ELSIF x.follow.nof=1 THEN
+						IF adr=0 THEN result:=nil ELSE result:=invalid END; EXIT
+					END
+				ELSIF x.follow.nof=1 THEN result:=nofollowfield; EXIT
+				END;
+				IF put THEN (* put current on stack an follow path *)
+					IF (depth<MaxDepth-1) THEN
+						IF (i<x.follow.nof-1) THEN (* smart stack: push item only if needed again *)
+							INC(depth); recadr[depth]:=p; recno[depth]:=SHORT(SHORT(i))
+						END; i:=0; p:=adr
+					ELSE result:=notenoughmem; EXIT
+					END
+				ELSIF i>=x.follow.nof-1 THEN (* all paths traversed, pop previous *)
+					IF (hd>=0) & (history[hd].no=x.follow.nof-1) THEN DEC(hd) END;
+					IF depth<0 THEN EXIT (* everything traversed *)END;
+					p:=recadr[depth]; i:=recno[depth]+1; DEC(depth);
+					DEC(history[hd].noffollowed);
+					IF history[hd].noffollowed=0 THEN DEC(hd) END
+				ELSE
+					INC(i)
+				END
+			END
+		END
+	END SearchCond;			
+						
+
+	(* ______________________________ auxiliary functions ____________________________ *)
+	
+	PROCEDURE GetActivationFrame*(oldfp: LONGINT; VAR newfp, newpc: LONGINT; VAR res: BOOLEAN);
+	(* get previous activation frame *)
+	BEGIN
+		DebugD.GetLInt(oldfp+4, newpc, res);
+		IF res THEN DebugD.GetLInt(oldfp, newfp, res);
+			IF newfp>DebugD.StackOrg THEN res:=FALSE (* procedure not called from stack *) END
+		END
+	END GetActivationFrame;
+	
+	PROCEDURE GetMod*(pc: LONGINT): myModule;
+	(* get module at pc *)
+		VAR mod: myModule;
+	BEGIN
+		mod:=ModuleList;
+		WHILE mod#NIL DO
+			IF (pc>=mod.code) & (pc<mod.size+mod.entries) THEN RETURN mod END;
+			mod:=mod.next
+		END;
+		RETURN NIL
+	END GetMod;
+	
+	(* ______________________________ initialization ____________________________ *)
+
+	PROCEDURE RetrieveModules;
+	(* retrieve module descriptors from dump *)
+		VAR
+			mod, mod2: myModule;
+			link, i: LONGINT;
+			res: BOOLEAN;
+	BEGIN
+		NEW(mod); ModuleList:=mod; link:=DebugD.ModAnchor;
+		REPEAT
+			mod.SymbolTable:=NIL; FOR i:=0 TO maxImps-1 DO mod.GlbMod[i]:=NIL END;
+			DebugD.GetBytes(link, mod^, SIZE(Modules.ModuleDesc), res);
+			mod.adr:=link; mod.state:=notchecked; mod.RecTab:=NIL; mod.pcList:=NIL;
+			link:=SYSTEM.VAL(LONGINT, mod.link); mod.link:=NIL; mod2:=mod; NEW(mod.next); mod:=mod.next;
+		UNTIL (link=0) OR ~res;
+		mod2.next:=NIL
+	END RetrieveModules;
+	
+	PROCEDURE RetrieveStack(prochandle, modhandle: Handle);
+	(* retrieve stack *)
+		VAR
+			pc, fp, refstart: LONGINT;
+			mod: myModule;
+			procname: DebugT.Name;
+			proc, stackend: Unit;
+			res: BOOLEAN;
+	BEGIN
+		pc:=DebugD.pc; fp:=DebugD.fp; NEW(stack); stackend:=stack;
+		LOOP
+			mod:=GetMod(pc);
+			IF mod=NIL THEN EXIT END;
+			GetProcName(mod, pc-mod.code, procname, refstart, res);
+			IF res THEN
+				InsertProc(mod, pc-mod.code, refstart, fp, procname, prochandle, modhandle, proc);
+				stack.stacklink:=proc; stack:=proc;
+			ELSE EXIT
+			END;
+			GetActivationFrame(fp, fp, pc, res);
+			IF ~res THEN EXIT END
+		END; stack:=stackend.stacklink
+	END RetrieveStack;
+	
+	PROCEDURE Open*(DumpName: ARRAY OF CHAR; prochandle, modhandle: Handle; VAR res: BOOLEAN);
+	(* open dump/initialize data structures *)
+	BEGIN
+		IF DumpName#CurDumpName THEN
+			nofItems:=0; ItemList:=NIL; ModuleList:=NIL; DebugD.OpenDump(DumpName);
+			res:=DebugD.open;
+			IF res THEN RetrieveModules; RetrieveStack(prochandle, modhandle); COPY(DumpName, CurDumpName) END
+		ELSIF DumpName#"" THEN res:=TRUE
+		ELSE res:=FALSE
+		END
+	END Open;
+	
+	PROCEDURE Init;
+	(* initialize nlmod, pointertyp *)
+		VAR
+			i: LONGINT;
+			strobj: DOCT.Object;
+	BEGIN
+		NEW(nlmod); nlmod.name:="!ModuleNotLoaded"; nlmod.next:=NIL;
+		FOR i:=0 TO maxImps-1 DO nlmod.GlbMod[i]:=NIL END;
+		NEW(pointertyp); pointertyp.form:=fPointer; pointertyp.size:=4; NEW(pointertyp.strobj);
+		pointertyp.BaseTyp:=DOCT.linttyp; strobj:=pointertyp.strobj; strobj.typ:=pointertyp; strobj.name:="";
+	END Init;
+
+	PROCEDURE Close*;
+	BEGIN
+		stack:=NIL; ItemList:=NIL; ModuleList:=NIL; nofItems:=0; CurDumpName:=""
+	END Close;
+
+BEGIN
+	CurDumpName:=""; Init
+END DebugS.
+
+

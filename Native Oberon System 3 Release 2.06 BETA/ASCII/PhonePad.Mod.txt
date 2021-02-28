@@ -1,0 +1,67 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE PhonePad; (*JG 27.7.94*)
+
+  IMPORT Objects, Texts, Gadgets, TextGadgets;
+
+  VAR W: Texts.Writer;
+
+  PROCEDURE Search*;
+    VAR M: Objects.AttrMsg; field, log: Objects.Object; T: Texts.Text;
+      Name, FName, Business, Street, City, PhoneNo: ARRAY 64 OF CHAR;
+  BEGIN
+    M.id := Objects.get; M.name := "Value";
+    field := Gadgets.FindObj(Gadgets.context, "Name");
+    field.handle(field, M); COPY(M.s, Name);
+    field := Gadgets.FindObj(Gadgets.context, "FName");
+    field.handle(field, M); COPY(M.s, FName); 
+    field := Gadgets.FindObj(Gadgets.context, "Business");
+    field.handle(field, M); COPY(M.s, Business);
+    field := Gadgets.FindObj(Gadgets.context, "Street");
+    field.handle(field, M); COPY(M.s, Street);
+    field := Gadgets.FindObj(Gadgets.context, "City");
+    field.handle(field, M); COPY(M.s, City);
+    field := Gadgets.FindObj(Gadgets.context, "PhoneNo");
+    field.handle(field, M); COPY(M.s, PhoneNo);
+    log := Gadgets.FindObj(Gadgets.context, "Log");
+    T := log(TextGadgets.Frame).text;
+    IF PhoneNo[0] # 0X THEN
+        Texts.WriteString(W, "T-Query ");
+        Texts.WriteString(W, PhoneNo)
+    ELSIF Name[0] # 0X THEN
+      IF FName[0] # 0X THEN
+        Texts.WriteString(W, "NFC-Query ");
+        Texts.WriteString(W, Name); Texts.Write(W, " ");
+        Texts.WriteString(W, FName); Texts.Write(W, " ");
+        Texts.WriteString(W, City)
+      ELSE Texts.WriteString(W, "NC-Query ");
+        Texts.WriteString(W, Name); Texts.Write(W, " ");
+        Texts.WriteString(W, City)
+      END
+    ELSIF Street[0] # 0X THEN
+      Texts.WriteString(W, "SC-Query ");
+        Texts.WriteString(W, Street); Texts.Write(W, " ");
+        Texts.WriteString(W, City)
+    ELSIF Business[0] # 0X THEN
+      Texts.WriteString(W, "BC-Query ");
+        Texts.WriteString(W, Business); Texts.Write(W, " ");
+        Texts.WriteString(W, City)
+    ELSE Texts.WriteString(W, "incomplete")
+    END;
+    Texts.WriteLn(W);
+    Texts.Append(T, W.buf)
+  END Search;
+
+BEGIN Texts.OpenWriter(W)
+END PhonePad.

@@ -1,0 +1,1846 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE DosDisk; (* harry 1996-02-09 / pjm 27.02.96 *)
+  IMPORT Kernel, Diskette, Disk, Strings := ISOStrings, SYSTEM, Oberon, Texts, 
+  	Viewers, MenuViewers, TextFrames;
+
+(* pjm 27.02.96, port to Native Oberon *)
+(* pjm 28.03.96 - GetClusters added *)
+
+  (*HALT(52) = hardware error in GetSector
+     HALT(53) = hardware error in PutSector (diskette write protected?)
+     HALT(54) = drive not ready/not supported
+     HALT(55) = no such partition
+     HALT(56) = general error halt
+  *)
+  CONST
+(* Error codes *)
+    eLow = 7100;
+    eHigh = 7199;
+    eOK = 0;
+    eDiskFULL = eLow + 000;
+    eNoMoreEntries = eLow + 001;
+    eNoEXIST = eLow + 002;
+    eIO = eLow + 003;
+    eAccess = eLow + 004;
+    eEOF= eLow + 005;
+
+	minus = CHR(173); (* 255 *)
+	more = CHR(170); (* 252 *)
+	single = CHR(155); (* 277 *)
+	not = CHR(168); (* 241 *)
+	lbrack = CHR(219); (* 333X; *)
+	rbrack = CHR(221); (* 335X; *)
+
+	cRootIno    = 1;
+	cSectorBits = 9;
+	cSectorSize* = 512;
+
+		(* Directory entries *)
+	cEntrySize  = 32;
+	cDirEntries = cSectorSize DIV cEntrySize;
+	cEntriesPS  = {0..3}; (* 16 - 1 *)
+	cDirBits    = 32; (* 2^5 *)
+
+	cDeleted  = 0E5H;
+	cFillByte = 0F6H;
+
+		(* Atributes *)
+	cRdOnly   = 1;
+	cHidden   = 2;
+	cSystem   = 4;
+	cVolume   = 8;
+	cDirectory= 16;
+	cArchive  = 32;
+	cNone     = 0;
+	cUnused   = cVolume + cArchive + cSystem + cHidden;
+
+	cFATCache   = 8;
+	cFAT12      = 4078; (* Max clusters in a 12 bit FAT *)
+
+	cNameSize   = 11;
+	cDot        = ".          ";
+	cDotDot     = "..         ";
+
+TYPE
+	tBlockPtr = POINTER TO tBlock;
+	tBlock = ARRAY 512 OF CHAR;
+	Cluster* = POINTER TO ARRAY 512*128 OF CHAR;
+	tFilename* = ARRAY 9 OF CHAR;
+	tExtension* = ARRAY 4 OF CHAR;
+
+	tDEPtr = POINTER TO tDirectoryEntry;
+	tDirectoryEntry* = RECORD
+		DirStart, DirNumber : LONGINT;
+		FileName: tFilename;
+		Extension: tExtension;
+		Attribute: LONGINT;
+		AttrRecord: RECORD
+			RO, Hid, Sys, Vol, Dir, Arc, Del, Empty : BOOLEAN
+		END;
+		Time: LONGINT;
+		Date: LONGINT;
+		Start*: LONGINT;
+		FileSize*: LONGINT;
+		Next: tDEPtr
+	END;
+
+	tBootBlock = RECORD
+		OEMID: tFilename;
+		SectorSize,
+		ClusterSize,
+		ReservedSector,
+		FATCopies,
+		RootEntries,
+		Sectors,
+		Media,
+		FATLength,
+		SectorsTrack,
+		Heads,
+		HiddenSectors,
+		TotalSectors: LONGINT
+	END;
+
+	tSuperBlock = RECORD
+		ClusterSize,
+		FATCount,
+		FATBits,
+		FATStart,
+		FATLength,
+		RootStart,
+		RootEntries,
+		RootLength,
+		DataStart,
+		DataSectors,
+		Clusters,
+		PrevFree: LONGINT;
+		FreeClusters: LONGINT
+	END;
+
+	tFile* = RECORD
+			(* And the file specific stuff *)
+		Legal: BOOLEAN;
+		Position: LONGINT;
+		Size*: LONGINT;
+		FirstCluster*: LONGINT;
+		DirStart: LONGINT;
+		EntryNum: LONGINT
+	END;
+
+	tSectorListPtr = POINTER TO tSectorList;
+	tSectorList = RECORD
+		SectorNumber: LONGINT;
+		Next: tSectorListPtr
+	END;
+
+	tCacheBlocks = RECORD
+		Cache : tBlockPtr;
+		Dirty : BOOLEAN
+	END;
+			(* Keep one subdirectory block in a cache *)
+	tSubdirCache = RECORD
+		S : LONGINT; (* SectorNumber *)
+		Cache : tBlockPtr;
+		Dirty : BOOLEAN
+	END;
+	Transfer = PROCEDURE(d,s,n: LONGINT; VAR b: ARRAY OF SYSTEM.BYTE) : LONGINT;
+
+	Partition = RECORD
+		type: INTEGER;
+		letter: CHAR;
+		drive: SHORTINT;
+		start, size: LONGINT
+	END;
+
+VAR res*: INTEGER; Drive*: LONGINT;
+	DEV: LONGINT; SUPER: tSuperBlock;
+	FATTable: POINTER TO ARRAY 512 OF tCacheBlocks;
+	RootTable: POINTER TO ARRAY 512 OF tCacheBlocks;
+	SubdirCache: tSubdirCache;
+	CurrentDrive: CHAR;
+	RDSECTOR, WRSECTOR: Transfer;
+	W: Texts.Writer;
+	partitionoffset, partitionlen: LONGINT;
+
+PROCEDURE FloppyWriteSector(drive, startSector, numSectors: LONGINT;
+		VAR buf: ARRAY OF SYSTEM.BYTE): LONGINT;
+BEGIN
+	Diskette.drive := SHORT(SHORT(drive));
+	Diskette.PutSectors(SHORT(startSector), SHORT(numSectors), buf, 0);
+	RETURN 0
+END FloppyWriteSector;
+
+PROCEDURE FloppyReadSector(drive, startSector, numSectors: LONGINT;
+		VAR buf: ARRAY OF SYSTEM.BYTE): LONGINT;
+BEGIN
+	Diskette.drive := SHORT(SHORT(drive));
+	Diskette.GetSectors(SHORT(startSector), SHORT(numSectors), buf, 0);
+	RETURN 0
+END FloppyReadSector;
+
+PROCEDURE HDWriteSector(drive, startSector, numSectors: LONGINT;
+		VAR buf: ARRAY OF SYSTEM.BYTE): LONGINT;
+BEGIN
+	IF (partitionoffset < 0) OR (startSector < 0) OR 
+			(startSector+numSectors > partitionlen) OR (numSectors < 0) THEN
+		HALT(99)
+	END;
+	Disk.PutBlocks(SHORT(SHORT(drive)), startSector + partitionoffset, numSectors, buf, 0);
+	RETURN 0
+END HDWriteSector;
+
+PROCEDURE HDReadSector(drive, startSector, numSectors: LONGINT;
+		VAR buf: ARRAY OF SYSTEM.BYTE): LONGINT;
+BEGIN
+	IF partitionoffset < 0 THEN HALT(99) END;
+	Disk.GetBlocks(SHORT(SHORT(drive)), startSector + partitionoffset, numSectors, buf, 0);
+	RETURN 0
+END HDReadSector;
+
+PROCEDURE ReadBlock(start, length: LONGINT; VAR buf: ARRAY OF SYSTEM.BYTE): LONGINT;
+BEGIN
+	RETURN RDSECTOR(Drive, start, length, buf)
+END ReadBlock;
+
+PROCEDURE WriteBlock(start, length: LONGINT; VAR buf: ARRAY OF CHAR): LONGINT;
+BEGIN
+	RETURN WRSECTOR(Drive, start, length, buf)
+END WriteBlock;
+
+PROCEDURE Error(Msg: ARRAY OF CHAR; r: LONGINT);
+BEGIN
+	Texts.WriteString(W, Msg);  Texts.WriteInt(W, r, 1);  Texts.WriteLn(W);
+	Texts.Append(Oberon.Log, W.buf);
+	HALT(56)
+END Error;
+
+(* Round to multiple *)
+PROCEDURE Round(n,m : LONGINT) : LONGINT;
+BEGIN
+	IF (n # 0) & (m # 0) THEN RETURN(((n+m)-1)-((n-1) MOD m))
+	ELSE RETURN(0)
+	END
+END Round;
+
+PROCEDURE ReadBootBlock(VAR oBoot : tBootBlock);
+VAR Blk : tBlock; r,i : LONGINT;
+BEGIN
+	r := ReadBlock(0, 1, Blk);
+	IF r = 0 THEN
+		i := 0; WHILE (i < 8) DO oBoot.OEMID[i] := Blk[3+i]; INC(i) END; oBoot.OEMID[8] := 0X;
+		oBoot.SectorSize := 0; SYSTEM.GET(SYSTEM.ADR(Blk[0BH]), SYSTEM.VAL(INTEGER, oBoot.SectorSize));
+		oBoot.ClusterSize := 0; SYSTEM.GET(SYSTEM.ADR(Blk[0DH]), SYSTEM.VAL(CHAR, oBoot.ClusterSize));
+		oBoot.ReservedSector := 0; SYSTEM.GET(SYSTEM.ADR(Blk[0EH]), SYSTEM.VAL(INTEGER, oBoot.ReservedSector));
+		oBoot.FATCopies := 0; SYSTEM.GET(SYSTEM.ADR(Blk[10H]), SYSTEM.VAL(CHAR, oBoot.FATCopies));
+		oBoot.RootEntries := 0; SYSTEM.GET(SYSTEM.ADR(Blk[11H]), SYSTEM.VAL(INTEGER, oBoot.RootEntries));
+		oBoot.Sectors := 0; SYSTEM.GET(SYSTEM.ADR(Blk[13H]), SYSTEM.VAL(INTEGER, oBoot.Sectors));
+		oBoot.Media := 0; SYSTEM.GET(SYSTEM.ADR(Blk[15H]), SYSTEM.VAL(CHAR, oBoot.Media));
+		oBoot.FATLength := 0; SYSTEM.GET(SYSTEM.ADR(Blk[16H]), SYSTEM.VAL(INTEGER, oBoot.FATLength));
+		oBoot.SectorsTrack := 0; SYSTEM.GET(SYSTEM.ADR(Blk[18H]), SYSTEM.VAL(INTEGER, oBoot.SectorsTrack));
+		oBoot.Heads := 0; SYSTEM.GET(SYSTEM.ADR(Blk[1AH]), SYSTEM.VAL(INTEGER, oBoot.Heads));
+		SYSTEM.GET(SYSTEM.ADR(Blk[1CH]), oBoot.HiddenSectors);
+		SYSTEM.GET(SYSTEM.ADR(Blk[20H]), oBoot.TotalSectors)
+	ELSE
+		Error("MSDosFS.ReadBootBlock: Error Reading - ", r)
+	END;
+END ReadBootBlock;
+
+PROCEDURE GetSuperBlock(VAR oB  : tBootBlock; VAR oS : tSuperBlock);
+VAR Multiplier : LONGINT; i : LONGINT; b : SET; res : LONGINT;
+BEGIN
+	ReadBootBlock(oB);
+	Multiplier := oB.SectorSize DIV cSectorSize;
+	oS.ClusterSize := oB.ClusterSize * Multiplier;
+	oS.FATCount := oB.FATCopies;
+	oS.FATStart := oB.ReservedSector * Multiplier;
+	oS.FATLength := oB.FATLength * Multiplier;
+	oS.RootStart:=(oB.ReservedSector+(oB.FATCopies*oB.FATLength))*Multiplier;
+	oS.RootEntries := oB.RootEntries;
+	oS.DataStart := oS.RootStart + Round(((oS.RootEntries*cDirBits) DIV cSectorSize), Multiplier);
+	oS.RootLength := oS.DataStart - oS.RootStart;
+	IF (oB.Sectors # 0) THEN oS.DataSectors := oB.Sectors - oS.DataStart
+	ELSE oS.DataSectors := (oB.TotalSectors*Multiplier) - oS.DataStart
+	END;
+
+	IF (oB.ClusterSize # 0) & (Multiplier # 0) THEN
+		oS.Clusters := (oS.DataSectors*Multiplier) DIV oB.ClusterSize;
+		IF (oS.Clusters > cFAT12) THEN
+			oS.FATBits := 16
+		ELSE
+			oS.FATBits := 12
+		END;
+		res := 0;
+		IF (oS.FATCount=0) OR (oB.SectorsTrack=0) OR (oB.Heads=0) THEN res := 1 END;
+		b := SYSTEM.VAL(SET, oS.RootEntries) * cEntriesPS;
+		IF b # {} THEN INC(res, 2) END;
+		IF ((oS.Clusters+2) > ((oS.FATLength*cSectorSize*8) DIV oS.FATBits)) THEN INC(res, 4) END;
+		IF (oB.SectorSize MOD 512) # 0 THEN INC(res, 8) END
+	ELSE res := 16
+	END;
+	IF (res = 0) THEN
+		oS.FreeClusters := -1;
+		oS.PrevFree := 0
+	ELSE
+		Error("DosDisk.GetSuperBlock: Error - ", res)
+	END
+END GetSuperBlock;
+
+PROCEDURE GetFATTable(iSuperBlock : tSuperBlock);
+VAR i,r : LONGINT;
+BEGIN
+	i := 0;
+	WHILE (i < iSuperBlock.FATLength) DO
+		NEW(FATTable[i].Cache);
+		r := ReadBlock(iSuperBlock.FATStart+i, 1, FATTable[i].Cache^);
+		IF (r # 0) THEN
+			Error("DosDisk.GetFATTable: Read error - ", r)
+		END;
+		FATTable[i].Dirty := FALSE;
+		INC(i)
+	END
+END GetFATTable;
+
+PROCEDURE PutFATTable(iSuperBlock : tSuperBlock);
+VAR i,j,r : LONGINT;
+BEGIN
+	i := 0;
+	WHILE (i < iSuperBlock.FATLength) DO
+		IF FATTable[i].Dirty THEN
+			j := 0;
+			WHILE (j < iSuperBlock.FATCount) DO
+				r := WriteBlock(i+iSuperBlock.FATStart+(j*iSuperBlock.FATLength), 1, FATTable[i].Cache^);
+				IF (r # 0) THEN
+					Error("DosDisk.PutFATTable: Write error - ", r)
+				END;
+				INC(j)
+			END;
+			FATTable[i].Dirty := FALSE
+		END;
+		INC(i)
+	END
+END PutFATTable;
+
+PROCEDURE GetRootTable(iSuperBlock : tSuperBlock);
+VAR i,r : LONGINT;
+BEGIN
+	i := 0;
+	WHILE (i < iSuperBlock.RootLength) DO
+		NEW(RootTable[i].Cache);
+		r := ReadBlock(iSuperBlock.RootStart+i, 1, RootTable[i].Cache^);
+		IF (r # eOK) THEN
+			Error("DosDisk.GetRootTable: Read error - ", r)
+		END;
+		RootTable[i].Dirty := FALSE;
+		INC(i)
+	END
+END GetRootTable;
+
+PROCEDURE PutRootTable(iSuperBlock : tSuperBlock);
+VAR i,r : LONGINT;
+BEGIN
+	i := 0;
+	WHILE (i < iSuperBlock.RootLength) DO
+		IF RootTable[i].Dirty THEN
+			r := WriteBlock(i+iSuperBlock.RootStart, 1, RootTable[i].Cache^);
+			IF (r # eOK) THEN
+				Error("DosDisk.PutRootTable: Write error - ", r)
+			END;
+			RootTable[i].Dirty := FALSE
+		END;
+		INC(i)
+	END
+END PutRootTable;
+
+PROCEDURE ClusterToSector(iCluster: LONGINT) : LONGINT;
+BEGIN
+		(* This will always return the first sector in the cluster *)
+	IF (iCluster < 2) THEN
+		Error("DosDisk.ClusterToSector: Illegal cluster - ", iCluster)
+	END;
+	RETURN(((iCluster - 2)*SUPER.ClusterSize) + SUPER.DataStart)
+END ClusterToSector;
+
+PROCEDURE SectorToCluster(iSector: LONGINT) : LONGINT;
+BEGIN
+		(* This will always return the cluster for the group of sectors *)
+	IF (iSector < SUPER.DataStart) THEN
+		Error("DosDisk.SectorToCluster: Illegal Sector - ",iSector)
+	END;
+	RETURN(((iSector - SUPER.DataStart) DIV SUPER.ClusterSize) + 2)
+END SectorToCluster;
+
+(* Get the word situated at cluster iCluster in the FAT *)
+PROCEDURE GetFATWord(iCluster: LONGINT) : LONGINT;
+VAR Bl,Bh,Sl,Sh,O,y : LONGINT;
+BEGIN
+	IF (SUPER.FATBits = 16) THEN
+		O := iCluster*2
+	ELSE
+		O := (iCluster*3) DIV 2
+	END;
+	Bl := O MOD cSectorSize; (* Get the low byte position *)
+	Sl := O DIV cSectorSize;
+	Bh := (O+1) MOD cSectorSize; (* Get the high byte position *)
+	Sh := (O+1) DIV cSectorSize;
+	IF (Sl >= SUPER.FATLength) THEN
+		Error("DosDisk.GetFATWord: Corrupt Disk/Virus (l) - ", Sl)
+	END;
+	IF (Sh >= SUPER.FATLength) THEN
+		Error("DosDisk.GetFATWord: Corrupt Disk/Virus (h) - ", Sh)
+	END;
+		(* MUST be a word *)
+	y := 0;
+	SYSTEM.GET(SYSTEM.ADR(FATTable[Sh].Cache[Bh]), SYSTEM.VAL(CHAR, y)); y := y*100H;
+	SYSTEM.GET(SYSTEM.ADR(FATTable[Sl].Cache[Bl]), SYSTEM.VAL(CHAR, y));
+
+	IF (SUPER.FATBits # 16) THEN
+		IF ((iCluster MOD 2) = 0) THEN (* EVEN *)
+			y := y MOD 1000H (* Get rid of top digit    *)
+		ELSE                    (* ODD  *)
+			y := y DIV 10H   (* Get rid of bottom digit *)
+		END
+	END;
+	RETURN(y)
+END GetFATWord;
+
+PROCEDURE PutFATWord(iCluster: LONGINT; iWord: LONGINT);
+VAR O,Bl,Bh,Sl,Sh,y,lo,hi : LONGINT;
+BEGIN
+	IF (SUPER.FATBits = 16) THEN
+		O := iCluster * 2
+	ELSE
+		O := (iCluster*3) DIV 2
+	END;
+	Bl := O MOD cSectorSize;     (* Get the low byte position  *)
+	Sl := O DIV cSectorSize;
+	Bh := (O+1) MOD cSectorSize; (* Get the high byte position *)
+	Sh := (O+1) DIV cSectorSize;
+
+	IF (Sl >= SUPER.FATLength) THEN
+		Error("DosDisk.PutFATWord: Corrupt Disk/Virus (l) - ", Sl)
+	END;
+	IF (Sh >= SUPER.FATLength) THEN
+		Error("DosDisk.PutFATWord: Corrupt Disk/Virus (h) - ", Sh)
+	END;
+    
+	IF (SUPER.FATBits = 16) THEN
+		O := iWord MOD 10000H
+	ELSE
+		iWord := iWord MOD 1000H; (* Make sure only three digits *)
+		y := 0;
+		SYSTEM.GET(SYSTEM.ADR(FATTable[Sh].Cache[Bh]), SYSTEM.VAL(CHAR, y)); y := y*100H;
+		SYSTEM.GET(SYSTEM.ADR(FATTable[Sh].Cache[Bl]), SYSTEM.VAL(CHAR, y));
+		IF ((iCluster MOD 2) = 0) THEN
+			O := (iWord MOD 1000H) + ((y DIV 1000H)*1000H)   (* add TOP digit *)
+		ELSE
+			O := (iWord * 10H) + (y MOD 10H)         (* add BOT digit *)
+		END
+	END;
+	lo := O MOD 100H;
+	hi := (O DIV 100H) MOD 100H;
+
+	SYSTEM.PUT(SYSTEM.ADR(FATTable[Sh].Cache[Bh]), SYSTEM.VAL(CHAR, hi));
+	FATTable[Sh].Dirty := TRUE;
+	SYSTEM.PUT(SYSTEM.ADR(FATTable[Sl].Cache[Bl]), SYSTEM.VAL(CHAR, lo));
+	FATTable[Sl].Dirty := TRUE
+END PutFATWord;
+
+PROCEDURE PutEOF(iCluster: LONGINT);
+BEGIN
+	IF (SUPER.FATBits = 16) THEN
+		PutFATWord(iCluster, 0FFFFH)
+	ELSE
+		PutFATWord(iCluster, 0FFFH)
+	END
+END PutEOF;
+
+PROCEDURE GetDirectoryEntry(iStartSector: LONGINT; iWhich: LONGINT; VAR oDEntry: tDirectoryEntry) : LONGINT;
+VAR SecPtr,Attr,r,B,S,y,i : LONGINT; f: CHAR;
+BEGIN
+	IF (iStartSector = SUPER.RootStart) & (iWhich > SUPER.RootEntries) THEN
+		Texts.WriteString(W, "No such entry = ");  Texts.WriteInt(W, iWhich, 1);  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		RETURN(eNoMoreEntries)
+	END;
+		(* Get the offsets for this directory item *)
+	i := iWhich * cEntrySize;
+	B := i MOD cSectorSize;
+	S := i DIV cSectorSize;
+	IF (S+1 > SUPER.DataSectors) THEN
+		Texts.WriteString(W, "disk is full = ");  Texts.WriteInt(W, S, 1);  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		RETURN(eDiskFULL)
+	END;
+	IF (iStartSector # SUPER.RootStart) THEN  (* Some subdir *)
+		i := 0;
+		y := SectorToCluster(iStartSector);
+			(* you need the S'th sector of the directory *)
+		WHILE (i < (S DIV SUPER.ClusterSize)) DO
+			y := GetFATWord(y);
+			IF (SUPER.FATBits = 16) THEN
+				IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+					Error("DosDisk.GetDirectoryEntry: Invalid cluster, 0 - ", y)
+				END
+			ELSE
+				IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+					Error("DosDisk.GetDirectoryEntry: Invalid cluster, 1 - ", y)
+				END
+			END;
+			INC(i)
+		END;
+		S := ClusterToSector(y) + (S MOD SUPER.ClusterSize);
+		IF (S = 0) THEN
+				(* This should simply NEVER be *)
+			Error("DosDisk.GetDirectoryEntry: Invalid sector - ", S)
+		END;
+		IF (S # SubdirCache.S) THEN
+			IF SubdirCache.Dirty THEN
+				r := WriteBlock(SubdirCache.S, 1, SubdirCache.Cache^);
+				SubdirCache.Dirty := FALSE
+			END;
+			r := ReadBlock(S, 1, SubdirCache.Cache^);
+			SubdirCache.S := S
+		END;
+		SecPtr := SYSTEM.VAL(LONGINT, SubdirCache.Cache)
+	ELSE
+		SecPtr := SYSTEM.VAL(LONGINT, RootTable[S].Cache)
+	END;
+
+	oDEntry.DirStart := iStartSector;
+	oDEntry.DirNumber := iWhich;
+	SYSTEM.MOVE(SecPtr+B+0, SYSTEM.ADR(oDEntry.FileName), 8); oDEntry.FileName[8] := 0X;
+	SYSTEM.MOVE(SecPtr+B+08H, SYSTEM.ADR(oDEntry.Extension), 3); oDEntry.Extension[3] := 0X;
+	oDEntry.Attribute := 0; SYSTEM.GET(SecPtr+B+0BH, SYSTEM.VAL(CHAR, oDEntry.Attribute));
+
+	oDEntry.AttrRecord.RO := FALSE; oDEntry.AttrRecord.Hid:= FALSE;
+	oDEntry.AttrRecord.Sys:= FALSE; oDEntry.AttrRecord.Vol:= FALSE;
+	oDEntry.AttrRecord.Dir:= FALSE; oDEntry.AttrRecord.Arc:= FALSE;
+	oDEntry.AttrRecord.Del:= FALSE; oDEntry.AttrRecord.Empty:= FALSE;
+	Attr := oDEntry.Attribute;
+	FOR i := 0 TO 5 DO
+		IF ((Attr MOD 2) # 0) THEN
+			CASE i OF
+			0 : oDEntry.AttrRecord.RO  := TRUE
+			| 1 : oDEntry.AttrRecord.Hid := TRUE
+			| 2 : oDEntry.AttrRecord.Sys := TRUE
+			| 3 : oDEntry.AttrRecord.Vol := TRUE
+			| 4 : oDEntry.AttrRecord.Dir := TRUE
+			| 5 : oDEntry.AttrRecord.Arc := TRUE
+			END
+		END;
+		Attr := Attr DIV 2
+	END;
+	SYSTEM.GET(SecPtr+B+0H, f);
+	IF f = 0E5X THEN oDEntry.AttrRecord.Del := TRUE END;
+	IF f = 0X THEN oDEntry.AttrRecord.Empty := TRUE END;
+
+	oDEntry.Time := 0; SYSTEM.GET(SecPtr+B+16H, SYSTEM.VAL(INTEGER, oDEntry.Time));
+	oDEntry.Date := 0; SYSTEM.GET(SecPtr+B+18H, SYSTEM.VAL(INTEGER, oDEntry.Date));
+	oDEntry.Start := 0; SYSTEM.GET(SecPtr+B+1AH, SYSTEM.VAL(INTEGER, oDEntry.Start));
+	SYSTEM.GET(SecPtr+B+1CH, oDEntry.FileSize);
+	RETURN 0
+END GetDirectoryEntry;
+
+PROCEDURE PutDirectoryEntry*(iDEntry : tDirectoryEntry) : LONGINT;
+VAR SecPtr,Attr,r,B,S,y,i : LONGINT; byte: CHAR;
+BEGIN
+	IF (iDEntry.DirStart = SUPER.RootStart) & (iDEntry.DirNumber > SUPER.RootEntries) THEN
+		Texts.WriteString(W, "No such entry = ");  Texts.WriteInt(W, iDEntry.DirNumber, 1);  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		RETURN(eNoMoreEntries)
+	END;
+		(* Get the offsets for this directory item *)
+	i := iDEntry.DirNumber * cEntrySize;
+	B := i MOD cSectorSize;
+	S := i DIV cSectorSize;
+	IF (S+1 > SUPER.DataSectors) THEN
+		Texts.WriteString(W, "disk is full = ");  Texts.WriteInt(W, S, 1);  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		RETURN(eDiskFULL)
+	END;
+
+	IF (iDEntry.DirStart = SUPER.RootStart) THEN (* Root dir *)
+		SecPtr := SYSTEM.VAL(LONGINT, RootTable[S].Cache)
+	ELSE  (* Some subdir *)
+		y := SectorToCluster(iDEntry.DirStart);
+			(* you need the S'th sector of the directory *)
+		i := 0;
+		WHILE (i < (S DIV SUPER.ClusterSize)) DO
+			y := GetFATWord(y);
+			IF (SUPER.FATBits = 16) THEN
+				IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+					Error("DosDisk.PutDirectoryEntry: Invalid cluster, 0 - ", y)
+				END
+			ELSE
+				IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+					Error("DosDisk.PutDirectoryEntry: Invalid cluster, 1 - ", y)
+				END
+			END;
+			INC(i)
+		END;
+		S := ClusterToSector(y) + (S MOD SUPER.ClusterSize);
+			(* Get the sector S *)
+		IF (S = 0) THEN
+			Error("DosDisk.PutDirectoryEntry: Invalid sector - ", S)
+		END;
+		IF (S # SubdirCache.S) THEN
+			IF SubdirCache.Dirty THEN
+				r := WriteBlock(SubdirCache.S, 1, SubdirCache.Cache^);
+				SubdirCache.Dirty := FALSE
+        		END;
+        		r := ReadBlock(S, 1, SubdirCache.Cache^);
+        		SubdirCache.S := S
+      		END;
+      		SecPtr := SYSTEM.VAL(LONGINT, SubdirCache.Cache)
+    	END;
+
+	SYSTEM.MOVE(SYSTEM.ADR(iDEntry.FileName), SecPtr+B+0, 8);
+	SYSTEM.MOVE(SYSTEM.ADR(iDEntry.Extension), SecPtr+B+08H, 3);
+	Attr := 0;
+	IF iDEntry.AttrRecord.Arc THEN INC(Attr) END; Attr := Attr * 2;
+	IF iDEntry.AttrRecord.Dir THEN INC(Attr) END; Attr := Attr * 2;
+	IF iDEntry.AttrRecord.Vol THEN INC(Attr) END; Attr := Attr * 2;
+	IF iDEntry.AttrRecord.Sys THEN INC(Attr) END; Attr := Attr * 2;
+	IF iDEntry.AttrRecord.Hid THEN INC(Attr) END; Attr := Attr * 2;
+	IF iDEntry.AttrRecord.RO  THEN INC(Attr) END;
+	SYSTEM.PUT(SecPtr+B+0BH, SYSTEM.VAL(CHAR, Attr));
+	FOR i := 0 TO 9 DO SYSTEM.PUT(SecPtr+B+0CH+i, 0X); END;
+
+	SYSTEM.PUT(SecPtr+B+16H, SYSTEM.VAL(INTEGER, iDEntry.Time));
+	SYSTEM.PUT(SecPtr+B+18H, SYSTEM.VAL(INTEGER, iDEntry.Date));
+	SYSTEM.PUT(SecPtr+B+1AH, SYSTEM.VAL(INTEGER, iDEntry.Start));
+	SYSTEM.PUT(SecPtr+B+1CH, iDEntry.FileSize);
+
+	IF (iDEntry.DirStart = SUPER.RootStart) THEN (* Root dir *)
+		RootTable[S].Dirty := TRUE
+	ELSE
+		SubdirCache.Dirty := TRUE
+	END;
+	RETURN 0
+END PutDirectoryEntry;
+
+(* Create a cluster list consisting of n clusters, and return the first one*)
+PROCEDURE AllocateClusterList*(n : LONGINT; VAR oStart : LONGINT) : LONGINT;
+VAR i,c,y,p : LONGINT;
+BEGIN
+	oStart := 0;
+	IF (n > 0) THEN
+		c := 2; (* 2 is always first cluster *)
+		i := 0;
+		WHILE (i < n) DO
+			WHILE (GetFATWord(c) # 0H) & (c < (SUPER.Clusters+2)) DO INC(c) END;
+			IF (c < (SUPER.Clusters+2)) & (GetFATWord(c) = 0H) THEN
+				IF (oStart = 0) THEN oStart := c
+				ELSE PutFATWord(p, c)
+				END;
+				PutEOF(c);
+				p := c
+			ELSE
+				IF (p # 0) THEN PutEOF(p) END;
+				Texts.WriteString(W, " Disk is full");  Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				RETURN(eDiskFULL)
+			END;
+			INC(i)
+		END;
+	END;
+	RETURN(eOK)
+END AllocateClusterList;
+
+(* Delete a set of clusters allocated to a file *)
+PROCEDURE FreeClusterList(iStartCluster : LONGINT);
+VAR c,y : LONGINT; EOF: BOOLEAN;
+BEGIN
+	IF (iStartCluster > 1) THEN
+		c := iStartCluster;
+		EOF := FALSE;
+		WHILE ~EOF DO
+			y := GetFATWord(c);
+			IF (SUPER.FATBits = 16) THEN
+				IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+					Error("DosDisk.FreeClusterList: Invalid cluster, 0 - ", y)
+				ELSIF (y >= 0FFF8H) & (y <= 0FFFFH) THEN (* EOF reached *)
+					PutFATWord(c,0000H);
+					EOF := TRUE
+				ELSE
+					PutFATWord(c,0000H);
+					c := y
+				END
+			ELSE
+				IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+					Error("DosDisk.FreeClusterList: Invalid cluster, 1 - ", y)
+				ELSIF (y >= 0FF8H) & (y <= 0FFFH) THEN (* EOF reached *)
+					PutFATWord(c,000H);
+					EOF := TRUE
+				ELSE
+					PutFATWord(c,000H);
+					c := y
+				END
+			END
+		END
+	END
+END FreeClusterList;
+
+(* Search for the EOF of the file starting at cluster iStartCluster,
+*  and add a list of n clusters to its end.
+*)
+PROCEDURE AddClusterList(iStartCluster: LONGINT; n: LONGINT; VAR oListStart: LONGINT) : LONGINT;
+VAR c,y: LONGINT; EOF: BOOLEAN;
+BEGIN
+	IF (iStartCluster > 1) & (ClusterToSector(iStartCluster) # SUPER.RootStart) THEN
+		c := iStartCluster;
+		EOF := FALSE;
+		WHILE ~EOF DO
+			y := GetFATWord(c);
+			IF (SUPER.FATBits = 16) THEN
+				IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+					Error("DosDisk.AddClusterList: Invalid cluster, 0 - ", y)
+				ELSIF (y >= 0FFF8H) & (y <= 0FFFFH) THEN (* EOF reached *)
+					EOF := TRUE
+				ELSE
+					c := y
+				END
+			ELSE
+				IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+					Error("DosDisk.AddClusterList: Invalid cluster, 1 - ", y)
+				ELSIF (y >= 0FF8H) & (y <= 0FFFH) THEN (* EOF reached *)
+					EOF := TRUE
+				ELSE
+					c := y
+				END
+			END
+		END;
+		IF (AllocateClusterList(n,oListStart) = eOK) THEN
+			PutFATWord(c,oListStart);
+			RETURN eOK
+		ELSE
+			RETURN eDiskFULL
+		END
+	ELSE
+		RETURN eIO
+	END
+END AddClusterList;
+
+(* This procedure will map a cluster as bad, and return a new cluster *)
+PROCEDURE MapBadCluster(iFirstCluster: LONGINT; VAR aStukkend: LONGINT) : LONGINT;
+VAR EOF: BOOLEAN; y,c,p,NewOne: LONGINT;
+BEGIN
+	IF (iFirstCluster > 1) THEN
+		p := 0;
+		c := iFirstCluster;
+		EOF := FALSE;
+		LOOP
+			y := GetFATWord(c);
+			IF (c = aStukkend) THEN
+				IF (SUPER.FATBits = 16) THEN
+					PutFATWord(c, 0FFF7H )
+				ELSE
+					PutFATWord(c, 0FF7H )
+				END;
+				IF (AllocateClusterList(1,NewOne) = eOK) THEN
+					Texts.WriteString(W, "Mapping bad cluster ");  
+					Texts.WriteInt(W, c, 1);  Texts.WriteString(W, " to ");
+					Texts.WriteInt(W, NewOne, 1);  Texts.WriteString(W, " (");
+					Texts.WriteInt(W, ClusterToSector(c), 1);  Texts.WriteString(W, " - ");
+					Texts.WriteInt(W, ClusterToSector(NewOne), 1);  Texts.WriteString(W, ")");
+					Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf);
+					IF (p # 0) THEN PutFATWord(p, NewOne) END;
+					PutFATWord(NewOne, y);
+					aStukkend := NewOne;
+					RETURN(eOK)
+				ELSE
+					IF (p # 0) THEN PutEOF(p) END;
+					RETURN(eDiskFULL)
+				END
+			ELSIF EOF THEN
+					(* Reached EOF without getting the bad one ... *)
+				Error("DosDisk.MapBadCluster: Reached EOF, 0 - ", iFirstCluster)
+			ELSE
+				p := c;
+				IF (SUPER.FATBits = 16) THEN
+					IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+						Error("DosDisk.MapBadCluster: Invalid cluster, 0 - ", y)
+					ELSIF (y >= 0FFF8H) & (y <= 0FFFFH) THEN (* EOF reached *)
+						EOF := TRUE
+					ELSE
+						c := y
+					END
+				ELSE
+					IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+						Error("DosDisk.MapBadCluster: Invalid cluster, 1 - ", y)
+					ELSIF (y >= 0FF8H) & (y <= 0FFFH) THEN (* EOF reached *)
+						EOF := TRUE
+					ELSE
+						c := y
+					END
+				END
+			END
+		END
+	ELSE
+			(* Something wrong with starting cluster       *)
+		Error("DosDisk.MapBadCluster: Invalid cluster, 2 - ", iFirstCluster)
+	END
+END MapBadCluster;
+
+(* GetCluster - where iStart = first cluster of file;
+*		iRelative = relative cluster in file;
+*		pBlock = POINTER to one or MORE sectors
+*	NOTE: I am typecasting pBlock to tBlockPtr, and
+*	then live dangerously by dereferencing the cast,
+*	and assuming the lower layers will not break anything.
+*)
+PROCEDURE GetCluster*(iStart: LONGINT; iRelative: LONGINT; pBlock: Cluster): LONGINT;
+VAR y,r,i,c : LONGINT; EOF : BOOLEAN;
+BEGIN
+	i := 0;
+	EOF := FALSE;
+	c := iStart;
+	WHILE (i < iRelative) & ~EOF DO
+		y := GetFATWord(c);
+		IF (SUPER.FATBits = 16) THEN
+			IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+				Error("DosDisk.GetCluster: Invalid cluster, 0 - ", y)
+			ELSIF (y >= 0FFF8H) & (y <= 0FFFFH) THEN (* EOF reached *)
+				EOF := TRUE
+			ELSE
+				c := y
+			END
+		ELSE
+			IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+				Error("DosDisk.GetCluster: Invalid cluster, 1 - ", y)
+			ELSIF (y >= 0FF8H) & (y <= 0FFFH) THEN (* EOF reached *)
+				EOF := TRUE
+			ELSE
+				c := y
+			END
+		END;
+		INC(i)
+	END;
+
+	IF EOF & (i # iRelative) THEN
+		r := eEOF
+	ELSE
+			(* c now has the actual cluster, translate this to the physical sector *)
+		i := ClusterToSector(c);
+		r := ReadBlock(i, SUPER.ClusterSize, pBlock^)
+	END;
+	RETURN(r)
+END GetCluster;
+
+PROCEDURE GetSector(iStart: LONGINT; iRelative: LONGINT): LONGINT;
+VAR y,r,i,c : LONGINT; EOF : BOOLEAN;
+BEGIN
+	i := 0;
+	EOF := FALSE;
+	c := iStart;
+	WHILE (i < iRelative) & ~EOF DO
+		y := GetFATWord(c);
+		IF (SUPER.FATBits = 16) THEN
+			IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+				Error("DosDisk.GetSector: Invalid cluster, 0 - ", y)
+			ELSIF (y >= 0FFF8H) & (y <= 0FFFFH) THEN (* EOF reached *)
+				EOF := TRUE
+			ELSE
+				c := y
+			END
+		ELSE
+			IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+				Error("DosDisk.GetSector: Invalid cluster, 1 - ", y)
+			ELSIF (y >= 0FF8H) & (y <= 0FFFH) THEN (* EOF reached *)
+				EOF := TRUE
+			ELSE
+				c := y
+			END
+		END;
+		INC(i)
+	END;
+	IF EOF & (i # iRelative) THEN
+		HALT(99)
+	ELSE
+			(* c now has the actual cluster, translate this to the physical sector *)
+		i := ClusterToSector(c)
+	END;
+	RETURN i
+END GetSector;
+
+PROCEDURE GetClusters*(iStart: LONGINT; iRelative, iNum: LONGINT; VAR buf: ARRAY OF SYSTEM.BYTE): LONGINT;
+VAR p: Cluster;  i, err, sec, sec0, sec1: LONGINT;
+BEGIN
+	ASSERT(iNum > 0);
+	i := 0;
+	WHILE i # iNum DO
+		sec := GetSector(iStart, iRelative+i);
+		p := SYSTEM.VAL(Cluster, SYSTEM.ADR(buf[i*SUPER.ClusterSize*cSectorSize]));
+		err := ReadBlock(sec, SUPER.ClusterSize, p^);
+		IF err # 0 THEN RETURN err END;
+		INC(i)
+	END;
+	RETURN 0
+END GetClusters;
+
+(* PutCluster - where iStart = first cluster of file;
+*		iRelative = relative cluster in file;
+*		pBlock = POINTER to one or MORE sectors
+*	NOTE: I am typecasting pBlock to tBlockPtr, and
+*	then live dangerously by dereferencing the cast,
+*	and assuming the lower layers will not break anything.
+*)
+PROCEDURE PutCluster*(iStart: LONGINT; iRelative: LONGINT; pBlock: Cluster): LONGINT;
+VAR y,r,i,c,S,Cnt: LONGINT; EOF: BOOLEAN;
+BEGIN
+	i := 0;
+	EOF := FALSE;
+	c := iStart;
+	WHILE (i < iRelative) & ~EOF DO
+		y := GetFATWord(c);
+
+		IF (SUPER.FATBits = 16) THEN
+			IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+				Error("DosDisk.PutCluster: Invalid cluster, 0 - ", y)
+			ELSIF (y >= 0FFF8H) & (y <= 0FFFFH) THEN (* EOF reached *)
+				EOF := TRUE
+			ELSE
+				c := y
+			END
+		ELSE
+			IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+				Error("DosDisk.PutCluster: Invalid cluster, 1 - ", y)
+			ELSIF (y >= 0FF8H) & (y <= 0FFFH) THEN (* EOF reached *)
+				EOF := TRUE
+			ELSE
+				c := y
+			END
+		END;
+		INC(i)
+	END;
+
+	IF EOF & (i # iRelative) THEN
+		y := iRelative - i;
+		r := AddClusterList(iStart, y, i);
+		IF (r = eOK) THEN
+			RETURN(PutCluster(iStart, iRelative, pBlock))
+		END
+	ELSE
+		Cnt := 0;
+		LOOP
+				(* c now has the actual cluster, translate this to physical sector *)
+			IF (Cnt > 3) THEN r := eIO; EXIT END;
+			i := ClusterToSector(c);
+			r := WriteBlock(i, SUPER.ClusterSize, pBlock^);
+			IF (r = eOK) THEN EXIT
+			ELSE
+				y := c;
+				IF (MapBadCluster(iStart, y) # eOK) THEN RETURN(eDiskFULL) END;
+				i := ClusterToSector(y);
+				r := WriteBlock(i, SUPER.ClusterSize, pBlock^);
+				IF (r = eOK) THEN EXIT END;
+				c := y
+			END
+		END
+	END;
+	RETURN(r)
+END PutCluster;
+
+(* Get the byte size of an item from the FAT table *)
+PROCEDURE GetSize(iStart : LONGINT; VAR oClusterCount : LONGINT) : LONGINT;
+VAR FSize,c,y,n : LONGINT; EOF: BOOLEAN;
+BEGIN
+	oClusterCount := 0; FSize := 0;
+	IF (iStart > 1) THEN
+		EOF := FALSE;
+		c := iStart;
+		WHILE ~EOF DO
+			y := GetFATWord(c);
+			IF (SUPER.FATBits = 16) THEN
+				IF (y = 0) OR (y = 0FFF7H) OR ((y>= 0FFF0H) & (y <= 0FFF6H)) THEN
+					Error("DosDisk.GetSize: Invalid cluster, 0 - ", y)
+				ELSIF (y >= 0FFF8H) & (y <= 0FFFFH) THEN (* EOF reached *)
+					EOF := TRUE
+				ELSE
+					c := y
+				END
+			ELSE
+				IF (y = 0) OR (y = 0FF7H) OR ((y>= 0FF0H) & (y <= 0FF6H)) THEN
+					Error("DosDisk.GetSize: Invalid cluster, 1 - ", y)
+				ELSIF (y >= 0FF8H) & (y <= 0FFFH) THEN (* EOF reached *)
+					EOF := TRUE
+				ELSE
+					c := y
+				END
+			END;
+			INC(oClusterCount)
+		END;
+		FSize := oClusterCount * (cSectorSize * SUPER.ClusterSize)
+	END;
+	RETURN(FSize)
+END GetSize;
+
+(* Extend the directory starting on iStart with one cluster *)
+PROCEDURE ExtendDir(iStart : LONGINT) : LONGINT;
+VAR r,L,i,tmp : LONGINT; pCluster: Cluster; Empty: tBlock;
+BEGIN
+	IF (iStart = SUPER.RootStart) THEN (* Oops cannot extend root *) RETURN(eDiskFULL) END;
+
+	r := AddClusterList(SectorToCluster(iStart), 1, L);
+	IF (r # eOK) THEN RETURN(r) END;
+
+	SYSTEM.NEW(pCluster, SUPER.ClusterSize * cSectorSize); tmp := SYSTEM.VAL(LONGINT, pCluster);
+	FOR i := 0 TO LEN(Empty)-1 DO Empty[i] := 0X END;
+	FOR i := 0 TO SUPER.ClusterSize-1 DO SYSTEM.MOVE(SYSTEM.ADR(Empty), tmp, LEN(Empty)); INC(tmp, LEN(Empty)) END;
+	r := WriteBlock(ClusterToSector(L), SUPER.ClusterSize, pCluster^);
+
+	IF (r # eOK) THEN
+		i := 0;
+		LOOP
+			IF (i >= 3) THEN r := eIO; EXIT END;
+			r := MapBadCluster(SectorToCluster(iStart), L);
+			IF (r # eOK) THEN EXIT END;
+			r := WriteBlock(ClusterToSector(L), SUPER.ClusterSize, pCluster^);
+			IF (r = eOK) THEN EXIT END;
+			INC(i)
+		END
+	END;
+	pCluster := NIL;
+	RETURN(r)
+END ExtendDir;
+
+(*
+*  This procedure will lookup the file name string, and return
+*  its directory entry as well as the starting sector of the directory
+*  that it was found in, and the entry number in that directory.
+*  iNew indicates if this is a new entry, and in that case it the procedure
+*  will return the first available spot, if there is one...
+*)
+PROCEDURE Lookup(iS: ARRAY OF CHAR; iNew: BOOLEAN; VAR oStart,oEntryNum: LONGINT; VAR oEntry: tDirectoryEntry) : BOOLEAN;
+VAR TmpName1, TmpName2 : ARRAY 257 OF CHAR; Found: BOOLEAN; i,j,Count: LONGINT; FileName: tFilename; Extension: tExtension;
+PatternFound: BOOLEAN;
+BEGIN
+	Found := FALSE;
+	Strings.FindNext(":", iS, 0, PatternFound, i);
+	IF PatternFound THEN
+		Strings.Extract(iS, i+1, Strings.Length(iS), TmpName1)
+	ELSE
+		Strings.Assign(iS, TmpName1)
+	END;
+
+	Strings.Capitalize(TmpName1);
+
+	FOR i := 0 TO Strings.Length(TmpName1)-1 DO IF TmpName1[i] = "\" THEN TmpName1[i] := "/" END END;
+
+	oStart := SUPER.RootStart;
+	oEntryNum := 0;
+	Count := SUPER.RootEntries;
+	IF (Strings.Length(TmpName1) = 0) OR Strings.Equal(TmpName1, "/") THEN
+		FileName[0] := 0X;
+		Extension[0] := 0X;
+		Found := TRUE
+	ELSE
+		WHILE (TmpName1[0] # 0X) DO
+			IF (TmpName1[0] = "/") THEN
+				Strings.Extract(TmpName1,1,Strings.Length(TmpName1),TmpName1)
+			END;
+			Strings.FindNext("/", TmpName1, 0, PatternFound, i);
+			IF PatternFound THEN
+				Strings.Extract(TmpName1,0,i,TmpName2);
+				Strings.Extract(TmpName1,i+1,Strings.Length(TmpName1),TmpName1)
+			ELSE
+				Strings.Assign(TmpName1, TmpName2);
+				TmpName1[0] := 0X
+			END;
+
+			IF Strings.Equal(".",TmpName2) OR Strings.Equal("..",TmpName2) THEN
+				Strings.Assign(TmpName2,FileName);
+				Extension[0] := 0X
+			ELSE
+				Strings.FindNext(".", TmpName2, 0, PatternFound, i);
+				IF PatternFound THEN
+					Strings.Extract(TmpName2,0,i,FileName);
+					Strings.Extract(TmpName2,i+1,Strings.Length(TmpName2),Extension)
+				ELSE
+					Strings.Assign(TmpName2,FileName);
+					Extension[0] := 0X
+				END
+			END;
+			i := Strings.Length(FileName); WHILE (i < 8) DO FileName[i] := " "; INC(i) END; FileName[8] := 0X;
+			i := Strings.Length(Extension); WHILE (i < 3) DO Extension[i] := " "; INC(i) END; Extension[3] := 0X;
+			LOOP
+				IF (oEntryNum < Count) THEN
+					IF (GetDirectoryEntry(oStart,oEntryNum,oEntry) # 0) THEN
+						Texts.WriteString(W, "Error on read of entry number = ");  
+						Texts.WriteInt(W, oEntryNum, 1);  Texts.WriteLn(W);
+						Texts.Append(Oberon.Log, W.buf);
+					ELSIF (oEntry.AttrRecord.Del OR oEntry.AttrRecord.Empty) & iNew & (TmpName1[0] = 0X) THEN
+						Found := TRUE;
+						EXIT
+					ELSIF Strings.Equal(FileName,oEntry.FileName) & Strings.Equal(Extension,oEntry.Extension) THEN
+						IF oEntry.AttrRecord.Dir THEN
+							IF Strings.Equal("..      ",oEntry.FileName) & (oEntry.Start = 0) THEN
+								oStart := SUPER.RootStart;
+								Count := SUPER.RootEntries
+							ELSE
+								oStart := ClusterToSector(oEntry.Start);
+								Count := GetSize(oEntry.Start,i) DIV cEntrySize
+							END;
+							oEntryNum := 0
+						END;
+							(* Was this the last one ? *)
+						IF (TmpName1[0] = 0X) THEN Found := TRUE END;
+						EXIT
+					ELSE
+					END
+				ELSE
+					TmpName1[0] := 0X;
+					EXIT
+				END;
+				INC(oEntryNum)
+			END
+		END
+	END;
+	IF iNew OR ~Found THEN
+		Strings.Assign(FileName, oEntry.FileName);
+		Strings.Assign(Extension, oEntry.Extension)
+	END;
+	RETURN(Found)
+END Lookup;
+
+(* RegExp stuff ported from MCS *)
+PROCEDURE Match(exp,str:ARRAY OF CHAR):BOOLEAN;
+VAR Chs,Che : CHAR; chset : ARRAY 8 OF SET;
+ 	oldSIndex, oldEIndex, EIndex,SIndex : LONGINT; set : BOOLEAN;
+ 
+  PROCEDURE ReadChe;
+    VAR first:BOOLEAN;
+  BEGIN
+    first:=TRUE;
+    LOOP
+      IF (EIndex>LEN(exp)-1) OR (exp[EIndex]<" ") OR (exp[EIndex]>=CHR(80H)) THEN
+         Che:=0X; EXIT;
+      ELSIF (exp[EIndex]="\") & first THEN
+         INC(EIndex); first:=FALSE;
+      ELSE
+         Che:=exp[EIndex]; INC(EIndex); 
+         IF first THEN 
+            IF (Che="?") OR (Che="*") OR (Che="[") 
+	       OR (Che="]") OR (Che="-") OR (Che="!") THEN
+	       Che := CHR(ORD(Che)+80H)
+            END;
+         END;
+         EXIT;
+      END;
+    END;
+  END ReadChe;
+
+  PROCEDURE ReadChs;
+  BEGIN
+    IF (SIndex>LEN(str)-1) OR (str[SIndex]<" ") OR (str[SIndex]>=CHR(80H)) THEN
+       Chs:=0X;
+    ELSE
+       Chs:=str[SIndex]; INC(SIndex);
+    END;
+  END ReadChs;
+  
+  PROCEDURE CreateMatchSet(VAR set:BOOLEAN):BOOLEAN;
+    VAR ch1:CHAR; neg:BOOLEAN; c:LONGINT;
+  BEGIN
+    IF Che#lbrack THEN set:=FALSE; RETURN TRUE; END;
+    set:=TRUE;
+    FOR c := 0 TO (LEN(chset)-1) DO
+      chset[c] := {}
+    END;
+    ReadChe;
+    IF Che=not THEN neg:=TRUE; ELSE DEC(EIndex); neg:=FALSE; END;
+    LOOP
+      ch1:=Che;
+      ReadChe;
+      IF Che=0X THEN RETURN FALSE;
+      ELSIF Che=rbrack THEN EXIT;
+      ELSIF Che=minus THEN
+         ReadChe;
+         IF (ch1>=CHR(80H)) OR (Che>=CHR(80H)) OR (ch1>=Che) THEN RETURN FALSE; END;
+         WHILE ch1 <= Che DO
+           INCL(chset[ORD(ch1) DIV 16],ORD(ch1) MOD 16);
+           ch1 := CHR(ORD(ch1)+1)
+         END;
+      ELSIF Che>=CHR(80H) THEN RETURN FALSE;
+      ELSE
+         INCL(chset[ORD(Che) DIV 16],ORD(Che) MOD 16);
+      END;
+    END;
+    IF neg THEN
+       ch1:=" ";
+       WHILE ch1 <= CHR(7FH) DO
+         IF ORD(ch1) MOD 16 IN chset[ORD(ch1) DIV 16] THEN
+            EXCL(chset[ORD(ch1) DIV 16],ORD(ch1) MOD 16);
+         ELSE
+            INCL(chset[ORD(ch1) DIV 16],ORD(ch1) MOD 16);
+         END;
+         ch1 := CHR(ORD(ch1)+1)
+       END;
+    END;
+    RETURN TRUE;
+  END CreateMatchSet;
+ 
+  PROCEDURE inset():BOOLEAN;
+  BEGIN
+    RETURN ORD(Chs) MOD 16 IN chset[ORD(Chs) DIV 16];
+  END inset;
+ 
+  PROCEDURE matchsingle(set:BOOLEAN):BOOLEAN;
+  BEGIN
+    IF set THEN  RETURN inset() 
+    ELSIF Che=single THEN 
+       RETURN (Chs#0X) & (Chs#"/");
+    ELSE
+       RETURN Che=Chs;
+    END;
+  END matchsingle;
+ 
+  PROCEDURE match():BOOLEAN;
+  BEGIN
+    LOOP
+      IF Che=more THEN
+         ReadChe;
+         IF Che=more THEN
+            ReadChe;
+            WHILE (Che=more) OR (Che=single) DO ReadChe; END;
+            IF Che=0X THEN RETURN TRUE; END;
+            LOOP
+              oldEIndex:=EIndex-1;
+              IF ~ CreateMatchSet(set) THEN RETURN FALSE; END;
+              LOOP
+                ReadChs;
+                IF Chs=0X THEN RETURN FALSE;
+                ELSIF matchsingle(set) THEN EXIT;
+                END;
+              END;
+              oldSIndex:=SIndex;
+              LOOP
+                ReadChe;
+                IF Che=more THEN RETURN match();
+                ELSIF ~ CreateMatchSet(set) THEN RETURN FALSE; 
+                ELSE
+                   ReadChs;
+                   IF Che=0X THEN
+                      IF Chs=0X THEN RETURN TRUE; END;
+                      EIndex:=oldEIndex; ReadChe; SIndex:=oldSIndex; EXIT;
+                   ELSIF Chs=0X THEN RETURN FALSE;
+                   ELSIF ~ matchsingle(set) THEN
+                      EIndex:=oldEIndex; ReadChe; SIndex:=oldSIndex; EXIT;
+                   END;
+                END;
+              END;
+            END;
+         ELSE
+            WHILE Che=single DO ReadChe; END;
+            IF Che=0X THEN 
+               LOOP
+                 ReadChs;
+                 IF Chs=0X THEN RETURN TRUE;
+                 ELSIF Chs="/" THEN RETURN FALSE;
+                 END;
+               END;
+            END;
+            LOOP
+              oldEIndex:=EIndex-1;
+              IF ~ CreateMatchSet(set) THEN RETURN FALSE; END;
+              LOOP
+                ReadChs;
+                IF Chs=0X THEN RETURN FALSE;
+                ELSIF matchsingle(set) THEN EXIT;
+                ELSIF Chs="/" THEN RETURN FALSE;
+                END;
+              END;
+              oldSIndex:=SIndex;
+              LOOP
+                ReadChe;
+                IF Che=more THEN RETURN match();
+                ELSIF ~ CreateMatchSet(set) THEN RETURN FALSE; 
+                ELSE
+                   ReadChs;
+                   IF Che=0X THEN
+                      IF Chs=0X THEN RETURN TRUE; END;
+                      EIndex:=oldEIndex; ReadChe; SIndex:=oldSIndex; EXIT;
+                   ELSIF Chs=0X THEN RETURN FALSE;
+                   ELSIF ~ matchsingle(set) THEN
+                      EIndex:=oldEIndex; ReadChe; SIndex:=oldSIndex; EXIT;
+                   END;
+                END;
+              END; (* LOOP *)
+            END; (* LOOP *)
+         END; (* IF Chs=more *)
+      ELSE
+         ReadChs;
+         IF ~ CreateMatchSet(set) THEN RETURN FALSE;
+         ELSIF Che=0X THEN RETURN Che=Chs;
+         ELSIF ~ matchsingle(set) THEN RETURN FALSE;
+         END;
+      END;
+      ReadChe;
+    END;
+  END match;
+ 
+BEGIN (* Match *)
+  EIndex:=0; SIndex:=0; ReadChe;
+  RETURN match();
+END Match;
+ 
+PROCEDURE GetVolumeName(VAR iVol : ARRAY OF CHAR);
+VAR i: LONGINT; E: tDirectoryEntry;
+BEGIN
+	iVol[0] := 0X;
+	IF (CurrentDrive # 0X) THEN
+		i := 0;
+		LOOP
+			IF (i < SUPER.RootEntries) THEN
+				IF (GetDirectoryEntry(SUPER.RootStart, i, E) = 0) & E.AttrRecord.Vol THEN
+					Strings.Assign(E.FileName, iVol);
+					Strings.Concat(iVol, E.Extension, iVol);
+					EXIT
+				END;
+				INC(i)
+			ELSE
+				EXIT
+			END
+		END
+	END
+END GetVolumeName;
+
+PROCEDURE MakeComparable(Entry : tDirectoryEntry; VAR oComp : ARRAY OF CHAR);
+VAR i,j : LONGINT; Tmp : ARRAY 5 OF CHAR; Found: BOOLEAN;
+BEGIN
+	Strings.FindNext(" ", Entry.FileName, 0, Found, i);
+	IF Found THEN
+		Strings.Extract(Entry.FileName, 0, i, oComp)
+	ELSE
+		Strings.Assign(Entry.FileName, oComp)
+	END;
+	Strings.FindNext(" ", Entry.Extension, 0, Found, i);
+	IF Found THEN
+		Strings.Extract(Entry.Extension, 0, i, Tmp)
+	ELSE
+		Strings.Assign(Entry.Extension, Tmp)
+	END;
+	IF (Strings.Length(Tmp) # 0) THEN
+		Strings.Concat(oComp, ".", oComp);
+		Strings.Concat(oComp, Tmp, oComp)
+	END
+END MakeComparable;
+
+(* This procedure will make a list of files that matches the regular expression.  *)
+PROCEDURE GetMatchingList(iPrefix : ARRAY OF CHAR; iRex : ARRAY OF CHAR; VAR oEntryList : tDEPtr);
+VAR i,j : LONGINT; Tmp : ARRAY 256 OF CHAR; pE, pPrev : tDEPtr;
+Entry : tDirectoryEntry; C,S,E : LONGINT;
+BEGIN
+	oEntryList := NIL;
+	IF Lookup(iPrefix, FALSE, S, E, Entry) THEN
+			(* Will always be a directory entry *)
+		IF (S = SUPER.RootStart) THEN
+			C := SUPER.RootEntries
+		ELSE
+			C := GetSize(Entry.Start,i) DIV cEntrySize
+		END;
+		i := 0;
+		pPrev := NIL;
+		WHILE (i < C) DO
+			IF (GetDirectoryEntry(S, i, Entry) = eOK) THEN
+				IF Entry.AttrRecord.Del OR Entry.AttrRecord.Empty THEN
+				ELSE
+					MakeComparable(Entry, Tmp);
+					IF Match(iRex, Tmp) THEN
+						NEW(pE);
+						pE^ := Entry;
+						pE^.Next := NIL;
+						IF (pPrev = NIL) THEN
+							oEntryList := pE
+						ELSE
+							pPrev^.Next := pE
+						END;
+						pPrev := pE
+					END
+				END
+			ELSE
+				Texts.WriteString(W, "Unexpected end on i =");
+				Texts.WriteInt(W, i, 1);  Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+			END;
+			INC(i)
+		END
+	END
+END GetMatchingList;
+
+(* ---- Read partition table ---- *)
+
+(* Partition table starts at 01BEH in partition table sector and consists
+	of 4 records of the type:
+	
+	00    bootind: Types.Byte;
+	01    head: Types.Byte;
+	02    sector: Types.Byte;
+	03    cyl: Types.Byte;
+	04    type: Types.Byte;
+	05    head2: Types.Byte;
+	06    sector2: Types.Byte;
+	07    cyl2: Types.Byte;
+	08    start: Types.DWord;
+	12    num: Types.DWord
+*)
+
+(* ReadPrimary - Read primary partition table entries into p *)
+
+PROCEDURE ReadPrimary(VAR p: ARRAY OF Partition;  VAR n: SHORTINT);
+VAR d, i: SHORTINT;  b: ARRAY 512 OF CHAR;  e: LONGINT;  size: LONGINT;
+BEGIN
+	n := 0;
+	FOR d := 0 TO Disk.NumDrives()-1 DO
+		Disk.GetBlocks(d, 0, 1, b, 0);
+		IF (b[510] = 055X) & (b[511] = 0AAX) THEN
+			FOR i := 0 TO 3 DO
+				e := 01BEH + 16*i;  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+				IF (b[e+4] # 0X) & (size # 0) THEN
+					p[n].type := ORD(b[e+4]);  p[n].letter := 0X;  p[n].drive := d;
+					SYSTEM.GET(SYSTEM.ADR(b[e+8]), p[n].start);  p[n].size := size;
+					INC(n)
+				END
+			END
+		END
+	END
+END ReadPrimary;
+
+(* ReadLogical - Read "logical drive" partitions into p *)
+
+PROCEDURE ReadLogical(d: SHORTINT;  first: LONGINT;  VAR p: ARRAY OF Partition;  VAR n, letter: SHORTINT);
+VAR b: ARRAY 512 OF CHAR;  e: LONGINT;  sec, size: LONGINT;
+BEGIN
+	sec := first;
+	LOOP
+		Disk.GetBlocks(d, sec, 1, b, 0);
+		IF (b[510] = 055X) & (b[511] = 0AAX) THEN
+			e := 01BEH;  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+			IF (b[e+4] = 5X) OR (size = 0) THEN HALT(99) END;
+			p[n].type := ORD(b[e+4]);  p[n].drive := d;
+			IF (p[n].type < 32) & (p[n].type IN {1,4,6,7}) THEN
+				p[n].letter := CHR(letter);  INC(letter)
+			ELSE
+				p[n].letter := 0X
+			END;
+			SYSTEM.GET(SYSTEM.ADR(b[e+8]), p[n].start);  INC(p[n].start, sec);
+			p[n].size := size;
+			INC(n);
+			INC(e, 16);  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+			IF (b[e+4] # 5X) OR (size = 0) THEN EXIT END;
+			SYSTEM.GET(SYSTEM.ADR(b[e+8]), sec);  INC(sec, first)
+		END
+	END
+END ReadLogical;
+
+(* ReadPartitionTable - Read all partition tables into p *)
+
+PROCEDURE ReadPartitionTable(VAR p: ARRAY OF Partition;  VAR n: SHORTINT);
+VAR
+	pt: ARRAY 8 OF Partition;
+	pn, letter, i: SHORTINT;
+BEGIN
+	ReadPrimary(pt, pn);
+	letter := SHORT(ORD("C"));  n := 0;
+	FOR i := 0 TO pn-1 DO
+		IF (pt[i].type < 32) & (pt[i].type IN {1,4,6,7}) THEN
+			pt[i].letter := CHR(letter);  INC(letter)
+		END
+	END;
+	FOR i := 0 TO pn-1 DO
+		IF pt[i].type = 5 THEN
+			ReadLogical(pt[i].drive, pt[i].start, p, n, letter)
+		ELSE
+			p[n] := pt[i];  INC(n)
+		END
+	END
+END ReadPartitionTable;
+
+PROCEDURE InitPartition(ch: CHAR;  VAR drive, offset, len: LONGINT);
+VAR
+	pt: ARRAY 16 OF Partition;
+	numfat, pn, pi, m: SHORTINT;
+BEGIN
+	IF (ch >= "a") & (ch <= "z") THEN ch := CAP(ch) END;
+	ReadPartitionTable(pt, pn);
+	pi := 0;  m := pn;
+	WHILE pi # m DO
+		IF (pt[pi].letter = ch) & (pt[pi].type < 32) & (pt[pi].type IN {1,4,6}) THEN m := pi
+		ELSE INC(pi)
+		END
+	END;
+	IF pi = pn THEN HALT(99) END;	(* partition not found *)
+	drive := pt[pi].drive;  offset := pt[pi].start;  len := pt[pi].size
+END InitPartition;
+
+PROCEDURE SetInput(a : CHAR);
+VAR r, m, size, sec, h, t : LONGINT;
+BEGIN
+	a := CAP(a);
+	IF (a = "A") OR (a = "B") THEN	(* floppy *)
+		Drive := ORD(a)-ORD("A");
+		RDSECTOR := FloppyReadSector;
+		WRSECTOR := FloppyWriteSector
+	ELSIF (a >= "C") & (a <= "Z") THEN	(* hard disk *)
+			(* Get the nth DOS partition *)
+		InitPartition(a, Drive, partitionoffset, partitionlen);
+		RDSECTOR := HDReadSector;
+		WRSECTOR := HDWriteSector
+	ELSE
+		HALT(54)
+	END
+END SetInput;
+
+PROCEDURE Initialise(iDrive: CHAR);
+VAR BOOT: tBootBlock;
+BEGIN
+	SetInput(iDrive);
+	GetSuperBlock(BOOT, SUPER);
+	GetFATTable(SUPER);
+	GetRootTable(SUPER);
+	CurrentDrive := iDrive
+END Initialise;
+
+(* This procedure will take the incoming name, normalise it,
+*  set the drive, prefix, and reg expression, and init the drive.
+*
+*  IF Drive = 0X then defaults to current drive
+*  IF oPrefix = 0X then defaults to "/"
+*  IF oName = 0X then defaults to "*"
+*)
+PROCEDURE InitCall(VAR iLong: ARRAY OF CHAR; VAR oDrive : CHAR; VAR oPrefix, oName : ARRAY OF CHAR);
+VAR i,j,Len : LONGINT; Tmp: ARRAY 256 OF CHAR; EList, ETmp : tDEPtr; Found: BOOLEAN;
+BEGIN
+		(* First normalize the incoming string *)
+	Strings.Capitalize(iLong);
+	i := 0;
+	WHILE (i < Strings.Length(iLong)) DO
+		IF iLong[i] = "\" THEN iLong[i] := "/" END;
+		IF (i > 0) & (iLong[i] = "/") & (iLong[i-1] = "/") THEN
+			Strings.Delete(iLong, i, 1)
+		ELSE
+			INC(i)
+		END
+	END;
+
+		(* Now separate the drive number *)
+	oDrive := 0X;
+	Strings.FindNext(":", iLong, 0, Found, i);
+	IF Found THEN
+		IF (i > 0) THEN
+			oDrive := iLong[i-1]
+		ELSE
+			oDrive := CAP(CurrentDrive)
+		END;
+		Strings.Extract(iLong, i+1, Strings.Length(iLong), Tmp)
+	ELSE
+		oDrive := CAP(CurrentDrive);
+		Strings.Assign(iLong, Tmp)
+	END;
+
+	IF (CurrentDrive = 0X) THEN
+		IF (oDrive = 0X) THEN
+			oDrive := "A"
+		END;
+		Initialise(oDrive)
+	ELSE
+		IF (oDrive # 0X) & (oDrive # CurrentDrive) THEN
+			Initialise(oDrive)
+		END
+	END;
+		(* Check if there is a prefix *)
+	Len := Strings.Length(Tmp);
+	IF (Len = 0) THEN
+		Strings.Assign("/", oPrefix);
+		Strings.Assign("*", oName)
+	ELSE
+		Strings.FindNext("/", Tmp, 0, Found, i);
+		IF ~Found THEN
+			Strings.Assign("/", oPrefix);
+			Strings.Assign(Tmp, oName)
+		ELSE
+			i := 0;
+			j := 0;
+			WHILE Found DO
+				Strings.FindNext("/", Tmp, i, Found, j);
+				i := j+1
+			END;
+			Strings.Extract(Tmp, 0, i-1, oPrefix);
+			Strings.Extract(Tmp, i, Len, oName)
+		END;
+	END;
+	IF (oPrefix[0] # "/") THEN Strings.Insert("/", 0, oPrefix) END;
+	IF (Strings.Length(oName) = 0) THEN Strings.Assign("*", oName) END;
+
+		(* Now make sure that the prefix is a directory, and try out the
+		*  rex to make sure that it isnt perhaps just a subdir of the prefix.
+		*  If rex is a subdir of prefix, extend the prefix with the subdir,
+		*  and wildcard the rex.
+		*)
+	i := 0;
+	j := 0;
+	GetMatchingList(oPrefix, oName, EList);
+	WHILE (EList # NIL) DO
+		ETmp := EList;
+		EList := EList.Next;
+		IF ETmp.AttrRecord.Dir THEN
+			MakeComparable(ETmp^, Tmp);
+			INC(i)
+		ELSE
+			INC(j)
+		END;
+		ETmp := NIL
+	END;
+	IF (i = 1) & (j = 0) THEN (* Will only match one dir always *)
+		IF (Strings.Length(oPrefix) # 0) & (oPrefix[Strings.Length(oPrefix)-1] # "/") THEN
+			Strings.Concat(oPrefix, "/", oPrefix)
+		END;
+		Strings.Concat(oPrefix, Tmp, oPrefix);
+		Strings.Assign("*", oName)
+	END
+END InitCall;
+
+(* Get the size of a cluster in sectors *)
+PROCEDURE GetClusterSize*() : LONGINT;
+BEGIN
+	RETURN(SUPER.ClusterSize)
+END GetClusterSize;
+
+PROCEDURE GetFreeSize() : LONGINT;
+VAR i,f : LONGINT;
+BEGIN
+	f := 0; i := 2; WHILE (i < SUPER.Clusters+2) DO IF (GetFATWord(i) = 0) THEN INC(f) END; INC(i)
+	END;
+	RETURN(f*cSectorSize)
+END GetFreeSize;
+
+PROCEDURE UpdateCache();
+VAR r : LONGINT;
+BEGIN
+	PutFATTable(SUPER);
+	PutRootTable(SUPER);
+	IF SubdirCache.Dirty THEN
+		r := WriteBlock(SubdirCache.S, 1, SubdirCache.Cache^);
+		SubdirCache.Dirty := FALSE
+	END
+END UpdateCache;
+
+PROCEDURE Init;
+VAR i: LONGINT;
+BEGIN
+    Texts.OpenWriter(W);
+	Drive := 0;  partitionoffset := -1;
+	CurrentDrive := 0X;
+	i := 0;
+	WHILE (i < 512) DO
+		FATTable[i].Cache := NIL;
+		FATTable[i].Dirty := FALSE;
+		RootTable[i].Cache := NIL;
+		RootTable[i].Dirty := FALSE;
+		INC(i)
+	END;
+	SubdirCache.S := 0;
+	SubdirCache.Dirty := FALSE;
+	NEW(SubdirCache.Cache)
+END Init;
+
+PROCEDURE UnCap(VAR iS : ARRAY OF CHAR);
+VAR i,ch : INTEGER;
+BEGIN
+	i := 0;
+	WHILE (i < Strings.Length(iS)) DO
+		ch := ORD(iS[i]);
+		IF (ch >= ORD("A")) & (ch <= ORD("Z")) THEN INC(ch, ORD(" ")) END;
+		iS[i] := CHR(ch);
+		INC(i)
+	END
+END UnCap;
+
+PROCEDURE ShowEntry(e: tDirectoryEntry;  VAR T: Texts.Text);
+VAR Attr,Hold,i : LONGINT; Holdch : CHAR;tmp: ARRAY 8 OF CHAR; found: BOOLEAN;
+BEGIN
+	IF e.AttrRecord.Dir & (Strings.Equal(".       ", e.FileName) OR Strings.Equal("..      ", e.FileName)) THEN RETURN END;
+	UnCap(e.FileName); UnCap(e.Extension);
+	Strings.FindNext(" ", e.FileName, 0, found, i);
+	IF found THEN
+		Strings.Extract(e.FileName, 0, i, tmp);
+		IF Strings.Length(tmp) # 0 THEN Texts.WriteString(W, tmp) END
+	ELSE Texts.WriteString(W, e.FileName)
+	END;
+	Strings.FindNext(" ", e.Extension, 0, found, i);
+	IF found THEN
+		Strings.Extract(e.Extension, 0, i, tmp); 
+		IF Strings.Length(tmp) # 0 THEN
+			Texts.Write(W, ".");
+			Texts.WriteString(W, tmp); 
+		END
+	ELSE
+		Texts.Write(W, ".");
+		Texts.WriteString(W, e.Extension);
+	END;
+	IF e.AttrRecord.Dir THEN Texts.Write(W, "/") END;
+	Texts.WriteLn(W);
+	Texts.Append(T, W.buf)
+END ShowEntry;
+
+PROCEDURE Dir*(iName : ARRAY OF CHAR);
+VAR EList, Tmp : tDEPtr;Drive : CHAR; Prefix, Rex : ARRAY 256 OF CHAR; Volume : ARRAY 12 OF CHAR;
+	T: Texts.Text;
+	V: Viewers.Viewer;
+	X, Y: INTEGER;
+BEGIN
+	InitCall(iName, Drive, Prefix, Rex); (* This must always be done *)
+
+	T := TextFrames.Text("");
+	
+    Texts.WriteString(W, "Directory of "); Texts.WriteString(W, iName); Texts.WriteLn(W);
+    Texts.Append(T, W.buf);
+    
+	Texts.WriteString(W, "Volume in drive ");
+	Texts.Write(W, Drive);
+	IF (Strings.Length(Volume) # 0) & (Volume[0] # CHR(0E5H)) THEN
+		Texts.WriteString(W, " is ");
+		Texts.WriteString(W, Volume)
+	ELSE
+		Texts.WriteString(W, " has no label");
+	END;
+	Texts.WriteLn (W);
+	Texts.Append(T, W.buf);
+	
+	GetMatchingList(Prefix, Rex, EList);
+	IF (EList # NIL) THEN
+		WHILE (EList # NIL) DO
+			Tmp := EList;
+			EList := EList^.Next;
+			IF ~Tmp^.AttrRecord.Vol THEN
+				ShowEntry(Tmp^, T)
+			END;
+			Tmp := NIL
+		END
+	END;
+	Oberon.AllocateSystemViewer(Oberon.Par.vwr.X, X, Y);
+	V := MenuViewers.New(TextFrames.NewMenu("DOS.Dir", 
+		"System.Close System.Copy System.Grow Edit.Search Edit.Store"),
+		TextFrames.NewText(T, 0), TextFrames.menuH, X, Y);
+	GetVolumeName(Volume)
+END Dir;
+
+(* This not to be exported, will only delete one file, does not update FAT *)
+PROCEDURE Delete(iName: ARRAY OF CHAR) : LONGINT;
+VAR r,S,E : LONGINT;
+Entry : tDirectoryEntry;
+BEGIN
+	IF Lookup(iName,FALSE,S,E,Entry) THEN
+		IF (GetDirectoryEntry(S,E,Entry) = eOK) THEN
+			IF ~Entry.AttrRecord.Dir THEN
+				FreeClusterList(Entry.Start);
+				Entry.FileName[0] := CHR(0E5H); (* Deleted *)
+				r := PutDirectoryEntry(Entry);
+				RETURN(r)
+			ELSE
+				RETURN(eAccess)
+			END
+		ELSE
+			RETURN(eIO)
+		END
+	ELSE
+		RETURN(eNoEXIST)
+	END
+END Delete;
+
+PROCEDURE Create*(iUpdate: BOOLEAN; iName : ARRAY OF CHAR; VAR oFD : tFile; VAR Entry: tDirectoryEntry) : LONGINT;
+VAR i,r, Hour,Min,Sec,Day,Month,Year,t,d : LONGINT;
+Drive : CHAR; Prefix, Rex : ARRAY 256 OF CHAR;
+BEGIN
+	InitCall(iName, Drive, Prefix, Rex); (* This must always be done *)
+
+	oFD.Legal := FALSE;
+	oFD.Position := 0;
+	oFD.Size := 0;
+	IF Lookup(iName,TRUE,oFD.DirStart,oFD.EntryNum,Entry) THEN
+		r := Delete(iName);
+		IF ~((r = eOK) OR (r = eNoEXIST)) THEN RETURN(r) END
+	ELSE
+			(* If Lookup was FALSE, then EntryNum will have next possible value *)
+		r := ExtendDir(oFD.DirStart);
+		IF (r # eOK) THEN RETURN(r) END
+	END;
+		(* If we get here, We have a legal Entry, and enough space in the dir *)
+	Entry.DirStart := oFD.DirStart;
+	Entry.DirNumber := oFD.EntryNum;
+	Entry.Start := 0;
+	Entry.Attribute := 0;
+	Entry.AttrRecord.RO := FALSE;
+	Entry.AttrRecord.Hid := FALSE;
+	Entry.AttrRecord.Sys := FALSE;
+	Entry.AttrRecord.Vol := FALSE;
+	Entry.AttrRecord.Dir := FALSE;
+	Entry.AttrRecord.Arc := TRUE;
+	Entry.AttrRecord.Del := FALSE;
+	Entry.AttrRecord.Empty := FALSE;
+	Entry.FileSize := 0;
+	Kernel.GetClock(t,d);
+	Day := d MOD 32; Month := d DIV 32 MOD 16; Year := d DIV 512 MOD 128;
+	Hour := t DIV 4096 MOD 32; Min := t DIV 64 MOD 64; Sec := t MOD 64; 
+	Entry.Time := (Hour*2048) + (Min*32) + (Sec DIV 2); (* Hrs Min Sec *)
+	Entry.Date := ((Year+20) * 0200H) + (Month*32) + Day;
+	r := PutDirectoryEntry(Entry);
+	IF (r = eOK) THEN
+		oFD.FirstCluster := Entry.Start;
+		oFD.Legal := TRUE;
+	END;
+	IF iUpdate THEN UpdateCache() END;
+	RETURN r
+END Create;
+
+PROCEDURE Open*(iName : ARRAY OF CHAR; VAR oFD : tFile) : LONGINT;
+VAR Entry : tDirectoryEntry; Drive : CHAR; Prefix, Rex : ARRAY 256 OF CHAR;
+BEGIN
+	InitCall(iName, Drive, Prefix, Rex); (* This must always be done *)
+	IF Lookup(iName, FALSE, oFD.DirStart, oFD.EntryNum, Entry) THEN
+		oFD.FirstCluster := Entry.Start;
+		oFD.Legal := TRUE;
+		oFD.Position := 0;
+		oFD.Size := Entry.FileSize;
+		RETURN(eOK)
+	ELSE
+		oFD.Legal := FALSE;
+		oFD.Position := 0;
+		RETURN(eNoEXIST)
+	END
+END Open;
+
+PROCEDURE Close*(iUpdate : BOOLEAN; VAR aFD : tFile);
+BEGIN
+	aFD.Legal := FALSE;
+	IF iUpdate THEN UpdateCache() END
+END Close;
+
+PROCEDURE Reset*;
+BEGIN
+	IF (CAP(CurrentDrive) = "A") OR (CAP(CurrentDrive) = "B") THEN  
+		CurrentDrive := 0X	(* invalidate cache *)
+	END
+END Reset;
+
+BEGIN
+	NEW(FATTable);  NEW(RootTable);
+	Init
+END DosDisk.
+
+System.Free DOS DosDisk ~
+
+System.DeleteFiles t ~
+DOS.CopyFrom a:/t => t ~

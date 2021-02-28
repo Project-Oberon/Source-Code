@@ -1,0 +1,682 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Disk;	(* pjm/w.ibl *)
+
+(* Note: AHA1520.InstDisk module contains copy of disk driver *)
+
+(* pjm 04.07.96 - rearranged and added Size, Marked *)
+
+IMPORT Kernel, SYSTEM, SCSI := AHA1520, Cache;
+
+CONST
+	SectorSize* = 2048;
+
+	BS = 512;	(* disk block size *)
+	SS = SectorSize;	(* Oberon sector size *)
+	BPS = SS DIV BS;	(* blocks per sector *)
+
+TYPE
+	Sector* = RECORD END;	(** 2k Oberon Sector *)
+
+	Partition = RECORD
+		type: INTEGER;
+		letter: CHAR;
+		drive: SHORTINT;
+		start, size: LONGINT
+	END;
+
+	Node = POINTER TO NodeDesc;
+	NodeDesc = RECORD(Cache.ElemDesc)
+		data: ARRAY SS OF CHAR;
+	END;
+
+VAR
+		(* sector management *)
+	file,error: ARRAY 20 OF CHAR;	(* report initialisation errors *)
+	numused: LONGINT;	(* number of used Sectors *)
+	nummax: LONGINT;	(* total number of Sectors *)
+	map: POINTER TO ARRAY OF LONGINT;
+	init: BOOLEAN;
+
+		(* random sector cache *)
+	cache: Cache.Pool;
+
+		(* driver variables *)
+	native: BOOLEAN;
+	ddrive: SHORTINT;
+	requ: SCSI.Command;	(* SCSI command buffer *)
+	drives: SHORTINT;	(* amount of drives found on inquiry *)
+	tgt: ARRAY SCSI.Targets OF SHORTINT;	(* available disks *)
+	partitionoffset, partitionlen, rootoffset: LONGINT;
+	parttype: INTEGER;
+
+(* ---- Disk driver specific part) ---- *)
+
+PROCEDURE RequestSense(tgt: INTEGER; VAR key,code: INTEGER);
+(* request error information for last failed request *)
+VAR
+	cmd: ARRAY 6 OF CHAR;
+	data: ARRAY 14 OF CHAR;
+BEGIN
+	cmd[0]:= 03X; cmd[1]:= 00X; cmd[2]:= 00X;
+	cmd[3]:= 00X; cmd[4]:= 0EX; cmd[5]:= 00X;
+
+	requ.target:= SHORT(tgt); requ.lun:= 00H; requ.clen:= 6;
+	requ.cmd:= SYSTEM.ADR(cmd); requ.data:= SYSTEM.ADR(data);
+	SCSI.Initiate(requ); WHILE ~requ.done DO END;
+		
+	IF (requ.status # SCSI.Good) THEN HALT(99); END;
+	key:= ORD(data[2]);	(* Sense Key *)
+	code:= SYSTEM.LSH(ORD(data[12]),8)+ORD(data[13]);	(* Sense Code *)
+END RequestSense;
+
+PROCEDURE Inquiry(tgt: INTEGER): BOOLEAN;
+(* inquire device information *)
+VAR
+	cmd: ARRAY 6 OF CHAR;
+	data: ARRAY 1 OF CHAR;
+BEGIN
+	cmd[0]:= 12X; cmd[1]:= 00X; cmd[2]:= 00X;
+	cmd[3]:= 00X; cmd[4]:= 01X; cmd[5]:= 00X;
+
+	requ.target:= SHORT(tgt); requ.lun:= 00H; requ.clen:= 6;
+	requ.cmd:= SYSTEM.ADR(cmd); requ.data:= SYSTEM.ADR(data);
+	SCSI.Initiate(requ); WHILE ~requ.done DO END;
+	IF (requ.status = SCSI.Good) THEN
+		RETURN(data[0] = 00X);
+	ELSIF (requ.status = SCSI.DriverError) THEN
+		IF (SCSI.status = SCSI.drvNoConnect) THEN RETURN(FALSE); END;
+	END;
+	HALT(99);
+END Inquiry;
+
+PROCEDURE TestUnitReady(tgt: INTEGER): BOOLEAN;
+(* check, if device is rarrin' to go *)
+VAR
+	cmd: ARRAY 6 OF CHAR;
+BEGIN
+	cmd[0]:= 00X; cmd[1]:= 00X; cmd[2]:= 00X;
+	cmd[3]:= 00X; cmd[4]:= 00X; cmd[5]:= 00X;
+
+	requ.target:= SHORT(tgt); requ.lun:= 00H; requ.clen:= 6;
+	requ.cmd:= SYSTEM.ADR(cmd); requ.data:= 0;
+	SCSI.Initiate(requ); WHILE ~requ.done DO END;
+	RETURN(requ.status = SCSI.Good);	(* no data transmission *)
+END TestUnitReady;
+
+PROCEDURE DiskError();
+(* produce a nice trap in case of error occurrence *)
+VAR
+	target,lun,scsi,driver,key,code: INTEGER;
+BEGIN
+	key:= 0; code:= 0;
+	target:= requ.target; lun:= requ.lun; scsi:= requ.status; driver:= SCSI.status;
+	IF (driver = SCSI.Good) & (scsi = SCSI.cmdCheckCondition) THEN
+		RequestSense(requ.target,key,code);
+	END;
+	HALT(23);
+END DiskError;
+
+PROCEDURE Interrogate(dev: SET);
+(* loop over all targets to get the disks connected,
+	non accessible drives (not ready) are skipped without reclaims *)
+VAR
+	rider: SHORTINT;
+	ready: BOOLEAN;
+	key,code: INTEGER;
+BEGIN
+	drives:= 0;
+	FOR rider:= 0 TO SCSI.Targets-1 DO
+		IF (rider IN dev) & Inquiry(rider) THEN
+			ready:= TestUnitReady(rider);
+			IF ~ready THEN
+				RequestSense(rider,key,code);
+				(* UNIT ATTENTION & POWER ON are not really a fault *) 
+				IF (key = 06H) & (code = 2900H) THEN
+					ready:= TestUnitReady(rider);	(* so try again *)
+				END;
+			END;
+			IF ready THEN tgt[drives]:= rider; INC(drives); END;
+		END;
+	END;
+	FOR rider:= drives TO SCSI.Targets-1 DO tgt[rider]:= -1; END;
+END Interrogate;
+
+(* ---- Ceres-like interface ---- *)
+
+(** AllocSector - Allocate a new Sector.  "hint" can be previously allocated
+	Sector to preserve adjacency, or 0 if previous Sector not known *)
+
+PROCEDURE AllocSector*(hint: LONGINT; VAR sec: LONGINT);
+VAR i : LONGINT;
+BEGIN
+	i := hint+29;
+	IF ~init OR (i < 29) OR (i MOD 29 # 0) THEN HALT(21) END;
+	i := i DIV 29;  hint := i-1;
+	IF hint > nummax THEN hint := 0 END;
+	LOOP
+		IF i > nummax THEN i := 0 END;
+		IF native THEN
+			IF (i MOD 32) IN SYSTEM.VAL(SET, map[i DIV 32]) THEN INC(i)	(* in use *)
+			ELSE
+				sec := i;  INCL(SYSTEM.VAL(SET, map[i DIV 32]), i MOD 32);  INC(numused);
+				sec := sec*29;	(* "Encode" sector number. *)
+				EXIT
+			END
+		ELSE
+			IF map[i] < 0 THEN INC(i)	(* in use *)
+			ELSE
+				sec := i;  map[i] := -map[i];  INC(numused);
+				sec := sec*29;	(* "Encode" sector number. *)
+				EXIT
+			END
+		END;
+		IF i = hint THEN HALT(22) (* Disk full *) END
+	END
+END AllocSector;
+
+(** MarkSector - Mark an unused Sector as used.  Do not mark already marked sectors. *)
+
+PROCEDURE MarkSector*(sec: LONGINT);
+BEGIN
+	IF ~init OR (sec MOD 29 # 0) THEN HALT(21) END;
+	sec := sec DIV 29;
+	IF (sec < 1) OR (sec > nummax) THEN HALT(21) END;
+	IF native THEN INCL(SYSTEM.VAL(SET, map[sec DIV 32]), sec MOD 32)
+	ELSE map[sec] := -ABS(map[sec])
+	END;
+	INC(numused)
+END MarkSector;
+
+(** FreeSector - Mark a used Sector as unused.  Do not unmark already unmarked sectors. *)
+
+PROCEDURE FreeSector*(sec: LONGINT);
+BEGIN
+	IF ~init OR (sec MOD 29 # 0) THEN HALT(21) END;
+	sec := sec DIV 29;
+	IF (sec < 1) OR (sec > nummax) THEN HALT(21) END;
+	IF native THEN EXCL(SYSTEM.VAL(SET, map[sec DIV 32]), sec MOD 32)
+	ELSE map[sec] := ABS(map[sec])
+	END;
+	DEC(numused)
+END FreeSector;
+
+(** Marked - Test if a sector is marked as used. *)
+
+PROCEDURE Marked*(sec: LONGINT): BOOLEAN;
+BEGIN
+	IF ~init OR (sec MOD 29 # 0) THEN HALT(21) END;
+	sec := sec DIV 29;
+	IF (sec < 1) OR (sec > nummax) THEN HALT(21) END;
+	IF native THEN RETURN (sec MOD 32) IN SYSTEM.VAL(SET, map[sec DIV 32])
+	ELSE RETURN map[sec] < 0
+	END
+END Marked;
+
+PROCEDURE ^PutBlocks*(drive: SHORTINT; start,num: LONGINT; VAR buf: ARRAY OF SYSTEM.BYTE; ofs: LONGINT);
+PROCEDURE ^GetBlocks*(drive: SHORTINT; start,num: LONGINT; VAR buf: ARRAY OF SYSTEM.BYTE; ofs: LONGINT);
+
+(** GetSector - Read a 2k Sector from disk *)
+
+PROCEDURE GetSector*(src: LONGINT; VAR dest: Sector);
+VAR
+	e: Cache.Elem;
+	n: Node;
+BEGIN
+	IF ~init OR (src MOD 29 # 0) THEN HALT(21) END;
+	src := src DIV 29;
+	IF (src < 1) OR (src > nummax) THEN HALT(21) END;
+	e:= Cache.Get(cache,src);
+	IF (e = NIL) THEN	(* miss *)
+		e:= Cache.Remove(cache);
+		IF (e = NIL) THEN NEW(n); n.dirty:= FALSE; ELSE n:= e(Node); END;
+		IF n.dirty THEN
+			IF native THEN
+				PutBlocks(ddrive,rootoffset+partitionoffset+(n.adr-1)*BPS,BPS,n.data,0);
+			ELSE
+				PutBlocks(ddrive,partitionoffset+ABS(map[n.adr]),BPS,n.data,0);
+			END;
+		END;
+		n.adr:= src; Cache.Add(cache,n);
+		IF native THEN
+			GetBlocks(ddrive,rootoffset+partitionoffset+(src-1)*BPS,BPS,n.data,0);
+		ELSE
+			GetBlocks(ddrive,partitionoffset+ABS(map[src]),BPS,n.data,0);
+		END;
+	ELSE
+		n:= e(Node);
+	END;
+	SYSTEM.MOVE(SYSTEM.ADR(n.data),SYSTEM.ADR(dest),SS);
+END GetSector;
+
+(** PutSector - Write a 2k Sector to disk *)
+
+PROCEDURE PutSector*(dest: LONGINT; VAR src: Sector);
+VAR
+	e: Cache.Elem;
+	n: Node;
+BEGIN
+	IF ~init OR (dest MOD 29 # 0) THEN HALT(21) END;
+	dest := dest DIV 29;
+	IF (dest < 1) OR (dest > nummax) THEN HALT(21) END;
+	e:= Cache.Put(cache,dest);
+	IF (e = NIL) THEN	(* miss *)
+		e:= Cache.Remove(cache);
+		IF (e = NIL) THEN NEW(n); n.dirty:= FALSE; ELSE n:= e(Node); END;
+		IF n.dirty THEN
+			IF native THEN
+				PutBlocks(ddrive,rootoffset+partitionoffset+(n.adr-1)*BPS,BPS,n.data,0);
+			ELSE
+				PutBlocks(ddrive,partitionoffset+ABS(map[n.adr]),BPS,n.data,0);
+			END;
+		END;
+		n.dirty:= TRUE; n.adr:= dest; Cache.Add(cache,n);
+	ELSE
+		n:= e(Node);
+	END;	
+	SYSTEM.MOVE(SYSTEM.ADR(src),SYSTEM.ADR(n.data),SS);
+
+(* write behind not possible at this time *)
+	n.dirty:= FALSE;
+	IF native THEN
+		PutBlocks(ddrive,rootoffset+partitionoffset+(n.adr-1)*BPS,BPS,n.data,0);
+	ELSE
+		PutBlocks(ddrive,partitionoffset+ABS(map[n.adr]),BPS,n.data,0);
+	END;
+(* remove this if it once is *)
+END PutSector;
+
+(** GetBlocks - Read 512-byte disk blocks.  Low-level interface to driver.
+	"drive" - hard disk number (0 or 1)
+	"start" - start sector number
+	"num" - number of sectors
+	"buf" - buffer to read into
+	"ofs" - offset from start of buf in bytes *)
+
+PROCEDURE GetBlocks*(drive: SHORTINT; start,num: LONGINT; VAR buf: ARRAY OF SYSTEM.BYTE; ofs: LONGINT);
+VAR
+	cmd: ARRAY 10 OF CHAR;
+BEGIN
+	cmd[0]:= 28X;
+	cmd[1]:= 00X;
+	cmd[2]:= CHR(SYSTEM.LSH(start,-24));
+	cmd[3]:= CHR(SYSTEM.LSH(start,-16));
+	cmd[4]:= CHR(SYSTEM.LSH(start,-8));
+	cmd[5]:= CHR(start);
+	cmd[6]:= 00X;
+	cmd[7]:= CHR(SYSTEM.LSH(num,-8));
+	cmd[8]:= CHR(num);
+	cmd[9]:= 00X;
+
+	requ.target:= tgt[drive]; requ.lun:= 00H;
+	requ.clen:= 10; requ.dlen:= num * 512;
+	requ.cmd:= SYSTEM.ADR(cmd); requ.data:= SYSTEM.ADR(buf) + ofs;
+
+	SCSI.Initiate(requ); WHILE ~requ.done DO END;
+	IF (requ.status # SCSI.Good) THEN DiskError(); END;
+END GetBlocks;
+
+(** PutBlocks - Write 512-byte disk blocks.  Low-level interface to driver.
+	"drive" - hard disk number (0 or 1)
+	"start" - start sector number
+	"num" - number of sectors
+	"buf" - buffer to write from
+	"ofs" - offset from start of buf in bytes *)
+
+PROCEDURE PutBlocks*(drive: SHORTINT; start,num: LONGINT; VAR buf: ARRAY OF SYSTEM.BYTE; ofs: LONGINT);
+VAR
+	cmd: ARRAY 10 OF CHAR;
+BEGIN
+	cmd[0]:= 2AX;
+	cmd[1]:= 00X;
+	cmd[2]:= CHR(SYSTEM.LSH(start,-24));
+	cmd[3]:= CHR(SYSTEM.LSH(start,-16));
+	cmd[4]:= CHR(SYSTEM.LSH(start,-8));
+	cmd[5]:= CHR(start);
+	cmd[6]:= 00X;
+	cmd[7]:= CHR(SYSTEM.LSH(num,-8));
+	cmd[8]:= CHR(num);
+	cmd[9]:= 00X;
+
+	requ.target:= tgt[drive]; requ.lun:= 00H;
+	requ.clen:= 10; requ.dlen:= num * 512;
+	requ.cmd:= SYSTEM.ADR(cmd); requ.data:= SYSTEM.ADR(buf) + ofs;
+
+	SCSI.Initiate(requ); WHILE ~requ.done DO END;
+	IF (requ.status # SCSI.Good) THEN DiskError(); END;
+END PutBlocks;
+
+(* ---- Read partition table ---- *)
+
+(* Partition table starts at 01BEH in partition table sector and consists
+	of 4 records of the type:
+	
+	00    bootind: Types.Byte;
+	01    head: Types.Byte;
+	02    sector: Types.Byte;
+	03    cyl: Types.Byte;
+	04    type: Types.Byte;
+	05    head2: Types.Byte;
+	06    sector2: Types.Byte;
+	07    cyl2: Types.Byte;
+	08    start: Types.DWord;
+	12    num: Types.DWord
+*)
+
+PROCEDURE ReadPrimary(VAR p: ARRAY OF Partition;  VAR n: SHORTINT);
+VAR d, i: SHORTINT;  b: ARRAY 512 OF CHAR;  e: LONGINT;  size: LONGINT;
+BEGIN
+	n := 0;
+	FOR d := 0 TO drives-1 DO
+		GetBlocks(d, 0, 1, b, 0);
+		IF (b[510] = 055X) & (b[511] = 0AAX) THEN
+			FOR i := 0 TO 3 DO
+				e := 01BEH + 16*i;  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+				IF (b[e+4] # 0X) & (size # 0) THEN
+					p[n].type := ORD(b[e+4]);  p[n].letter := 0X;  p[n].drive := d;
+					SYSTEM.GET(SYSTEM.ADR(b[e+8]), p[n].start);  p[n].size := size;
+					INC(n)
+				END
+			END
+		END
+	END
+END ReadPrimary;
+
+PROCEDURE ReadLogical(d: SHORTINT;  first: LONGINT;  VAR p: ARRAY OF Partition;  VAR n, letter: SHORTINT);
+VAR b: ARRAY 512 OF CHAR;  e: LONGINT;  sec, size: LONGINT;
+BEGIN
+	sec := first;
+	LOOP
+		GetBlocks(d, sec, 1, b, 0);
+		IF (b[510] = 055X) & (b[511] = 0AAX) THEN
+			e := 01BEH;  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+			IF (b[e+4] = 5X) THEN HALT(23) END;
+			IF size # 0 THEN
+				p[n].type := ORD(b[e+4]);  p[n].drive := d;
+				IF (p[n].type < 32) & (p[n].type IN {1,4,6,7}) THEN
+					p[n].letter := CHR(letter);  INC(letter)
+				ELSE
+					p[n].letter := 0X
+				END;
+				SYSTEM.GET(SYSTEM.ADR(b[e+8]), p[n].start);  INC(p[n].start, sec);
+				p[n].size := size;  INC(n)
+			END;
+			INC(e, 16);  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+			IF (b[e+4] # 5X) OR (size = 0) THEN EXIT END;
+			SYSTEM.GET(SYSTEM.ADR(b[e+8]), sec);  INC(sec, first)
+		END
+	END
+END ReadLogical;
+
+PROCEDURE ReadPartitionTable(VAR p: ARRAY OF Partition;  VAR n: SHORTINT);
+VAR
+	pt: ARRAY 8 OF Partition;
+	pn, letter, i: SHORTINT;
+BEGIN
+	ReadPrimary(pt, pn);
+	letter := SHORT(ORD("C"));  n := 0;
+	FOR i := 0 TO pn-1 DO
+		IF (pt[i].type < 32) & (pt[i].type IN {1,4,6,7}) THEN
+			pt[i].letter := CHR(letter);  INC(letter)
+		END
+	END;
+	FOR i := 0 TO pn-1 DO
+		IF pt[i].type = 5 THEN
+			ReadLogical(pt[i].drive, pt[i].start, p, n, letter)
+		ELSE
+			p[n] := pt[i];  INC(n)
+		END
+	END
+END ReadPartitionTable;
+
+(* ---- Mapping to oberon.dsk ---- *)
+
+(* InitMapping - Initialise sector mapping for file system in a file *)
+
+PROCEDURE InitMapping;
+VAR
+	b: ARRAY 512 OF CHAR;
+	err, x, i, j, k, m: LONGINT;
+	found, fat16: BOOLEAN;
+	name, disk: ARRAY 12 OF CHAR;
+	csize, fatb, fatsize, rootb, datab, rootsize, start, fsize, cache: LONGINT;
+	numfat, pn, pi: SHORTINT;
+	reqletter: CHAR;
+	pt: ARRAY 16 OF Partition;
+
+	PROCEDURE Cap(ch: CHAR): CHAR;
+	BEGIN
+		IF (ch >= "a") & (ch <= "z") THEN RETURN CAP(ch)
+		ELSE RETURN ch
+		END
+	END Cap;
+	
+BEGIN
+		(* parse the file name *)
+	reqletter := Cap(file[0]);
+	IF (reqletter < "C") OR (reqletter > "Z") OR (file[1] # ":") OR ((file[2] # "\") & (file[2] # "/")) THEN
+		error := "Bad drive"; RETURN
+	END;
+	i := 3;  j := 0;
+	WHILE (file[i] # 0X) & (file[i] # ".") & (j # 8) DO
+		disk[j] := Cap(file[i]); INC(i); INC(j)
+	END;
+	WHILE j # 8 DO disk[j] := " "; INC(j) END;
+	IF file[i] = "." THEN INC(i) END;
+	WHILE (file[i] # 0X) & (j # 11) DO
+		disk[j] := Cap(file[i]); INC(i); INC(j)
+	END;
+	WHILE j # 11 DO disk[j] := " "; INC(j) END;
+	disk[j] := 0X;
+		(* read the partition table *)
+	ReadPartitionTable(pt, pn);
+	pi := 0;  m := pn;
+	WHILE pi # m DO
+		IF (pt[pi].letter = reqletter) & (pt[pi].type < 32) & (pt[pi].type IN {1,4,6}) THEN m := pi
+		ELSE INC(pi)
+		END
+	END;
+	IF pi = pn THEN error := "~drive"; RETURN END;
+	partitionoffset := pt[pi].start;  partitionlen := pt[pi].size;
+	ddrive := pt[pi].drive;
+		(* read BPB from boot block *)
+	GetBlocks(ddrive, partitionoffset, 1, b, 0);
+	x := 0;  SYSTEM.GET(SYSTEM.ADR(b[0BH]), SYSTEM.VAL(INTEGER, x));
+	IF x # BS THEN error := "Bad block size"; RETURN END;
+	x := 0;  SYSTEM.GET(SYSTEM.ADR(b[0DH]), SYSTEM.VAL(CHAR, x));
+	csize := x*BS;	(* bytes per cluster *)
+	SYSTEM.GET(SYSTEM.ADR(b[10H]), numfat);	(* FAT copies *)
+	x := 0;  SYSTEM.GET(SYSTEM.ADR(b[16H]), SYSTEM.VAL(INTEGER, x));
+	fatsize := x;	(* sectors in FAT *)
+	x := 0;  SYSTEM.GET(SYSTEM.ADR(b[0EH]), SYSTEM.VAL(INTEGER, x));
+	fatb := x;	(* start of FAT *)
+	rootb := fatb + numfat*fatsize;
+	x := 0;  SYSTEM.GET(SYSTEM.ADR(b[11H]), SYSTEM.VAL(INTEGER, x));
+	rootsize := (x*32) DIV BS;
+	datab := rootb + rootsize;	(* start of data *)
+	x := 0;  SYSTEM.GET(SYSTEM.ADR(b[13H]), SYSTEM.VAL(INTEGER, x));
+	IF x = 0 THEN
+		SYSTEM.GET(SYSTEM.ADR(b[20H]), x)	(* big number of sectors *)
+	END;
+	x := (x-datab) DIV (csize DIV BS);	(* total clusters *)
+	fat16 := x > 4078;	(* 16-bit fat *)
+		(* find name in root directory *)
+	i := 0;  found := FALSE;  start := MAX(LONGINT);
+	WHILE (i # rootsize) & ~found DO
+		GetBlocks(ddrive, partitionoffset+rootb+i, 1, b, 0);
+		j := 0;
+		WHILE (j # 16) & ~found DO
+			SYSTEM.MOVE(SYSTEM.ADR(b[j*32]), SYSTEM.ADR(name[0]), 11);
+			name[11] := 0X;
+			IF name = disk THEN
+				found := TRUE;  start := 0;
+				SYSTEM.GET(SYSTEM.ADR(b[j*32+1AH]), SYSTEM.VAL(INTEGER, start));
+				SYSTEM.GET(SYSTEM.ADR(b[j*32+1CH]), fsize)
+			ELSE INC(j)
+			END
+		END;
+		INC(i)
+	END;
+	IF ~found THEN
+		error := "~found:";  i := 0;  WHILE error[i] # 0X DO INC(i) END;
+		j := 0;  WHILE disk[j] # 0X DO error[i] := disk[j]; INC(i); INC(j) END;
+		error[i] := 0X;  nummax := 0; RETURN
+	END;
+		(* create the mapping *)
+	nummax := fsize DIV SS;
+	IF (nummax < 8) OR (start = 0) THEN
+		error := "File too small"; nummax := 0; RETURN
+	END;
+	IF ~fat16 THEN error := "~16-bit FAT"; nummax := 0; RETURN END;
+	IF csize MOD SS # 0 THEN error := "bad cluster size"; nummax := 0; RETURN END;
+	NEW(map, nummax+1);
+	map[0] := -1;	(* reserve sector 0 (illegal to use) *)
+	i := start;  j := 1;  cache := -1;
+	LOOP
+			(* the next csize bytes of the file is stored in cluster i *)
+		FOR m := 0 TO (csize DIV SS)-1 DO
+			map[j] := (i-2)*(csize DIV BS) + datab + m*BPS;  INC(j);	(* i-2 for 1st 2 FAT entries *)
+			IF j > nummax THEN EXIT END	(* done *)
+		END;
+			(* get FAT block containing i *)
+		k := i DIV (BS DIV 2) + fatb;	(* FAT block *)
+		IF k # cache THEN
+			GetBlocks(ddrive, partitionoffset+k, 1, b, 0);
+			cache := k
+		END;
+			(* get next in chain *)
+		x := 0;  SYSTEM.GET(SYSTEM.ADR(b[(i MOD (BS DIV 2))*2]), 
+				SYSTEM.VAL(INTEGER, x));
+		IF x >= 0FFF8H THEN nummax := j;  EXIT	(* was last cluster *)
+		ELSIF x >= 0FFF0H THEN
+			error := "Bad cluster"; nummax := 0; RETURN
+		ELSE i := x	(* step to next *)
+		END
+	END;
+	FOR i := 1 TO nummax DO
+		ASSERT((map[i] >= datab) & (map[i] < partitionoffset+partitionlen))
+	END
+END InitMapping;
+
+(* InitTable - Initialise sector reservation table *)
+
+PROCEDURE InitTable;
+VAR s, err, x: LONGINT;  b: ARRAY 512 OF CHAR;  pt: ARRAY 16 OF Partition;  pn, pi: SHORTINT;
+BEGIN
+		(* read partition table, finding first Native Oberon partition *)
+	native := TRUE;  ReadPartitionTable(pt, pn);
+	pi := 0;  x := pn;
+	WHILE pi # x DO
+		IF pt[pi].type = parttype THEN x := pi
+		ELSE INC(pi)
+		END
+	END;
+	IF pi = pn THEN error := "~partition"; RETURN END;
+	partitionoffset := pt[pi].start;  partitionlen := pt[pi].size;
+	ddrive := pt[pi].drive;
+		(* read boot block to get offset *)
+	GetBlocks(ddrive, partitionoffset, 1, b, 0);
+	rootoffset := 1;
+	x := 0;  SYSTEM.GET(SYSTEM.ADR(b[510]), SYSTEM.VAL(INTEGER, x));
+	b[0] := "x"; b[1] := "x"; b[2] := "x";  b[9] := 0X;
+	IF (x = 0AA55H) & (b = "xxxOBERON") THEN	(* valid boot block *)
+		SYSTEM.GET(SYSTEM.ADR(b[0EH]), SYSTEM.VAL(INTEGER, rootoffset))
+	END;
+		(* set up sector reservation table *)
+	nummax := (partitionlen-rootoffset) DIV BPS;
+	s := (nummax+1+31) DIV 32;
+	NEW(map, s);
+	WHILE s # 0 DO DEC(s); map[s] := 0 END;
+	INCL(SYSTEM.VAL(SET, map[0]), 0)	(* reserve sector 0 (illegal to use) *)
+END InitTable;
+
+(** ResetDisk - Reset the disk driver *)
+
+PROCEDURE ResetDisk*;
+VAR s: ARRAY 20 OF CHAR;  i: SHORTINT;
+BEGIN
+	IF ~init THEN
+		error := "";
+		NEW(cache); Cache.InitPool(cache);
+		ddrive := 0;  partitionoffset := 0;  native := FALSE;
+		nummax := 0;  numused := 0;  map := NIL;
+		Kernel.GetConfig("PartType", s);
+		i := 0;  parttype := 0;
+		WHILE (s[i] >= "0") & (s[i] <= "9") DO
+			parttype := parttype*10 + (ORD(s[i])-48);
+			INC(i)
+		END;
+		IF parttype = 0 THEN parttype := 79 END;
+		Kernel.GetConfig("FileSystem", file);
+		IF file = "" THEN InitTable	(* native partition *)
+		ELSE InitMapping	(* inside FAT file *)
+		END;
+		IF nummax = 0 THEN
+			Kernel.WriteString(error);  Kernel.WriteLn	(* error message *)
+		ELSE
+			init := TRUE
+		END
+	END
+END ResetDisk;
+
+(** Available - Return number of 2k Sectors available (unmarked) on disk *)
+
+PROCEDURE Available*(): LONGINT;
+BEGIN
+	RETURN nummax - numused
+END Available;
+
+(** Size - Return total number of 2k Sectors on disk *)
+
+PROCEDURE Size*(): LONGINT;
+BEGIN
+	RETURN nummax
+END Size;
+
+(** NumDrives - Return number of disk drives available *)
+
+PROCEDURE NumDrives*(): SHORTINT;
+BEGIN
+	RETURN drives
+END NumDrives;
+
+(** GetParams - Return parameters of drive (for Install) *)
+
+PROCEDURE GetParams*(drive: SHORTINT; VAR cyls,hds,spt: LONGINT);
+VAR
+	cmd: ARRAY 6 OF CHAR;
+	data: ARRAY 16 OF CHAR;
+BEGIN
+	cmd[0]:= 1AX; cmd[1]:= 08X; cmd[2]:= 03X;
+	cmd[3]:= 00X; cmd[4]:= 10X; cmd[5]:= 00X;
+
+	requ.target:= tgt[drive]; requ.lun:= 00H; requ.clen:= 6; requ.dlen:= 16;
+	requ.cmd:= SYSTEM.ADR(cmd); requ.data:= SYSTEM.ADR(data);
+	
+	SCSI.Initiate(requ); WHILE ~requ.done DO END;
+	IF (requ.status # SCSI.Good) THEN DiskError(); END;
+	spt:= SYSTEM.LSH(ORD(data[4+10]),8) + ORD(data[4+11]);
+
+	cmd[2]:= 04X; cmd[4]:= 0AX; requ.dlen:= 10;
+	
+	SCSI.Initiate(requ); WHILE ~requ.done DO END;
+	IF (requ.status # SCSI.Good) THEN DiskError(); END;
+
+	cyls:= SYSTEM.LSH(LONG(ORD(data[4+2])),16) + SYSTEM.LSH(ORD(data[4+3]),8) + ORD(data[4+4]);
+	hds:= ORD(data[4+5]);
+END GetParams;
+
+BEGIN
+	init:= FALSE; NEW(requ); Interrogate({0..7});
+END Disk.

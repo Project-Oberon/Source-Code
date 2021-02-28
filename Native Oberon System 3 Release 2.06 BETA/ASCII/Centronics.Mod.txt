@@ -1,0 +1,109 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Centronics;	(* pmuller 07.08.95 *)
+
+(* Native version *)
+
+IMPORT Kernel, Input, SYSTEM;
+
+CONST 
+	LPT1* = 0;
+	LPT2* = 1;
+	LPT3* = 2;
+
+	Timeout = 30;	(* seconds *)
+
+VAR
+	adr: ARRAY 3 OF INTEGER;
+	num: INTEGER;
+
+PROCEDURE Wait;
+VAR t: LONGINT;
+BEGIN
+	t := Kernel.GetTimer()+2;	(* assume one GetTimer tick > 50us *)
+	REPEAT UNTIL Kernel.GetTimer() >= t
+END Wait;
+
+PROCEDURE Reset(p: INTEGER);
+BEGIN
+	INC(p, 2);  SYSTEM.PORTOUT(p, 8X);
+	Wait;  SYSTEM.PORTOUT(p, 0CX)
+END Reset;
+
+PROCEDURE Start*(port: INTEGER);
+VAR error: ARRAY 32 OF CHAR;
+BEGIN
+	error := "Invalid parallel port";
+	IF port >= num THEN HALT(99) END;
+	Reset(adr[port])
+END Start;
+
+PROCEDURE Send*(port: INTEGER; x: CHAR);
+VAR error: ARRAY 32 OF CHAR;  p: INTEGER;  s: SET;  t: LONGINT;
+BEGIN
+	IF port >= num THEN error := "Invalid parallel port";  HALT(99) END;
+	p := adr[port]+1;  t := Input.Time();
+	REPEAT
+		SYSTEM.PORTIN(p, SYSTEM.VAL(CHAR, s));
+		SYSTEM.PORTIN(p, SYSTEM.VAL(CHAR, s));
+		IF 5 IN s THEN	(* out of paper *)
+			SYSTEM.PORTIN(p, SYSTEM.VAL(CHAR, s));
+			IF 5 IN s THEN	(* still out of paper *)
+				error := "Out of paper";  HALT(99)
+			END
+		END;
+		IF ~(3 IN s) THEN	(* error *)
+			error := "Printer error";  HALT(99)
+		END
+	UNTIL (7 IN s) OR (Input.Time() - t > Timeout*Input.TimeUnit);
+	IF 7 IN s THEN
+		p := adr[port];  SYSTEM.PORTOUT(p, x);
+		INC(p, 2);  SYSTEM.PORTOUT(p, 0DX);
+		SYSTEM.PORTOUT(p, 0DX);  SYSTEM.PORTOUT(p, 0CX)
+	ELSE
+		error := "Printer timeout";  HALT(99)
+	END
+END Send;
+
+PROCEDURE Detected(adr: INTEGER): BOOLEAN;
+VAR p: INTEGER;  t: LONGINT;  ch: CHAR;
+BEGIN
+	p := adr+2;  SYSTEM.PORTOUT(p, 0CX);
+	p := adr;  SYSTEM.PORTOUT(p, 55X);
+	Wait;  SYSTEM.PORTIN(p, ch);
+	IF ch = 55X THEN
+		SYSTEM.PORTOUT(p, 0AAX);
+		Wait;  SYSTEM.PORTIN(p, ch);
+		IF ch = 0AAX THEN RETURN TRUE END
+	END;
+	RETURN FALSE
+END Detected;
+
+PROCEDURE Init;
+VAR i: SHORTINT;  p: INTEGER;
+BEGIN
+	num := 0;
+	FOR i := 0 TO 2 DO
+		CASE i OF
+			0: p := 3BCH
+			|1: p := 378H
+			|2: p := 278H
+		END;
+		IF Detected(p) THEN adr[num] := p;  INC(num) END
+	END
+END Init;
+
+BEGIN
+	Init
+END Centronics.

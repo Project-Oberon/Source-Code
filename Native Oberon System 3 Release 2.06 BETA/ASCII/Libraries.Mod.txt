@@ -1,0 +1,678 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Libraries;
+
+(*
+	4.1.94 - improved Free
+	7.11.95 - PutModel now uses the LinkMsg
+*)
+	
+IMPORT
+	Fonts, Files, Objects, Texts, Display, Attributes, Gadgets, TextGadgets, Oberon, Documents, Desktops, Views;
+
+VAR W: Texts.Writer;
+	cache: Objects.Library;
+	
+PROCEDURE Backup (VAR name: ARRAY OF CHAR);
+VAR res, i: INTEGER; bak: ARRAY 64 OF CHAR;
+BEGIN i := 0;
+	WHILE name[i] # 0X DO bak[i] := name[i]; INC(i) END;
+	bak[i] := "."; bak[i+1] := "B"; bak[i+2] := "a"; bak[i+3] := "k"; bak[i+4] := 0X;
+	Files.Rename(name, bak, res)
+END Backup;
+
+PROCEDURE OpenText(name: ARRAY OF CHAR; T: Texts.Text);
+VAR doc: Objects.Object; F: TextGadgets.Frame;
+BEGIN
+	doc := Gadgets.CreateObject("TextDocs.NewDoc");
+	WITH doc: Documents.Document DO
+		COPY(name, doc.name);
+		NEW(F); TextGadgets.Init(F, T, FALSE);
+		Documents.Init(doc, F);
+		Desktops.ShowDoc(doc)
+	END
+END OpenText;
+
+PROCEDURE Show(obj: Objects.Object; t: Texts.Text);
+VAR L: Objects.LinkMsg;
+BEGIN
+	L.id := Objects.set; L.name := "Model"; L.obj := t; L.res := -1;
+	obj.handle(obj, L);
+	IF L.res < 0 THEN
+		Texts.WriteString(W, " could not set Model"); Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf)
+	END;
+END Show;
+
+PROCEDURE Enum(L: Objects.Library);
+BEGIN IF ~(L IS Fonts.Font) THEN Texts.WriteString(W, L.name); Texts.WriteLn(W) END
+END Enum;
+
+PROCEDURE ShowLibs*;
+VAR t: Texts.Text; dst: Objects.Object;
+BEGIN
+	Objects.Enumerate(Enum);
+	NEW(t); Texts.Open(t, ""); Texts.Append(t, W.buf);
+
+	dst := Gadgets.FindObj(Gadgets.context, "liblist");
+	IF dst # NIL THEN Show(dst, t)
+	ELSE OpenText("Libraries.ShowLibs", t)
+	END;
+END ShowLibs;
+
+PROCEDURE showObjs(libname: ARRAY OF CHAR; dst: Objects.Object);
+VAR L: Objects.Library; t: Texts.Text; i: INTEGER; name: Objects.Name; obj: Objects.Object;
+BEGIN
+	L := Objects.ThisLibrary(libname);
+	IF L # NIL THEN
+		cache := L;
+		 i := 0; WHILE (libname[i] # 0X) & (libname[i] # ".") DO INC(i) END;
+		 IF libname[i] = "." THEN libname[i] := 0X END;
+		FOR i := 0 TO L.maxref DO
+			L.GetObj(L, i, obj);
+			IF obj # NIL THEN
+				Objects.GetName(L.dict, i, name);
+				IF name # "" THEN
+					Texts.Write(W, 22X); Texts.WriteString(W, name); Texts.Write(W, 22X); Texts.WriteLn(W);
+				END
+			END
+		END;
+	END;
+	NEW(t); Texts.Open(t, ""); Texts.Append(t, W.buf);
+	IF dst = NIL THEN OpenText(libname, t)
+	ELSE Show(dst, t)
+	END
+END showObjs;
+
+PROCEDURE ShowObjs*;
+VAR S: Attributes.Scanner; dst: Objects.Object; libname: ARRAY 32 OF CHAR; i: INTEGER;
+	A: Objects.AttrMsg;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN COPY(S.s, libname);	
+		dst := NIL;
+		dst := Gadgets.FindObj(Gadgets.context, "objlist");
+		showObjs(libname, dst);
+		(*
+		IF Gadgets.executorObj # NIL THEN
+			A.id := Objects.set; A.name := "Sel"; A.class := Objects.String; COPY(libname, A.s); A.res := -1; 
+			Gadgets.executorObj.handle(Gadgets.executorObj, A);
+			Gadgets.Update(Gadgets.executorObj);
+		END;
+		*)
+		dst := Gadgets.FindObj(Gadgets.context, "thelib");
+		IF dst # NIL THEN
+			A.id := Objects.set; A.name := "Value"; A.class := Objects.String; COPY(libname, A.s); A.res := -1; 
+			i := 0; WHILE (A.s[i] # 0X) & (A.s[i] # ".") DO INC(i) END;
+			IF A.s[i] = "." THEN A.s[i] := 0X END;
+			dst.handle(dst, A);
+			Gadgets.Update(dst);
+		END;
+		
+		dst := Gadgets.FindObj(Gadgets.context, "selobj");
+		IF dst # NIL THEN
+			A.id := Objects.set; A.name := "Value"; A.class := Objects.String; A.s := ""; A.res := -1; 
+			dst.handle(dst, A);
+			Gadgets.Update(dst);
+		END;
+	END
+END ShowObjs;
+
+PROCEDURE CopyStyle(): INTEGER;
+	VAR style: INTEGER; obj: Objects.Object; M: Objects.AttrMsg;
+BEGIN
+	style := Objects.deep;
+	obj := Gadgets.FindObj(Gadgets.context, "this");
+	IF obj # NIL THEN
+		M.id := Objects.get; M.name := "Value"; M.res := -1; obj.handle(obj, M);
+		IF (M.res >= 0) & (M.class = Objects.Bool) & M.b THEN style := -1 END;
+	END;
+	obj := Gadgets.FindObj(Gadgets.context, "shallow");
+	IF obj # NIL THEN
+		M.id := Objects.get; M.name := "Value"; M.res := -1; obj.handle(obj, M);
+		IF (M.res >= 0) & (M.class = Objects.Bool) & M.b THEN style := Objects.shallow END;
+	END;
+	RETURN style
+END CopyStyle;
+
+PROCEDURE GetObj*;
+VAR S: Attributes.Scanner; obj: Objects.Object; C: Objects.CopyMsg; style: INTEGER;
+	sel: Objects.Object; time: LONGINT; L: Objects.LinkMsg;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN
+		style := CopyStyle();
+		obj := Gadgets.FindPublicObj(S.s);
+		IF obj # NIL THEN
+			IF obj IS Documents.Document THEN
+				C.id := Objects.deep; C.obj := NIL; Objects.Stamp(C); obj.handle(obj, C);  (* always make a deep copy *)
+				IF C.obj # NIL THEN Desktops.ShowDoc(C.obj(Documents.Document))
+				ELSE
+					Texts.WriteString(W, " could not make a copy of "); Texts.WriteString(W, S.s); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf)
+				END
+			ELSIF obj IS Gadgets.Frame THEN
+				IF style >= 0 THEN C.id := style; C.obj := NIL; Objects.Stamp(C); obj.handle(obj, C); obj := C.obj END ;
+				IF obj # NIL THEN Gadgets.Integrate(obj)
+				ELSE
+					Texts.WriteString(W, " could not make a copy of "); Texts.WriteString(W, S.s); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf)
+				END
+			ELSIF obj IS Gadgets.Object THEN
+				Gadgets.GetSelection(sel, time);
+				IF time >= 0 THEN
+					WHILE sel # NIL DO
+						IF sel IS Gadgets.Frame THEN
+							L.id := Objects.set; L.name := "Model"; L.obj := obj; L.res := -1; sel.handle(sel, L)
+						END;
+						sel := sel.slink
+					END;
+					Gadgets.Update(obj)
+				ELSE
+					Texts.WriteString(W, " cannot link model; check selection"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf)
+				END
+			ELSE
+				Texts.WriteString(W, " unknown type "); Texts.WriteString(W, S.s); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf)
+			END
+		ELSE
+			Texts.WriteString(W, S.s); Texts.WriteString(W, " not found"); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END
+END GetObj;
+
+PROCEDURE SplitName(name: ARRAY OF CHAR; VAR libname, objname: ARRAY OF CHAR);
+VAR i, j, k: INTEGER;
+BEGIN
+	i := 0; j := 0;
+	WHILE (name[i] # ".") & (name[i] # 0X) DO libname[j] := name[i]; INC(j); INC(i); END;
+	IF name[i] = 0X THEN RETURN END;
+	libname[j] := 0X; k := j; INC(i); j := 0;
+	WHILE (name[i] # " ") & (name[i] # 0X) DO objname[j] := name[i]; INC(j); INC(i); END;
+	objname[j] := 0X;
+	libname[k] := "."; libname[k+1] := "L"; libname[k+2] := "i"; libname[k+3] := "b"; libname[k+4] := 0X;
+END SplitName;
+
+PROCEDURE FindPublicObj(name: ARRAY OF CHAR; VAR libname, objname: ARRAY OF CHAR; VAR lib: Objects.Library): Objects.Object; (* Lib.obj format, assumes .Lib extension *)
+VAR obj: Objects.Object; ref: INTEGER;
+BEGIN
+	obj := NIL; SplitName(name, libname, objname);
+	lib := Objects.ThisLibrary(libname);
+	IF lib # NIL THEN
+		Objects.GetRef(lib.dict, objname, ref);
+		IF ref # MIN(INTEGER) THEN lib.GetObj(lib, ref, obj); END
+	END;
+	RETURN obj;
+END FindPublicObj;
+
+PROCEDURE PutObj*;
+VAR S: Attributes.Scanner; obj: Objects.Object; C: Objects.CopyMsg; M: Display.SelectMsg; L: Objects.Library;
+	ref, style: INTEGER; libname, objname: ARRAY 64 OF CHAR; B: Objects.BindMsg; N: Display.SelectMsg;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN
+		M.id := Display.get; M.F := NIL; M.sel := NIL; M.time := -1; M.obj := NIL; Display.Broadcast(M);
+		IF (M.time >= 0) & (M.obj # NIL) & (M.obj.slink = NIL) THEN
+			ref := -1;
+			obj := FindPublicObj(S.s, libname, objname, L);
+			IF L = NIL THEN (* lib does not exist yet *)
+				Texts.WriteString(W, S.s); Texts.WriteString(W, " is not a library"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				RETURN
+			END;
+			IF (libname = "") OR (objname = "") THEN
+				Texts.WriteString(W, S.s); Texts.WriteString(W, " is an illegal object name"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				RETURN
+			END;
+			Texts.WriteString(W, "Libraries.PutObj "); 
+			IF obj = NIL THEN (* no such object *)
+				L.GenRef(L, ref);
+				IF ref < 0 THEN
+					Texts.WriteString(W, libname); Texts.WriteString(W, " is full, sorry"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf);
+					RETURN
+				END
+			ELSE
+				ref := obj.ref;
+				Texts.WriteString(W, "replacing ")
+			END;
+			style := CopyStyle();
+			IF style = -1 THEN (* this style *)
+				Texts.WriteString(W, " sorry, This copy style not allowed"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				RETURN;
+			END;
+			obj := M.obj;
+			IF style >= 0 THEN C.id := style; C.obj := NIL; Objects.Stamp(C); M.obj.handle(M.obj, C); obj := C.obj END ;
+			IF obj # NIL THEN
+				N.id := Display.reset; N.x := 0; N.y := 0; N.F := obj(Display.Frame); N.dlink := NIL;
+				N.res := -1;
+				obj.handle(obj, N);
+				L.PutObj(L, ref, obj); Objects.PutName(L.dict, ref, objname);
+				B.lib := L; obj.handle(obj, B);
+				Texts.WriteString(W, S.s); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				showObjs(libname, Gadgets.FindObj(Gadgets.context, "objlist"));
+			ELSE
+				Texts.WriteString(W, " could not make a copy of the selection"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf)
+			END;
+		ELSE
+			Texts.WriteString(W, " no or more than one selected gadget"); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END
+END PutObj;
+
+PROCEDURE PutModel*;
+VAR S: Attributes.Scanner; obj: Objects.Object; M: Display.SelectMsg; L: Objects.Library;
+	ref: INTEGER; libname, objname: ARRAY 64 OF CHAR; B: Objects.BindMsg; LM: Objects.LinkMsg;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN
+		M.id := Display.get; M.F := NIL; M.sel := NIL; M.time := -1; M.obj := NIL; Display.Broadcast(M);
+		IF (M.time >= 0) & (M.obj # NIL) & (M.obj.slink = NIL) & (M.obj IS Gadgets.Frame) THEN
+			ref := -1;
+			obj := FindPublicObj(S.s, libname, objname, L);
+			IF L = NIL THEN (* lib does not exist yet *)
+				Texts.WriteString(W, S.s); Texts.WriteString(W, " is not a library"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				RETURN
+			END;
+			IF (libname = "") OR (objname = "") THEN
+				Texts.WriteString(W, S.s); Texts.WriteString(W, " is an illegal object name"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				RETURN
+			END;
+			Texts.WriteString(W, "Libraries.PutModel "); 
+			IF obj = NIL THEN (* no such object *)
+				L.GenRef(L, ref);
+				IF ref < 0 THEN
+					Texts.WriteString(W, libname); Texts.WriteString(W, " is full, sorry"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf);
+					RETURN
+				END
+			ELSE
+				ref := obj.ref;
+				Texts.WriteString(W, "replacing ")
+			END;
+			LM.obj := NIL; LM.id := Objects.get; LM.name := "Model"; M.obj.handle(M.obj, LM);
+			IF LM.obj # NIL THEN
+				L.PutObj(L, ref, LM.obj); Objects.PutName(L.dict, ref, objname);
+				B.lib := L; LM.obj.handle(LM.obj, B);
+				Texts.WriteString(W, S.s); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				showObjs(libname, Gadgets.FindObj(Gadgets.context, "objlist"))
+			ELSE
+				Texts.WriteString(W, " selected object doesn't have a model"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+			END
+		ELSE
+			Texts.WriteString(W, " cannot identify model; check selection"); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END
+END PutModel;
+
+PROCEDURE FreeObj*;
+VAR S: Attributes.Scanner; obj, dst: Objects.Object; libname, objname: ARRAY 64 OF CHAR; L: Objects.Library;
+	A: Objects.AttrMsg;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN
+		obj := FindPublicObj(S.s, libname, objname, L);
+		IF obj # NIL THEN
+			Objects.PutName(L.dict, obj.ref, ""); L.FreeObj(L, obj.ref);
+			showObjs(libname, Gadgets.FindObj(Gadgets.context, "objlist"));
+			
+			dst := Gadgets.FindObj(Gadgets.context, "selobj");
+			IF dst # NIL THEN
+				A.id := Objects.set; A.name := "Value"; A.class := Objects.String; A.s := ""; A.res := -1; 
+				dst.handle(dst, A);
+				Gadgets.Update(dst);
+			END;
+			
+			Texts.WriteString(W, "Libraries.FreeObj "); Texts.WriteString(W, S.s); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+		ELSE
+			Texts.WriteString(W, S.s); Texts.WriteString(W, " not found"); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END
+END FreeObj;
+
+PROCEDURE Store*;
+VAR S: Attributes.Scanner; libname: ARRAY 64 OF CHAR; f: Files.File; L: Objects.Library; len: LONGINT;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN COPY(S.s, libname);
+		L := Objects.ThisLibrary(libname);
+		IF L # NIL THEN
+			Texts.WriteString(W, "Libraries.Store "); Texts.WriteString(W, libname); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+			Backup(libname);
+			f := Files.New(libname);
+			Objects.StoreLibrary(L, f, 0, len);
+			Files.Register(f);
+			Files.Close(f)
+		END
+	END
+END Store;
+
+PROCEDURE GC*;
+VAR S: Attributes.Scanner; libname, name: ARRAY 64 OF CHAR; f: Files.File; L, L0: Objects.Library; len, count, count0: LONGINT;
+	obj, obj0: Objects.Object; C: Objects.CopyMsg; B: Objects.BindMsg; i: INTEGER;
+BEGIN count0 := 0;
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN COPY(S.s, libname);
+		L := Objects.ThisLibrary(libname);
+		IF (L # NIL) & ~(L IS Fonts.Font) THEN
+			Texts.WriteString(W, "Libraries.GC "); Texts.WriteString(W, libname);
+			
+			NEW(L0); Objects.OpenLibrary(L0);
+			count := 0; Objects.Stamp(C);
+			FOR i := 0 TO L.maxref DO
+				L.GetObj(L, i, obj);
+				IF obj # NIL THEN INC(count);
+					Objects.GetName(L.dict, i, name);
+					IF name # "" THEN (* named object found *)
+						C.id := Objects.deep; C.obj := NIL; obj.handle(obj, C);
+						obj0 := C.obj; IF obj0 = NIL THEN HALT(99) END;
+						B.lib := L0; obj0.handle(obj0, B);
+						Objects.PutName(L0.dict, obj0.ref, name);
+					END
+				END
+			END;
+			FOR i := 0 TO L0.maxref DO
+				L0.GetObj(L0, i, obj);
+				IF obj # NIL THEN INC(count0) END;
+			END;
+			Texts.WriteInt(W, count - count0, 5); Texts.WriteString(W, " objects collected");
+			Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+			Backup(libname);
+			f := Files.New(libname);
+			Objects.StoreLibrary(L0, f, 0, len);
+			Files.Register(f);
+			Files.Close(f);
+			
+			Objects.FreeLibrary(libname);
+		END
+	END
+END GC;
+
+PROCEDURE Free*;
+VAR S: Attributes.Scanner; t: Texts.Text; dst: Objects.Object;
+BEGIN
+	Texts.WriteString(W, "Libraries.Free "); Texts.Append(Oberon.Log, W.buf);
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S); 
+	WHILE S.class = Attributes.Name DO
+		Texts.WriteString(W, S.s); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+		Objects.FreeLibrary(S.s);
+		Attributes.Scan(S)
+	END;
+	dst := Gadgets.FindObj(Gadgets.context, "liblist");
+	IF dst # NIL THEN
+		Objects.Enumerate(Enum);
+		NEW(t); Texts.Open(t, ""); Texts.Append(t, W.buf);
+		Show(dst, t)
+	END
+END Free;
+
+PROCEDURE PutDoc*;
+VAR S: Attributes.Scanner; doc: Documents.Document; L: Objects.Library; obj: Objects.Object; ref: INTEGER;
+	objname, libname: ARRAY 64 OF CHAR; C: Objects.CopyMsg; B: Objects.BindMsg;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN
+		doc := Documents.MarkedDoc();
+		IF doc # NIL THEN COPY(S.s, libname); COPY(doc.name, objname);
+			IF doc.name = "" THEN
+				Texts.WriteString(W, doc.name); Texts.WriteString(W, " is not a valid name"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				RETURN
+			END; 
+			ref := -1;
+			L := Objects.ThisLibrary(libname);
+			IF L = NIL THEN (* lib does not exist yet *)
+				Texts.WriteString(W, S.s); Texts.WriteString(W, " is not a library"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				RETURN
+			END;
+			Objects.GetRef(L.dict, objname, ref);
+			IF ref >= 0 THEN L.GetObj(L, ref, obj)
+			ELSE obj := NIL
+			END;
+			Texts.WriteString(W, "Libraries.PutDoc "); 
+			IF obj = NIL THEN (* no such object *)
+				L.GenRef(L, ref);
+				IF ref < 0 THEN
+					Texts.WriteString(W, libname); Texts.WriteString(W, " is full, sorry"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf);
+					RETURN
+				END
+			ELSE
+				ref := obj.ref;
+				Texts.WriteString(W, "replacing ");
+			END;
+			C.id := Objects.deep; C.obj := NIL; Objects.Stamp(C); doc.handle(doc, C);
+			IF C.obj # NIL THEN
+				L.PutObj(L, ref, C.obj);
+				Objects.PutName(L.dict, ref, objname);
+				B.lib := L; C.obj.handle(C.obj, B);
+				Texts.WriteString(W, objname); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				showObjs(libname, Gadgets.FindObj(Gadgets.context, "objlist"));
+			ELSE
+				Texts.WriteString(W, " could not make a copy of the marked document"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf)
+			END;
+		ELSE
+			Texts.WriteString(W, " no marked document"); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END
+END PutDoc;
+
+PROCEDURE GetView*;
+VAR S: Attributes.Scanner; obj: Objects.Object; f: Gadgets.Frame;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF S.class = Attributes.Name THEN
+		obj := Gadgets.FindPublicObj(S.s);
+		IF (obj # NIL) & (obj IS Gadgets.Frame) THEN
+			WITH obj: Gadgets.Frame DO
+				f := Views.ViewOf(obj); f.W := obj.W + f(Views.View).border * 2; f.H := obj.H + f(Views.View).border * 2;
+				Gadgets.Integrate(f)
+			END
+		ELSE
+			Texts.WriteString(W, S.s); Texts.WriteString(W, " not found or not a gadget"); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END
+END GetView;
+
+(*
+(* Mail handling *)
+
+PROCEDURE Parse (mail: Texts.Text; VAR sender, replyadr, subject: ARRAY OF CHAR);
+	CONST LineLen = 128;
+	VAR line: ARRAY LineLen OF CHAR;
+		R: Texts.Reader; senderFound, subjectFound: BOOLEAN;
+
+	PROCEDURE ReadLine;
+		VAR ch: CHAR; i: INTEGER;
+	BEGIN i := 0;
+		REPEAT Texts.Read(R, ch);
+			IF i < LineLen-1 THEN line[i] := ch; INC(i) END;
+		UNTIL R.eot OR (ch = 0DX);
+		line[i] := 0X;
+	END ReadLine;
+
+	PROCEDURE matches (s: ARRAY OF CHAR): BOOLEAN;
+		VAR i: INTEGER;
+	BEGIN i := 0;
+		WHILE s[i] # 0X DO
+			IF CAP(s[i]) # CAP(line[i]) THEN RETURN FALSE END;
+			INC(i);
+		END;
+		RETURN TRUE;
+	END matches;
+
+	PROCEDURE extractSender;
+		VAR i,j: INTEGER; ch: CHAR;
+	BEGIN i := 0; ch := line[0];
+		WHILE ch # 0X DO
+			IF (ch = "(") OR (ch = 22X) THEN INC(i); ch := line[i]; j := 0;
+				WHILE (ch # ")") & (ch # 22X) & (ch # 0X) DO sender[j] := ch; INC(i); INC(j); ch := line[i] END ;
+				sender[j] := 0X; RETURN
+			ELSIF ch = "<" THEN
+				IF (i > 10) & (line[i-1] = " ") THEN
+					j := 0; i := 5; (* pos after "FROM:" *)
+					WHILE line[i] <= " " DO INC(i) END;
+					WHILE line[i] # "<" DO sender[j] := line[i]; INC(i); INC(j) END;
+					sender[i-1] := 0X;
+					RETURN
+				ELSE INC(i); ch := line[i]; j := 0;
+					WHILE (ch # ">") & (ch # 0X) DO sender[j] := ch; INC(i); INC(j); ch := line[i] END ;
+					sender[j] := 0X; RETURN
+				END
+			END ;
+			INC(i); ch := line[i]
+		END;
+		(* if we got until here, just strip the "From:" from the line *)
+		j := 0; i := 5; (* first char after ":" *);
+		WHILE (line[i] # 0X) & (line[i] <= " ") DO INC(i) END;
+		IF ch = "<" THEN INC(i) END;
+		WHILE (line[i] # 0X) & (line[i] # ">") DO sender[j] := line[i]; INC(i); INC(j) END;
+		sender[j] := 0X;
+	END extractSender;
+
+	PROCEDURE extractReplyadr;
+		VAR i, j, k: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE (line[i] # 0X) & (line[i] # "@") DO INC(i) END;
+		IF line[i] = "@" THEN j := i; k := 0;
+			WHILE (i > 0) & (line[i] > " ") DO DEC(i) END;
+			INC(i);
+			IF line[i] = "<" THEN INC(i) END;
+			WHILE (line[j] > " ") DO INC(j) END;
+			DEC(j);
+			IF line[j] = ">" THEN DEC(j) END;
+			WHILE i <= j DO replyadr[k] := line[i]; INC(k); INC(i) END;
+			replyadr[k] := 0X;
+		END
+	END extractReplyadr;
+
+	PROCEDURE extractSubject;
+		VAR i,j: INTEGER; ch: CHAR;
+	BEGIN i := 0; j := 0;
+		WHILE line[i] # ":" DO INC(i) END;
+		INC(i);
+		WHILE (line[i] # 0X) & (line[i] <= " ") DO INC(i) END;
+		WHILE line[i] # 0X DO subject[j] := line[i]; INC(j); INC(i) END;
+		subject[j] := 0X
+	END extractSubject;
+
+BEGIN
+	Texts.OpenReader(R, mail, 0); senderFound := FALSE; subjectFound := FALSE;
+	REPEAT ReadLine;
+		IF matches("FROM:") & ~senderFound THEN senderFound := TRUE; extractReplyadr; extractSender;
+		ELSIF (matches("RE:") OR matches("SUBJECT:")) & ~subjectFound THEN subjectFound := TRUE; extractSubject;
+		END;
+	UNTIL (senderFound & subjectFound) OR R.eot;
+END Parse;
+
+PROCEDURE PutText*;
+VAR S: Attributes.Scanner; L: Objects.Library; obj: Objects.Object; ref, t: INTEGER;
+	objname, libname: ARRAY 64 OF CHAR; C: Objects.CopyMsg; B: Objects.BindMsg; LM: Objects.LinkMsg; f: Display.Frame;
+	sender, replyaddr, subject: ARRAY 64 OF CHAR; T: Texts.Text;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF (S.class = Attributes.Name) & Oberon.Pointer.on THEN
+		Gadgets.ThisFrame(Oberon.Pointer.X, Oberon.Pointer.Y, f, t, t);
+		T := NIL;
+		IF f # NIL THEN
+			LM.id := Objects.get; LM.name := "Model"; LM.res := -1; f.handle(f, LM);
+			IF (LM.res >= 0) & (LM.obj # NIL) & (LM.obj IS Texts.Text) THEN T := LM.obj(Texts.Text) END;
+		END;
+		IF T # NIL THEN COPY(S.s, libname);
+			Parse(T, sender, replyaddr, subject);
+			IF sender # "" THEN
+				COPY(sender, objname);
+				t := 0; WHILE objname[t] # 0X DO INC(t) END;
+				ref := 0;
+				WHILE subject[ref] # 0X DO
+					IF t < LEN(objname)-1 THEN objname[t] := subject[ref]; INC(t) END;
+					INC(ref)
+				END; objname[t] := 0X
+			ELSE
+				Texts.WriteString(W, " not a mail"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf); RETURN
+			END;
+			
+			ref := -1;
+			L := Objects.ThisLibrary(libname);
+			IF L = NIL THEN (* lib does not exist yet *)
+				Texts.WriteString(W, S.s); Texts.WriteString(W, " is not a library"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf); RETURN
+			END;
+			Objects.GetRef(L.dict, objname, ref);
+			IF ref >= 0 THEN L.GetObj(L, ref, obj)
+			ELSE obj := NIL
+			END;
+			Texts.WriteString(W, "Libraries.PutText "); 
+			IF obj = NIL THEN (* no such object *)
+				L.GenRef(L, ref);
+				IF ref < 0 THEN
+					Texts.WriteString(W, libname); Texts.WriteString(W, " is full, sorry"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf); RETURN
+				END
+			ELSE ref := obj.ref; Texts.WriteString(W, "replacing ");
+			END;
+			C.id := Objects.deep; C.obj := NIL; Objects.Stamp(C); T.handle(T, C);
+			IF C.obj # NIL THEN
+				L.PutObj(L, ref, C.obj);
+				Objects.PutName(L.dict, ref, objname);
+				B.lib := L; C.obj.handle(C.obj, B);
+				Texts.WriteString(W, objname); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+				showObjs(libname, Gadgets.FindObj(Gadgets.context, "objlist"));
+			ELSE
+				Texts.WriteString(W, " could not make a copy of the text"); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+			END;
+		ELSE
+			Texts.WriteString(W, " no marked text"); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+		END
+	END
+END PutText;
+*)
+
+BEGIN Texts.OpenWriter(W)
+END Libraries.
+

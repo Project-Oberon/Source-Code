@@ -1,0 +1,379 @@
+MODULE MailServer;  (*NW 17.4.89 / 10.2.94*)
+	IMPORT SYSTEM, Core, Files, Texts, Oberon;
+
+	VAR W: Texts.Writer;
+		handler: Oberon.Task;
+		myadr: ARRAY 16 OF CHAR;
+
+	PROCEDURE Dispatch(F: Files.File; rno, sno, hdlen: INTEGER; bdypos: LONGINT;
+			VAR orig, head: ARRAY OF CHAR);
+	(*insert external message (from msg) in recipient rno's mail file*)
+		VAR i, j, k, h: INTEGER;
+			ch: CHAR; ok: BOOLEAN;
+			pos, L, bdylen, tm, dt: LONGINT;
+			fname: Core.Name;
+			MF: Files.File; (*destination*)
+			R, Q: Files.Rider;
+			mrtab: Core.MResTab;
+			mdir: Core.MailDir;
+	BEGIN Core.GetFileName(rno, fname); MF := Files.Old(fname);
+		IF MF # NIL THEN
+			Files.Set(Q, MF, 0); Files.ReadBytes(Q, mrtab, 32);
+			Files.ReadBytes(Q, mdir, SIZE(Core.MailDir))
+		ELSE (*create new mailbox file*)
+			MF := Files.New(fname); Files.Set(Q, MF, 0);  Files.Register(MF);
+			mdir[0].next := 0; mrtab[0] := {4 .. 31}; i := 1;
+			REPEAT mrtab[i] := {0 .. 31}; INC(i) UNTIL i = 7;
+			mrtab[7] := {0 .. 29}; i := 0;
+			REPEAT mdir[i].len := 0; INC(i) UNTIL i = 31
+		END ;
+		Files.Set(R, F, bdypos);
+		IF bdypos > 0 THEN  (*find length of body*)
+			Files.ReadInt(R, k); Files.ReadLInt(R, bdylen)
+		ELSE bdylen := Files.Length(F)
+		END ;
+		ok := FALSE; i := 0;
+		REPEAT INC(i) UNTIL (i = 31) OR (mdir[i].len = 0);
+		IF i < 31 THEN  (*free slot found, now find free blocks in file*)
+			j := -1;
+			REPEAT INC(j);
+				IF j MOD 32 IN mrtab[j DIV 32] THEN
+					h := j; k := SHORT((bdylen + hdlen + 255) DIV 256) + j;
+					LOOP INC(h);
+						IF h = k THEN ok := TRUE; EXIT END ;
+						IF (h = 256) OR ~(h MOD 32 IN mrtab[h DIV 32]) THEN j := h; EXIT END
+					END
+				END
+			UNTIL ok OR (j >= 255)
+		END ;
+		IF ok THEN (*insert msg in blocks j .. k-1*)
+			pos := LONG(j) * 256; mdir[i].pos := j;
+			REPEAT EXCL(mrtab[j DIV 32], j MOD 32); INC(j) UNTIL j = k;
+			mdir[i].len := bdylen + hdlen;
+			Oberon.GetClock(tm, dt);
+			mdir[i].time := SHORT(tm DIV 2); mdir[i].date := SHORT(dt);
+			j := 0;
+			WHILE (j < 19) & (orig[j] > " ") DO mdir[i].originator[j] := orig[j]; INC(j) END ;
+			mdir[i].originator[j] := 0X;
+			mdir[i].next := mdir[0].next; mdir[0].next := i;
+			Files.Set(Q, MF, 0); Files.WriteBytes(Q, mrtab, 32);
+			Files.WriteBytes(Q, mdir, SIZE(Core.MailDir)); Files.Set(Q, MF, pos);
+			j := 0;
+			WHILE j < hdlen DO Files.Write(Q, SYSTEM.ROT(head[j], 5)); INC(j) END ;
+			L := bdylen;
+			WHILE L > 0 DO Files.Read(R, ch); Files.Write(Q, SYSTEM.ROT(ch, 5)); DEC(L) END ;
+			L := (-Files.Pos(Q)) MOD 256;
+			WHILE L > 0 DO Files.Write(Q, 0); DEC(L) END ;
+			Files.Close(MF)
+		ELSIF (rno # sno) & (sno > 0) & (rno > 0) THEN (*return to sender*)
+			Dispatch(F, sno, sno, hdlen, bdypos, orig, head)
+		ELSIF (rno # 0) & (sno # 0) THEN (*send to postmaster*)
+			Dispatch(F, 0, sno, hdlen, bdypos, orig, head)
+		END
+	END Dispatch;
+
+	PROCEDURE Encode(F0: Files.File; textpos: LONGINT;
+			VAR orig: Core.LongName; VAR recip, subj: ARRAY OF CHAR);
+	(*CX-400 encode message F0 and insert it in export queue*)
+		VAR ch: CHAR;
+			i, j: INTEGER;
+			tm, dt, p0, p1: LONGINT;
+			R, Q: Files.Rider; F1: Files.File;
+
+		PROCEDURE WC(n: LONGINT);
+		BEGIN Files.Write(Q, CHR(n))
+		END WC;
+
+		PROCEDURE WI(n: INTEGER);
+		BEGIN Files.WriteBytes(Q, n, 2)
+		END WI;
+
+		PROCEDURE WL(n: LONGINT);
+		BEGIN Files.WriteBytes(Q, n, 4)
+		END WL;
+
+	BEGIN F1 := Files.New(""); Files.Set(Q, F1, 0);
+		WI(4000H); WL(0);    (*MSG*)
+		WI(5000H); WL(0);    (*ENV*)
+		WI(1010H); WI(6);   (*MSGID*)
+		Oberon.GetClock(tm, dt); p0 := tm*dt; i := 0;
+		REPEAT WC(p0 MOD 10H + 41H); p0 := p0 DIV 10H; INC(i) UNTIL i = 6;
+		i := 0;
+		WHILE orig[i] > 0X DO INC(i) END ;
+		WI(1020H); WI(i+27);   (*ORIG*)
+		WI(2011H); WI(2020H); WI(2030H); WI(2041H); WI(3030H); WI(i+15);
+		j := 0;
+		WHILE j < i DO Files.Write(Q, orig[j]); INC(j) END ;
+		j := 0;
+		REPEAT Files.Write(Q, myadr[j]); INC(j) UNTIL j = 15;
+		i := 0;
+		LOOP (*recipients*) j := i;
+			WHILE recip[j] > 1X DO INC(j) END ;
+			IF i = j THEN EXIT END ;
+			WI(1031H); WI(j-i+12);   (*RECIP*)
+			WI(ORD(recip[j])+2010H); WI(2020H); WI(2030H); WI(2041H); WI(3030H); WI(j-i);
+			WHILE i < j DO Files.Write(Q, recip[i]); INC(i) END ;
+			INC(i)
+		END ;
+		i := 0; j := 0;
+		WHILE subj[j] > 0X DO INC(j) END ;
+		WI(1060H); WI(j);   (*SUBJ*)
+		WHILE i < j DO Files.Write(Q, subj[i]); INC(i) END ;
+		WI(1090H); WI(6);   (*SUBM*)
+		WC(dt DIV 200H); WC(dt DIV 20H MOD 10H); WC(dt MOD 20H);
+		WC(tm DIV 1000H); WC(tm DIV 40H MOD 40H); WC(tm MOD 40H);
+		p0 := Files.Pos(Q);
+		WI(6020H); WL(Files.Length(F0) - textpos);   (*TEXT*)
+		Files.Set(R, F0, textpos); Files.Read(R, ch);
+		WHILE ~R.eof DO
+			IF ch >= 7FX THEN
+				IF ch = "É" THEN ch := "a"
+				ELSIF ch = "Ñ" THEN ch := "o"
+				ELSIF ch = "Ö" THEN ch := "u"
+				ELSIF ch = "Ä" THEN ch := "A"
+				ELSIF ch = "Å" THEN ch := "O"
+				ELSIF ch = "Ç" THEN ch := "U"
+				ELSE ch := "?"
+				END
+			END ;
+			Files.Write(Q, ch); Files.Read(R, ch)
+		END ;
+		p1 := Files.Pos(Q); Files.Set(Q, F1, 2);
+		WL(p1-6); WI(5000H); WL(p0-12);   (*fixup*)
+		Files.Close(F1);
+		Core.InsertTask(Core.LineQueue, F1, Oberon.User, -1);
+		Texts.Append(Oberon.Log, W.buf)
+	END Encode;
+
+	PROCEDURE Decode(F: Files.File; pos: LONGINT);
+	(*CX-400 decode message from mail rider MR and dispatch*)
+
+		CONST bufsize = 96; msgsize = 2048;
+
+		VAR i, x, len, mx, rx, rno: INTEGER;
+			list, broadcast: BOOLEAN; ch, mo, yr: CHAR;
+			length: LONGINT;
+			R: Files.Rider;
+			rtab: ARRAY 32 OF INTEGER;  (*table of recipients*)
+			buf, orig: ARRAY bufsize OF CHAR;
+			msg: ARRAY msgsize OF CHAR;  (*message header*)
+
+		PROCEDURE put(ch: CHAR);
+		BEGIN
+			IF mx < msgsize THEN msg[mx] := ch; INC(mx) END
+		END put;
+
+		PROCEDURE PutString(s: ARRAY OF CHAR);
+			VAR i: INTEGER; ch: CHAR;
+		BEGIN i := 0;
+			REPEAT ch := s[i]; INC(i); put(ch)
+			UNTIL ch <= " "
+		END PutString;
+
+		PROCEDURE PutInt(n: INTEGER);
+		BEGIN put(CHR(n DIV 10 + 30H)); put(CHR(n MOD 10 + 30H))
+		END PutInt;
+
+		PROCEDURE ReadORName(len: INTEGER; VAR buf: ARRAY OF CHAR; title: ARRAY OF CHAR);
+			VAR x, i, L: INTEGER; ch: CHAR;
+		BEGIN Files.ReadInt(R, x); list := x = 2011H;
+			Files.ReadInt(R, x); Files.ReadInt(R, x);
+			Files.ReadInt(R, x); Files.ReadInt(R, L);
+			Files.ReadInt(R, L); i := 0;
+			IF x = 2041H THEN
+				PutString(title);
+				WHILE i < L DO
+					Files.Read(R, ch);
+					IF i < bufsize THEN buf[i] := ch END ;
+					INC(i); put(ch)
+				END ;
+				put(0DX)
+			ELSE
+				WHILE i < L DO
+					Files.Read(R, ch);
+					IF i < bufsize THEN buf[i] := ch END ;
+					INC(i)
+				END ;
+			END ;
+			IF i >= bufsize THEN i := bufsize-1 END ;
+			buf[i] := 0X; DEC(len, L+12);
+			WHILE len > 0 DO Files.Read(R, ch); DEC(len) END
+		END ReadORName;
+
+	BEGIN Files.Set(R, F, pos); Files.ReadInt(R, x);
+		Files.ReadLInt(R, length); INC(pos, length+6);
+		IF x = 5000H THEN   (*ENV*)
+			mx := 0; rx := 0; broadcast := FALSE;
+			IF length > 40000 THEN length := 40000 END ;
+			LOOP
+				IF Files.Pos(R) >= pos THEN EXIT END ;
+				Files.ReadInt(R, x); Files.ReadInt(R, len);
+				IF x = 1020H THEN  (*ORIG*)
+					ReadORName(len, orig, "From: ")
+				ELSIF x DIV 10H = 103H THEN  (*RECIP*)
+					ReadORName(len, buf, "To: ");
+					IF buf = "all@cs.inf.ethz.ch" THEN broadcast := TRUE
+					ELSIF list THEN
+						rno := Core.UserNum(buf);
+						IF rno >= 0 THEN rtab[rx] := rno; INC(rx) END
+					END
+				ELSIF x DIV 10H = 106H THEN  (*SUBJ, TITLE*)
+					PutString("Re: "); i := 0;
+					WHILE i < len DO Files.Read(R, ch); put(ch); INC(i) END ;
+					put(0DX)
+				ELSIF x = 1090H THEN  (*SUBMI*)
+					PutString("Submission: ");
+					Files.Read(R, yr); Files.Read(R, mo); Files.Read(R, ch);
+					PutInt(ORD(ch)); put("."); PutInt(ORD(mo)); put(".");
+					PutInt(ORD(yr)); put(" ");
+					Files.Read(R, ch); PutInt(ORD(ch)); put(":");
+					Files.Read(R, ch); PutInt(ORD(ch)); put(":");
+					Files.Read(R, ch); PutInt(ORD(ch)); put(0DX)
+				ELSE Files.Set(R, F, Files.Pos(R) + len)  (*skip*)
+				END
+			END ;
+			IF broadcast THEN (*broadcast*)
+				i := 1; rno := Core.NofUsers();
+				WHILE i < rno DO Dispatch(F, i, 0, mx, pos, orig, msg); INC(i) END
+			ELSIF rx = 0 THEN (*no valid recipient*) Dispatch(F, 0, -1, mx, pos, orig, msg)
+			ELSE i := 0;
+				REPEAT x := rtab[i]; INC(i); Dispatch(F, x, -1, mx, pos, orig, msg) UNTIL i = rx
+			END
+		END
+	END Decode;
+
+
+	PROCEDURE Serve;
+		CONST L0 = 64; L1 = 1024;
+		VAR i, j, ex, sx, sno, rno, hdlen: INTEGER;
+			ch: CHAR; anyext: BOOLEAN;
+			pos, length, dt, tm: LONGINT;
+			F: Files.File; R: Files.Rider;
+			Id: Core.ShortName;
+			orig: Core.LongName;
+			head, recip, subj: ARRAY L0 OF CHAR;
+			extrecip: ARRAY L1 OF CHAR;
+
+		PROCEDURE Pair(ch: CHAR; x: LONGINT);
+		BEGIN head[j] := ch; INC(j);
+			head[j] := CHR(x DIV 10 + 30H); INC(j); head[j] := CHR(x MOD 10 + 30H); INC(j)
+		END Pair;
+
+	BEGIN
+		IF Core.MailQueue.n > 0 THEN
+			Core.GetTask(Core.MailQueue, F, Id, sno);
+			IF sno >= 0 THEN (*internal originator*)
+				Core.GetUserName(sno, orig); Oberon.GetClock(tm, dt);
+				COPY("From: ", head); i := 0; j := 6;
+				WHILE orig[i] > 0X DO head[j] := orig[i]; INC(i); INC(j) END ;
+				head[j] := 0DX; INC(j); head[j] := "A"; INC(j); head[j] := "t"; INC(j); head[j] := ":"; INC(j);
+				Pair(" ", dt MOD 20H); Pair(".", dt DIV 20H MOD 10H); Pair(".", dt DIV 200H MOD 80H);
+				Pair(" ", tm DIV 1000H MOD 20H); Pair(":", tm DIV 40H MOD 40H); Pair(":", tm MOD 40H);
+				head[j] := 0DX; hdlen := j+1;
+				Files.Set(R, F, 0); anyext := FALSE; ex := 0; sx := 0;
+				LOOP (*next line*) pos := Files.Pos(R);
+					REPEAT Files.Read(R, ch) UNTIL (ch > " ") OR R.eof;
+					IF R.eof THEN EXIT END ;
+					i := 0;
+					REPEAT
+						IF i < L0-1 THEN recip[i] := ch; INC(i) END ;
+						Files.Read(R, ch)
+					UNTIL ch <= ":";
+					recip[i] := 0X;
+					IF (recip # "To") & (recip # "cc") THEN EXIT END ;
+					IF ch = ":" THEN Files.Read(R, ch) END ;
+					LOOP (*next recipient*)
+						WHILE ch = " " DO Files.Read(R, ch) END ;
+						WHILE ch = "(" DO
+							REPEAT Files.Read(R, ch) UNTIL (ch = ")") OR (ch < " ");
+							IF ch = ")" THEN Files.Read(R, ch) END ;
+							WHILE ch = " " DO Files.Read(R, ch) END
+						END ;
+						IF ch < " " THEN EXIT END ;
+						i := 0;
+						WHILE (ch > " ") & (ch # "@") DO
+							IF i < L0-1 THEN recip[i] := ch; INC(i) END ;
+							IF ex < L1-1 THEN extrecip[ex] := ch; INC(ex) END ;
+							Files.Read(R, ch)
+						END ;
+						IF ch = "@" THEN (*external recipient*)
+							REPEAT
+								IF ex < L1-1 THEN extrecip[ex] := ch; INC(ex) END ;
+								Files.Read(R, ch)
+							UNTIL (ch <= " ") OR (ch = ",");
+							extrecip[ex] := 1X; INC(ex); anyext := TRUE
+						ELSE (*internal recipient*)
+							recip[i] := 0X; extrecip[ex] := 0X; INC(ex);
+							IF recip = "all" THEN rno := Core.NofUsers();
+								WHILE rno > 1 DO  (*exclude postmaster*)
+									DEC(rno); Dispatch(F, rno, 0, hdlen, 0, orig, head)
+								END
+							ELSE rno := Core.UserNum(recip);
+								IF rno < 0 THEN rno := sno END ;
+								Dispatch(F, rno, sno, hdlen, 0, orig, head)
+							END
+						END ;
+						IF ch = "," THEN Files.Read(R, ch) END
+					END
+				END ;
+				IF anyext THEN
+					IF recip = "Re" THEN
+						Files.Read(R, ch);
+						WHILE (ch >= " ") & (sx < L0-1) DO subj[sx] := ch; INC(sx); Files.Read(R, ch) END ;
+						pos := Files.Pos(R)
+					END ;
+					subj[sx] := 0X; extrecip[ex] := 0X; Encode(F, pos, orig, extrecip, subj)
+				END
+			ELSE (*external originator*)
+				pos := 0;
+				LOOP Files.Set(R, F, pos); Files.ReadInt(R, i);
+					IF R.eof THEN EXIT END ;
+					IF i = 4000H THEN  (*MSG*)
+						Files.ReadLInt(R, length); INC(pos, 6); Decode(F, pos); INC(pos, length)
+					ELSE Texts.WriteString(W, "message not fully decoded");
+						Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf); EXIT
+					END
+				END
+			END ;
+			Core.RemoveTask(Core.MailQueue)
+		END
+	END Serve;
+
+	(*------------------------ Commands --------------------------*)
+
+	PROCEDURE Start*;
+	BEGIN Oberon.Remove(handler); Oberon.Install(handler);
+		Texts.WriteString(W, "Mailer started  (NW 17.12.92)");
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END Start;
+
+	PROCEDURE State*;
+	BEGIN Texts.WriteString(W, "Mail queue:"); Texts.WriteInt(W, Core.MailQueue.n, 3);
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END State;
+
+	PROCEDURE Stop*;
+	BEGIN Oberon.Remove(handler); Texts.WriteString(W, "Mailer stopped");
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END Stop;
+
+	PROCEDURE RemoveMsg*;
+		VAR ch: CHAR;
+			F, G: Files.File; R, Q: Files.Rider;
+			id: Core.ShortName; uno: INTEGER;
+			S: Texts.Scanner;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF Core.MailQueue.n > 0 THEN
+			Core.GetTask(Core.MailQueue, F, id, uno); Files.Set(R, F, 0); Files.Read(R, ch);
+			G := Files.New(S.s); Files.Set(Q, G, 0);
+			WHILE ~R.eof DO Files.Write(Q, ch); Files.Read(R, ch) END ;
+			Files.Register(G); Core.RemoveTask(Core.MailQueue);
+			Texts.WriteString(W, S.s); Texts.WriteString(W, " saved")
+		ELSE Texts.WriteString(W, " MQ empty")
+		END ;
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END RemoveMsg;
+
+BEGIN Texts.OpenWriter(W);
+	myadr := "@cs.inf.ethz.ch"; NEW(handler); handler.handle := Serve
+END MailServer.

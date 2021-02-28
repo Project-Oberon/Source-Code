@@ -1,0 +1,362 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Dates; (* KR  Thu, 1-Jul-1993/jt 7.11.95 *)
+
+	IMPORT Display, Oberon, Input, Kernel;
+	
+CONST	
+	minute* = 60; quarter* = 15 * minute; hour* = 60*minute; day* = 24*hour; week*= 7* day;  
+	zeroY = 1961; 
+	firstY* = 1900; lastY* = zeroY +  MAX(LONGINT)  DIV 365 DIV day;
+	tick* = 0; alarm* = 1;
+	
+TYPE 
+	DateTime* = LONGINT;
+	Alarm = POINTER TO AlarmDesc;
+	AlarmHandler* = PROCEDURE (at : DateTime; VAR handled : BOOLEAN);
+	AlarmDesc = RECORD
+						at : DateTime;
+						handle : AlarmHandler;
+						handled : BOOLEAN;
+						next : Alarm;
+					END;
+					
+	TickMsg* = RECORD
+		(Display.FrameMsg);
+		id* : INTEGER;
+		now* : DateTime
+	END;
+	
+VAR
+	error* : LONGINT;
+	alarms : BOOLEAN;
+	firstAlarm  : Alarm;
+	lastTick : DateTime;
+	lastTask,lastAlarm : LONGINT;
+	task : Oberon.Task;
+	A : ARRAY 13 OF INTEGER; 
+	T : ARRAY 365 OF SHORTINT;
+	i, j : INTEGER;
+	
+PROCEDURE DaysOfMonth*(year, month : INTEGER) : INTEGER;
+(* bestimme die Anzahl Tage des Monats m *)
+	VAR d : INTEGER;
+BEGIN 
+	IF (month >= 1) & (month <=12) THEN
+		d := A[month] - A[month-1];
+		IF (year MOD 4 = 0) & (month =2) THEN INC(d) END;
+		RETURN d
+	ELSE
+		RETURN -1 
+	END
+END DaysOfMonth;
+
+PROCEDURE DayOfWeek* (dateTime : DateTime) : INTEGER;
+(* monday = 0, .. 1. 1.1901 was Tuesday *)
+BEGIN  
+	RETURN SHORT(((dateTime DIV day)+6) MOD 7);
+END DayOfWeek;
+
+PROCEDURE Date*(y, m, d : INTEGER) : DateTime;
+(* wandle Jahr, Monat Tag in ein Datum um, error falls kein g…ltiges Datum *)
+	VAR num : LONGINT;
+BEGIN 
+	IF (y >= firstY) & (y < lastY) & (m >= 1) &  (m <= 12) & (d >= 1) &  (d <= DaysOfMonth(y,m)) THEN 
+		y := y - zeroY;
+		num := LONG(y)*365 + y DIV 4 + A[m-1] + d -1;
+		IF ((y +1) MOD 4 =0) & (m > 2) THEN INC(num) END;
+		RETURN num * day
+	ELSE 
+		RETURN error
+	END;
+END Date;
+
+PROCEDURE Time*(h, m, s : INTEGER) : DateTime;
+(* wandle Stunde, Minute, Sekunde in eine Zeit um, error falls nicht g…ltig *)
+BEGIN 
+	RETURN LONG(s) * minute DIV 60 + LONG(m) *minute + LONG(h) * hour;
+	(*
+	IF (h >= 0) & (h < 24) & (m >=  0) & (m < 60) & (s >= 0) & (s < 60 ) THEN
+		RETURN LONG(s) * minute DIV 60 + LONG(m) *minute + LONG(h) * hour
+	ELSE
+		RETURN error
+	END
+	*)
+END Time;
+
+PROCEDURE Put(VAR str : ARRAY OF CHAR;  VAR p : INTEGER; n : LONGINT; ch : CHAR);
+BEGIN
+	str[p] := CHR(48 + n DIV 10);INC(p);
+	str[p] := CHR(48 + n MOD 10);INC(p);
+	str[p] := ch;INC(p);
+END Put;
+
+PROCEDURE IntToString*(i : LONGINT; VAR alpha : ARRAY OF CHAR);
+VAR d,p : INTEGER;	tmp : ARRAY 15 OF CHAR; neg:BOOLEAN;
+BEGIN
+	IF i = 0 THEN COPY("0 ",alpha); RETURN; END;
+	p := 0; d := 0;
+	IF i < 0 THEN i := -i; neg := TRUE; ELSE neg := FALSE; END;
+	WHILE i > 0 DO tmp[p] := CHR(i MOD 10 + 30H);  i := i DIV 10; INC(p); END;
+	DEC(p);
+	IF neg THEN alpha[d] := "-"; INC(d); END;
+	WHILE p >= 0 DO alpha[d] := tmp[p]; INC(d); DEC(p); END;
+	alpha[d] := 0X;
+END IntToString;
+
+PROCEDURE StringToInt*(s: ARRAY OF CHAR) : LONGINT;
+VAR x, d: INTEGER; neg: BOOLEAN;  i: LONGINT;
+BEGIN
+	x := 0; i := 0;
+	WHILE s[x] = " " DO INC(x); END;
+	IF s[x] = "-" THEN neg:= TRUE; INC(x); ELSE neg:= FALSE; END;
+	WHILE s[x] = " " DO INC(x); END;
+	WHILE s[x] # 0X DO
+		d := ORD(s[x]) - 30H;
+		IF (d >= 0) & (d < 10) THEN
+			IF i <= (MAX(LONGINT) - d) DIV 10 THEN i := i * 10 + d; ELSE i := 0; END;
+		ELSE
+			i := 0; RETURN i;
+		END;
+		INC(x);
+	END;
+	IF neg THEN i := -i; END;
+	RETURN i
+END StringToInt;
+
+PROCEDURE YearMonthDay*(dateTime : DateTime; VAR y, m, d : INTEGER);
+	VAR M  : INTEGER; num : LONGINT; 
+BEGIN 
+	IF dateTime = error THEN HALT(40) END;
+	num := dateTime DIV day;
+	IF (num + 307) MOD 1461 = 0 THEN d := 2 ELSE d := 1 END;
+	num := num - (num + 307) DIV 1461; y := zeroY + SHORT(num DIV 365);
+	M := SHORT(num MOD 365); m := T[M]; d := M - A[m -1] + d;
+END  YearMonthDay;
+
+PROCEDURE HourMinuteSecond*(dateTime : DateTime; VAR h, m, s : INTEGER);
+	VAR time : LONGINT;
+BEGIN
+	time := dateTime MOD day;
+	h := SHORT(time DIV hour); m := SHORT(time DIV minute  MOD minute); s := SHORT(time MOD minute * 60 DIV minute);
+END HourMinuteSecond;
+
+PROCEDURE TimeToString*(dateTime : DateTime; VAR  t : ARRAY OF CHAR);
+(* wandle Zeit in String *)
+	VAR p : INTEGER; time : LONGINT;
+BEGIN 
+	IF dateTime = error THEN HALT(40) END;
+	time := dateTime MOD day; p:=0;
+	Put(t,p,time DIV hour,":");
+	Put(t,p,time DIV minute  MOD minute,":");
+	Put(t,p,time MOD minute * 60  DIV minute,0X);
+END TimeToString;
+
+PROCEDURE DateToString*(dateTime : DateTime; VAR s : ARRAY OF CHAR);
+(* wandle Datum in String *)
+	VAR p,y, m, d : INTEGER;
+BEGIN
+	YearMonthDay(dateTime,y, m, d);
+	p := 0;
+	Put(s,p,d,".");	
+	Put(s,p, m,".");
+	IF y > 1999 THEN s[p] := "2"; s[p+1] := "0" ELSE  s[p] := "1"; s[p+1] := "9" END; p := p + 2;
+	Put(s, p, y MOD 100, 0X); 
+END DateToString;
+
+PROCEDURE Get(s : ARRAY OF CHAR; VAR p : INTEGER) : INTEGER;
+	VAR h : ARRAY 32 OF CHAR; i : INTEGER; 
+BEGIN 
+	WHILE ((s[p] < "0") OR (s[p] > "9"))  & (s[p] # 0X) DO INC(p) END;
+	i :=0;
+	WHILE (s[p] >= "0") & (s[p] <= "9") DO h[i] := s[p]; INC(p); INC(i);  END; h[i] := 0X;
+	IF i # 0 THEN
+		i := SHORT(StringToInt(h)); 
+	END;
+	RETURN i
+END Get;
+
+PROCEDURE StringToDate*(VAR s : ARRAY OF CHAR)  : DateTime; 
+	VAR  p : INTEGER; year,month,day : INTEGER;
+BEGIN 
+	p := 0;
+	day := Get(s,p); month := Get(s,p); year := Get(s,p);
+	RETURN Date(year,month,day);
+END StringToDate;
+
+PROCEDURE StringToTime*(VAR s : ARRAY OF CHAR)  : DateTime; 
+	VAR p :  INTEGER;
+BEGIN  p := 0;
+	WHILE (CAP(s[p]) < "A") & (s[p] # 0X) DO INC(p) END;
+	IF (s[p] # 0X)  THEN
+		IF (CAP(s[p]) = "M") & (CAP(s[p+1]) = "I") & (CAP(s[p+2]) = "N") THEN
+			p := 0;  RETURN Get(s,p) * minute
+		ELSIF (CAP(s[p]) = "D") & (CAP(s[p+1]) = "A") & (CAP(s[p+2]) = "Y") THEN
+			p := 0; RETURN Get(s,p) * day
+		ELSIF (CAP(s[p]) = "H") & (CAP(s[p+1]) = "O") & (CAP(s[p+2]) = "U") THEN
+			p := 0; RETURN Get(s,p) * hour
+		ELSE RETURN 0
+		END
+	ELSE
+		p := 0;
+		RETURN Time(Get(s,p),Get(s,p),Get(s,p))
+	END
+END StringToTime;
+
+
+PROCEDURE DayToString*(day : INTEGER; VAR str : ARRAY OF CHAR);
+BEGIN
+	CASE day OF
+		0 : COPY("Monday",str);
+	| 1 : COPY("Tuesday",str);  
+	| 2 : COPY("Wednesday",str);  
+	| 3 : COPY("Thursday",str);  
+	| 4 : COPY("Friday",str);  
+	| 5 : COPY("Saturday",str);  
+	| 6 : COPY("Sunday",str);  
+	END;
+END DayToString;
+
+PROCEDURE MonthToString*(month : INTEGER; VAR str : ARRAY OF CHAR);
+BEGIN
+	CASE month - 1 OF
+		0 : COPY("January",str);
+	| 1 : COPY("February",str);
+	| 2 : COPY("March",str);
+	| 3 : COPY("April",str);
+	| 4 : COPY("May",str);
+	| 5 : COPY("June",str);
+	| 6 : COPY("July",str);
+	| 7 : COPY("August",str);
+	| 8 : COPY("September",str);
+	| 9 : COPY("October",str);
+	| 10 : COPY("November",str);
+	| 11 : COPY("December",str);
+	END;
+END MonthToString;
+
+PROCEDURE Today*() : DateTime;
+	VAR date,time : LONGINT;
+BEGIN
+	Oberon.GetClock(time,date);
+	RETURN Date(SHORT(date DIV 512 MOD 128+1900), SHORT(date DIV 32 MOD 16), SHORT(date MOD 32))
+END Today;
+
+PROCEDURE Now*() : DateTime;
+	VAR d,t : LONGINT;
+BEGIN
+	Oberon.GetClock(t,d);
+	RETURN Time(SHORT(t DIV 4096 MOD 32), SHORT(t DIV 64 MOD 64), SHORT(t MOD 64));
+END Now;
+
+PROCEDURE *AlarmTask(me : Oberon.Task);
+	VAR a, p : Alarm; now : DateTime; M : TickMsg; hour,min,sec : INTEGER; handled : BOOLEAN;
+BEGIN
+	IF alarms & (Input.Time() - lastAlarm > Input.TimeUnit) THEN lastAlarm := Input.Time();
+		M.now := Today() + Now(); M.id := alarm; M.F := NIL; Display.Broadcast(M);
+	END;
+	IF Input.Time() - lastTask  >  5 * Input.TimeUnit THEN  lastTask := Input.Time();
+		now := Today() + Now();
+		HourMinuteSecond(now,hour,min,sec);
+		IF (now - lastTick > 16)  & (sec  < 15) THEN
+			M.now := now; M.id := tick; M.F := NIL; Display.Broadcast(M); lastTick := now;
+		END;
+		a := firstAlarm; alarms := FALSE;
+		WHILE a # NIL DO 
+			IF a.handled THEN IF a = firstAlarm THEN firstAlarm := firstAlarm.next ELSE p.next := a.next END END;
+			handled := a.handled; a.handled := TRUE;
+			IF (a.at <  now) & ~handled THEN a.handle(a.at,handled); alarms := alarms OR ~handled; END;
+			a.handled := handled;
+			p := a; a := a.next;
+		END
+	END;
+	me.time := Input.Time() + Input.TimeUnit;
+END AlarmTask;
+
+PROCEDURE InstallAlarm*(at : DateTime; handle : AlarmHandler);
+	VAR a ,alarm: Alarm; now : DateTime;
+BEGIN
+	NEW(alarm); alarm.at := at; alarm.handle := handle;
+	now :=  Today() + Now();
+	IF alarm.at > now THEN
+		a := firstAlarm;
+		LOOP
+			IF a = NIL THEN alarm.next := firstAlarm; firstAlarm := alarm; EXIT
+			ELSIF a.at = alarm.at THEN a.handle := alarm.handle; a.handled := alarm.handled; EXIT 
+			END;
+			a := a.next
+		END;
+	END;
+END InstallAlarm;
+
+PROCEDURE RemoveAlarm*(at : DateTime);
+	VAR p,a : Alarm; T : TickMsg;
+BEGIN
+	a := firstAlarm;
+	WHILE (a # NIL) & (a.at # at) DO p := a; a := a.next END;
+	IF a # NIL THEN
+		IF a = firstAlarm THEN firstAlarm := a.next ELSE p.next := a.next END;
+		alarms := FALSE; T.now := (Today() + Now()) DIV 2 * 2; T.id := alarm; T.F := NIL; Display.Broadcast(T);
+	END;
+END RemoveAlarm;
+
+PROCEDURE ShowAlarms*(enum : AlarmHandler);
+	VAR a : Alarm;
+BEGIN
+	a :=  firstAlarm;
+	WHILE a # NIL DO
+		IF ~a.handled THEN
+			enum(a.at,a.handled)
+		END;
+		a := a.next;
+	END;
+END ShowAlarms;
+
+PROCEDURE *Cleanup;
+BEGIN
+	Oberon.Remove(task)
+END Cleanup;
+
+(*
+PROCEDURE Test*;
+	VAR date,time : LONGINT; s,s2 : ARRAY 32 OF CHAR; h,m,S : INTEGER;
+BEGIN		
+	date := Date(1901,1,1); DayToString(DayOfWeek(date),s2); DateToString(date,s); Debug.SSI(s,s2,date DIV day);
+	date := Date(1902,1,1); DayToString(DayOfWeek(date),s2); DateToString(date,s); Debug.SSI(s,s2,date DIV day);	
+	date := Date(1903,1,1); DayToString(DayOfWeek(date),s2); DateToString(date,s); Debug.SSI(s,s2,date DIV day);
+	date := Date(1904,1,1); DayToString(DayOfWeek(date),s2); DateToString(date,s); Debug.SSI(s,s2,date DIV day );	
+	date := Date(1960,1,1); DayToString(DayOfWeek(date),s2); DateToString(date,s); Debug.SSI(s,s2,date DIV day);
+	date := Date(1990,1,1); DayToString(DayOfWeek(date),s2); DateToString(date,s); Debug.SSI(s,s2,date DIV day);	
+	date := Today(); DayToString(DayOfWeek(date),s2); DateToString(date,s); Debug.SSII(s,s2,DayOfWeek(date),date DIV day);	
+	LOOP
+		time := Now();
+		REPEAT UNTIL time # Now(); TimeToString(time,s); 
+		HourMinuteSecond(time,h,m,S); 
+		time := Time(h,m,S);
+		TimeToString(time,s2); 
+		Debug.SS(s,s2);
+	END
+END Test;
+*)
+BEGIN 
+	NEW(task); task.handle := AlarmTask; lastTick := 0; task.safe := TRUE; Oberon.Install(task);
+	Kernel.InstallTermHandler(Cleanup);
+	A[0] := 0; A[1] := 31; A[2] := 59; A[3] := 90; A[4] := 120; A[5] := 151; A[6] := 181;
+	A[7] := 212; A[8] := 243; A[9] :=  273; A[10] := 304; A[11] := 334; A[12] := 365;
+	i := 0; j := 0;
+	WHILE i < 12 DO WHILE j < A[i+1] DO  T[j] := SHORT(i + 1); INC(j) END; INC(i) END;
+	error := MIN(LONGINT);
+END Dates.
+
+Dates.Test

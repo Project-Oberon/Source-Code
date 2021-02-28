@@ -1,0 +1,73 @@
+MODULE Modules;	(* JT, 6.2.90 / RC 7.12.90 / ARD 4.2.93*)
+
+	IMPORT Kernel, Files, SYSTEM;
+	
+	CONST ModNameLen* = 32;
+
+	TYPE
+		Command* = Kernel.Proc;
+		Name = POINTER TO Kernel.Name;
+		
+		Module* = POINTER TO ModuleDesc;
+		ModuleDesc* = RECORD
+			link*: Module;
+			name*: ARRAY 32 OF CHAR;
+			init*, trapped: BOOLEAN;
+			key*, refcnt*, nofentr*, nofcom*, nofptr*, nofimp*, size*, nofrecs*: LONGINT;
+			entries*: LONGINT;
+			cmds*: LONGINT;
+			ptrTab*: LONGINT;
+			tdescs*: LONGINT;
+			imports*: LONGINT;
+			SB*: LONGINT (* Static base *);
+			data*, code*: LONGINT;
+			refs*: LONGINT;
+		END ;
+		
+	VAR
+		imported*: Kernel.Name;
+		importing*: Kernel.Name;
+		res*: INTEGER;
+		loop: Command;
+
+	PROCEDURE ThisMod* (name: ARRAY OF CHAR): Module;
+	VAR pn1, pn2: Name; mod: Module; r: INTEGER; n: ARRAY 32 OF CHAR;
+	BEGIN
+		r := 0; WHILE (r < 27) & (name[r] # 0X) DO n[r] := name[r]; INC(r) END; 
+		n[r] := "."; n[r+1] := "O"; n[r+2] := "b"; n[r+3] := "j"; n[r+4] := 0X;
+		Kernel.Load(n, SYSTEM.VAL(Kernel.Module, mod), r);
+		IF r # 0 THEN
+			pn1 := SYSTEM.VAL(Name, Kernel.File1); pn2 := SYSTEM.VAL(Name, Kernel.File2);
+			COPY(pn1^, importing); COPY(pn2^, imported)
+		END ;
+		res := r;
+		RETURN mod
+	END ThisMod;
+
+	PROCEDURE ThisCommand* (mod: Module; name: ARRAY OF CHAR): Command;
+	VAR P: Command;  r: INTEGER; pn1: Name;
+	BEGIN 
+		Kernel.GetProc(name, SYSTEM.VAL(Kernel.Module, mod), P, r); res := r; 
+		pn1 := SYSTEM.VAL(Name, Kernel.File1); COPY(pn1^, importing); RETURN P
+	END ThisCommand;
+
+	PROCEDURE Free* (name: ARRAY OF CHAR; all: BOOLEAN);
+	VAR r: INTEGER;
+	BEGIN Kernel.Free(name, all, r); res := r
+	END Free;
+	
+	PROCEDURE *Cleanup;
+	VAR mod: Module;
+	BEGIN
+		SYSTEM.GET(Kernel.modules, mod);
+		WHILE mod # NIL DO
+			IF mod.trapped THEN Free(mod.name, FALSE) END;
+			mod := mod.link
+		END;
+	END Cleanup;
+
+BEGIN 
+	Kernel.InstallgcNotifier(Cleanup);
+	loop := ThisCommand(ThisMod("Oberon"), "Loop");
+	loop;
+END Modules.

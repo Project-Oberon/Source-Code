@@ -1,0 +1,204 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE NetBackup;	(* muller 15.12.95 *)
+
+IMPORT NetSystem, Texts, Oberon, Files, Input;
+
+CONST
+	Port = 5007;
+	
+VAR
+	W: Texts.Writer;
+	
+PROCEDURE WriteString(c: NetSystem.Connection;  s: ARRAY OF CHAR);
+VAR res, i: LONGINT;
+BEGIN
+	i := 0;  WHILE s[i] # 0X DO INC(i) END;
+	NetSystem.WriteBytes(c, 0, i+1, s);
+	IF c.res # NetSystem.done THEN res := c.res;  HALT(99) END
+END WriteString;
+
+PROCEDURE OpenScanner(VAR S: Texts.Scanner);
+VAR
+	beg, end, time: LONGINT;
+	text: Texts.Text;
+BEGIN
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(S);
+	IF (S.class = Texts.Char) & (S.c = "^") THEN
+		time := -1;
+		text := NIL;
+		Oberon.GetSelection(text, beg, end, time);
+		IF (text # NIL) & (time >= 0) THEN
+			Texts.OpenScanner(S, text, beg);
+			Texts.Scan(S)
+		END
+	END
+END OpenScanner;
+
+PROCEDURE ScanPair(VAR S: Texts.Scanner; VAR name1, name2: ARRAY OF CHAR): BOOLEAN;
+BEGIN
+	WHILE ~(S.class IN {Texts.Name, Texts.String}) & ((S.class # Texts.Char) OR (S.c # "~")) & ~S.eot DO
+		Texts.Scan(S)
+	END;
+	IF S.class IN {Texts.Name, Texts.String} THEN
+		COPY(S.s, name1);
+		Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "=") THEN
+			Texts.Scan(S);
+			IF (S.class = Texts.Char) & (S.c = ">") THEN
+				Texts.Scan(S);
+				IF S.class IN {Texts.Name, Texts.String} THEN
+					COPY(S.s, name2);
+					Texts.Scan(S);
+					RETURN TRUE
+				END
+			END
+		ELSE
+			COPY(name1, name2);
+			RETURN TRUE
+		END
+	END;
+	RETURN FALSE
+END ScanPair;
+
+PROCEDURE SendFiles*;	(* server { file [=> file] } ~ *)
+CONST BufSize = 1024;
+VAR
+	res: INTEGER;  f: Files.File;  r: Files.Rider;  len, num: LONGINT;
+	c: NetSystem.Connection;  name1, name2: ARRAY 32 OF CHAR;  ip: NetSystem.IPAdr;
+	buf: ARRAY BufSize OF CHAR;  tnum, tlen, time: LONGINT;
+	S: Texts.Scanner;
+BEGIN
+	OpenScanner(S);
+	IF S.class IN {Texts.Name, Texts.String} THEN
+		Texts.WriteString(W, "Looking up ");  Texts.WriteString(W, S.s);  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		NetSystem.GetIP(S.s, ip);  Texts.Scan(S);
+		NetSystem.OpenConnection(c, NetSystem.anyport, ip, Port, res);
+		IF res # NetSystem.done THEN HALT(99) END;
+		tnum := 0;  tlen := 0;  time := Input.Time();
+		LOOP
+			IF ~ScanPair(S, name1, name2) THEN EXIT END;
+			Texts.WriteString(W, name1);
+			IF name2 # name1 THEN
+				Texts.WriteString(W, " => ");  Texts.WriteString(W, name2)
+			END;
+			Texts.WriteLn(W);  Texts.Append(Oberon.Log, W.buf);
+			f := Files.Old(name1);  IF f = NIL THEN HALT(99) END;
+			Files.Set(r, f, 0);  WriteString(c, name2);
+			len := Files.Length(f);  NetSystem.WriteLInt(c, len);
+			LOOP
+				IF len > BufSize THEN num := BufSize ELSE num := len END;
+				Files.ReadBytes(r, buf, num);  DEC(num, r.res);  DEC(len, num);
+				IF num = 0 THEN
+					EXIT
+				ELSE
+					NetSystem.WriteBytes(c, 0, num, buf);
+					IF c.res # NetSystem.done THEN res := c.res;  HALT(99) END;
+					INC(tlen, num)
+				END
+			END;
+			INC(tnum)
+		END;
+		WriteString(c, "");
+		NetSystem.CloseConnection(c);
+		time := Input.Time() - time;
+		Texts.WriteString(W, "Files sent: ");  Texts.WriteInt(W, tnum, 1);  Texts.WriteLn(W);
+		Texts.WriteString(W, "Bytes sent: ");  Texts.WriteInt(W, tlen, 1);  Texts.WriteLn(W);
+		IF time DIV Input.TimeUnit # 0 THEN
+			Texts.WriteInt(W, time DIV Input.TimeUnit, 1);
+			Texts.WriteString(W, " seconds.");  Texts.WriteLn(W);
+			IF tlen > MAX(LONGINT) DIV Input.TimeUnit THEN
+				Texts.WriteInt(W, tlen DIV (time DIV Input.TimeUnit), 1)
+			ELSE
+				Texts.WriteInt(W, tlen*Input.TimeUnit DIV time, 1)
+			END;
+			Texts.WriteString(W, " bytes per second.");  Texts.WriteLn(W)
+		END;
+		Texts.Append(Oberon.Log, W.buf)
+	END
+END SendFiles;
+
+PROCEDURE ReceiveFiles*;	(* server { file [=> file] } ~ *)
+CONST BufSize = 1024;
+VAR
+	res: INTEGER;  f: Files.File;  r: Files.Rider;  len, num: LONGINT;
+	c: NetSystem.Connection;  name1, name2: ARRAY 32 OF CHAR;  ip: NetSystem.IPAdr;
+	buf: ARRAY BufSize OF CHAR;  tnum, tlen, time: LONGINT;
+	S: Texts.Scanner;
+BEGIN
+	OpenScanner(S);
+	IF S.class IN {Texts.Name, Texts.String} THEN
+		Texts.WriteString(W, "Looking up ");  Texts.WriteString(W, S.s);  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		NetSystem.GetIP(S.s, ip);  Texts.Scan(S);
+		NetSystem.OpenConnection(c, NetSystem.anyport, ip, Port, res);
+		IF res # NetSystem.done THEN HALT(99) END;
+		tnum := 0;  tlen := 0;  time := Input.Time();
+		LOOP
+			IF ~ScanPair(S, name1, name2) THEN EXIT END;
+			Texts.WriteString(W, name1);
+			IF name2 # name1 THEN
+				Texts.WriteString(W, " => ");  Texts.WriteString(W, name2)
+			END;
+			Texts.Append(Oberon.Log, W.buf);
+			WriteString(c, name1);  NetSystem.WriteLInt(c, -1);
+			NetSystem.ReadLInt(c, len);
+			IF (c.res # NetSystem.done) OR (len < 0) THEN res := c.res;  HALT(99) END;
+			Texts.Write(W, " ");  Texts.WriteInt(W, len, 1);
+			Texts.WriteLn(W);  Texts.Append(Oberon.Log, W.buf);
+			f := Files.New(name2);  IF f = NIL THEN HALT(99) END;
+			Files.Set(r, f, 0);
+			LOOP
+				IF len > BufSize THEN num := BufSize ELSE num := len END;
+				IF num = 0 THEN
+					EXIT
+				ELSE
+					NetSystem.ReadBytes(c, 0, num, buf);
+					IF c.res # NetSystem.done THEN res := c.res;  HALT(99) END;
+					Files.WriteBytes(r, buf, num);
+					IF r.res # 0 THEN res := SHORT(r.res);  HALT(99) END;
+					DEC(len, num);
+					INC(tlen, num)
+				END
+			END;
+			Files.Register(f);
+			INC(tnum)
+		END;
+		WriteString(c, "");
+		NetSystem.CloseConnection(c);
+		time := Input.Time() - time;
+		Texts.WriteString(W, "Files received: ");  Texts.WriteInt(W, tnum, 1);  Texts.WriteLn(W);
+		Texts.WriteString(W, "Bytes received: ");  Texts.WriteInt(W, tlen, 1);  Texts.WriteLn(W);
+		IF time DIV Input.TimeUnit > 1 THEN
+			Texts.WriteInt(W, time DIV Input.TimeUnit, 1);
+			Texts.WriteString(W, " seconds.");  Texts.WriteLn(W);
+			IF tlen > MAX(LONGINT) DIV Input.TimeUnit THEN
+				Texts.WriteInt(W, tlen DIV (time DIV Input.TimeUnit), 1)
+			ELSE
+				Texts.WriteInt(W, tlen*Input.TimeUnit DIV time, 1)
+			END;
+			Texts.WriteString(W, " bytes per second.");  Texts.WriteLn(W)
+		END;
+		Texts.Append(Oberon.Log, W.buf)
+	END
+END ReceiveFiles;
+
+BEGIN
+	Texts.OpenWriter(W)
+END NetBackup.
+
+NetBackup.SendFiles cerberus t1 t2 t ~
+NetBackup.ReceiveFiles cerberus t1=>t t2  ~

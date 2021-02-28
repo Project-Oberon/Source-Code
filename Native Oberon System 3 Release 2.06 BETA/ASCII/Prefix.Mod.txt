@@ -1,0 +1,47 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Prefix;
+
+(* 01.11.94 pmuller - Set FileDir prefix *)
+
+IMPORT In, FileDir, Out;
+
+PROCEDURE Set*;
+VAR prefix: ARRAY 10 OF CHAR;
+BEGIN
+	In.Open; In.Name(prefix);
+	IF In.Done THEN
+		COPY(prefix, FileDir.prefix);
+		Out.String("Prefix.Set "); Out.Char(22X); Out.String(FileDir.prefix); 
+		Out.Char(22X); Out.Ln
+	END
+END Set;
+
+PROCEDURE Clear*;
+BEGIN
+	FileDir.prefix := "";
+	Out.String("Prefix.Clear"); Out.Ln
+END Clear;
+
+PROCEDURE Show*;
+BEGIN
+	Out.String("Prefix.Show ");
+	Out.Char(22X); Out.String(FileDir.prefix); Out.Char(22X); Out.Ln
+END Show;
+
+END Prefix.
+
+Prefix.Show
+Prefix.Clear
+Prefix.Set Test.

@@ -1,0 +1,906 @@
+MODULE Bitmaps0;
+
+* File                  Bitmaps.Asm
+* Purpose           Assembler Routines to handle Bitmaps 
+*             in Memory and to display them on a 
+*             standard VGA card
+* Date			
+* Author       Thomas Notter
+* 
+* Changes     
+
+ReplaceMode	EQU	$0
+PaintMode		EQU	$1
+InvertMode		EQU 	$2
+
+VGAReplace	EQU	$00
+VGAInvert		EQU	$18
+VGAPaint		EQU	$10
+
+WrMode2		EQU	$02
+Controller		EQU	$03CE
+
+
+* offsets in bitmap descriptor
+width  					EQU   0
+height			 		EQU	2
+depth		  			EQU	4
+wth			 			EQU	8
+address					EQU	12
+
+* offsets in pattern descriptor
+patWidth			 	EQU 0
+patHeight				EQU 2
+patRaster				EQU 6
+
+BitmapWth		   	SBLKD	1
+SourceWth				SBLKD	1
+DestinationWth		SBLKD	1
+SourceAdr				SBLKD	1
+DestAdr					SBLKD	1
+PatWth				 	SBLKD	1
+PatHeight			 	SBLKD	1
+PatH					 	SBLKD	1
+AreaHeight		 	  SBLKD	1
+Remain					 SBLKD	1
+
+VGAAddr			   	SBLKD	1
+VGAWidth			 	SBLKD	1
+VGAHeight				SBLKD	1
+VGAWth					SBLKD	1
+
+
+*Main
+								RET 0
+								
+*PROCEDURE InitMod* (DisplayAddress:LONGINT; DispWidth,DispHeight:INTEGER);
+InitMod					ENTER 0,0
+								MOVZX EAX, 8[EBP] :word
+								DEC EAX
+								MOV VGAHeight, EAX
+								MOVZX EAX, 12[EBP] :word
+								MOV VGAWidth, EAX
+								SHR EAX, 3
+								MOV VGAWth, EAX
+								MOV EAX,16[EBP]
+								MOV VGAAddr, EAX
+								LEAVE
+								RET 12
+				
+*PROCEDURE Define* (B:Bitmap; width,height,depth:INTEGER; address:LONGINT);
+Define					POP EAX
+								MOV ESI, 24[EBP] 			; address of bitmap descriptor
+								XOR EAX, EAX
+								MOV AX, 20[EBP]
+								MOV width[ESI], AX
+								MOV wth[ESI], EAX
+								MOV AX, 16[EBP]
+								MOV height[ESI], AX
+								MOV AX, 12[EBP]
+								MOV depth[ESI], AX
+								MOV EAX, 8[EBP]
+								MOV address[ESI], EAX
+								LEAVE
+								RET 20
+
+*PROCEDURE Dot* (B:Bitmap;col,X,Y,mode:INTEGER);
+Dot						POP EAX
+								MOVZX EBX, 12[EBP] :word			
+								MOV ESI, 24[EBP]			; address of bitmap descriptor
+								IMUL EBX, wth[ESI]
+								ADD EBX, 16[EBP]
+								ADD EBX, address[ESI]	; address of PEL
+								MOV AL, 20[EBP]
+								MOV CX, 8[EBP]				; get mode
+								CMP CX, PaintMode			; case mode
+								JL DotReplPaint
+DotInvert				XOR [EBX], AL
+								JMP DotEnd
+DotReplPaint			MOV [EBX], AL		
+DotEnd					LEAVE
+								RET 20
+
+*PROCEDURE Get*(B:Bitmap;X,Y:INTEGER):INTEGER;
+Get						POP EAX
+								MOV EBX, 8[EBP] 			
+								MOV ESI, 16[EBP]			; address of bitmap descriptor
+								IMUL EBX, wth[ESI]
+								ADD EBX, 12[EBP]
+								ADD EBX, address[ESI]
+								MOVZX EAX, [EBX] :byte	; return value
+								LEAVE
+								RET 12   
+
+*PROCEDURE CopyBlock*(sB,dB:Bitmap;SX,SY,W,H,DX,DY,mode:INTEGER);
+CopyBlock			POP EAX
+* prepare for default case : copy from upper left to lower right corner
+CBSource			AND 20[EBP], $0FFFF:double
+							AND 24[EBP], $0FFFF:double
+							MOV ESI, 40[EBP]
+							MOV EAX, wth[ESI]
+							MOV SourceWth, EAX
+							MOVSX EBX, 28[EBP]: word
+							IMUL EAX, EBX
+							MOVSX ECX, 32[EBP]: word
+							ADD EAX, ECX
+							MOV ESI, address[ESI]
+							ADD ESI, EAX				; source address
+CBDest				MOV EDI, 36[EBP]
+							MOV EAX, wth[EDI]
+							MOV DestinationWth, EAX
+							MOVSX ECX, 12[EBP] :word
+							IMUL EAX, ECX 
+							MOVSX EDX, 16[EBP] :word
+							ADD EAX, EDX
+							MOV EDI, address[EDI]
+							ADD EDI, EAX				; destination address
+							MOV EAX, 32[EBP]
+							CMP BX,CX
+							JL CBTopDown				; jump if DY <= SY
+CBBottomUp		CMP AX,DX
+							JGE LLCtoURC
+LRCtoULC			MOV EAX, 24[EBP]
+							ADD SourceWth, EAX
+							ADD DestinationWth, EAX
+							DEC EAX
+							ADD ESI, EAX
+							ADD EDI, EAX				; lower right corner
+							MOV EAX, -1				; from right to left
+							JMP CBMode
+LLCtoURC			MOV EAX, 24[EBP]
+							SUB SourceWth, EAX
+							SUB DestinationWth, EAX
+							MOV EAX, 1					; from left to right, default case
+							JMP CBMode
+CBTopDown		CMP AX, DX
+							JGE ULCtoLRC				; jump if DX <= SX
+URCtoLLC			MOV EAX, 20[EBP]
+							DEC EAX
+							MOV ECX, EAX
+							MOV EDX, SourceWth
+							MOV EBX, EDX
+							IMUL EAX, EDX 
+							ADD ESI, EAX
+							MOV EAX, 24[EBP]
+							NEG EBX
+							ADD EBX, EAX
+							MOV SourceWth, EBX
+							MOV EDX, DestinationWth
+							MOV EBX, EDX
+							NEG EBX
+							ADD EBX, EAX
+							MOV DestinationWth, EBX
+							DEC EAX
+							ADD ESI, EAX				; source : upper right corner
+							ADD EDI, EAX
+							MOV EAX, ECX
+							IMUL EAX, EDX :word
+							ADD EDI, EAX				; destination : upper right corner
+							MOV EAX, -1				; from right to left
+							JMP CBMode
+ULCtoLRC			MOV EAX, 20[EBP]
+							DEC EAX
+							MOV ECX, EAX
+							MOV EDX, SourceWth
+							MOV EBX, EDX
+							IMUL EAX, EDX 
+							ADD ESI, EAX				; source : upper left corner
+							MOV EAX, 24[EBP]
+							NEG EBX
+							SUB EBX, EAX
+							MOV SourceWth, EBX	; adjust offset to next row
+							MOV EDX, DestinationWth
+							MOV EBX, EDX
+							NEG EBX
+							SUB EBX, EAX
+							MOV DestinationWth, EBX
+							MOV EAX, ECX
+							IMUL EAX, EDX 
+							ADD EDI, EAX				; destination : upper left coner
+							MOV EAX, 1					; from left to right
+CBMode				CMP 8[EBP], PaintMode :byte
+							JG CBIMode	
+CBRMode			CMP EAX, 0
+							JL RCBr2l						; from right to left...
+RCBl2r				MOV BX, 20[EBP]
+RCBl2rRowLoop  JE CBEnd
+							SAL EAX, 2
+							MOV ECX, 24[EBP]
+RCBl2rColLoop	CMP ECX, 4
+							JL RCBl2rColRemain
+							MOV EDX, [ESI] 
+							MOV [EDI], EDX
+							ADD ESI, EAX
+							ADD EDI, EAX
+							SUB ECX,4
+							JMP RCBl2rColLoop
+RCBl2rColRemain SAR EAX, 2
+RCBl2rColRLoop  CMP ECX,0
+							JE RCBl2rColEnd
+							MOV DL, [ESI] 
+							MOV [EDI], DL
+							ADD ESI, EAX
+							ADD EDI, EAX
+							DEC ECX
+							JMP RCBl2rColRLoop
+RCBl2rColEnd	 ADD ESI, SourceWth
+							ADD EDI, DestinationWth
+							DEC BX
+							JMP RCBl2rRowLoop
+
+RCBr2l				MOV BX, 20[EBP]
+RCBr2lRowLoop  JE CBEnd
+							SAL EAX, 2
+							SUB ESI, 3
+							SUB EDI, 3
+							MOV ECX, 24[EBP]
+RCBr2lColLoop	CMP ECX, 4
+							JL RCBr2lColRemain
+							MOV EDX, [ESI] 
+							MOV [EDI], EDX
+							ADD ESI, EAX
+							ADD EDI, EAX
+							SUB ECX,4
+							JMP RCBr2lColLoop
+RCBr2lColRemain SAR EAX, 2
+							ADD ESI, 3
+							ADD EDI, 3
+RCBr2lColRLoop  CMP ECX,0
+							JE RCBr2lColEnd
+							MOV DL, [ESI] 
+							MOV [EDI], DL
+							ADD ESI, EAX
+							ADD EDI, EAX
+							DEC ECX
+							JMP RCBr2lColRLoop
+RCBr2lColEnd	 ADD ESI, SourceWth
+							ADD EDI, DestinationWth
+							DEC BX
+							JMP RCBr2lRowLoop
+
+CBIMode			CMP EAX, 0
+							JL ICBr2l						; from right to left...
+ICBl2r				MOV BX, 20[EBP]
+ICBl2rRowLoop  JE CBEnd
+							SAL EAX, 2
+							MOV ECX, 24[EBP]
+ICBl2rColLoop	CMP ECX, 4
+							JL ICBl2rColRemain
+							MOV EDX, [ESI] 
+							XOR [EDI], EDX
+							ADD ESI, EAX
+							ADD EDI, EAX
+							SUB ECX,4
+							JMP ICBl2rColLoop
+ICBl2rColRemain SAR EAX, 2
+ICBl2rColRLoop  CMP ECX,0
+							JE ICBl2rColEnd
+							MOV DL, [ESI] 
+							XOR [EDI], DL
+							ADD ESI, EAX
+							ADD EDI, EAX
+							DEC ECX
+							JMP ICBl2rColRLoop
+ICBl2rColEnd	 ADD ESI, SourceWth
+							ADD EDI, DestinationWth
+							DEC BX
+							JMP ICBl2rRowLoop
+
+ICBr2l				MOV BX, 20[EBP]
+ICBr2lRowLoop  JE CBEnd
+							SAL EAX, 2
+							SUB ESI, 3
+							SUB EDI, 3
+							MOV ECX, 24[EBP]
+ICBr2lColLoop	CMP ECX, 4
+							JL ICBr2lColRemain
+							MOV EDX, [ESI] 
+							XOR [EDI], EDX
+							ADD ESI, EAX
+							ADD EDI, EAX
+							SUB ECX,4
+							JMP ICBr2lColLoop
+ICBr2lColRemain SAR EAX, 2
+							ADD ESI, 3
+							ADD EDI, 3
+ICBr2lColRLoop  CMP ECX,0
+							JE ICBr2lColEnd
+							MOV DL, [ESI] 
+							XOR [EDI], DL
+							ADD ESI, EAX
+							ADD EDI, EAX
+							DEC ECX
+							JMP ICBr2lColRLoop
+ICBr2lColEnd	 ADD ESI, SourceWth
+							ADD EDI, DestinationWth
+							DEC BX
+							JMP ICBr2lRowLoop
+CBEnd				LEAVE
+							RET 36
+
+*PROCEDURE CopyPattern*(B:Bitmap;col:INTEGER;pat:LONGINT;X,Y,mode:INTEGER);
+CopyPattern		POP EAX
+							AND 16[EBP], $0FFFF:double
+							AND 12[EBP], $0FFFF:double
+							MOV ESI, 20[EBP]
+							MOV EDI, 28[EBP]
+							MOVZX ECX, 0[ESI] :byte	; pattern width
+							MOV PatWth, ECX
+							MOV EDX, ECX
+							MOV EAX, 16[EBP]
+							ADD EAX, ECX
+							MOV EBX,wth[EDI]
+							MOV BitmapWth, EBX
+							CMP EAX, EBX
+							JLE CPClipV
+CPClipH				MOV EDX, EBX
+							SUB EDX, 16[EBP]
+CPClipV				MOV DestAdr, EDX
+							MOVZX EAX, 1[ESI] :byte	; pattern height
+							CMP EAX, 0
+							JE CopyPatEnd
+  						  MOV EDX, 12[EBP]
+							ADD EDX, EAX
+							MOV EBX, height[EDI]
+							CMP EDX, EBX
+							JLE CPPrepare
+							MOV EAX, EBX
+  						  SUB EAX, 12[EBP]
+CPPrepare			MOV PatHeight, EAX
+							ADD ESI, 2							; source index
+							MOV EBX, wth[EDI]
+							NEG ECX
+							ADD ECX, EBX
+							MOV DestinationWth, ECX	; offset to next row
+							MOVZX EAX, 12[EBP] :word	
+							IMUL EAX, EBX 
+							ADD EAX, 16[EBP]
+							MOV ECX, address[EDI]
+							ADD EAX, ECX :word
+							MOV EDI, EAX					; destination index
+							MOV EBX, EAX
+							ADD EBX, DestAdr
+CPMode				MOV DX, 8[EBP]
+							CMP DX, PaintMode
+							JE CPPaintMode
+							JG CPInvertMode
+CPReplaceMode	MOV DH, 24[EBP] :byte
+							MOV ECX, PatHeight
+RCPRowLoop		JE CopyPatEnd
+							MOV AL, 1
+							MOV ECX, PatWth
+RCPColLoop		CMP CX,0
+							JE RCPColEnd
+							DEC CX
+							MOV DL, [ESI]
+							AND DL, AL
+							ROL AL, 1
+							CMP AL,1
+							JNE RCPDispl
+							INC ESI
+RCPDispl			CMP DL,0
+							JE RCPClearPEL
+							CMP EDI, EBX
+							JGE RCPInc
+							MOV [EDI], DH
+RCPInc				 INC EDI
+							JMP RCPColLoop
+RCPClearPEL		CMP EDI, EBX
+							JGE RCPInc
+							MOV [EDI], 0 :byte
+							INC EDI	
+							JMP RCPColLoop
+RCPColEnd			ADD EBX, BitmapWth
+							ADD EDI, DestinationWth
+							CMP AL,1
+							JE RCPDecHeight
+							INC ESI									; ignore garbage
+RCPDecHeight	DEC PatHeight
+							JMP RCPRowLoop
+
+CPPaintMode	  MOV DH, 24[EBP] :byte
+							MOV ECX, PatHeight
+PCPRowLoop		CMP PatHeight, 0
+							JE CopyPatEnd
+							MOV AL, 1
+							MOV ECX, PatWth
+PCPColLoop		CMP CX,0
+							JE PCPColEnd
+							DEC CX
+							MOV DL, [ESI]
+							AND DL, AL
+							ROL AL, 1
+							CMP AL,1
+							JNE PCPDispl
+							INC ESI
+PCPDispl			CMP DL,0
+							JE PCPClearPEL
+							CMP EDI, EBX
+							JGE PCPInc
+							MOV [EDI], DH 
+PCPInc				 INC EDI
+							JMP PCPColLoop
+PCPClearPEL		INC EDI
+							JMP PCPColLoop
+PCPColEnd			ADD EBX, BitmapWth
+							ADD EDI, DestinationWth
+							CMP AL,1
+							JE PCPDecHeight
+							INC ESI
+PCPDecHeight	 DEC PatHeight
+							JMP PCPRowLoop
+
+CPInvertMode	MOV DH, 24[EBP] :byte
+							MOV ECX, PatHeight
+ICPRowLoop		CMP PatHeight, 0
+							JE CopyPatEnd
+							MOV AL, 1
+							MOV ECX, PatWth
+ICPColLoop		CMP CX,0
+							JE ICPColEnd
+							DEC CX
+							MOV DL, [ESI]
+							AND DL, AL
+							ROL AL, 1
+							CMP AL,1
+							JNE ICPDispl
+							INC ESI
+ICPDispl			 CMP DL,0
+							JE ICPClearPEL
+							CMP EDI, EBX
+							JGE ICPInc
+							XOR [EDI], DH
+ICPInc				  INC EDI
+							JMP ICPColLoop
+ICPClearPEL		INC EDI
+							JMP ICPColLoop
+ICPColEnd			ADD EBX, BitmapWth
+							ADD EDI, DestinationWth
+							CMP AL,1
+							JE ICPDecHeight
+							INC ESI
+ICPDecHeight	  DEC PatHeight
+							JMP ICPRowLoop
+
+CopyPatEnd		LEAVE
+							RET 24
+
+
+
+*PROCEDURE ReplConst*(B:Bitmap;col,X,Y,W,H,mode:INTEGER);
+ReplConst			POP EAX
+							MOV ESI, 32[EBP]
+							MOV EDI, address[ESI]
+							MOV EAX, wth[ESI] 
+							MOV BitmapWth, EAX	;	width in bytes	
+							MOVZX ECX, 20[EBP] : word
+							IMUL EAX, ECX
+							AND 24[EBP], $0FFFF:double
+							ADD EAX, 24[EBP]	
+							ADD EDI, EAX				
+							MOV ESI, EDI					; copy
+
+ReplConstMode	CMP 8[EBP], InvertMode:word
+							JE RCInvert
+RCReplace		MOV DL, 28[EBP]
+							MOV DH, DL
+							MOV AX, DX
+							SHL EDX, 16
+							MOV DX, AX
+							MOV AX, 16[EBP]
+							MOV BX, 12[EBP]
+							CMP BX, 0
+RRCRowLoop	  JE ReplConstEnd
+							MOV CX,AX
+RRCColLoop		CMP CX, 4
+							JL RRCCol2
+							MOV [EDI], EDX
+							ADD EDI, 4
+							SUB CX, 4
+							JMP RRCColLoop
+RRCCol2			CMP CX, 0
+							JLE RRCColEnd
+							MOV [EDI], DL
+							INC EDI
+							DEC CX
+							JMP RRCCol2
+RRCColEnd	 	ADD ESI, BitmapWth
+							MOV EDI, ESI
+							DEC  BX
+							JMP RRCRowLoop
+							
+RCInvert				MOV DL, 28[EBP]
+							MOV DH, DL
+							MOV AX, DX
+							SHL EDX, 16
+							MOV DX, AX
+							MOV AX, 16[EBP]
+							MOV BX, 12[EBP]
+							CMP BX, 0
+IRCRowLoop		JE ReplConstEnd
+							MOV CX,AX
+IRCColLoop		 CMP CX, 4
+							JL IRCCol2
+							XOR [EDI], EDX
+							ADD EDI, 4
+							SUB CX, 4
+							JMP IRCColLoop
+IRCCol2			CMP CX, 0
+							JLE IRCColEnd
+							XOR [EDI], DL
+							INC EDI
+							DEC CX
+							JMP IRCCol2
+IRCColEnd	 	ADD ESI, BitmapWth
+							MOV EDI, ESI
+							DEC  BX
+							JMP IRCRowLoop
+							
+ReplConstEnd	LEAVE
+							RET 28
+
+*PROCEDURE ReplPattern*(B:Bitmap;col:INTEGER;pat:LONGINT;X,Y,W,H,mode:INTEGER);
+ReplPattern		POP EAX
+							AND 16[EBP], $0FFFF:double
+							AND 24[EBP], $0FFFF:double
+							MOVSX EAX, 12[EBP]:word
+							MOV AreaHeight,EAX
+							MOV ESI, 28[EBP]
+							MOVZX ECX, 0[ESI] :byte	; pattern width
+							MOV PatWth, ECX
+							MOVZX EAX, 1[ESI] :byte	; pattern height
+							MOV PatHeight, EAX
+							ADD ESI, 2							; source index
+							MOVSX EBX, 20[EBP]:word
+							
+							MOV EDX, ECX					; Y-Offset
+RPLabel1			CMP EBX, PatHeight
+							JL RPLabel2
+							SUB EBX, PatHeight
+							JMP RPLabel1
+RPLabel2			SUB EAX, EBX
+							MOV PatH, EAX
+							SHR EDX, 3
+							IMUL EBX, EDX
+							MOV SourceAdr, ESI
+							ADD ESI, EBX
+							
+							MOV EDI, 36[EBP]
+							MOV EDX, wth[EDI]
+							MOV EBX, EDX
+							SUB EDX, 16[EBP]
+							MOV DestinationWth, EDX	; offset to next row
+							MOVZX EAX, 20[EBP] :word
+							IMUL EAX, EBX 
+							ADD EAX, 24[EBP]
+							ADD EAX, address[EDI]
+							MOV EDI, EAX					; destination index
+							
+RPMode				CMP 8[EBP], PaintMode:word
+							JE RPPaintMode
+							JG RPInvertMode
+							
+RPReplaceMode	MOV BL, 32[EBP]
+
+RRPRowLoop	  CMP AreaHeight, 0: double			; X-Offset
+							JLE ReplPatEnd
+							
+							CMP PatH,0
+							JE RRPpatRowEnd
+RRPpatRowLoop	CMP PatWth, 16
+							JE RPR16
+							MOV EDX, [ESI]
+							ADD ESI, 4
+							JMP RPRCont
+RPR16				MOV DX, [ESI]
+							SHL EDX, 16
+							MOV DX, [ESI]
+							ADD ESI, 2
+RPRCont			MOV ECX, 24[EBP]
+							ROR EDX, CL
+							MOV ECX, 16[EBP]
+							
+							MOV EAX, 1
+							CMP ECX, 0
+RRPColLoop		JE RRPColEnd
+							TEST EDX, EAX
+							JNE RRPSet
+							MOV [EDI], 0:byte
+							JMP RRPLabel3
+RRPSet				MOV [EDI], BL
+RRPLabel3			ROL EAX, 1
+							INC EDI
+							DEC ECX
+							JMP RRPColLoop
+RRPColEnd			DEC PatH
+							ADD EDI, DestinationWth
+							DEC AreaHeight
+							JMP RRPRowLoop
+RRPpatRowEnd	MOV ESI, SourceAdr
+							MOV EAX, PatHeight
+							MOV PatH, EAX
+							JMP RRPpatRowLoop
+
+RPPaintMode	MOV BL, 32[EBP]
+							
+PRPRowLoop	  CMP AreaHeight, 0: double			; X-Offset
+							JE ReplPatEnd
+							
+							CMP PatH,0
+							JLE PRPpatRowEnd
+PRPpatRowLoop	CMP PatWth, 16
+							JE PPR16
+							MOV EDX, [ESI]
+							ADD ESI, 4
+							JMP PPRCont
+PPR16				MOV DX, [ESI]
+							SHL EDX, 16
+							MOV DX, [ESI]
+							ADD ESI, 2
+PPRCont			MOV ECX, 24[EBP]
+							ROR EDX, CL
+							MOV ECX, 16[EBP]
+							
+							MOV EAX, 1
+							CMP ECX, 0
+PRPColLoop		JE PRPColEnd
+							TEST EDX, EAX
+							JE PRPnotSet
+							MOV [EDI], BL
+PRPnotSet			ROL EAX, 1
+							INC EDI
+							DEC ECX
+							JMP PRPColLoop
+PRPColEnd			DEC PatH
+							ADD EDI, DestinationWth
+							DEC AreaHeight
+							JMP PRPRowLoop
+PRPpatRowEnd	MOV ESI, SourceAdr
+							MOV EAX, PatHeight
+							MOV PatH, EAX
+							JMP PRPpatRowLoop
+
+RPInvertMode	MOV BL, 32[EBP]
+
+IRPRowLoop	  CMP AreaHeight, 0: double			; X-Offset
+							JLE ReplPatEnd
+							
+							CMP PatH,0
+							JE IRPpatRowEnd
+IRPpatRowLoop	CMP PatWth, 16
+							JE IPR16
+							MOV EDX, [ESI]
+							ADD ESI, 4
+							JMP IPRCont
+IPR16				MOV DX, [ESI]
+							SHL EDX, 16
+							MOV DX, [ESI]
+							ADD ESI, 2
+IPRCont			MOV ECX, 24[EBP]
+							ROR EDX, CL
+							MOV ECX, 16[EBP]
+							
+							MOV EAX, 1
+							CMP ECX, 0
+IRPColLoop		JE IRPColEnd
+							TEST EDX, EAX
+							JE IRPnotSet
+							XOR [EDI], BL
+IRPnotSet			ROL EAX, 1
+							INC EDI
+							DEC ECX
+							JMP IRPColLoop
+IRPColEnd			DEC PatH
+							ADD EDI, DestinationWth
+							DEC AreaHeight
+							JMP IRPRowLoop
+IRPpatRowEnd	MOV ESI, SourceAdr
+							MOV EAX, PatHeight
+							MOV PatH, EAX
+							JMP IRPpatRowLoop
+
+ReplPatEnd		LEAVE
+							RET 32
+
+*PROCEDURE Copy*(sB,dB:Bitmap;SX,SY,SW,SH,DX,DY,DW,DH,mode:INTEGER);
+*                                 
+Copy					POP EAX
+							RET 44
+
+*PROCEDURE Display*(B:Bitmap;SX,SY,W,H,DX,DY,mode:INTEGER);
+Display				POP EAX
+							MOV ESI, 36[EBP]    		; address of bitmap descriptor
+							MOV EDI, address[ESI]
+							MOV EAX, wth[ESI] 
+							MOV BitmapWth, EAX
+							MOVZX ECX, 28[EBP] : word
+							IMUL EAX,ECX
+							MOVZX EBX, 32[EBP] :word
+							ADD EAX, EBX	
+							ADD EAX, EDI				; source address
+							MOV SourceAdr, EAX 	
+							MOV ESI, EAX				; esi = source index register
+							MOV EAX, VGAWth 
+							MOV EBX, VGAHeight 
+							SUB EBX,12[EBP] :double
+							IMUL EAX,EBX 
+							MOVZX EBX, 16[EBP] :word
+							SHR EBX,3
+							ADD EAX, EBX
+							ADD EAX, VGAAddr		; destination address
+							MOV DestAdr, EAX		
+							MOV EDI, EAX				; edi = destination index register
+							MOV DX, Controller
+							MOV AL, 3
+							MOV BX, 8[EBP]
+							CMP BX, PaintMode
+							JE DispPMode
+							JG DispIMode
+DispRMode  		MOV AH,VGAReplace
+							JMP DispSetMode
+DispPMode		  MOV AH, VGAPaint
+							JMP DispSetMode
+DispIMode	  	MOV AH, VGAInvert
+DispSetMode	  OUT DX, AX
+							MOV AX, $0205
+							OUT DX, AX				  ; set writemode 2, readmode 0
+							MOV CL, 16[EBP]
+							AND CL, 7						; DX MOD 8
+							MOV AX, $8008   		
+							SHR AH,CL					  ; prepare bitmask
+							MOV DestAdr, EDI
+							MOVZX ECX, 20[EBP] :word
+							IMUL ECX, BitmapWth :word
+							ADD ECX, ESI
+							MOVZX EBX, 24[EBP] :word
+							MOV AreaHeight, EBX
+DispRowLoop 	 JE DispEnd
+							OUT DX, AX					; set bitmask register
+							MOV SourceAdr, ESI
+DispColLoop	    CMP ESI, ECX
+							JGE DispColEnd
+							MOV BL, [EDI]
+							MOV BL, [ESI]				; get PEL from bitmap
+							MOV [EDI], BL				; write PEL to VGA
+							ADD ESI, BitmapWth
+							SUB EDI, VGAWth
+							JMP DispColLoop
+DispColEnd		  MOV ESI, SourceAdr
+							INC ESI
+							INC ECX
+							MOV EDI, DestAdr
+							ROR AH,1
+							JNB NextCol
+							INC EDI	
+							MOV DestAdr, EDI
+NextCol				DEC AreaHeight		  	; next row
+							JMP DispRowLoop
+DispEnd			   MOV AL, 3						; restore invert mode
+							MOV AH, VGAInvert
+							OUT DX, AX
+							MOV AX, $FF08				; enable all latches
+							OUT DX, AX
+							MOV AX, $05					; restore read/write mode 0
+							OUT DX, AX
+							LEAVE
+							RET 32
+
+*PROCEDURE Clear*(B:Bitmap);
+Clear					POP EAX
+							MOV ESI, 8[EBP]     	   ; address of bitmap descriptor
+							MOVZX ECX, height[ESI] :word
+							MOVZX EBX, wth[ESI] :word
+							IMUL ECX, EBX :word
+							MOV EDI, address[ESI]
+							MOV EAX, 0
+							CLD
+							TEST EDI, 3
+							JE ClearLoop
+							STOSB
+							DEC ECX
+							TEST EDI, 3
+							JE ClearLoop
+							STOSB
+							DEC ECX
+							TEST EDI, 3
+							JE ClearLoop
+							STOSB
+							DEC ECX
+ClearLoop 			CMP ECX,0
+							JLE ClearEnd
+							SUB ECX, 4
+							STOSD 
+							JMP ClearLoop
+ClearEnd			LEAVE
+							RET 4
+
+*PROCEDURE GetPix(VAR addr:LONGINT; VAR buf:SYSTEM.BYTE; depth:INTEGER);
+GetPix				POP EAX
+							MOV EDX, 1
+							MOV EDI, 16[EBP]
+							MOV ESI, [EDI]
+							MOV EDI, 12[EBP]
+							MOV EAX, 8[EBP]
+							CMP EAX, 8
+							JGE GPdepth8
+							CMP EAX, 1
+							JG GPdepth4
+GPdepth1			MOV ECX, 8
+							XOR EAX,EAX
+GPd1Loop			CMP ECX, 0
+							JE GetPixEnd
+							DEC ECX
+							MOV BL, [ESI] 
+							INC ESI
+							CMP BL, 0
+							JE GPd1Clear
+GPd1Set				OR EAX, EDX
+GPd1Clear			SHL EDX,1
+							JMP GPd1Loop
+GPdepth4			MOV BL, [ESI]
+							INC ESI
+							MOV AL, [ESI]
+							INC ESI
+							SHL AL, 4
+							AND BL, $F
+							OR AL, BL
+							JMP GetPixEnd
+GPdepth8			MOV AL, [ESI]
+							INC ESI
+GetPixEnd			MOV [EDI], AL
+							MOV EDI, 16[EBP]
+							MOV [EDI], ESI
+							LEAVE
+							RET 12
+
+
+*PROCEDURE PutPix(VAR addr:LONGINT; border:LONGINT;buf:SYSTEM.BYTE; depth:INTEGER);
+PutPix				POP EAX
+							MOV BL, 12[EBP]
+							MOV ESI, 20[EBP]
+							MOV EDI, [ESI]
+							MOVZX EAX, 8[EBP] :word
+							MOV EDX, 16[EBP]
+							CMP EAX, 4
+							JG PPdepth8
+							CMP EAX,1
+							JG PPdepth4
+PPdepth1			MOV CX, 8
+							MOV BH,1
+PPd1Loop			CMP CX,0
+							JE PutPixEnd
+							DEC CX
+							ROR BH,1
+							MOV AL, BL
+							AND AL, BH
+							CMP AL, 0
+							JNE PPd1Set
+PPd1Clear			CMP EDI, EDX
+							JGE PPd1IncAdr
+							MOV [EDI], 0 :byte
+PPd1IncAdr		 INC EDI
+							JMP PPd1Loop
+PPd1Set			  CMP EDI, EDX
+							JGE PPd1IncAdr
+							MOV [EDI], 15:byte
+							INC EDI
+							JMP PPd1Loop
+PPdepth4			MOV AL, BL
+							AND BL, $F
+							SHR AL, 4
+							CMP EDI, EDX
+							JGE PPd4IncAdr
+							MOV [EDI], BL
+PPd4IncAdr		  INC EDI
+							CMP EDI, EDX
+							JGE PPd4IncAdr2
+							MOV [EDI], AL
+PPd4IncAdr2		INC EDI
+							JMP PutPixEnd
+PPdepth8			CMP EDI, EDX
+							JGE PPd8IncAdr
+							MOV [EDI], BL
+PPd8IncAdr		 INC EDI
+PutPixEnd			MOV [ESI], EDI
+							LEAVE
+							RET 16		

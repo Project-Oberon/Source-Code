@@ -1,0 +1,544 @@
+MODULE OBH;    (*NW 7.6.87 / 11.7.93*)
+
+	IMPORT OBS, OBT, OBC;
+
+	CONST
+		(*instruction format prefixes*)
+			F6 = 4EH; F7 = 0CEH; F9 = 3EH; F11 = 0BEH;
+
+		(*object and item modes*)
+			Var   =  1; VarX  =  2; Ind   =  3; IndX  =  4; RegI  =  5;
+			RegX  =  6; Abs   =  7; Con   =  8; Stk   =  9; Stk0 = 10; Coc   = 11; Reg   = 12;
+			Fld   = 13; LProc = 15; CProc = 17; IProc = 18; Mod   = 19;
+
+		(*structure forms*)
+			Undef = 0; Byte = 1; Bool = 2; Char = 3; SInt = 4; Int = 5; LInt = 6;
+			Real = 7; LReal = 8; Set = 9; String = 10; NilTyp = 11; NoTyp = 12;
+			Pointer = 13; ProcTyp = 14; Array = 15; DynArr = 16; Record = 17;
+
+	TYPE LabelRange* = RECORD low*, high*: INTEGER; label*: INTEGER END ;
+
+	VAR clrchk*, stkchk*: BOOLEAN;
+		lengcode: ARRAY 18 OF INTEGER;
+
+	PROCEDURE setCC(VAR x: OBT.Item; cc: LONGINT);
+	BEGIN
+		x.typ := OBT.booltyp; x.mode := Coc; x.a0 := cc; x.a1 := 0; x.a2 := 0
+	END setCC;
+
+	PROCEDURE AdjustSP*(n: LONGINT);
+	BEGIN  (*ADJSPB n*)
+		IF n <= 127 THEN OBC.PutF3(-5A84H); OBC.PutByte(n)
+		ELSE OBC.PutF3(-5A83H); OBC.PutWord(n)
+		END
+	END AdjustSP;
+
+	PROCEDURE move(L: INTEGER; VAR x, y: OBT.Item);
+	BEGIN
+		IF (y.mode = Con) & (y.a0 <= 7) & (y.a0 >= -8) THEN OBC.PutF2(L+5CH, y.a0, x)  (*MOVQi*)
+		ELSE OBC.PutF4(L+14H, x, y)  (*MOVi*)
+		END
+	END move;
+	
+	PROCEDURE load(VAR x: OBT.Item);
+		VAR y: OBT.Item;
+	BEGIN IF x.mode # Reg THEN y := x; OBC.GetReg(x); move(lengcode[x.typ.form], x, y) END
+	END load;
+
+	PROCEDURE moveBW(VAR x, y: OBT.Item);
+	BEGIN
+		IF (y.mode = Con) & (y.a0 <= 7) & (y.a0 >= -8) THEN OBC.PutF2(5DH, y.a0, x)
+		ELSE OBC.Put(F7, 10H, x, y)  (*MOVXBW*)
+		END
+	END moveBW;
+
+	PROCEDURE moveBD(VAR x, y: OBT.Item);
+	BEGIN
+		IF (y.mode = Con) & (y.a0 <= 7) & (y.a0 >= -8) THEN OBC.PutF2(5FH, y.a0, x)
+		ELSE OBC.Put(F7, 1CH, x, y)  (*MOVXBD*)
+		END
+	END moveBD;
+
+	PROCEDURE moveWD(VAR x, y: OBT.Item);
+	BEGIN
+		IF (y.mode = Con) & (y.a0 <= 7) & (y.a0 >= -8) THEN OBC.PutF2(5FH, y.a0, x)
+		ELSE OBC.Put(F7, 1DH, x, y)  (*MOVXWD*)
+		END
+	END moveWD;
+
+	PROCEDURE Leng(VAR x: OBT.Item; L: LONGINT);
+		VAR y: OBT.Item;
+	BEGIN
+		IF L <= 7 THEN OBC.PutF2(5FH, L, x)       (*MOVQD*)
+		ELSE y.mode := Con; y.a0 := L; y.typ := OBT.linttyp; OBC.PutF4(17H, x, y)
+		END
+	END Leng;
+
+	PROCEDURE MoveBlock(VAR x, y: OBT.Item; s: LONGINT; param: BOOLEAN);
+		VAR L: INTEGER; z: OBT.Item;
+	BEGIN
+		IF s > 0 THEN
+			IF param THEN s := (s+3) DIV 4 * 4; AdjustSP(s) END ;
+			IF s <= 16 THEN
+				OBC.Put(F7, 0, x, y); OBC.PutDisp(s-1)   (*MOVMB*)
+			ELSE
+				z.mode := Reg; z.a0 := 1; OBC.PutF4(27H, z, y);    (*ADDR y,R1*)
+				z.a0 := 2; OBC.PutF4(27H, z, x); z.a0 := 0;        (*ADDR x,R2*)
+				IF s MOD 4 = 0 THEN L := 3; s := s DIV 4
+				ELSIF s MOD 2 = 0 THEN L := 1; s := s DIV 2
+				ELSE L := 0
+				END ;
+				Leng(z, s);
+				OBC.PutF1(14); OBC.PutByte(L); OBC.PutByte(0)      (*MOVS*)
+			END
+		END
+	END MoveBlock;
+
+	PROCEDURE DynArrBnd(ftyp, atyp: OBT.Struct; lev: INTEGER; adr: LONGINT; varpar: BOOLEAN);
+		VAR f: INTEGER; x, y, z: OBT.Item;
+	BEGIN (* ftyp.form = DynArr *)
+		x.mode := Stk; y.mode := Var;
+		IF varpar & (ftyp.BaseTyp.form = Byte) THEN
+			IF atyp.form # DynArr THEN
+				IF (atyp.form # Array) OR (atyp.BaseTyp.size > 1) THEN OBS.Mark(-1) END ;
+				Leng(x, atyp.size)
+			ELSE y.lev := lev; y.a0 := adr + atyp.adr; y.typ := OBT.linttyp;
+				atyp := atyp.BaseTyp;
+				IF atyp.form # DynArr THEN
+					IF atyp.size > 1 THEN
+						OBS.Mark(-1); z.mode := Con; z.typ := OBT.linttyp; z.a0 := atyp.size;
+						load(y); OBC.Put(F7, 23H, y, z);	(* MULD z, Ry *)
+						z.mode := Con; z.typ := OBT.linttyp; z.a0 := atyp.size
+					END
+				ELSE OBS.Mark(-1); load(y); OBC.PutF2(0FH, 1, y);
+					REPEAT z.mode := Var; z.lev := lev; z.a0 := atyp.adr + adr; z.typ := OBT.linttyp;
+						load(z); OBC.Put(F7, 23H, y, z);	(* MULD Rz, Ry *)
+						atyp := atyp.BaseTyp
+					UNTIL atyp.form # DynArr;
+					IF atyp.size > 1 THEN
+						z.mode := Con; z.typ := OBT.linttyp; z.a0 := atyp.size;
+						OBC.Put(F7, 23H, y, z)	(* MULD z, Ry *)
+					END
+				END ;
+				OBC.PutF4(17H, x, y)	(* MOVD apdynarrlen, TOS *)
+			END
+		ELSE
+			LOOP f := atyp.form;
+				IF f = Array THEN Leng(x, atyp.size DIV atyp.BaseTyp.size)
+				ELSIF f = DynArr THEN y.lev := lev; y.a0 := atyp.adr + adr; OBC.PutF4(17H, x, y)
+				ELSE OBS.Mark(66); EXIT
+				END ;
+				ftyp := ftyp.BaseTyp; atyp := atyp.BaseTyp;
+				IF ftyp.form # DynArr THEN
+					IF ftyp # atyp THEN
+						IF ~varpar & (ftyp.form = Pointer) & (atyp.form = Pointer) THEN
+							ftyp := ftyp.BaseTyp; atyp := atyp.BaseTyp;
+							IF (ftyp.form = Record) & (atyp.form = Record) THEN
+								WHILE (ftyp # atyp) & (atyp # NIL) DO atyp := atyp.BaseTyp END ;
+								IF atyp = NIL THEN OBS.Mark(113) END
+							ELSE OBS.Mark(67)
+							END
+						ELSE OBS.Mark(67)
+						END
+					END ;
+					EXIT
+				END
+			END
+		END
+	END DynArrBnd;
+
+	PROCEDURE Trap*(n: INTEGER);
+	BEGIN OBC.PutF1(0F2H); OBC.PutByte(n)  (*BPT n*)
+	END Trap;
+
+	PROCEDURE CompareParLists*(x, y: OBT.Object);
+		VAR xt, yt: OBT.Struct;
+	BEGIN
+		WHILE x # NIL DO
+			IF y # NIL THEN
+				xt := x.typ; yt := y.typ;
+				WHILE (xt.form = DynArr) & (yt.form = DynArr) DO
+					xt := xt.BaseTyp; yt := yt.BaseTyp
+				END ;
+				IF x.mode # y.mode THEN OBS.Mark(115)
+				ELSIF xt # yt THEN
+					IF (xt.form = ProcTyp) & (yt.form = ProcTyp) THEN
+						CompareParLists(xt.link, yt.link)
+					ELSE OBS.Mark(115)
+					END
+				END ;
+				y := y.next
+			ELSE OBS.Mark(116)
+			END ;
+			x := x.next
+		END ;
+		IF (y # NIL) & (y.mode <= Ind) & (y.a0 > 0) THEN OBS.Mark(117) END
+	END CompareParLists;
+
+	PROCEDURE Assign*(VAR x, y: OBT.Item; param: BOOLEAN);
+		VAR f, g, L, u: INTEGER; s, vsz: LONGINT;
+				p, q: OBT.Struct;
+				tag, tdes: OBT.Item;
+	BEGIN f := x.typ.form; g := y.typ.form;
+		IF x.mode = Con THEN OBS.Mark(56)
+		ELSIF (x.mode IN {Var, VarX}) & (x.lev < 0) THEN OBS.Mark(-3)
+		END ;
+		CASE f OF
+		Undef, String:
+	| Byte: IF g IN {Undef, Byte, Char, SInt} THEN
+						IF param THEN moveBD(x, y) ELSE move(0, x, y) END
+					ELSE OBS.Mark(113)
+					END
+
+	| Bool: IF param THEN u := 3 ELSE u := 0 END ;
+					IF y.mode = Coc THEN
+						IF (y.a1 = 0) & (y.a2 = 0) THEN OBC.PutF2(u+3CH, y.a0, x)
+						ELSE
+							IF ODD(y.a0) THEN OBC.PutF0(y.a0-1) ELSE OBC.PutF0(y.a0+1) END ;
+							OBC.PutWord(y.a2); y.a2 := OBC.pc-2;
+							OBC.FixLink(y.a1); OBC.PutF2(u+5CH, 1, x);
+							OBC.PutF0(14); L := OBC.pc; OBC.PutWord(0);
+							OBC.FixLink(y.a2); OBC.PutF2(u+5CH, 0, x); OBC.fixup(L)
+						END
+					ELSIF g = Bool THEN
+						IF y.mode = Con THEN OBC.PutF2(u+5CH, y.a0, x)
+						ELSIF param THEN OBC.Put(F7, 18H, x, y)  (*MOVZBD*)
+						ELSE OBC.PutF4(14H, x, y)
+						END
+					ELSE OBS.Mark(113)
+					END
+
+	| Char, SInt:
+					IF g = f THEN
+						IF param THEN moveBD(x, y) ELSE move(0, x, y) END
+					ELSE OBS.Mark(113)
+					END
+
+	| Int:  IF g = Int THEN
+						IF param THEN moveWD(x, y) ELSE move(1, x, y) END
+					ELSIF g = SInt THEN
+						IF param THEN moveBD(x, y) ELSE moveBW(x, y) END
+					ELSE OBS.Mark(113)
+					END
+
+	| LInt: IF g = LInt THEN move(3, x, y)
+					ELSIF g = Int THEN moveWD(x, y)
+					ELSIF g = SInt THEN moveBD(x, y)
+					ELSE OBS.Mark(113)
+					END
+
+	| Real: IF g = Real THEN OBC.Put(F11, 5, x, y)
+					ELSIF (SInt <= g) & (g <= LInt) THEN OBC.Put(F9, lengcode[g]+4, x, y)
+					ELSE OBS.Mark(113)
+					END
+
+	| LReal:IF g = LReal THEN OBC.Put(F11, 4, x, y)
+					ELSIF g = Real THEN OBC.Put(F9, 1BH, x, y)
+					ELSIF (SInt <= g) & (g <= LInt) THEN OBC.Put(F9, lengcode[g], x, y)
+					ELSE OBS.Mark(113)
+					END
+
+	| Set:  IF g = f THEN move(3, x, y) ELSE OBS.Mark(113) END
+
+	| Pointer:
+					IF x.typ = y.typ THEN move(3, x, y)
+					ELSIF g = NilTyp THEN OBC.PutF2(5FH, 0, x)
+					ELSIF g = Pointer THEN
+						p := x.typ.BaseTyp; q := y.typ.BaseTyp;
+						IF (p.form = Record) & (q.form = Record) THEN
+							WHILE (q # p) & (q # NIL) DO q := q.BaseTyp END ;
+							IF q # NIL THEN move(3, x, y) ELSE OBS.Mark(113) END
+						ELSE OBS.Mark(113)
+						END
+					ELSE OBS.Mark(113)
+					END
+
+	| Array: s := x.typ.size;
+					IF x.typ = y.typ THEN MoveBlock(x, y, s, param)
+					ELSIF (g = String) & (x.typ.BaseTyp.form = Char) THEN
+						s := y.a1; vsz := x.typ.size;  (*check length of string*)
+						IF s > vsz THEN OBS.Mark(114) END ;
+						IF param THEN
+							vsz := (vsz+3) DIV 4 - (s+3) DIV 4;
+							IF vsz > 0 THEN AdjustSP(vsz*4) END
+						END ;
+						MoveBlock(x, y, s, param)
+					ELSE OBS.Mark(113)
+					END
+
+	| DynArr: s := x.typ.size;
+					IF param THEN (*formal parameter is open array*)
+						IF (g = String) & (x.typ.BaseTyp.form = Char) THEN Leng(x, y.a1)
+						ELSIF y.mode >= Abs THEN OBS.Mark(59)
+						ELSE DynArrBnd(x.typ, y.typ, y.lev, y.a0, FALSE)
+						END ;
+						IF g = DynArr THEN OBC.DynArrAdr(x, y)
+						ELSE OBC.PutF4(27H, x, y)
+						END
+					ELSE OBS.Mark(113)
+					END
+
+	| Record: s := x.typ.size;
+					IF x.typ # y.typ THEN
+						IF g = Record THEN
+							q := y.typ.BaseTyp;
+							WHILE (q # NIL) & (q # x.typ) DO q := q.BaseTyp END ;
+							IF q = NIL THEN OBS.Mark(113) END
+						ELSE OBS.Mark(113)
+						END
+					END;
+					IF OBC.typchk & ~param &
+						( ((x.mode = Ind) OR (x.mode = RegI)) & (x.obj = OBC.wasderef)	(* p^ := *)
+							OR (x.mode = Ind) & (x.obj # NIL) & (x.obj # OBC.wasderef) )	(* varpar := *) THEN
+						tag := x; tdes.mode := Var; tdes.lev := -x.typ.mno; tdes.a0 := x.typ.adr;
+						IF x.obj = OBC.wasderef THEN tag.a1 := - 4
+						ELSE tag.mode := Var; INC(tag.a0, 4)
+						END;
+						OBC.PutF4(7, tdes, tag);	(* CMPD tag, tdes *)
+						OBC.PutF0(0); OBC.PutDisp(4);	(* BEQ continue *)
+						OBC.PutF1(0F2H); OBC.PutByte(19)	(* BPT 19 *)
+					END;
+					MoveBlock(x, y, s, param)
+
+	| ProcTyp:
+					IF (x.typ = y.typ) OR (y.typ.form = NilTyp) THEN OBC.PutF4(17H, x, y)
+					ELSIF (y.mode = LProc) & (y.lev <= 0) OR (y.mode = IProc) THEN
+						(*procedure y to proc. variable x; check compatibility*)
+						IF x.typ.BaseTyp = y.typ THEN
+							CompareParLists(x.typ.link, y.obj.dsc);
+							IF (y.a0 = 0) & (y.lev >= 0) THEN OBS.Mark(235) (*forward*) END ;
+							y.mode := Var; OBC.PutF4(27H, x, y)   (*ADDR*)
+						ELSE OBS.Mark(118)
+						END
+					ELSE OBS.Mark(111)
+					END
+	| NoTyp, NilTyp: OBS.Mark(111)
+		END
+	END Assign;
+
+
+	PROCEDURE FJ*(VAR loc: INTEGER);
+	BEGIN OBC.PutF0(14); OBC.PutWord(loc); loc := OBC.pc-2
+	END FJ;
+
+	PROCEDURE CFJ*(VAR x: OBT.Item; VAR loc: INTEGER);
+	BEGIN
+		IF x.typ.form = Bool THEN
+			IF x.mode # Coc THEN OBC.PutF2(1CH, 1, x); setCC(x, 0) END
+		ELSE OBS.Mark(120); setCC(x, 0)
+		END ;
+		IF ODD(x.a0) THEN OBC.PutF0(x.a0-1) ELSE OBC.PutF0(x.a0+1) END ;
+		loc := OBC.pc; OBC.PutWord(x.a2); OBC.FixLink(x.a1)
+	END CFJ;
+
+	PROCEDURE BJ*(loc: INTEGER);
+	BEGIN OBC.PutF0(14); OBC.PutDisp(loc - OBC.pc + 1)
+	END BJ;
+
+	PROCEDURE CBJ*(VAR x: OBT.Item; loc: INTEGER);
+	BEGIN
+		IF x.typ.form = Bool THEN
+			IF x.mode # Coc THEN OBC.PutF2(1CH, 1, x); setCC(x,0) END
+		ELSE OBS.Mark(120); setCC(x, 0)
+		END ;
+		IF ODD(x.a0) THEN OBC.PutF0(x.a0-1) ELSE OBC.PutF0(x.a0+1) END ;
+		OBC.PutDisp(loc - OBC.pc + 1);
+		OBC.FixLinkWith(x.a2, loc); OBC.FixLink(x.a1)
+	END CBJ;
+
+	PROCEDURE LFJ*(VAR loc: INTEGER);
+	BEGIN OBC.PutF0(14); OBC.PutWord(-4000H); OBC.PutWord(0); loc := OBC.pc-4
+	END LFJ;
+
+
+	PROCEDURE PrepCall*(VAR x: OBT.Item; VAR fpar: OBT.Object);
+	BEGIN
+		IF (x.mode = LProc) OR (x.mode = CProc) THEN
+			fpar := x.obj.dsc
+		ELSIF (x.typ # NIL) & (x.typ.form = ProcTyp) THEN
+			fpar := x.typ.link
+		ELSE OBS.Mark(121); fpar := NIL; x.typ := OBT.undftyp
+		END
+	END PrepCall;
+
+	PROCEDURE Param*(VAR ap: OBT.Item; f: OBT.Object);
+		VAR q: OBT.Struct; fp, tag: OBT.Item;
+	BEGIN fp.mode := Stk; fp.typ := f.typ;
+		IF f.mode = Ind THEN (*VAR parameter*)
+			IF ap.mode >= Con THEN OBS.Mark(122) END ;
+			IF fp.typ.form = DynArr THEN
+				DynArrBnd(fp.typ, ap.typ, ap.lev, ap.a0, TRUE);
+				IF ap.typ.form = DynArr THEN OBC.DynArrAdr(fp, ap)
+				ELSE OBC.PutF4(27H, fp, ap)
+				END
+			ELSIF (fp.typ.form = Record) & (ap.typ.form = Record) THEN
+				q := ap.typ;
+				WHILE (q # fp.typ) & (q # NIL) DO q := q.BaseTyp END ;
+				IF q # NIL THEN
+					IF (ap.mode = Ind) & (ap.obj # NIL) & (ap.obj # OBC.wasderef) THEN
+						(*actual par is VAR-par*)
+						ap.mode := Var; ap.a0 := ap.a0 + 4; OBC.PutF4(17H, fp, ap);
+						ap.a0 := ap.a0 - 4; OBC.PutF4(17H, fp, ap)
+					ELSIF ((ap.mode = Ind) OR (ap.mode = RegI)) & (ap.obj = OBC.wasderef) THEN
+						(*actual par is p^*)
+						ap.a1 := - 4; OBC.PutF4(17H, fp, ap);
+						IF ap.mode = Ind THEN ap.mode := Var ELSE ap.mode := Reg END;
+						OBC.PutF4(17H, fp, ap)
+					ELSE
+						tag.mode := Var; tag.lev := -ap.typ.mno; tag.a0 := ap.typ.adr;
+						OBC.PutF4(17H, fp, tag); OBC.PutF4(27H, fp, ap)
+					END
+				ELSE OBS.Mark(111)
+				END
+			ELSIF (ap.typ = fp.typ) OR ((fp.typ.form = Byte) & (ap.typ.form IN {Char, SInt})) THEN
+				IF (ap.mode = Ind) & (ap.a1 = 0) THEN (*actual var par*)
+					ap.mode := Var; OBC.PutF4(17H, fp, ap)
+				ELSE OBC.PutF4(27H, fp, ap)
+				END
+			ELSE OBS.Mark(123)
+			END
+		ELSE Assign(fp, ap, TRUE)
+		END
+	END Param;
+
+	PROCEDURE Call*(VAR x: OBT.Item);
+		VAR stk, sL: OBT.Item;
+	BEGIN
+		IF x.mode = LProc THEN
+			IF x.lev >= 0 THEN
+				IF x.lev > 0 THEN
+					sL.mode := Var; sL.typ := OBT.linttyp; sL.lev := x.lev; sL.a0 := 0;
+					stk.mode := Stk; OBC.PutF4(27H, stk, sL)  (*static link*)
+				END ;
+				OBC.PutF1(2);  (*BSR*)
+				IF x.a0 = 0 THEN OBC.PutWord(x.a1); x.obj.a1 := OBC.pc - 2 (*forward link*)
+				ELSE OBC.PutDisp(x.a0 - OBC.pc + 1)
+				END
+			ELSE OBC.PutF1(2); OBC.PutExtAdr(-x.lev, x.a0) (*BSR*)
+			END
+		ELSIF (x.mode < Con) & (x.typ.form # Undef) THEN
+			IF (x.mode = Var) & (x.lev > 0) & (x.lev = OBC.level) THEN x.mode := Ind
+			ELSE load(x); x.mode := RegI
+			END ;
+			x.a1 := 0; OBC.PutF2(7FH, 12, x); x.typ := x.typ.BaseTyp  (*JSRD*)
+		ELSIF x.mode = CProc THEN
+			OBC.PutF1(0E2H); OBC.PutByte(x.a0)            (*SVC n*)
+		ELSE OBS.Mark(121)
+		END
+		(*function result is marked when restoring registers*)
+	END Call;
+
+	PROCEDURE Enter*(mode: SHORTINT; VAR L: INTEGER);
+	BEGIN OBC.CheckCodeSize; OBC.PutF1(82H);  (*ENTER*)
+		IF mode = IProc THEN OBC.PutByte(0C0H) ELSE OBC.PutByte(0) END ;
+		IF mode = Mod THEN OBC.PutByte(0)
+		ELSIF stkchk & (mode # IProc) THEN (*check SP against stack limit*)
+			L := OBC.pc; OBC.PutWord(0);
+			OBC.PutF3(-47D9H); OBC.PutF3(547H); OBC.PutDisp(3FF0H);  (*ADDR TOS, R0; CMPD R0, lim*)
+			OBC.PutF0(4); OBC.PutDisp(4); OBC.PutF1(0F2H); OBC.PutByte(14);  (*BHI *+4  BPT 14*)
+		ELSIF clrchk THEN (*clear local frame*)
+			OBC.PutByte(0); OBC.PutF3(-57D9H); L := OBC.pc; OBC.PutWord(0);  (*ADDR @n, R0*)
+			OBC.PutF3(-47A1H); OBC.PutF3(64DH); OBC.PutDisp(-2)   (*MOVQD 0, TOS;  ACBW -4, R0, -2*)
+		ELSE L := OBC.pc; OBC.PutWord(0)
+		END
+	END Enter;
+
+	PROCEDURE CopyDynArray*(adr: LONGINT; typ: OBT.Struct);
+		VAR size, ptr, m2, tos: OBT.Item;
+
+		PROCEDURE DynArrSize(typ: OBT.Struct);
+			VAR len: OBT.Item;
+		BEGIN
+			IF typ.form = DynArr THEN DynArrSize(typ.BaseTyp);
+				len.mode := Var; len.lev := OBC.level; len.typ := OBT.linttyp;
+				len.a0 := adr + typ.adr; load(len);
+				IF size.a0 # 1 THEN OBC.Put(F7, 23H, len, size)	(* MULD size, len *) END;
+				size := len
+			ELSE size.mode := Con; size.typ := OBT.linttyp; size.a0 := typ.size
+			END
+		END DynArrSize;
+		
+	BEGIN
+		DynArrSize(typ);	(* load total byte size of dyn array *)
+		OBC.PutF2(0FH, 3, size);	(* ADDQD 3, size *)
+		m2.mode := Con; m2.typ := OBT.sinttyp;
+		m2.a0 := -2; OBC.Put(F6, 7, size, m2);	(* ASHD -2, size *)
+		ptr.mode := Var; ptr.lev := OBC.level; ptr.typ := OBT.linttyp;
+		ptr.a0 := adr; load(ptr); 
+		ptr.mode := RegX; ptr.a1 := -4; ptr.a2 := size.a0; tos.mode := Stk;
+		OBC.PutF4(17H, tos, ptr);	(* loop:	MOVD -4(ptr)[size:D], TOS *)
+		OBC.PutF2(4FH, -1, size); OBC.PutDisp(-4);	(* ACBD -1, size, loop *)
+		OBC.PutF3(-31D9H); OBC.PutDisp(0); OBC.PutDisp(adr);	(* ADDR 0(SP), adr(FP) *)
+		OBC.FreeRegs({})
+	END CopyDynArray;
+	
+	PROCEDURE Result*(VAR x: OBT.Item; typ: OBT.Struct);
+		VAR res: OBT.Item;
+	BEGIN res.mode := Reg; res.typ := typ; res.a0 := 0;
+		Assign(res, x, FALSE)
+	END Result;
+
+	PROCEDURE Return*(mode: INTEGER; psize: LONGINT);
+	BEGIN OBC.PutF1(92H);                                     (*EXIT*)
+		IF mode = LProc THEN
+			OBC.PutByte(0); OBC.PutF1(12H); OBC.PutDisp(psize-8)  (*RET*)
+		ELSIF mode = IProc THEN
+			OBC.PutByte(3); OBC.PutF1(42H); OBC.PutDisp(0)        (*RETT 0*)
+		END
+	END Return;
+
+	PROCEDURE CaseIn*(VAR x: OBT.Item; VAR L0, L1: INTEGER);
+		VAR f: INTEGER; x0, z: OBT.Item;
+	BEGIN f := x.typ.form;
+		IF f = LInt THEN load(x)
+		ELSIF f = Int THEN x0 := x; OBC.GetReg(x); OBC.Put(F7, 1DH, x, x0)  (*MOVXWD*)
+		ELSIF f = Char THEN x0 := x; OBC.GetReg(x); OBC.Put(F7, 18H, x, x0)  (*MOVZBD*)
+		ELSIF f = SInt THEN x0 := x; OBC.GetReg(x); OBC.Put(F7, 1CH, x, x0)  (*MOVXBD*)
+		ELSE OBS.Mark(125)
+		END ;
+		z.mode := Con; z.typ := OBT.linttyp; z.a0 := 0; OBC.PutF4(23H, x, z);   (*SUBi*)
+		L0 := OBC.pc; OBC.PutF4(7, z, x);   (*CMPi*)
+		OBC.PutF0(11); OBC.PutWord(0);   (*BHS*)
+		L1 := OBC.pc; OBC.PutF3(-1083H); OBC.PutByte(x.a0+0D8H); OBC.PutWord(0)  (*CASE*)
+	END CaseIn;
+
+	PROCEDURE CaseOut*(L0, L1, L2, L3, n: INTEGER;
+										 VAR tab: ARRAY OF LabelRange);
+		VAR i, j, lim, len: INTEGER; k: LONGINT;
+	BEGIN (*generate jump table*)
+		IF ODD(OBC.pc) THEN OBC.PutByte(0A2H) END ;
+		IF n > 0 THEN len := tab[n-1].high - tab[0].low + 1 ELSE len := 0 END ;
+		OBC.PutByte(6); OBC.PutF3(len);   (*for decoder*)
+		OBC.FixupImm(L0, tab[0].low);  (*SUB*)
+		OBC.FixupImm(L1-3, len);  (*CMP*)
+		OBC.FixupWith(L1-2, L2-L1+3);  (*out of bounds jump addr*)
+		OBC.FixupWith(L1+3, OBC.pc-L1);     (*jump address to table*)
+		i := 0; j := tab[0].low;
+		WHILE i < n DO
+			lim := tab[i].high;
+			WHILE j < tab[i].low DO OBC.PutF3(L2-L1); INC(j) END ;
+			WHILE j <= lim DO OBC.PutF3(tab[i].label-L1); INC(j) END ;
+			INC(i)
+		END ;
+		OBC.FixLink(L3)
+	END CaseOut;
+
+BEGIN
+	lengcode[Undef] := 0;
+	lengcode[Byte] := 0;
+	lengcode[Bool] := 0;
+	lengcode[Char] := 0;
+	lengcode[SInt] := 0;
+	lengcode[Int] := 1;
+	lengcode[LInt] := 3;
+	lengcode[Real] := 1;
+	lengcode[LReal] := 0;
+	lengcode[Set] := 3;
+	lengcode[String] := 0;
+	lengcode[NilTyp] := 3;
+	lengcode[ProcTyp] := 3;
+	lengcode[Pointer] := 3;
+	lengcode[Array] := 1;
+	lengcode[DynArr] := 1;
+	lengcode[Record] := 1;
+END OBH.

@@ -1,0 +1,70 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+outdated
+
+MODULE Coroutines;
+(* NW 3. 8. 89/JG 22. 5. 92/ARD 2. 9. 92 *)
+(* ARD 6. 10. 93, Oberon version, compile with /no *)
+
+IMPORT SYSTEM;
+
+CONST ESP = 4; EBP = 5; EDX = 2; ECX = 1; EAX = 0;
+
+TYPE Coroutine* = POINTER TO CorDesc;
+
+		Proc* = PROCEDURE(me: Coroutine);
+		
+		Stack* = POINTER TO RECORD END;
+		
+		CorDesc* = RECORD
+			SP: LONGINT; P*: Proc; S*: Stack; L*: LONGINT; 
+		END;
+		
+VAR main*, cur: Coroutine;
+
+PROCEDURE Start*(me: Coroutine);
+BEGIN
+	SYSTEM.PUTREG(ECX, SYSTEM.VAL(LONGINT, cur));
+	(*$DInline.Assemble
+				MOV   0[ECX], EBP
+				MOV   EAX, 8[EBP]
+				MOV   EBX, 8[EAX]
+				ADD   EBX, 12[EAX]
+				MOV   ESP, EBX
+				PUSH  EAX
+	END *);
+	SYSTEM.GETREG(EAX, SYSTEM.VAL(LONGINT, cur));
+	(*$DInline.Assemble
+				CALL  4[EAX]:double
+				PUSH  29:double
+				INT3
+	END *);
+END Start;
+
+PROCEDURE Transfer*(to: Coroutine);
+BEGIN
+	SYSTEM.PUTREG(ECX, SYSTEM.VAL(LONGINT, cur));
+	(*$DInline.Assemble
+				MOV   0[ECX], EBP
+				MOV   ECX, 8[EBP]
+				MOV   EBP, 0[ECX]
+	END *);
+	SYSTEM.GETREG(ECX, SYSTEM.VAL(LONGINT, cur));
+END Transfer;
+
+BEGIN
+	NEW(main); cur := main
+END Coroutines.
+
+Compiler.Compile */o

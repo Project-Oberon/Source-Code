@@ -1,0 +1,593 @@
+MODULE FPA;	(* RC 25.2.92 *)
+(* MIPS R2010 Floating-Point Accelerator Emulator *)
+(* runs on MIPS only because of code procedures and register conventions *)
+
+(* Changed for DOS-Oberon *)
+(* Compile with overflow check off *)
+(* ARD, 3. 9. 92 *)
+
+
+(* all routines deliver and accept only normalized numbers or +0 *)
+
+	IMPORT Kernel, S := SYSTEM;
+
+	CONST
+		zeroDivTrap = 80;
+		ovflTrap = 81;
+
+		sign = {31}; plus = {}; minus = sign;
+		expS = {23..30}; eshiftS = 23; biasS = 127; maxexpS = 254;
+		expD = {52-32..62-32}; eshiftD = 52-32; biasD = 1023; maxexpD = 2046;
+		mantS = {0..22}; normS = 8388608; normSbit = {23};
+		mantD = {0..51-32}; normD = 1048576; normDbit = {52-32}; (* high part *)
+		
+		FXCH = 0C9X; FCHS = 0E0X; FABS = 0E1X; FLD1 = 0E8X; FLDZ = 0EEX;
+		FADDP = 0C1X; FMULP = 0C9X; FCOMPP = 0D9X; FSUBP = 0E9X; FDIVP = 0F9X; FDIVRP = 0F1X;
+		FSTSWAX = 0E0X;
+		
+	TYPE Proc = PROCEDURE;
+
+	VAR
+		FGR*: ARRAY 16 OF SET; xch: ARRAY 2 OF SET;
+		equal, less: BOOLEAN;
+		adr: LONGINT;
+		SP, length, opfield: INTEGER;
+		OP1, OP2, OP3: CHAR;
+		EAX, EBX, ECX, EDX, ESI, EDI, EIP, EBP, oldebp: LONGINT;
+		flags: SET;
+		low, hi, carry, R3: LONGINT;
+		
+(*	PROCEDURE -Install(p: Proc)		
+		0C8H, 0, 0, 0,									(* ENTER *)
+		0BBH, 20H, 0, 0, 0,						(* MOV BX, 20H									;Data32Sel *)
+		8EH, 0E3H,									(* MOV FS, BX *)
+		0BBH, 038H, 0, 0, 0,						(* MOV EBX, 56 *)
+		8BH, 45H, 08H,							(* MOV EAX, dword ptr SS:[EBP+8] 		;Procedure to fill in *)
+		64H, 89H, 03H,								(* MOV dword ptr FS:[EBX], EAX 			Place to put: FS:54 *)
+		0C9H, 0C2H, 4H, 0;
+*)
+		
+	PROCEDURE Install(p: Proc);
+	VAR seg: LONGINT;
+	BEGIN
+	seg := Kernel.OldSegment;
+	(*$ DInline.Assemble
+			MOV EBX, $20
+			MOV FS, BX
+			MOV EBX, 56
+			ADD EBX, seg[EBP]
+			MOV EAX, 8[EBP]
+			MOV FS:[EBX], EAX
+			END *)
+	END Install;
+	
+	PROCEDURE MFLO(): LONGINT;
+	BEGIN RETURN low END MFLO;
+	
+	PROCEDURE MFHI(): LONGINT;
+	BEGIN RETURN hi END MFHI;
+	
+	PROCEDURE MULTU(r4, r5: LONGINT);
+	VAR l, h: LONGINT;
+	BEGIN
+	(*$ DInline.Assemble
+		MOV EAX, r4[EBP]
+		MUL r5[EBP]:double
+		MOV l[EBP], EAX
+		MOV h[EBP], EDX
+		END *)
+		low := l; hi := h;
+	END MULTU;
+	
+	PROCEDURE DIVU(r4, r5: LONGINT);
+	VAR l, h: LONGINT;
+	BEGIN
+	(*$ DInline.Assemble
+		XOR EDX, EDX
+		MOV EAX, r4[EBP]
+		DIV r5[EBP]:double
+		MOV l[EBP], EAX
+		MOV h[EBP], EDX
+		END *)
+		low := l; hi := h;
+	END DIVU;
+
+	PROCEDURE Carry(r4, r5: LONGINT): LONGINT;
+	BEGIN
+	(*$ DInline.Assemble
+		XOR EAX, EAX
+		MOV EBX, r5[EBP]
+		ADD EBX, r4[EBP]
+		SETB AL
+		LEAVE
+		RET 8
+		END *)
+	END Carry;
+	
+	PROCEDURE SLRVD(r4, r5, r6: LONGINT): LONGINT;
+	VAR r3: LONGINT; dmy: LONGINT;
+	BEGIN
+	(*$ DInline.Assemble
+			MOV EDX, r5[EBP]
+			MOV EAX, r4[EBP]
+			MOV ECX, r6[EBP]
+			CMP ECX, 32
+			JGE lab1
+			SHRD EAX, EDX, CL
+			SHR EDX, CL
+			JMP end
+lab1	MOV EAX, EDX
+			XOR EDX, EDX
+			SHR EAX, CL
+end		MOV r3[EBP], EDX
+			MOV dmy[EBP], EAX
+		END *)
+		R3 := r3; RETURN dmy
+	END SLRVD;
+	
+	PROCEDURE ABSD*(d, s: LONGINT);	(* FPR[d] := ABS(FPR[s]) *)
+	BEGIN
+		FGR[d] := FGR[s]; FGR[d+1] := FGR[s+1] - sign
+	END ABSD;
+
+	PROCEDURE NEGD*(d, s: LONGINT);	(* FPR[d] := -FPR[s] *)
+		VAR s1: SET;
+	BEGIN
+		FGR[d] := FGR[s];
+		s1 := FGR[s+1];
+		IF s1 = {} THEN FGR[d+1] := {}
+		ELSE FGR[d+1] := s1 / sign
+		END
+	END NEGD;
+
+	PROCEDURE ADDD*(d, s, t: LONGINT);	(* FPR[d] := FPR[s]+FPR[t] *)	(* denormalized allowed as input, Round = RN *)
+		VAR m1l, m2l, m1h, m2h, e1, e2, ed: LONGINT; s1, s2: SET; Error: ARRAY 32 OF CHAR;
+	BEGIN
+		m1h := S.VAL(LONGINT, FGR[s+1]); m2h := S.VAL(LONGINT, FGR[t+1]);
+		e1 := S.LSH(S.LSH(m1h, 1), -eshiftD-1); s1 := S.VAL(SET, m1h)*sign; m1h := S.VAL(LONGINT, S.VAL(SET, m1h)*mantD);
+		e2 := S.LSH(S.LSH(m2h, 1), -eshiftD-1); s2 := S.VAL(SET, m2h)*sign; m2h := S.VAL(LONGINT, S.VAL(SET, m2h)*mantD);
+		IF e1 = 0 THEN e1 := 1 ELSE INC(m1h, normD) END;
+		IF e2 = 0 THEN e2 := 1 ELSE INC(m2h, normD) END;
+		(* IF (e1 = maxexpD + 1) OR (e2 = maxexpD + 1) THEN HALT(NaNTrap) END; *)
+		IF e1 < e2 THEN
+			m1l := S.VAL(LONGINT, FGR[t]); m2l := S.VAL(LONGINT, FGR[s]);
+			ed := e2; e2 := e1; e1 := ed;
+			ed := m2h; m2h := m1h; m1h := ed;
+			ed := S.VAL(LONGINT, s2); s2 := s1; s1 := S.VAL(SET, ed)
+		ELSE m1l := S.VAL(LONGINT, FGR[s]); m2l := S.VAL(LONGINT, FGR[t])
+		END;
+		(* e1 is exponent of result *)
+		ed := e1- e2;
+		IF ed > 56 THEN ed := 56 END;
+		m1h := S.LSH(m1h, 3) + S.LSH(m1l, -29); m1l := S.LSH(m1l, 3);
+		IF ed < 3 THEN	(* sticky = 0, shift left by 3-ed, ed < 3 *)
+			m2h := S.LSH(m2h, 3-ed) + S.LSH(m2l, -29-ed); m2l := S.LSH(m2l, 3-ed);
+		ELSIF (ed > 34) & (m2l = 0) & (S.VAL(SET, m2h)*{0..ed-35} = {}) OR
+				(ed <= 34) & (S.VAL(SET, m2l)*{0..ed-3} = {}) THEN	(* sticky = 0, shift right by ed-3, ed >= 3 *)
+			m2l := SLRVD(m2l, m2h, ed-3); m2h := R3
+		ELSE	(* sticky = 1, shift right by ed-3, ed >= 3 *)
+			m2l := SLRVD(m2l, m2h, ed-3); m2h := R3;
+			INCL(S.VAL(SET, m2l), 0)
+		END;
+		IF s1 # plus THEN m1h := -m1h;
+			IF m1l # 0 THEN DEC(m1h) END;
+			m1l := -m1l
+		END;
+		IF s2 # plus THEN m2h := -m2h;
+			IF m2l # 0 THEN DEC(m2h) END;
+			m2l := -m2l
+		END;
+		m1h := m1h + m2h + Carry(m1l, m2l); m1l := m1l + m2l;
+		IF m1h < 0 THEN s1 := minus; m1h := -m1h;
+			IF m1l # 0 THEN DEC(m1h) END;
+			m1l := -m1l
+		ELSE s1 := plus
+		END;
+		IF m1h >= ASH(normD, 4) THEN m1l := S.LSH(m1l, -1) + S.LSH(m1h, 31); m1h := S.LSH(m1h, -1); INC(e1)
+		ELSIF (m1h = 0) & (m1l = 0) THEN e1 := 1; s1 := plus
+		ELSE
+			WHILE (m1h < ASH(normD, 3)) & (e1 > 0) DO
+				m1h := S.LSH(m1h, 1) + S.LSH(m1l, -31); m1l := S.LSH(m1l, 1); DEC(e1)
+			END
+		END;
+		IF m1l MOD 16 IN {5..7, 12..15} THEN
+			m1l := S.LSH(m1l, -3) + S.LSH(m1h, 29); m1h := S.LSH(m1h, -3);
+			IF m1l = -1 THEN (* carry *) m1l := 0; INC(m1h);
+				IF m1h >= ASH(normD, 1) THEN m1h := S.LSH(m1h, -1); (*1.00...00*); INC(e1) END
+			ELSE INC(m1l)
+			END
+		ELSE m1l := S.LSH(m1l, -3) + S.LSH(m1h, 29); m1h := S.LSH(m1h, -3)
+		END;
+		IF e1 > maxexpD THEN Error := "FLOATING POINT OVERFLOW"; HALT(ovflTrap)
+		ELSIF e1 <= 0 THEN (* denormalized FGR[d] := s1 + S.VAL(SET, m1) => +0 *) FGR[d] := {}; FGR[d+1] := {}
+		ELSE FGR[d+1] := s1 + S.VAL(SET, S.LSH(e1, eshiftD)) + (S.VAL(SET, m1h) - normDbit); FGR[d] := S.VAL(SET, m1l)
+		END
+	END ADDD;
+
+	PROCEDURE SUBD*(d, s, t: LONGINT);	(* FPR[d] := FPR[s]-FPR[t], Round = RN *)
+	(* identical to ADDD except in the second line *)
+		VAR m1l, m2l, m1h, m2h, e1, e2, ed: LONGINT; s1, s2: SET; Error: ARRAY 32 OF CHAR;
+	BEGIN
+		m1h := S.VAL(LONGINT, FGR[s+1]); m2h := S.VAL(LONGINT, FGR[t+1] / sign);
+		e1 := S.LSH(S.LSH(m1h, 1), -eshiftD-1); s1 := S.VAL(SET, m1h)*sign; m1h := S.VAL(LONGINT, S.VAL(SET, m1h)*mantD);
+		e2 := S.LSH(S.LSH(m2h, 1), -eshiftD-1); s2 := S.VAL(SET, m2h)*sign; m2h := S.VAL(LONGINT, S.VAL(SET, m2h)*mantD);
+		IF e1 = 0 THEN e1 := 1 ELSE INC(m1h, normD) END;
+		IF e2 = 0 THEN e2 := 1 ELSE INC(m2h, normD) END;
+		(* IF (e1 = maxexpD + 1) OR (e2 = maxexpD + 1) THEN HALT(NaNTrap) END; *)
+		IF e1 < e2 THEN
+			m1l := S.VAL(LONGINT, FGR[t]); m2l := S.VAL(LONGINT, FGR[s]);
+			ed := e2; e2 := e1; e1 := ed;
+			ed := m2h; m2h := m1h; m1h := ed;
+			ed := S.VAL(LONGINT, s2); s2 := s1; s1 := S.VAL(SET, ed)
+		ELSE m1l := S.VAL(LONGINT, FGR[s]); m2l := S.VAL(LONGINT, FGR[t])
+		END;
+		(* e1 is exponent of result *)
+		ed := e1- e2;
+		IF ed > 56 THEN ed := 56 END;
+		m1h := S.LSH(m1h, 3) + S.LSH(m1l, -29); m1l := S.LSH(m1l, 3);
+		IF ed < 3 THEN	(* sticky = 0, shift left by 3-ed, ed < 3 *)
+			m2h := S.LSH(m2h, 3-ed) + S.LSH(m2l, -29-ed); m2l := S.LSH(m2l, 3-ed);
+		ELSIF (ed > 34) & (m2l = 0) & (S.VAL(SET, m2h)*{0..ed-35} = {}) OR
+				(ed <= 34) & (S.VAL(SET, m2l)*{0..ed-3} = {}) THEN	(* sticky = 0, shift right by ed-3, ed >= 3 *)
+			m2l := SLRVD(m2l, m2h, ed-3); m2h := R3
+		ELSE	(* sticky = 1, shift right by ed-3, ed >= 3 *)
+			m2l := SLRVD(m2l, m2h, ed-3); m2h := R3;
+			INCL(S.VAL(SET, m2l), 0)
+		END;
+		IF s1 # plus THEN m1h := -m1h;
+			IF m1l # 0 THEN DEC(m1h) END;
+			m1l := -m1l
+		END;
+		IF s2 # plus THEN m2h := -m2h;
+			IF m2l # 0 THEN DEC(m2h) END;
+			m2l := -m2l
+		END;
+		m1h := m1h + m2h + Carry(m1l, m2l); m1l := m1l + m2l;
+		IF m1h < 0 THEN s1 := minus; m1h := -m1h;
+			IF m1l # 0 THEN DEC(m1h) END;
+			m1l := -m1l
+		ELSE s1 := plus
+		END;
+		IF m1h >= ASH(normD, 4) THEN m1l := S.LSH(m1l, -1) + S.LSH(m1h, 31); m1h := S.LSH(m1h, -1); INC(e1)
+		ELSIF (m1h = 0) & (m1l = 0) THEN e1 := 1; s1 := plus
+		ELSE
+			WHILE (m1h < ASH(normD, 3)) & (e1 > 0) DO
+				m1h := S.LSH(m1h, 1) + S.LSH(m1l, -31); m1l := S.LSH(m1l, 1); DEC(e1)
+			END
+		END;
+		IF m1l MOD 16 IN {5..7, 12..15} THEN
+			m1l := S.LSH(m1l, -3) + S.LSH(m1h, 29); m1h := S.LSH(m1h, -3);
+			IF m1l = -1 THEN (* carry *) m1l := 0; INC(m1h);
+				IF m1h >= ASH(normD, 1) THEN m1h := S.LSH(m1h, -1); (*1.00...00*); INC(e1) END
+			ELSE INC(m1l)
+			END
+		ELSE m1l := S.LSH(m1l, -3) + S.LSH(m1h, 29); m1h := S.LSH(m1h, -3)
+		END;
+		IF e1 > maxexpD THEN Error := "FLOATING POINT OVERFLOW"; HALT(ovflTrap)
+		ELSIF e1 <= 0 THEN (* denormalized FGR[d] := s1 + S.VAL(SET, m1) => +0 *) FGR[d] := {}; FGR[d+1] := {}
+		ELSE FGR[d+1] := s1 + S.VAL(SET, S.LSH(e1, eshiftD)) + (S.VAL(SET, m1h) - normDbit); FGR[d] := S.VAL(SET, m1l)
+		END
+	END SUBD;
+
+	PROCEDURE MULD*(d, s, t: LONGINT);	(* FPR[d] := FPR[s]*FPR[t], Round = RN *)
+		VAR m1l, m2l, m1h, m2h, e1, e2: LONGINT; s1, s2: SET; ah, bl, bh, cl, ch, dl, c0, c1: LONGINT; Error: ARRAY 32 OF CHAR;
+	BEGIN
+		m1l := S.VAL(LONGINT, FGR[s]); m1h := S.VAL(LONGINT, FGR[s+1]);
+		m2l := S.VAL(LONGINT, FGR[t]); m2h := S.VAL(LONGINT, FGR[t+1]);
+		IF (m1l = 0) & (m1h = 0) OR (m2l = 0) & (m2h = 0) THEN FGR[d] := {}; FGR[d+1] := {}; RETURN END;
+		e1 := S.LSH(S.LSH(m1h, 1), -eshiftD-1); s1 := S.VAL(SET, m1h)*sign;
+		m1h := S.VAL(LONGINT, S.VAL(SET, m1h)*mantD) + normD;
+		e2 := S.LSH(S.LSH(m2h, 1), -eshiftD-1); s2 := S.VAL(SET, m2h)*sign;
+		m2h := S.VAL(LONGINT, S.VAL(SET, m2h)*mantD) + normD;
+		(* IF (e1 = maxexpD + 1) OR (e2 = maxexpD + 1) THEN HALT(NaNTrap) END; *)
+		(* IF (e1 = 0) OR (e2 = 0) THEN HALT(DenormTrap) END; *)
+		e1 := e1 + e2 - biasD; s1 := s1/s2;
+		m1h := S.LSH(m1h, 8) + S.LSH(m1l, -24); m1l := S.LSH(m1l, 8);
+		m2h := S.LSH(m2h, 7) + S.LSH(m2l, -25); m2l := S.LSH(m2l, 7);
+		MULTU(m2l, m1l); s2 (*sticky*) := S.VAL(SET, MFLO()); ah := MFHI();
+		MULTU(m2l, m1h); bl := MFLO(); bh := MFHI();
+		MULTU(m2h, m1l); cl := MFLO(); ch := MFHI();
+		MULTU(m2h, m1h); dl := MFLO(); m1h := MFHI();
+		c0 := Carry(ah, bl); m2h := ah + bl; s2 := s2 + S.VAL(SET, m2h);
+		c1 := Carry(m2h, cl); m2h := m2h + cl; s2 := s2 + S.VAL(SET, m2h);
+		m1l := c0 + c1 + bh;
+		c0 := Carry(m1l, ch); m1l := m1l + ch;
+		c1 := Carry(m1l, dl); m1l := m1l + dl;
+		m1h := m1h + c0 + c1;
+		IF m1h >= ASH(normD, 4) THEN m1l := S.LSH(m1l, -1) + S.LSH(m1h, 31); m1h := S.LSH(m1h, -1); INC(e1) END;
+		IF s2 # {} THEN (* sticky *) INCL(S.VAL(SET, m1l), 0) END;
+		IF m1l MOD 16 IN {5..7, 12..15} THEN
+			m1l := S.LSH(m1l, -3) + S.LSH(m1h, 29); m1h := S.LSH(m1h, -3);
+			IF m1l = -1 THEN (* carry *) m1l := 0; INC(m1h);
+				IF m1h >= ASH(normD, 1) THEN m1h := S.LSH(m1h, -1); (*1.00...00*); INC(e1) END
+			ELSE INC(m1l)
+			END
+		ELSE m1l := S.LSH(m1l, -3) + S.LSH(m1h, 29); m1h := S.LSH(m1h, -3)
+		END;
+		IF e1 > maxexpD THEN Error := "FLOATING POINT OVERFLOW"; HALT(ovflTrap)
+		ELSIF e1 <= 0 THEN (* denormalized FGR[d] := s1 + S.VAL(SET, m1) => +0 *) FGR[d] := {}; FGR[d+1] := {}
+		ELSE FGR[d+1] := s1 + S.VAL(SET, S.LSH(e1, eshiftD)) + (S.VAL(SET, m1h) - normDbit); FGR[d] := S.VAL(SET, m1l)
+		END
+	END MULD;
+
+	PROCEDURE DIVD*(d, s, t: LONGINT);	(* FPR[d] := FPR[s]/FPR[t], Round = RN *)
+		VAR m1l, m2l, m1h, m2h, q, ql, qh, rl, rh, e1, e2: LONGINT; s1, s2: SET; Error: ARRAY 32 OF CHAR;
+	BEGIN
+		m1l := S.VAL(LONGINT, FGR[s]); m1h := S.VAL(LONGINT, FGR[s+1]);
+		m2l := S.VAL(LONGINT, FGR[t]); m2h := S.VAL(LONGINT, FGR[t+1]);
+		IF (m2l = 0) & (m2h = 0) THEN Error := "FLOATING POINT DIVIDE BY ZERO"; HALT(zeroDivTrap) END;
+		IF (m1l = 0) & (m1h = 0) THEN FGR[d] := {}; FGR[d+1] := {}; RETURN END;
+		e1 := S.LSH(S.LSH(m1h, 1), -eshiftD-1); s1 := S.VAL(SET, m1h)*sign;
+		m1h := S.VAL(LONGINT, S.VAL(SET, m1h)*mantD) + normD;
+		e2 := S.LSH(S.LSH(m2h, 1), -eshiftD-1); s2 := S.VAL(SET, m2h)*sign;
+		m2h := S.VAL(LONGINT, S.VAL(SET, m2h)*mantD) + normD;
+		(* IF (e1 = maxexpD + 1) OR (e2 = maxexpD + 1) THEN HALT(NaNTrap) END; *)
+		(* IF (e1 = 0) OR (e2 = 0) THEN HALT(DenormTrap) END; *)
+		e1 := e1 - e2 + biasD; s1 := s1/s2;
+		qh := 0; ql := 0; e2 := 5;
+		WHILE e2 > 0 DO DEC(e2);
+			qh := S.LSH(qh, 11) + S.LSH(ql, -21); ql := S.LSH(ql, 11);
+			m1h := S.LSH(m1h, 11) + S.LSH(m1l, -21); m1l := S.LSH(m1l, 11);
+			DIVU(m1h, m2h); q := MFLO(); rh := MFHI();
+			MULTU(q, m2l); rl := -MFLO(); m1h := -MFHI();
+			IF rl # 0 THEN DEC(m1h) END;
+			rh := rh + m1h + Carry(rl, m1l); rl := rl + m1l;
+			IF rh < 0 THEN rh := rh + m2h + Carry(rl, m2l); rl := rl + m2l; DEC(q) END;
+			qh := qh + Carry(ql, q); ql := ql + q; m1h := rh; m1l := rl
+		END;
+		WHILE (qh < ASH(normD, 3)) & (e1 > 0) DO
+			qh := S.LSH(qh, 1) + S.LSH(ql, -31); ql := S.LSH(ql, 1); DEC(e1)
+		END;
+		IF (rl # 0) OR (rh # 0) THEN (* sticky *) INCL(S.VAL(SET, ql), 0) END;
+		IF ql MOD 16 IN {5..7, 12..15} THEN
+			ql := S.LSH(ql, -3) + S.LSH(qh, 29); qh := S.LSH(qh, -3);
+			IF ql = -1 THEN (* carry *) ql := 0; INC(qh);
+				IF qh >= ASH(normD, 1) THEN qh := S.LSH(qh, -1); (*1.00...00*); INC(e1) END
+			ELSE INC(ql)
+			END
+		ELSE ql := S.LSH(ql, -3) + S.LSH(qh, 29); qh := S.LSH(qh, -3)
+		END;
+		IF e1 > maxexpD THEN Error := "FLOATING POINT OVERFLOW"; HALT(ovflTrap)
+		ELSIF e1 <= 0 THEN (* denormalized FGR[d] := s1 + S.VAL(SET, q) => +0 *) FGR[d] := {}; FGR[d+1] := {}
+		ELSE FGR[d+1] := s1 + S.VAL(SET, S.LSH(e1, eshiftD)) + (S.VAL(SET, qh) - normDbit); FGR[d] := S.VAL(SET, ql)
+		END
+	END DIVD;
+
+	PROCEDURE CEQD*(s, t: LONGINT);	(* equal := FPR[s]=FPR[t] *)
+	BEGIN
+		equal := (FGR[s] = FGR[t]) & (FGR[s+1] = FGR[t+1])
+	END CEQD;
+
+	PROCEDURE CLTD*(s, t: LONGINT);	(* less := FPR[s]<FPR[t] *)
+		VAR s1, s2: SET;
+	BEGIN
+		s1 := FGR[s+1]; s2 := FGR[t+1];
+		IF s1*s2*sign = plus THEN
+			IF s1 # s2 THEN less := S.VAL(LONGINT, s1) < S.VAL(LONGINT, s2)
+			ELSE s1 := FGR[s]; s2 := FGR[t];
+				IF (s1/s2)*sign = plus THEN less := S.VAL(LONGINT, s1) < S.VAL(LONGINT, s2)
+				ELSE (* bit 31 is different *) less := S.VAL(LONGINT, s2) < S.VAL(LONGINT, s1)
+				END
+			END
+		ELSE (* both negative *)
+			IF s1 # s2 THEN less := S.VAL(LONGINT, s2) < S.VAL(LONGINT, s1)
+			ELSE s1 := FGR[s]; s2 := FGR[t];
+				IF (s1/s2)*sign = plus THEN less := S.VAL(LONGINT, s2) < S.VAL(LONGINT, s1)
+				ELSE (* bit 31 is different *) less := S.VAL(LONGINT, s1) < S.VAL(LONGINT, s2)
+				END
+			END
+		END
+	END CLTD;
+
+	PROCEDURE CVTDW*(d, s: LONGINT);	(* FPR[d] := LONGFLOAT(FGR[s] *)	(* always exact *)
+		VAR m, e: LONGINT; sgn: SET;
+	BEGIN
+		m := S.VAL(LONGINT, FGR[s]); sgn := plus;
+		IF m = 0 THEN FGR[d] := {}; FGR[d+1] := {}; RETURN END;
+		IF m < 0 THEN sgn := minus;
+			IF m # MIN(LONGINT) THEN m := -m END
+		END;
+		e := biasD + 31;
+		WHILE m > 0 DO m := S.LSH(m, 1); DEC(e) END;
+		FGR[d] := S.VAL(SET, S.LSH(m, 21));
+		FGR[d+1] := sgn + S.VAL(SET, S.LSH(e, eshiftD)) + (S.VAL(SET, S.LSH(m, -11))*mantD)
+	END CVTDW;
+
+	PROCEDURE CVTSD*(d, s: LONGINT);	(* FGR[d] := SHORT(FPR[s]) *)	(* Round = RN *)
+		VAR ml, mh, sgn: SET; e: LONGINT; Error: ARRAY 32 OF CHAR;
+	BEGIN
+		ml := FGR[s]; mh := FGR[s+1]; sgn := mh*sign;
+		e := S.VAL(LONGINT, mh*expD) + ASH(biasS-biasD, eshiftD);
+		(* round to nearest: *)
+		IF ml*{28..31} = {28..31} THEN (* carry to mh *)
+			IF mh*mantD = mantD THEN (* carry to norm bit *)
+				INC(e, ASH(1, eshiftD)); mh := {}; ml := S.LSH(ml, -1)*{0..26}
+			ELSE ml := ml - {28..31}; INC(S.VAL(LONGINT, mh), 1)
+			END
+		ELSE INC(S.VAL(LONGINT, ml), ASH(1, 28))
+		END;
+		IF ml*{0..28} = {} THEN EXCL(ml, 29) END;
+		IF e > ASH(maxexpS, eshiftD) THEN Error := "FLOATING POINT OVERFLOW"; HALT(ovflTrap) END;
+		IF e <= 0 THEN FGR[d] := {}
+		ELSE FGR[d] := sgn + S.VAL(SET, S.LSH(e, 3)) + S.LSH(mh, 3)*mantS + S.LSH(ml, -29)
+		END
+	END CVTSD;
+
+	PROCEDURE CVTDS*(d, s: LONGINT);	(* FPR[d] := LONG(FGR[s]) *)
+		VAR m: SET;
+	BEGIN
+		m := FGR[s];
+		IF m = {} THEN FGR[d] := {}; FGR[d+1] := {}; RETURN END;
+		FGR[d] := S.LSH(m, 29);
+		FGR[d+1] := m*sign + S.VAL(SET, S.VAL(LONGINT, S.LSH(m*expS, -3)) + ASH(biasD-biasS, eshiftD)) + S.LSH(m, -3)*mantD;
+	END CVTDS;
+
+	PROCEDURE CVTWD*(d, s: LONGINT);	(* FGR[d] := ENTIER(FPR[s]) *)	(* Round = RM *)
+		VAR ml, mh, help: SET; e, help2: LONGINT; Error: ARRAY 32 OF CHAR;
+	BEGIN
+		ml := FGR[s]; mh := FGR[s+1];
+		IF (ml = {}) & (mh = {}) THEN FGR[d] := {}; RETURN END;
+		e := S.LSH(S.VAL(LONGINT, mh*expD), -eshiftD) - (biasD + 20);
+		IF mh*sign = plus THEN
+			IF e > 0 THEN
+				IF e > 10 THEN Error := "FLOATING POINT OVERFLOW"; HALT(ovflTrap) END;
+				help := S.LSH(ml, e-32)*{0..e-1};
+				FGR[d] := S.LSH(mh*mantD + normDbit, e) + help
+			ELSIF e < -20 THEN FGR[d] := {}
+			ELSE FGR[d] := S.LSH(mh*mantD + normDbit, e)
+			END
+		ELSE
+			IF e > 0 THEN
+				help2 := S.VAL(LONGINT, S.LSH(ml, e-32)*{0..e-1});
+				FGR[d] := S.VAL(SET, -(S.LSH(S.VAL(LONGINT, mh*mantD) + normD, e) + help2));
+				IF (e > 10) & (FGR[d] # {31}) THEN Error := "FLOATING POINT OVERFLOW"; HALT(ovflTrap) END;
+			ELSIF e < -20 THEN FGR[d] := (* -1 *) {0..31}
+			ELSIF (e # 0) & (mh*{0..-e-1} # {}) OR (ml # {}) THEN
+				FGR[d] := S.VAL(SET, -(S.LSH(S.VAL(LONGINT, mh*mantD) + normD, e) + 1))
+			ELSE FGR[d] := S.VAL(SET, -S.LSH(S.VAL(LONGINT, mh*mantD) + normD, e))
+			END
+		END
+	END CVTWD;
+	
+	PROCEDURE GetFlags(adr: LONGINT): SET;
+	VAR flags: SET;
+	BEGIN
+		S.GET(adr+56, flags);
+		RETURN flags
+	END GetFlags;
+	
+	PROCEDURE SetFlags(adr: LONGINT;  flags: SET);
+	BEGIN
+		S.PUT(adr+56, flags);
+	END SetFlags;
+	
+	PROCEDURE GetIP(adr: LONGINT): LONGINT;
+	VAR ip: LONGINT;
+	BEGIN
+		S.GET(adr+48, ip);
+		RETURN ip
+	END GetIP;
+	
+	PROCEDURE SetIP(adr, ip: LONGINT);
+	BEGIN
+		S.PUT(adr+48, ip);
+	END SetIP;
+	
+	PROCEDURE BP(): LONGINT;
+	VAR bp: LONGINT; nr: LONGINT;
+	BEGIN
+		S.GETREG(5, bp);
+		S.GET(bp, nr); S.GET(nr, nr); 
+		RETURN nr
+	END BP;
+	
+	PROCEDURE *Adr;		(* Empty procedure; lets space for 10 bytes *)
+	BEGIN (*HALT(32)*) END Adr;
+			
+	PROCEDURE GetAdr(start, len: LONGINT);
+	VAR Padr: LONGINT; nop: INTEGER; code: SHORTINT; P: Proc;
+	BEGIN
+		P := Adr;
+		Padr := S.VAL(LONGINT, P);		(* Procedure Address *)
+		nop := -28528;
+		S.PUT(Padr+2, nop); S.PUT(Padr+4, nop); S.PUT(Padr+6, nop); 	(* Init with NOP *)
+		S.PUT(Padr+8, nop); S.PUT(Padr+10, nop);  
+		IF len # 0 THEN S.MOVE(start+1, Padr+3, len) END;					(* Put Code *)
+		S.GET(start, code);
+		S.PUT(Padr, 90X); S.PUT(Padr+1, 8DX);											(* Put NOP, LEA *)
+		S.PUT(Padr+2, code MOD 8 + code DIV 64*64);						(* Put dest to EAX *)
+		S.PUTREG(0, EAX); S.PUTREG(1, ECX); S.PUTREG(2, EDX); 		(* Set registers *)
+		S.PUTREG(3, EBX); S.PUTREG(6, ESI); S.PUTREG(7, EDI);
+		S.GETREG(5, oldebp); S.PUTREG(5, EBP);									(* Set old EBP *)
+		Adr; S.GETREG(0, adr);																(* Get Address *)
+		S.PUTREG(5, oldebp);																	(* Reset EBP *)
+	END GetAdr;
+
+	PROCEDURE GetLength;
+	VAR rm: INTEGER;
+	BEGIN
+		rm := ORD(OP2) MOD 8;
+		CASE ORD(OP2) DIV 64 OF
+			0: IF rm = 4 THEN 
+					IF (ORD(OP3) MOD 8) = 5 THEN length := 7 ELSE length := 3 END
+				ELSIF rm = 5 THEN length := 6
+				ELSE length := 2 END; 
+			|1: IF rm = 4 THEN length := 4 ELSE length := 3 END;
+			|2: IF rm = 4 THEN length := 7 ELSE length := 6 END;
+			|3: length := 2
+		END
+	END GetLength;
+		
+	PROCEDURE +Interpret;	(* kernel mode *)
+	VAR dmy: LONGINT; 
+	BEGIN  
+		S.GETREG(0, EAX); S.GETREG(1, ECX); S.GETREG(2, EDX); 		(* Get registers *)
+		S.GETREG(3, EBX); S.GETREG(6, ESI); S.GETREG(7, EDI);
+		EIP := GetIP(S.ADR(dmy)); EBP := BP();								(* Get IP, BP *)
+		S.GET(EIP, OP1); S.GET(EIP+1, OP2); S.GET(EIP+2, OP3);			(* Get instruction bytes *)
+		length := 2; 																					(* Default *)
+		opfield := ORD(OP2) DIV 8 MOD 8; 											(* Decoded Mod/RM field *)
+		IF OP1 = 0D9X THEN 
+			IF OP2 = FXCH THEN 
+				xch[0] := FGR[SP-2]; xch[1] := FGR[SP-1]; 
+				FGR[SP-2] := FGR[SP-4]; FGR[SP-1] := FGR[SP-3];
+				FGR[SP-4] := xch[0]; FGR[SP-3] := xch[1]
+			ELSIF OP2 = FCHS THEN NEGD(SP-2, SP-2)
+			ELSIF OP2 = FABS THEN ABSD(SP-2, SP-2)
+			ELSIF OP2 = FLD1 THEN FGR[SP] := {}; FGR[SP+1] := {20 .. 29}; INC(SP, 2); 
+			ELSIF OP2 = FLDZ THEN FGR[SP] := {}; FGR[SP+1] := {}; INC(SP, 2)
+			ELSE 
+				GetLength; GetAdr(EIP+1, length-2);
+				IF opfield = 0 THEN S.GET(adr, FGR[SP]); CVTDS(SP, SP); INC(SP, 2)						(* FLD real *)
+				ELSIF opfield = 3 THEN DEC(SP, 2); CVTSD(SP, SP); S.PUT(adr, FGR[SP])					(* FSTP real *)
+				ELSIF (opfield = 5) OR (opfield = 7) THEN (* do nothing; FLDCW and FSTCW are not used, rounding done in procedure *)
+				ELSE HALT(88) 
+				END
+			END
+		ELSIF OP1 = 0DBX THEN
+			GetLength; GetAdr(EIP+1, length-2);
+			IF opfield = 0 THEN S.GET(adr, FGR[SP]); CVTDW(SP, SP); INC(SP, 2)						(* FILD longint *)
+			ELSIF opfield = 5 THEN S.GET(adr, FGR[SP]); S.GET(adr+4, FGR[SP+1]); INC(SP, 2)	(* FLD ext. real; treated as longreal *)
+			ELSIF opfield = 7 THEN DEC(SP, 2); S.PUT(adr, FGR[SP]); S.PUT(adr+4, FGR[SP+1])	(* FSTP ext. real; treated as longreal *)
+			ELSE HALT(88)
+			END
+		ELSIF OP1 = 0DDX THEN
+			GetLength; GetAdr(EIP+1, length-2);
+			IF opfield = 0 THEN S.GET(adr, FGR[SP]); S.GET(adr+4, FGR[SP+1]); INC(SP, 2)		(* FLD longreal *)
+			ELSIF opfield = 3 THEN DEC(SP, 2); S.PUT(adr, FGR[SP]); S.PUT(adr+4, FGR[SP+1])	(* FSTP longreal *)
+			ELSE HALT(88)
+			END
+		ELSIF OP1 = 0DEX THEN
+			IF OP2 = FADDP THEN DEC(SP, 2); ADDD(SP-2, SP-2, SP)
+			ELSIF OP2 = FMULP THEN DEC(SP, 2); MULD(SP-2, SP-2, SP)
+			ELSIF OP2 = FCOMPP THEN DEC(SP, 2); CEQD(SP, SP-2); CLTD(SP, SP-2); DEC(SP, 2)
+			ELSIF OP2 = FSUBP THEN DEC(SP, 2); SUBD(SP-2, SP-2, SP)
+			ELSIF OP2 = FDIVP THEN DEC(SP, 2); DIVD(SP-2, SP-2, SP)
+			ELSIF OP2 = FDIVRP THEN DEC(SP, 2); DIVD(SP-2, SP, SP-2)
+			ELSE HALT(88) 
+			END
+		ELSIF OP1 = 0DFX THEN
+			IF OP2 = FSTSWAX THEN flags := GetFlags(S.ADR(dmy)); 
+				IF less THEN INCL(flags, 0) ELSE EXCL(flags, 0) END;
+				IF equal THEN INCL(flags, 6) ELSE EXCL(flags, 6) END;
+				EXCL(flags, 2); INC(length);	(* set flags in EFLAGS on the stack, don't exec. SAHF *)
+				SetFlags(S.ADR(dmy), flags);
+			ELSE 
+				GetLength; GetAdr(EIP+1, length-2);
+				IF opfield = 7 THEN DEC(SP, 2); CVTWD(SP, SP); S.PUT(adr, FGR[SP])						(* FISTP longint *)
+				ELSE HALT(88) END
+			END
+		ELSIF OP1 = 9BX THEN (* do nothing *)
+		ELSE HALT(88)
+		END;
+		SetIP(S.ADR(dmy), EIP+length);										(* Execute next instruction *)
+		S.PUTREG(0, EAX); S.PUTREG(1, ECX); S.PUTREG(2, EDX);		(* Set registers *)
+		S.PUTREG(3, EBX); S.PUTREG(6, ESI); S.PUTREG(7, EDI)
+	END Interpret;
+	
+	PROCEDURE Reset*;
+	BEGIN SP := 0 END Reset;
+	
+BEGIN (* body runs in kernel mode *)
+	SP := 0; Install(Interpret)
+END FPA.

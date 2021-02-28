@@ -1,0 +1,353 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Config;
+
+IMPORT Texts, Modules, Oberon, Kernel;
+
+CONST
+	Normal = 15;  Command = 3;
+	Bootfile = "Native.Bootfile";
+	
+VAR
+	w: Texts.Writer;
+	filesystem: ARRAY 32 OF CHAR;
+	mousetype, mouseport, keyboard, buttons, parttype: ARRAY 6 OF CHAR;
+	display: ARRAY 128 OF CHAR;
+	manual, esc, fontconv: BOOLEAN;
+	dma: LONGINT;
+
+PROCEDURE GetParam(msg: ARRAY OF CHAR;  VAR num: LONGINT);
+VAR s: Texts.Scanner;  ch: CHAR;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(s);
+	IF s.class = Texts.Int THEN
+		Texts.WriteString(w, "--- ");  Texts.WriteString(w, msg);  Texts.WriteString(w, ": ");
+		num := s.i;  Texts.Read(s, ch);
+		WHILE ~s.eot & (ch # 0DX) DO
+			Texts.Write(w, ch);  Texts.Read(s, ch)
+		END;
+		Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf)
+	ELSE
+		num := -1
+	END
+END GetParam;
+
+PROCEDURE Execute;
+VAR error: ARRAY 128 OF CHAR;  t: Texts.Text;  par: Oberon.ParList;  s: Texts.Scanner;  res: INTEGER;
+BEGIN
+	Texts.WriteLn(w);
+	IF manual THEN
+		Texts.Append(Oberon.Log, w.buf)
+	ELSE
+		NEW(t);  Texts.Open(t, "");  Texts.Append(t, w.buf);
+		Texts.OpenScanner(s, t, 0);  Texts.Scan(s);
+		ASSERT(s.class = Texts.Name);
+		NEW(par);  par.vwr := Oberon.Par.vwr;  par.frame := Oberon.Par.frame;
+		par.text := t;  par.pos := Texts.Pos(s)-1;
+		Oberon.Call(s.s, par, FALSE, res);
+		IF res # 0 THEN COPY(Modules.resMsg, error);  HALT(99) END
+	END
+END Execute;
+
+PROCEDURE Color(n: SHORTINT);
+BEGIN
+	Texts.SetColor(w, n)
+END Color;
+
+PROCEDURE SetDisk(pre: ARRAY OF CHAR);
+VAR name: ARRAY 32 OF CHAR;
+BEGIN
+	Color(Command);  Texts.WriteString(w, "System.RenameFiles ");  Color(Normal);
+	Texts.WriteString(w, pre);  Texts.WriteString(w, "Disk.Obj=>Disk.Obj ");
+	Texts.WriteString(w, pre);  Texts.WriteString(w, "InstDisk.Obj=>InstDisk.Obj ~");
+	Execute;
+	Color(Command);  Texts.WriteString(w, "BootLinker.Link ");  Color(Normal);
+	Texts.WriteString(w, Bootfile);  Texts.WriteString(w, " \list Kernel.modules");
+	Texts.WriteString(w, " \new Kernel.NewRec \sysnew Kernel.NewSys \newarr Kernel.NewArr");
+	Texts.WriteString(w, " \refs \integrate 1000H Kernel Modules ~");
+	Execute
+END SetDisk;
+
+PROCEDURE Disk*;
+VAR n: LONGINT;
+BEGIN
+	GetParam("Disk", n);
+	CASE n OF
+		0: SetDisk("IDE.")
+		|1: SetDisk("AHA1520.")
+		(*|2: SetDisk("NCR810.")*)
+	END
+END Disk;
+
+PROCEDURE Display*;
+VAR n: LONGINT;
+BEGIN
+	GetParam("Display", n);
+	CASE n OF
+		0: display := "Display='VGA.' Init='b81200cd10'+'bb003fb80110cd10'"
+		|1: display := "Display='S3C805.' Init='bb0502b8024fcd10'+'bb000fb80110cd10'"
+		|2: display := "Display='S3C924.' Init='bb0502b8024fcd10'+'bb000fb80110cd10'"
+		|3: display := "Display='W32.' Init='b83800cd10'+'bb000fb80110cd10'"
+		|4: display := "Display='ET4000.' Init='b83f00cd10' DWidth='1280' DHeight='1024' DMem='2048'"
+		|5: display := "Display='ET4000.' Init='b83800cd10' DWidth='1024' DHeight='768' DMem='1024'"
+		|6: display := "Display='ET4000.' Init='b83000cd10' DWidth='800' DHeight='600' DMem='1024'"
+		|7: display := "Display='GD54xx.' Init='b86000cd10'"
+		|8: display := "Display='S3C805.' Init='b84d00cd10'+'bb000fb80110cd10'"
+		|9: display := "Display='ET4000.' Init='b82e00cd10' DWidth='640' DHeight='480' DMem='1024'"
+	END
+END Display;
+
+PROCEDURE Mouse*;
+VAR n: LONGINT;
+BEGIN
+	GetParam("Mouse", n);
+	CASE n OF
+		0: mousetype := "6";  buttons := "3";  mouseport := ""
+		|1: mousetype := "5";  buttons := "3";  mouseport := "1"
+		|2: mousetype := "1";  buttons := "3";  mouseport := "1"
+		|3: mousetype := "6";  buttons := "2";  mouseport := ""
+		|4: mousetype := "0";  buttons := "2";  mouseport := "1"
+		|5: mousetype := "2";  buttons := "3";  mouseport := "1"
+		|6: mousetype := "3";  buttons := "3";  mouseport := "1"
+		|7: mousetype := "4";  buttons := "3";  mouseport := "1"
+	END
+END Mouse;
+
+PROCEDURE MousePort*;
+VAR n: LONGINT;
+BEGIN
+	GetParam("Mouse", n);
+	CASE n OF
+		0: mouseport := ""
+		|1: mouseport := "1"
+		|2: mouseport := "2"
+	END
+END MousePort;
+
+PROCEDURE Keyboard*;
+VAR n: LONGINT;
+BEGIN
+	GetParam("Keyboard", n);
+	CASE n OF
+		0: keyboard := "US"
+		|1: keyboard := "CH"
+		|2: keyboard := "D"
+		|3: keyboard := "N"
+	END
+END Keyboard;
+
+PROCEDURE Check(msg, config: ARRAY OF CHAR): BOOLEAN;
+BEGIN
+	IF config = "" THEN
+		Texts.WriteString(w, msg);  Texts.WriteString(w, " not defined");
+		Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf);
+		RETURN FALSE
+	ELSE
+		RETURN TRUE
+	END
+END Check;
+
+PROCEDURE CheckAll(): BOOLEAN;
+BEGIN
+	RETURN Check("Display controller", display) & Check("Mouse type", mousetype) & 
+		Check("Keyboard type", keyboard)
+END CheckAll;
+
+PROCEDURE Quote;
+BEGIN
+	Texts.Write(w, 22X)
+END Quote;
+
+PROCEDURE FixQuotes(VAR conf: ARRAY OF CHAR);
+VAR i: LONGINT;
+BEGIN
+	i := 0;
+	WHILE conf[i] # 0X DO
+		IF conf[i] = "'" THEN conf[i] := 22X END;
+		INC(i)
+	END
+END FixQuotes;
+
+PROCEDURE Params;
+BEGIN
+	Texts.WriteString(w, " MouseType=");  Quote;  Texts.WriteString(w, mousetype);  Quote;
+	IF mouseport # "" THEN
+		Texts.WriteString(w, " MousePort=");  Quote;  Texts.WriteString(w, mouseport);  Quote
+	END;
+	Texts.WriteString(w, " Buttons=");  Quote;  Texts.WriteString(w, buttons);  Quote;
+	IF keyboard # "" THEN
+		Texts.WriteString(w, " Keyboard=");  Quote;  Texts.WriteString(w, keyboard);  Quote
+	END;
+	IF esc THEN
+		Texts.WriteString(w, " EscCompat=");  Quote;  Texts.WriteString(w, "1");  Quote
+	END;
+	IF ~fontconv THEN
+		Texts.WriteString(w, " FontConv=");  Quote;  Texts.WriteString(w, "0");  Quote
+	END;
+	IF dma # 0 THEN
+		Texts.WriteString(w, " DMASize=");  Quote;  Texts.WriteInt(w, dma, 1);  Quote
+	END;
+	IF parttype # "" THEN
+		Texts.WriteString(w, " PartType=");  Quote;  Texts.WriteString(w, parttype);  Quote
+	END;
+	FixQuotes(display);
+	Texts.Write(w, " ");  Texts.WriteString(w, display)
+END Params;
+
+PROCEDURE BootDiskette*;
+BEGIN
+	IF CheckAll() THEN
+		Color(Command);  Texts.WriteString(w, "FDInstall.CreateBootFloppy ");  Color(Normal);
+		Texts.WriteString(w, Bootfile);
+		Params;
+		IF filesystem # "" THEN
+			Texts.WriteString(w, " FileSystem=");  Quote;  Texts.WriteString(w, filesystem);  Quote
+		END;
+		Texts.WriteString(w, " \ ~");
+		Execute
+	END
+END BootDiskette;
+
+PROCEDURE EscNeutralise*;
+VAR s: Texts.Scanner;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(s);
+	IF s.class = Texts.Name THEN
+		esc := s.s = "on";  Texts.WriteString(w, "EscNeutralise ");
+		IF esc THEN Texts.WriteString(w, "on")
+		ELSE Texts.WriteString(w, "off")
+		END;
+		Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf)
+	END
+END EscNeutralise;
+
+PROCEDURE FontConversion*;
+VAR s: Texts.Scanner;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(s);
+	IF s.class = Texts.Name THEN
+		fontconv := s.s = "on";  Texts.WriteString(w, "FontConversion ");
+		IF fontconv THEN Texts.WriteString(w, "on")
+		ELSE Texts.WriteString(w, "off")
+		END;
+		Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf)
+	END
+END FontConversion;
+
+PROCEDURE DMABuffer*;
+VAR s: Texts.Scanner;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(s);
+	IF s.class = Texts.Int THEN
+		dma := s.i;
+		Texts.WriteString(w, "DMABuffer");  Texts.WriteHex(w, dma);
+		Texts.Write(w, "H");  Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf)
+	END
+END DMABuffer;
+
+PROCEDURE BootPartition*;
+BEGIN
+	IF CheckAll() THEN
+		Color(Command);  Texts.WriteString(w, "Install.CopyFiles ");  Color(Normal);
+		Texts.WriteString(w, Bootfile);  Texts.WriteString(w, " ~");
+		Execute;
+		Color(Command);  Texts.WriteString(w, "Install.InitBootFile");  Color(Normal);
+		Texts.WriteString(w, " -1 ");  Texts.WriteString(w, Bootfile);
+		Params;
+		Texts.WriteString(w, " ~");
+		Execute
+	END
+END BootPartition;
+
+PROCEDURE Manual*;
+VAR s: Texts.Scanner;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(s);
+	IF s.class = Texts.Name THEN
+		manual := s.s = "on";  Texts.WriteString(w, "Manual ");
+		IF manual THEN Texts.WriteString(w, "on")
+		ELSE Texts.WriteString(w, "off")
+		END;
+		Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf)
+	END;
+	IF manual THEN
+		Texts.WriteString(w, "Manual mode: Execute commands written in log");
+		Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf)
+	END
+END Manual;
+
+PROCEDURE FAT*;
+BEGIN
+	IF filesystem # "" THEN
+		Texts.WriteString(w, "Installing to: ");  Texts.WriteString(w, filesystem)
+	ELSE
+		Texts.WriteString(w, "Error: FileSystem not specified.")
+	END;
+	Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf)
+END FAT;
+
+BEGIN
+	Texts.OpenWriter(w);  Color(Normal);  manual := FALSE;  esc := FALSE;  fontconv := TRUE;
+	Kernel.GetConfig("FileSystem", filesystem);  Kernel.GetConfig("MouseType", mousetype);  
+	Kernel.GetConfig("Buttons", buttons);  Kernel.GetConfig("MousePort", mouseport);
+	Kernel.GetConfig("Keyboard", keyboard);  Kernel.GetConfig("PartType", parttype);
+	display := "";  dma := 0
+END Config.
+
+Config.Manual on
+Config.FAT
+Config.EscNeutralise on
+Config.FontConversion off
+Config.DMABuffer 14800H
+
+Config.Disk 0 Standard IDE or ESDI
+Config.Disk 1 Adaptec 1520 SCSI
+Config.Disk 2 NCR 810 SCSI
+
+Config.Display 0 Standard VGA 640x480 16 col
+Config.Display 1 Generic S3-805 1024x768 256 col
+Config.Display 2 Generic S3-924 1024x768 256 col
+Config.Display 3 Tseng ET4000/W32 1024x768 256 col
+Config.Display 4 Tseng ET4000 1280x1024 256 col (2M)
+Config.Display 5 Tseng ET4000 1024x768 256 col
+Config.Display 6 Tseng ET4000 800x600 256 col
+Config.Display 7 Cirrus Logic GD54xx 1024x768 256 col
+Config.Display 8 Video7 Mirage S3-805 1024x768 256 col
+Config.Display 9 Tseng ET4000 640x480 256 col
+
+Config.Mouse 0 3-button PS/2
+Config.Mouse 1 3-button Logitech serial
+Config.Mouse 2 3-button Mouse Systems serial type A
+Config.Mouse 7 3-button Mouse Systems serial type B
+Config.Mouse 3 2-button PS/2
+Config.Mouse 4 2-button Microsoft serial
+Config.Mouse 5 3-button Logitech serial old type A
+Config.Mouse 6 3-button Logitech serial old type B
+
+Config.MousePort 0 Mouse on Aux port (PS/2)
+Config.MousePort 1 Serial mouse on COM1
+Config.MousePort 2 Serial mouse on COM2
+
+Config.Keyboard 0 US 101-key
+Config.Keyboard 1 Swiss 102-key
+Config.Keyboard 2 German 102-key
+Config.Keyboard 3 Norwegian 102-key
+
+Config.BootDiskette
+Config.BootPartition

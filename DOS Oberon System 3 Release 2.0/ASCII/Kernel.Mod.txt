@@ -1,0 +1,722 @@
+MODULE Kernel;	(* RC 25.11.93 / ARD 1. 12. 93 *)
+(* ARD 31.08.93, New segments and parameters *)
+
+(* WARNING: do not use NEW nor SYSTEM.NEW in this module !! use NewRec, NewArr or NewSys instead *)
+(* WARNING: DON'T USE ANY COMPILEROPTIONS *)
+
+	IMPORT S := SYSTEM;
+
+	CONST MarkBit* = 0; 
+	
+	TYPE
+		Name* = ARRAY 32 OF CHAR;
+		ADDRESS = LONGINT;
+
+		Cmd* = RECORD name*: Name; adr*: ADDRESS END;
+
+(*	Entries* = POINTER TO ARRAY MaxEntry OF (*absolute*) LONGINT;
+		Cmds* = POINTER TO ARRAY MaxCmds OF RECORD name*: Name32; absentr*: (*absolute*) LONGINT END;
+		PtrTab* = POINTER TO ARRAY MaxPtrs+MaxTD OF (*offset*) LONGINT;
+		Imports* = POINTER TO ARRAY MaxImports OF LONGINT;
+		SB* = LONGINT;*)		
+		
+		Module* = POINTER TO ModuleDesc;
+		ModuleDesc = RECORD
+			link: Module;
+			name: Name;
+			init, trapped: BOOLEAN;
+			key, refcnt, nofentr, nofcom, nofptr, nofimp, size, nofrecs: LONGINT;
+			entries: LONGINT;
+			cmds: LONGINT;
+			ptrTab: LONGINT;
+			tdescs: LONGINT;
+			imports: LONGINT;
+			SB: LONGINT (* Static base *);
+			data, code: LONGINT;
+			refs: LONGINT;
+		END;
+		
+		REGISTER* = RECORD
+								AX*, CX*, DX*, BX*: INTEGER;
+								SP*, BP*, SI*, DI*: INTEGER;		(* SP, BP: read only *)
+								Flags*: INTEGER;							(* read only *)
+								CS*, SS*: LONGINT;						(* read only *)
+								DS*, ES*: LONGINT
+							END;
+							
+							(* Bit 0: Carry CF
+								Bit 1: unused
+								Bit 2: Parity PF
+								Bit 3: unused
+								Bit 4: Auxiliary AF
+								Bit 5: Overflow OF
+								Bit 6: Zero ZF
+								Bit 7: SignSF *)
+
+		GcNotifier* = PROCEDURE;
+		Buffer* = ARRAY 4096 OF CHAR;
+		Proc* = PROCEDURE;
+		Tag* = POINTER TO TypeDesc;
+		Buf* = POINTER TO Buffer;
+		Register* = POINTER TO REGISTER;
+		
+	VAR	(* the declaration order of the following variables is implicitly known by the loader ! *)
+		INT*: PROCEDURE(R: Register; Int: INTEGER);														(* initialized by the loader *)
+		Reg*: Register;																										(* initialized by the loader *)
+		Transfer*: Buf;																										(* initialized by the loader *)
+		heapAdr*: LONGINT;																										(* initialized by the loader *)
+		heapSize*: LONGINT;																										(* initialized by the loader *)
+		StackOrg*: LONGINT;																										(* initialized by the loader *)
+		xxx*: LONGINT;																										(* initialized by the loader *)
+		modules*: LONGINT;																	(* initialized by the loader, pointer to module list anchor *)
+		Load*: PROCEDURE (mod: ARRAY OF CHAR; VAR m: Module; VAR res: INTEGER);		(* initialized by the loader *)
+		GetProc*: PROCEDURE (cmd: ARRAY OF CHAR; m: Module; VAR command: Proc; VAR res: INTEGER);
+		Free*: PROCEDURE (mod: ARRAY OF CHAR; all: BOOLEAN; VAR res: INTEGER);			(* initialized by the loader *)
+		Main*: LONGINT; 	(* Address of Mainpath *)																(* initialized by the loader *)
+		File1*: LONGINT;	(* Address of File1 *)																		(* initialized by the loader *)
+		File2*: LONGINT;	(* Address of File2 *)																		(* initialized by the loader *)
+		Display*: LONGINT;																											(* initialized by the loader *)
+		dx*: LONGINT;																													(* initialized by the loader *)
+		TableRoot*: LONGINT;																										(* initialized by the loader *)	
+		new*: PROCEDURE(tag: Tag): LONGINT;										(* accessed by the loader to get the address for NEW *)
+		systemNew*: PROCEDURE(size: LONGINT): ADDRESS;		(* accessed by the loader to get the address for SYSTEM.NEW *)
+
+		TrapHandlingLevel*: LONGINT;
+		GCenabled*: BOOLEAN;
+		nofiles*: INTEGER;	(* number of open files *)
+		DX*: INTEGER;
+		WildCard*: LONGINT;
+		FontRoot*: LONGINT;	(* Addr of pointer to first Lib *)
+		DS*, ES*: INTEGER;																							(* initialized by the loader *)
+		OldSegment*: LONGINT;
+		
+	TYPE
+		TypeDesc = RECORD
+			size: LONGINT;
+			ptroff: LONGINT
+		END;
+
+		FreeBlockPtr = POINTER TO FreeBlock;
+		FreeBlock = RECORD
+			(* off-4 *) tag: Tag;
+			(* off0 *) size: LONGINT;	(* field size aligned to 8-byte boundary, size MOD B = B-4 *)
+			(* off4 *) next: ADDRESS
+		END;
+
+		BlockPtr = POINTER TO Block;
+		Block = RECORD
+			lastElemToMark, currElem, firstElem: BlockPtr
+		END;
+
+		Blockm4Ptr = POINTER TO Blockm4;
+		Blockm4 = RECORD
+			tag: Tag;
+			lastElemToMark, currElem, firstElem: LONGINT
+		END;
+
+		InitPtr = POINTER TO RECORD tag: Tag; z0, z1, z2, z3, z4, z5, z6, z7: LONGINT END;
+
+		PtrElemDesc = RECORD a: POINTER TO RECORD END END;	(* has same type descriptor as element of ARRAY OF POINTER *)
+
+	CONST
+		B = 32;	(* must be a mutiple of 32 *)
+		N = 9;
+		nil = 0;
+		ArrayBit = 1;
+		FreeBit = 2;
+		SubObjBit = 3;
+		mark = {MarkBit}; array = {ArrayBit}; free = {FreeBit};
+		ReserveSize = 65536-8;
+		
+	VAR
+		firstBlock, endBlock: (*FreeBlockPtr*) ADDRESS;	(* free blocks must be collected !! *)
+		A: ARRAY N+1 OF (*FreeBlockPtr*) ADDRESS;
+		reserve: BlockPtr;
+		ptrElemTag: LONGINT;
+		firstTry: BOOLEAN;
+		gcNotifier: ARRAY 16 OF GcNotifier;
+		candidates: ARRAY 1024 OF LONGINT;
+		nofcand: INTEGER;
+		wildcard: ARRAY 4 OF CHAR;
+
+	PROCEDURE InstallTrap*(p: Proc);
+	VAR seg: LONGINT;
+	BEGIN
+	seg := OldSegment;
+	(*$ DInline.Assemble
+			CLI
+			MOV EBX, $20
+			MOV FS, BX
+			MOV EBX, 66
+			ADD EBX, seg[EBP]
+			MOV EAX, 8[EBP]
+			MOV FS:[EBX], EAX
+			STI
+			END *)
+	END InstallTrap;
+	
+	PROCEDURE InstallLoop*(p: Proc);
+	VAR seg: LONGINT;
+	BEGIN
+	seg := OldSegment;
+	(*$ DInline.Assemble
+			CLI
+			MOV EBX, $20
+			MOV FS, BX
+			MOV EBX, 84
+			ADD EBX, seg[EBP]
+			MOV EAX, 8[EBP]
+			MOV FS:[EBX], EAX
+			STI
+			END *)
+	END InstallLoop;
+	
+	PROCEDURE InstallIP*(p: Proc; chan: INTEGER);
+	VAR seg: LONGINT;
+	BEGIN 
+		seg := OldSegment;
+		IF (chan >=0) & (chan <= 15) THEN 
+			IF chan = 0 THEN (* timer tick *) chan := 97
+			ELSE chan := 105 + (chan-1)*10 + 2 END;
+			(*$ DInline.Assemble
+			CLI
+			MOV EBX, $20
+			MOV FS, BX
+			MOV EBX, 8[EBP]
+			ADD EBX, seg[EBP]
+			MOV EAX, 12[EBP]
+			MOV CL, $9A
+			MOV FS:[EBX], CL
+			MOV FS:1[EBX], EAX
+			MOV FS:5[EBX], $18:word
+			STI
+			END *)	
+		END
+	END InstallIP;
+	
+	PROCEDURE GetOldIP*(VAR seg: INTEGER; VAR addr: LONGINT; chan: INTEGER);
+	(* Gets old interruptaddress *)
+	BEGIN 
+		IF (chan >=0) & (chan <= 15) THEN chan := 88 + chan*10 + 3; (*installip(p, 88 + chan*10 + 3)*)
+			(*$ DInline.Assemble
+			CLI
+			MOV EBX, $20
+			MOV FS, BX
+			MOV EBX, chan[EBP]
+			MOV EAX, addr[EBP]
+			MOV ECX, seg[EBP]
+			MOV EDX, FS:[EBX]		; address
+			MOV [EAX], EDX
+			MOV DX, FS:4[EBX]		; segment
+			MOV [EBX], DX
+			STI
+			END *)	
+		END
+	END GetOldIP;
+	
+	PROCEDURE CallOldIP*(seg: INTEGER; addr: LONGINT);
+	END CallOldIP;
+	
+	PROCEDURE ResetIP*(chan: INTEGER; addr: LONGINT);
+	VAR seg: LONGINT;
+	BEGIN
+	seg := OldSegment;
+		IF (chan =0) THEN chan := 97;
+			(*$ DInline.Assemble
+			CLI
+			MOV EBX, $20
+			MOV FS, BX
+			MOV EBX, chan[EBP]
+			ADD EBX, seg[EBP]
+			MOV AL, $61
+			MOV FS:[EBX], AL		; POPA
+			MOV AL, $CF
+			MOV FS:1[EBX], AL		; IRET
+			STI
+			END *)	
+		END
+	END ResetIP;
+	
+	PROCEDURE TRAP;
+	BEGIN
+		(*$ DInline.Assemble
+		PUSH 26:double
+		INT 3
+		END *)
+	END TRAP;
+	
+	PROCEDURE err*(adr: LONGINT): INTEGER;
+	VAR nr: INTEGER;
+	BEGIN
+		S.GET(adr+28, nr);
+		RETURN nr
+	END err;
+	
+	PROCEDURE pc*(adr: LONGINT): LONGINT;
+	VAR nr: LONGINT;
+	BEGIN
+		S.GET(adr+16, nr);
+		RETURN nr
+	END pc;
+	
+	PROCEDURE fp*(): LONGINT;
+	VAR bp: LONGINT; nr: LONGINT;
+	BEGIN
+		S.GETREG(5, bp);
+		S.GET(bp, nr); S.GET(nr, nr);
+		RETURN nr
+	END fp;
+	
+	PROCEDURE GetMod*(pc: LONGINT): LONGINT;
+	VAR start: Module;
+	BEGIN
+		S.GET(modules, start);
+		IF pc < (heapAdr + heapSize) THEN
+			WHILE (start # NIL) & ((pc < start.code) OR (start.size+start.entries <= pc)) DO start := start.link END;
+		END;
+		RETURN S.VAL(LONGINT, start)
+	END GetMod;
+	
+	PROCEDURE InstallgcNotifier*(notifier: GcNotifier);
+	VAR i: SHORTINT;
+	BEGIN
+		i := 0;
+		LOOP
+			IF gcNotifier[i] = NIL THEN gcNotifier[i] := notifier; EXIT END;
+			INC(i);
+			IF i = LEN(gcNotifier) THEN EXIT END
+		END
+	END InstallgcNotifier;
+
+	PROCEDURE RemovegcNotifier*(notifier: GcNotifier);
+		VAR i: SHORTINT;
+	BEGIN
+		i := 0;
+		LOOP
+			IF gcNotifier[i] = notifier THEN gcNotifier[i] := NIL; EXIT END;
+			INC(i);
+			IF i = LEN(gcNotifier) THEN EXIT END
+		END
+	END RemovegcNotifier;
+	
+	PROCEDURE Available*(): LONGINT;
+	VAR i, avail: LONGINT; ptr: FreeBlockPtr;
+	BEGIN
+		avail := 0; i := 0;
+		WHILE i <= N DO
+			ptr := S.VAL(FreeBlockPtr, A[i]);
+			WHILE ptr # NIL DO
+				INC(avail, ptr^.size); ptr := S.VAL(FreeBlockPtr, ptr^.next)
+			END;
+			INC(i)
+		END;
+		RETURN avail
+	END Available;
+	
+	PROCEDURE LargestAvailable*(): LONGINT;
+	VAR i, max: LONGINT; ptr: FreeBlockPtr;
+	BEGIN
+		i := N; max := 0;
+		WHILE (i >= 0) & (max = 0) DO
+			ptr := S.VAL(FreeBlockPtr, A[i]);
+			WHILE ptr # NIL DO
+				IF ptr^.size > max THEN max := ptr^.size END;
+				ptr := S.VAL(FreeBlockPtr, ptr^.next)
+			END;
+			DEC(i)
+		END;
+		RETURN max
+	END LargestAvailable;
+	
+	PROCEDURE Mark(block: BlockPtr);
+		TYPE Tag = POINTER TO RECORD (*size,*) ptroff: LONGINT	END;
+			(* size skipped, because accessed via tag = actual tag + 4 *)
+		VAR father, field, currElem: BlockPtr; offset: LONGINT; tag, downtag, marked: Tag; arraybit: SET;
+	BEGIN
+		S.GET(S.VAL(ADDRESS, block)-4, tag);
+		IF ~(SubObjBit IN S.VAL(SET, block)) THEN	(* not a subobject *)
+			marked := S.VAL(Tag, S.VAL(SET, tag) + mark);
+			IF tag # marked THEN
+				S.PUT(S.VAL(ADDRESS, block)-4, marked);
+				S.GET(S.VAL(ADDRESS, S.VAL(SET, tag) - array)-4, marked);
+				EXCL(S.VAL(SET, marked), MarkBit);	(* necessary to mask mark bit *)
+				S.GET(S.VAL(ADDRESS, marked)-4, arraybit);
+				INCL(arraybit, MarkBit);
+				S.PUT(S.VAL(ADDRESS, marked)-4, arraybit);
+				arraybit := S.VAL(SET, tag) * array;
+				IF arraybit # {} THEN currElem := block^.firstElem;
+					tag := S.VAL(Tag, S.VAL(SET, tag) - arraybit)
+				ELSE currElem := block END;
+				father := NIL;
+				LOOP
+					INC(S.VAL(ADDRESS, tag), 4);
+					offset := tag^.ptroff;
+					IF offset < 0 THEN
+						INC(S.VAL(ADDRESS, tag), offset);
+						IF (arraybit # {}) & (currElem # block^.lastElemToMark) THEN
+							INC(S.VAL(ADDRESS, currElem), (*tag^.size*) tag^.ptroff)	(* tag is correct, not actual tag + 4 *)
+						ELSE (* up *)
+							S.PUT(S.VAL(ADDRESS, block)-4, S.VAL(SET, tag) + arraybit + mark);
+							IF father = NIL THEN EXIT END;
+							S.GET(S.VAL(ADDRESS, father)-4, tag);
+							arraybit := S.VAL(SET, tag) * array;
+							tag := S.VAL(Tag, S.VAL(SET, tag) - (array + mark));
+							IF arraybit # {} THEN currElem := father^.currElem
+							ELSE currElem := father
+							END;
+							offset (*field address*) := S.VAL(ADDRESS, currElem) + tag^.ptroff;
+							S.GET(offset, field);
+							S.PUT(offset, block);
+							block := father;
+							father := field
+						END
+					ELSE
+						offset (*field address*) := S.VAL(ADDRESS, currElem) + offset;
+						S.GET(offset, field);
+						IF field # NIL THEN
+							S.GET(S.VAL(ADDRESS, field)-4, downtag);
+							IF ~(SubObjBit IN S.VAL(SET, field)) THEN	(* not a subobject *)
+								marked := S.VAL(Tag, S.VAL(SET, downtag) + mark);
+								IF downtag # marked THEN (* down *)
+									S.PUT(S.VAL(ADDRESS, field)-4, marked);
+									S.PUT(S.VAL(ADDRESS, block)-4, S.VAL(SET, tag) + arraybit + mark);
+									IF arraybit # {} THEN block^.currElem:= currElem END;
+									S.GET(S.VAL(ADDRESS, S.VAL(SET, downtag) - array)-4, marked);
+									EXCL(S.VAL(SET, marked), MarkBit);	(* necessary to mask mark bit *)
+									S.GET(S.VAL(ADDRESS, marked)-4, arraybit);
+									INCL(arraybit, MarkBit);
+									S.PUT(S.VAL(ADDRESS, marked)-4, arraybit);
+									arraybit := S.VAL(SET, downtag) * array;
+									IF arraybit # {} THEN currElem := field^.firstElem ELSE currElem := field END;
+									S.PUT(offset, father);
+									father := block;
+									block := field;
+									tag := S.VAL(Tag, S.VAL(SET, downtag) - arraybit)
+								END
+							ELSE	(* do not mark subobject *)
+								S.GET(S.VAL(ADDRESS, S.VAL(SET, downtag) - array)-4, marked);
+								EXCL(S.VAL(SET, marked), MarkBit);
+								S.GET(S.VAL(ADDRESS, marked)-4, downtag);
+								INCL(S.VAL(SET, downtag), MarkBit);
+								S.PUT(S.VAL(ADDRESS, marked)-4, downtag)
+							END
+						END
+					END
+				END
+			END
+		ELSE	(* do not mark subobject, subobjects are not traced *)
+			S.GET(S.VAL(ADDRESS, S.VAL(SET, tag) - array)-4, tag);
+			EXCL(S.VAL(SET, tag), MarkBit);
+			S.GET(S.VAL(ADDRESS, tag)-4, arraybit);
+			INCL(arraybit, MarkBit);
+			S.PUT(S.VAL(ADDRESS, tag)-4, arraybit)
+		END
+	END Mark;
+
+	PROCEDURE Sweep;
+	VAR p, end: Blockm4Ptr; lastp: FreeBlockPtr; tag, notmarked, tdesc: Tag; size, lastsize, i: LONGINT;
+			lastA: ARRAY N+1 OF ADDRESS;
+	BEGIN
+		i := 0;
+		WHILE i <= N DO A[i] := nil; lastA[i] := S.ADR(A[i]); INC(i) END;
+		p := S.VAL(Blockm4Ptr, firstBlock);
+		end := S.VAL(Blockm4Ptr, endBlock);
+		lastsize := 0;
+		WHILE p # end DO
+			tag := S.VAL(Tag, S.VAL(SET, p^.tag) - free);
+			notmarked := S.VAL(Tag, S.VAL(SET, tag) - mark);
+			tdesc := S.VAL(Tag, S.VAL(SET, notmarked) - array);
+			IF notmarked # tdesc THEN (* array block *) size := p^.lastElemToMark + tdesc^.size - S.VAL(ADDRESS, p)
+			ELSE size := tdesc^.size + 4
+			END;
+			size := S.VAL(LONGINT, S.VAL(SET, size + B-1)-S.VAL(SET, B-1));
+			IF tag = notmarked THEN (* collect *)
+				IF lastsize = 0 THEN lastp := S.VAL(FreeBlockPtr, p) END;
+				INC(lastsize, size)
+			ELSE
+				p^.tag := notmarked;
+				IF lastsize > 0 THEN
+					lastp^.size := lastsize - 4;
+					lastp^.tag := S.VAL(Tag, S.VAL(SET, S.ADR(lastp^.size)) + free);
+					i := lastsize DIV B;
+					IF i > N THEN i := N END;
+					lastp^.next := nil;
+					S.PUT(lastA[i], lastp);
+					lastA[i] := S.ADR(lastp^.next);
+					lastsize := 0
+				END
+			END;
+			INC(S.VAL(ADDRESS, p), size)
+		END;
+		(* last collected block: *)
+		IF lastsize > 0 THEN
+			lastp^.size := lastsize - 4;
+			lastp^.tag := S.VAL(Tag, S.VAL(SET, S.ADR(lastp^.size)) + free);
+			i := lastsize DIV B;
+			IF i > N THEN i := N END;
+			lastp^.next := nil;
+			S.PUT(lastA[i], lastp);
+			lastA[i] := S.ADR(lastp^.next)
+		END
+	END Sweep;
+
+	PROCEDURE CheckCandidates;	(* nofcand > 0 *)
+	VAR i, j, h, p: LONGINT; block: Blockm4Ptr; notmarked, tdesc: Tag;
+	BEGIN
+	(* first sort them in increasing order using shellsort *)
+		h := 1; REPEAT h := h*3 + 1 UNTIL h > nofcand;
+		REPEAT h := h DIV 3; i := h;
+			WHILE i < nofcand DO p := candidates[i]; j := i;
+				WHILE (j >= h) & (candidates[j-h] > p) DO
+					candidates[j] := candidates[j-h]; j := j-h;
+				END;
+				candidates[j] := p; INC(i)
+			END
+		UNTIL h = 1;
+	(* sweep phase *)
+		block := S.VAL(Blockm4Ptr, firstBlock);
+		i := 0; p := candidates[i];
+		LOOP
+			IF p <= S.VAL(ADDRESS, block) + 4 THEN
+				IF p = S.VAL(ADDRESS, block) + 4 THEN Mark(S.VAL(BlockPtr, p)) END;
+				INC(i);
+				IF i = nofcand THEN EXIT END;
+				p := candidates[i]
+(* ****** ****** *)
+			ELSIF p <= S.VAL(ADDRESS, block) + 28 THEN
+				IF p = S.VAL(ADDRESS, block) + 28 THEN Mark(S.VAL(BlockPtr, p)) END;
+				INC(i);
+				IF i = nofcand THEN EXIT END;
+				p := candidates[i]
+(* ****** ****** *)
+			ELSE
+				notmarked := S.VAL(Tag, S.VAL(SET, block^.tag) - (mark + free));
+				tdesc := S.VAL(Tag, S.VAL(SET, notmarked) - array);
+				IF notmarked # tdesc THEN (* array block *)
+					h := block^.lastElemToMark + tdesc^.size - S.VAL(ADDRESS, block)
+				ELSE h := tdesc^.size + 4 END;
+				INC(S.VAL(ADDRESS, block), S.VAL(LONGINT, S.VAL(SET, h + B-1)-S.VAL(SET, B-1)));
+				IF block = S.VAL(Blockm4Ptr, endBlock) THEN EXIT END
+			END
+		END;
+		nofcand := 0
+	END CheckCandidates;
+
+	PROCEDURE Candidate(p: LONGINT);
+	VAR tag: LONGINT;
+	BEGIN
+		IF ((p MOD B = 0) OR (p MOD 16 = 8)) & (p > firstBlock) & (p < endBlock) THEN
+			S.GET(p-4, tag);
+			IF tag MOD 8 IN {0, 2} (* array or record, not yet marked, not free *) THEN
+				candidates[nofcand] := p; INC(nofcand);
+				IF nofcand = LEN(candidates) THEN CheckCandidates END
+			END
+		END
+	END Candidate;
+	
+	PROCEDURE ^NewSys*(size: LONGINT): ADDRESS;	(* implementation of S.NEW(ptr, size) *)
+
+	PROCEDURE GC*;
+	VAR m: Module; i, SB, p, sp, ptradr: LONGINT; ptr: BlockPtr; curNotifier: GcNotifier; desc, root, first: LONGINT;
+	BEGIN
+		IF GCenabled THEN	(* ModuleDesc and ModuleBlock are marked via Kernel.modules *)
+			
+			(* for collecting Fonts: next-field is not a ptr *)
+			root := FontRoot;					(* addr of ptr *)
+			S.GET(root, root);		(* ptr to font *)
+			S.GET(root-4, desc);	(* descriptor *)
+			S.PUT(desc+4, 4);	(* next off to next field *)		(* !!! NOT PORTABLE *)
+		
+			S.GET(modules, m); 		(* <-- ARD ; m := modules;*)
+			WHILE m # NIL DO
+				IF S.VAL(LONGINT, m) > 100000H THEN
+					Mark(S.VAL(BlockPtr, m)); Mark(S.VAL(BlockPtr, m.entries));
+					 i := m.nofptr; SB := m^.SB; ptradr := m.ptrTab;
+					WHILE i > 0 DO
+						S.GET(ptradr, p); S.GET(SB+p, ptr);
+						IF ptr # NIL THEN Mark(ptr) END;
+						DEC(i); INC(ptradr, 4)
+					END;
+					i := m.nofrecs; ptradr := m.tdescs;
+					WHILE i > 0 DO
+						S.GET(ptradr, p); S.GET(SB+p, ptr); Mark(ptr);
+						DEC(i); INC(ptradr, 4)
+					END;
+				END;
+				m := m^.link
+			END;
+			S.GETREG(4, sp);
+			IF sp > StackOrg THEN HALT(99) END;
+			nofcand := 0;
+			WHILE sp < StackOrg DO
+				S.GET(sp, p); Candidate(p);
+				INC(sp, 4)
+			END;
+			IF nofcand > 0 THEN CheckCandidates END;
+
+			i := 0;
+			WHILE i < LEN(gcNotifier) DO
+				IF gcNotifier[i] # NIL THEN curNotifier := gcNotifier[i]; gcNotifier[i] := NIL; curNotifier; gcNotifier[i] := curNotifier END;
+				INC(i)
+			END;
+			
+			S.PUT(desc+4, 0H);	(* original next field *)		(* !!! NOT PORTABLE *)
+			first := FontRoot; S.GET(first, root);
+			WHILE root # 0 DO
+				S.GET(root-4, desc);
+				IF (desc MOD 2) = 1 THEN S.PUT(first, root); first := root END;
+				S.GET(root, root);
+			END;
+			S.PUT(first, 0);
+			
+			Sweep; 
+			IF (reserve = NIL) & firstTry THEN
+				IF LargestAvailable() >= ReserveSize THEN reserve := S.VAL(BlockPtr, NewSys(ReserveSize)) END
+			END;
+		END
+	END GC;
+
+	PROCEDURE NewBlock(size: LONGINT): InitPtr;	(* size MOD B = 0 *)
+	VAR i, rest: LONGINT; adr, AN: ADDRESS; ptr: InitPtr; restptr: FreeBlockPtr;
+	BEGIN
+		IF size < 0 (* NEW(p, MAX(LONGINT)) *) THEN HALT(99) END;
+		i := size DIV B;
+		IF i > N THEN i := N END;
+		adr := S.ADR(A[0]) + 4*i;
+		AN := S.ADR(A[N]);	(* constant register *)
+		LOOP
+			S.GET(adr, ptr);
+			IF adr = AN THEN
+				LOOP
+					IF ptr = NIL THEN
+						IF firstTry THEN GC;
+							firstTry := FALSE; ptr := NewBlock(size); firstTry := TRUE;
+							RETURN ptr
+						ELSE reserve := NIL; GC; firstTry := TRUE; TRAP;
+						END
+					END;
+					IF ptr^.z0 + 4 >= size THEN EXIT END;
+					adr := S.ADR(ptr^.z1); S.GET(adr, ptr)
+				END;
+				EXIT
+			END;
+			IF ptr # NIL THEN EXIT END;
+			INC(adr, 4)
+		END;
+		(* ptr # NIL *)
+		S.PUT(adr, ptr^.z1);
+		rest := ptr^.z0 + 4 - size;
+		restptr := S.VAL(FreeBlockPtr, S.VAL(ADDRESS, ptr) + size);
+		IF rest > 0 THEN	(* >= B >= 16 *)
+			i := rest DIV B;
+			IF i > N THEN i := N END;
+			restptr^.tag := S.VAL(Tag, S.ADR(restptr^.size));
+			restptr^.size := rest - 4;
+			restptr^.next := A[i]; A[i] := S.VAL(ADDRESS, restptr)
+		END;
+		RETURN ptr
+	END NewBlock;
+		
+	PROCEDURE NewRec*(tag: Tag): ADDRESS;	(* implementation of NEW(ptr) *)
+	VAR size, noftbp, off, entry: LONGINT; ptr, init: InitPtr; m, imported: Module; mno, pno: LONGINT;
+	BEGIN (* tag^.size = rectyp^.size *)
+		size := S.VAL(LONGINT, S.VAL(SET, tag^.size + (4 (*tag*) + B-1))-S.VAL(SET, B-1));
+		ptr := NewBlock(size);
+		init := S.VAL(InitPtr, S.VAL(ADDRESS, ptr) + size - 32);
+		init^.z0 := 0; init^.z1 := 0; init^.z2 := 0; init^.z3 := 0; init^.z4 := 0; init^.z5 := 0; init^.z6 := 0;
+		WHILE init # ptr DO
+			DEC(S.VAL(ADDRESS, init), 32);
+			init^.z0 := 0; init^.z1 := 0; init^.z2 := 0; init^.z3 := 0; init^.z4 := 0; init^.z5 := 0; init^.z6 := 0; init^.z7 := 0
+		END;
+		ptr^.tag := tag;
+		S.GET(S.VAL(LONGINT, tag)-172, noftbp);
+		IF noftbp > 0 THEN
+			S.GET(S.VAL(LONGINT, tag)-136, m);
+			WHILE noftbp > 0 DO
+				S.GET(S.VAL(LONGINT, tag)+noftbp*4-136, off);
+				mno := off MOD 10000H DIV 100H; pno := off MOD 100H; 
+				S.GET(m.imports + mno*4, imported);
+				S.GET(imported.entries+pno*4, entry);
+				S.PUT(S.VAL(LONGINT, ptr) + 4 + off DIV 10000H, entry);
+				DEC(noftbp)
+			END
+		END;
+		RETURN S.VAL(ADDRESS, ptr) + 4
+	END NewRec;
+	
+	PROCEDURE NewSys*(size: LONGINT): ADDRESS;	(* implementation of S.NEW(ptr, size) *)
+	VAR ptr, init: InitPtr; 
+	BEGIN
+		size := S.VAL(LONGINT, S.VAL(SET, size + (28 + B-1))-S.VAL(SET, B-1));
+		ptr := NewBlock(size);
+		init := S.VAL(InitPtr, S.VAL(ADDRESS, ptr) + size - 32);
+		WHILE init # ptr DO
+			init^.tag := NIL; init^.z0 := 0; init^.z1 := 0; init^.z2 := 0; init^.z3 := 0; init^.z4 := 0; init^.z5 := 0; init^.z6 := 0;
+			DEC(S.VAL(ADDRESS, init), 32);
+		END;
+		ptr^.tag := S.VAL(Tag, S.ADR(ptr^.z0));
+		ptr^.z0 := size - 4;
+		ptr^.z1 := -4;
+		init^.z2 := 0; init^.z3 := 0; init^.z4 := 0;
+		ptr^.z5 := S.ADR(ptr^.z0);
+		init^.z6 := 0;
+		RETURN S.VAL(ADDRESS, ptr) + 28
+	END NewSys;
+
+	PROCEDURE NewArr*(eltag: Tag; nofelem, nofdim: LONGINT): ADDRESS;	(* implementation of NEW(ptr, dim0, dim1, ...) *)
+	VAR size, firstElem, elSize, arrSize, vectSize: LONGINT; ptr, init: InitPtr;
+	BEGIN
+		IF eltag = NIL THEN (* ARRAY OF POINTER *) eltag := S.VAL(Tag, ptrElemTag) END;
+		elSize := eltag^.size;
+		arrSize := nofelem*elSize;
+		vectSize := 8*(nofdim DIV 2) + 4;	(* -> ADR(firstElem) MOD 8 = 0 *)
+		IF eltag^.ptroff = -4 THEN (* no pointers in element type *) RETURN NewSys(arrSize + vectSize + 12) END;
+		size := S.VAL(LONGINT, S.VAL(SET, arrSize + vectSize + (16 + B-1))-S.VAL(SET, B-1));
+		ptr := NewBlock(size);
+		init := S.VAL(InitPtr, S.VAL(ADDRESS, ptr) + size - 32);
+		WHILE init # ptr DO
+			init^.tag := NIL; init^.z0 := 0; init^.z1 := 0; init^.z2 := 0; init^.z3 := 0; init^.z4 := 0; init^.z5 := 0; init^.z6 := 0;
+			DEC(S.VAL(ADDRESS, init), 32);
+		END;
+		ptr^.tag := S.VAL(Tag, S.VAL(SET, eltag) + array);
+		firstElem := S.ADR(ptr^.z3) + vectSize;
+		ptr^.z0 := firstElem + arrSize - elSize;
+		(* ptr^.z1 is reserved for Mark phase *)
+		ptr^.z2 := firstElem;
+		ptr^.z3 := 0; ptr^.z4 := 0; ptr^.z5 := 0; ptr^.z6 := 0;
+		RETURN S.VAL(ADDRESS, ptr) + 4
+	END NewArr;
+
+	PROCEDURE InitKernel;	(* heapAdr, heapSize, firstBlock and modules already initialized *)
+	VAR size, i: LONGINT; rest: FreeBlockPtr; m: Module;
+	BEGIN
+		(* communicate allocation routine addresses to the loader *)
+		new := NewRec;
+		systemNew := NewSys;
+		(* newArr := NewArr; *)
+
+		size := heapAdr + heapSize - firstBlock;
+		DEC(size, size MOD B);
+		endBlock := firstBlock + size;
+		i := heapAdr;
+		WHILE i <=endBlock-4 DO S.PUT(i, LONG(LONG(0))); INC(i, 4) END;
+		
+		S.GET(modules, m);											 (* <-- ARD *)
+		S.GET(m.tdescs + (m.nofrecs-1)*4, ptrElemTag);		 (* <-- ARD *)
+		
+		rest := S.VAL(FreeBlockPtr, firstBlock);
+		rest^.tag := S.VAL(Tag, S.VAL(SET, S.ADR(rest^.size)) + free);
+		rest^.size := S.VAL(LONGINT, endBlock) - S.VAL(LONGINT, rest) - 4;
+		i := 0;
+		WHILE i < LEN(gcNotifier) DO gcNotifier[i] := NIL; INC(i) END;
+		firstTry := TRUE;
+		Sweep;
+		GCenabled := FALSE;
+		reserve := S.VAL(BlockPtr, NewSys(ReserveSize));
+	END InitKernel;
+	
+BEGIN
+	DX := SHORT(dx); wildcard := "*.*"; WildCard := S.ADR(wildcard);
+	firstBlock := heapAdr + ((-heapAdr-4) MOD B);
+	InitKernel; 
+END Kernel.

@@ -1,0 +1,311 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Gages; (* kr/ jm 21.12.94 *)
+
+IMPORT
+	Input, Display, Effects, Objects, Gadgets, Oberon, Files, BasicGadgets, Fonts, (*DOS,*) FileDir, Kernel, Display3, Attributes ; 
+
+CONST
+	ModName = "Gages"; Max = 128;
+
+TYPE
+	Frame* = POINTER TO FrameDesc;
+	FrameDesc* = RECORD (Gadgets.FrameDesc)
+		points*: ARRAY Max OF LONGINT;
+		min, max: LONGINT;
+		maxPoints : INTEGER;
+		beg, end: INTEGER;
+	END;
+
+VAR
+	mem, Load, lap: BasicGadgets.Integer;
+	drv : BasicGadgets.String;
+	task : Oberon.Task;
+	inthandle : Objects.Handler;
+	time, lastmem: LONGINT;
+	maxLoad, loadtime,load, laptime: LONGINT; 
+
+(* -------- mem integer ---------- *)
+
+PROCEDURE NewMem*;
+BEGIN
+	Objects.NewObj := mem;  
+END NewMem;
+
+PROCEDURE NewLoad*;
+BEGIN Objects.NewObj := Load;  
+END NewLoad;
+
+PROCEDURE NewDrv*;
+BEGIN Objects.NewObj := drv; 
+END NewDrv;
+
+PROCEDURE NewLap*;
+BEGIN Objects.NewObj := lap; 
+END NewLap;
+
+PROCEDURE *HandleMem(obj: Objects.Object; VAR M: Objects.ObjMsg);	
+BEGIN
+	IF M IS Objects.CopyMsg THEN 
+		WITH M : Objects.CopyMsg DO
+			M.obj := mem;
+		END
+	ELSIF M IS Objects.AttrMsg THEN
+		WITH M : Objects.AttrMsg DO
+			IF (M.id = Objects.get) & (M.name = "Gen") THEN M.s := "Gages.NewMem"
+			ELSE inthandle(obj, M)
+			END
+		END
+	ELSE inthandle(obj, M);
+	END
+END HandleMem;
+
+PROCEDURE *HandleL(obj: Objects.Object; VAR M: Objects.ObjMsg);	
+BEGIN
+	IF M IS Objects.CopyMsg THEN 
+		WITH M : Objects.CopyMsg DO
+			M.obj := Load;
+		END
+	ELSIF M IS Objects.AttrMsg THEN
+		WITH M : Objects.AttrMsg DO
+			IF (M.id = Objects.get) & (M.name = "Gen") THEN M.s := "Gages.NewLoad"
+			ELSE inthandle(obj, M)
+			END
+		END
+	ELSE inthandle(obj, M);
+	END
+END HandleL;
+
+PROCEDURE *HandleDrv(obj: Objects.Object; VAR M: Objects.ObjMsg);	
+BEGIN
+	IF M IS Objects.CopyMsg THEN 
+		WITH M : Objects.CopyMsg DO
+			M.obj := drv;
+		END
+	ELSIF M IS Objects.AttrMsg THEN
+		WITH M : Objects.AttrMsg DO
+			IF (M.id = Objects.get) & (M.name = "Gen") THEN M.s := "Gages.NewDrv" 
+			ELSE BasicGadgets.StringHandler(obj, M)
+			END
+		END
+	ELSE BasicGadgets.StringHandler(obj,M);
+	END
+END HandleDrv;
+
+PROCEDURE *HandleLap(obj: Objects.Object; VAR M: Objects.ObjMsg);	
+BEGIN
+	IF M IS Objects.CopyMsg THEN 
+		WITH M : Objects.CopyMsg DO
+			M.obj := lap;
+		END
+	ELSIF M IS Objects.AttrMsg THEN
+		WITH M : Objects.AttrMsg DO
+			IF (M.id = Objects.get) & (M.name = "Gen") THEN M.s := "Gages.NewLap" 
+			ELSE BasicGadgets.IntegerHandler(obj, M)
+			END
+		END
+	ELSE BasicGadgets.IntegerHandler(obj,M);
+	END
+END HandleLap;
+
+PROCEDURE *TaskHandle(me : Oberon.Task);
+VAR M: Gadgets.UpdateMsg; tm : LONGINT; s: ARRAY 64 OF CHAR;
+BEGIN
+	INC(load); tm := Oberon.Time();
+	IF tm - laptime > Input.TimeUnit DIV 2 THEN			
+		lap.val := (tm - laptime) * 1000  DIV Input.TimeUnit;
+		Gadgets.Update(lap);
+	END;
+	laptime := tm;
+	IF tm - loadtime > 300 THEN  
+		IF tm - loadtime > 450 THEN load  := 0;
+		ELSE load := load * 300 DIV (tm - loadtime);
+		END;
+		IF load > maxLoad THEN maxLoad := load END;
+		load := load * 100 DIV maxLoad; Load.val := (Load.val * 4 + (100 - load)) DIV 5;
+		load := 0; loadtime := tm; M.F := NIL;
+		M.obj :=Load; Display.Broadcast(M)
+	END; 
+	IF Oberon.Time() - time > 20 THEN time := Oberon.Time();
+	(* DOS
+		DOS.GetDir(Files.drv, s);
+	*)
+	(* Windows
+	FileDir.GetWorkingDirectory(s);
+	*)
+	(* Native *)
+	COPY(FileDir.prefix, s);
+	(* *)
+		IF drv.val # s THEN COPY(s,drv.val ); Gadgets.Update(drv) END;
+		IF (Kernel.Used() # lastmem) THEN 
+			mem.val := Kernel.Used(); M.F := NIL;
+			M.obj := mem; Display.Broadcast(M);
+			lastmem := Kernel.Used()
+		END
+	END
+END TaskHandle;
+
+(* --------- *)
+
+PROCEDURE AddPoint(F: Frame; x: LONGINT);
+VAR i: INTEGER;
+BEGIN
+	IF F.W -2 > Max THEN F.maxPoints := Max ELSE F.maxPoints  := F.W -2 END;
+	F.points[F.end] := x;
+	F.end := (F.end + 1) MOD F.maxPoints;
+	IF F.end = F.beg THEN
+		F.beg := (F.beg + 1) MOD F.maxPoints;
+	END;
+	i := F.beg; F.min := MAX(LONGINT); F.max := MIN(LONGINT);
+	WHILE i # F.end DO
+		IF F.points[i] < F.min THEN F.min := F.points[i] END; IF F.points[i] > F.max THEN F.max := F.points[i] END;
+		i := (i + 1) MOD F.maxPoints;
+	END;
+	IF ABS(F.max - F.min) = 0 THEN
+		F.max := F.min + 1;
+	END;
+END AddPoint;
+	
+PROCEDURE RestoreFrame(F: Frame; M: Display3.Mask; x, y, w, h: INTEGER);
+VAR i, j, mode: INTEGER; p: LONGINT; s: ARRAY 16 OF CHAR; 
+BEGIN
+	Oberon.RemoveMarks(x, y, w, h);
+	Display3.Rect3D(M, Display3.bottomC,Display3.topC, x, y, w, h, 1, Display.replace);
+	Display3.AdjustMask(M, x+1, y+1, w-2, h-2);
+	IF F.W -2 > Max THEN F.maxPoints := Max ELSE F.maxPoints  := F.W -2 END;
+	i := F.beg; j := 0;
+	WHILE i # F.end DO
+		p := (F.points[i] - F.min) * (h-5) DIV ABS(F.max - F.min);
+		Display3.ReplConst(M,12,x + j,  y , 1, SHORT(p) + 2, Display.replace);
+		Display3.ReplConst(M,Display3.textbackC,x + j,  y  + SHORT(p) + 2, 1, F.H - (SHORT(p) + 2), Display.replace);
+		i := (i + 1) MOD F.maxPoints; INC(j);
+	END;
+	Display3.ReplConst(M,Display3.textbackC, x+ j, y+1, F.W, h-2, Display.replace);
+	Attributes.IntToStr(F.max, s);
+	mode := Display.paint;
+	Display3.String(M,Display3.textC, x + 2, y + h - 12, Fonts.Default, s, mode);
+	Attributes.IntToStr(F.min, s);
+	Display3.String(M, Display3.textC, x + 2, y + 2,  Fonts.Default, s, mode);
+	IF Gadgets.selected IN F.state THEN
+		Display3.FillPattern(M, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+	END
+END RestoreFrame;
+
+PROCEDURE FrameAttr(F: Frame; VAR M: Objects.AttrMsg);
+BEGIN
+	IF M.id = Objects.get THEN
+		IF M.name = "Gen" THEN M.class := Objects.String; COPY("Gages.NewFrame", M.s); M.res := 0
+		ELSE Gadgets.framehandle(F, M)
+		END
+	ELSIF M.id = Objects.set THEN
+		Gadgets.framehandle(F, M);
+	ELSIF M.id = Objects.enum THEN
+		Gadgets.framehandle(F, M)
+	END
+END FrameAttr;
+
+PROCEDURE *FrameHandler(F: Objects.Object; VAR M: Objects.ObjMsg);
+VAR x, y, w, h, cx, cy, cw, ch, u, v: INTEGER; F0: Frame;  R : Display3.Mask;
+BEGIN
+	WITH F: Frame DO
+		IF M IS Objects.AttrMsg THEN
+			FrameAttr(F, M(Objects.AttrMsg))
+		ELSIF M IS Objects.FileMsg THEN
+			WITH M: Objects.FileMsg DO
+				(* --store private data here *)
+				Gadgets.framehandle(F, M);
+			END;
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				NEW(F0); Gadgets.CopyFrame(M, F, F0);
+				(* copy private data here *)
+				M.obj := F0;
+			END;
+		ELSIF M IS Display.FrameMsg THEN
+			WITH M: Display.FrameMsg DO
+				x := M.x + F.X; y := M.y + F.Y; w := F.W; h := F.H; (* calculate actual coordinates *)
+				IF M IS Display.DisplayMsg THEN
+					WITH M : Display.DisplayMsg DO
+					IF (M.F = F) OR (M.F = NIL) THEN
+						Gadgets.MakeMask(F, x, y, M.dlink, R);
+						IF M.id = Display.area THEN
+							Display3.AdjustMask(R, x + M.u, y + h - 1 + M.v, M.w, M.h);
+						END;
+						RestoreFrame(F, R, x, y, w, h)
+					END
+					END
+				ELSIF M IS Display.LocateMsg THEN
+					WITH M: Display.LocateMsg DO
+						Gadgets.framehandle(F, M);
+					END;
+				ELSIF  M IS Gadgets.UpdateMsg THEN
+					WITH M: Gadgets.UpdateMsg  DO
+						IF (M.obj = F.obj) & (M.obj IS BasicGadgets.Integer) THEN
+							IF M.stamp # F.stamp THEN
+								F.stamp := M.stamp;
+								AddPoint(F, F.obj(BasicGadgets.Integer).val); 
+							END;
+							Gadgets.MakeMask(F, x, y, M.dlink, R);
+							RestoreFrame(F, R, x, y, w, h);
+						END
+					END
+				ELSE
+					Gadgets.framehandle(F, M);	
+				END;
+			END;
+		ELSE
+			Gadgets.framehandle(F, M);
+		END;
+	END;
+END FrameHandler;
+
+PROCEDURE NewFrame*;
+VAR F: Frame;
+BEGIN
+	NEW(F); F.W := 130; F.H := 100; F.handle := FrameHandler; Objects.NewObj := F;
+	F.beg := 0; F.end := 0; F.min := 0; F.max := 1;
+END NewFrame;
+
+PROCEDURE *Cleanup;
+BEGIN
+	Oberon.Remove(task)
+END Cleanup;
+
+BEGIN
+	maxLoad := 1; load := 0;
+	NEW(task); task.handle := TaskHandle; Oberon.Install(task);
+	Kernel.InstallTermHandler(Cleanup);
+	BasicGadgets.NewInteger; mem := Objects.NewObj(BasicGadgets.Integer);
+	BasicGadgets.NewInteger; Load := Objects.NewObj(BasicGadgets.Integer);
+	Load.handle := HandleL;
+	inthandle := mem.handle; mem.handle := HandleMem;
+	time := Oberon.Time();
+	BasicGadgets.NewString; drv := Objects.NewObj(BasicGadgets.String);  drv.handle := HandleDrv;
+	BasicGadgets.NewInteger; lap := Objects.NewObj(BasicGadgets.Integer);  lap.handle := HandleLap;
+	lap.val := 0; laptime := time;
+END Gages.
+
+System.Free Gages  ~
+Gadgets.Insert TextFields.NewTextField Gages.NewDrv ~
+Gadgets.Insert Gages.NewFrame Gages.NewMem ~
+Gadgets.Insert TextFields.NewTextField Gages.NewLap ~
+Gadgets.Insert Gages.NewFrame ~Gages.NewLoad ~
+
+
+Gadgets.Change Gages.NewFrame ~
+Gadgets.SetAttr Max 1024
+Gadgets.SetAttr Min -1024
+
+Coordinates.Mod
+

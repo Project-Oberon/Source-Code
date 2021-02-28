@@ -1,0 +1,96 @@
+MODULE Display; (*NW 3.3.89 / 19.1.91 / 22.11.92*)
+	IMPORT SYSTEM;
+
+	CONST black* = 0; white* = 15;
+		replace* = 0; paint* = 1; invert* = 2;
+ 
+	TYPE
+		Frame* = POINTER TO FrameDesc;
+		FrameMsg* = RECORD END;
+		Pattern* = LONGINT;
+		Font* = POINTER TO Bytes;
+		Bytes* = RECORD END;
+
+		Handler* = PROCEDURE (f: Frame; VAR msg: FrameMsg);
+
+		FrameDesc* = RECORD
+			dsc*, next*: Frame;
+			X*, Y*, W*, H*: INTEGER;
+			handle*: Handler
+		END;
+
+	VAR
+		Unit*: LONGINT; (*RasterUnit = Unit/36000 mm*)
+		Left*, ColLeft*, Bottom*, UBottom*, Width*, Height*: INTEGER;
+		arrow*, star*, hook*, cross*, downArrow*: Pattern;
+		grey0*, grey1*, grey2*, ticks*: Pattern;
+
+	PROCEDURE Map*(X: INTEGER): LONGINT;
+	END Map;
+
+	PROCEDURE SetMode*(X: INTEGER; s: SET);
+	END SetMode;
+
+	PROCEDURE SetColor*(col, red, green, blue: INTEGER); (*col < 0: overlay color*)
+	END SetColor;
+
+	PROCEDURE GetColor*(col: INTEGER; VAR red, green, blue: INTEGER);
+	END GetColor;
+
+	PROCEDURE SetCursor*(mode: SET);  (*color cursor; 0: crosshair, 1: arrow*)
+	END SetCursor;
+
+	PROCEDURE DefCC*(x, y, w, h: INTEGER);  (*crosshair window*)
+	END DefCC;
+
+	PROCEDURE DefCP*(VAR raster: ARRAY OF SYSTEM.BYTE);  (*cursor pattern*)
+	END DefCP;
+
+	PROCEDURE DrawCX*(x, y: INTEGER);
+	END DrawCX;
+
+	PROCEDURE FadeCX*(x, y: INTEGER);
+	END FadeCX;
+
+	PROCEDURE GetChar*(f: Font; ch: CHAR; VAR dx, x, y, w, h: INTEGER; VAR p: LONGINT);
+		(*get raster data of character ch*)
+	END GetChar;
+
+	PROCEDURE NewPattern*(VAR image: ARRAY OF SET; w, h: INTEGER): Pattern;
+	END NewPattern;
+
+	(*raster operations*)
+
+	PROCEDURE CopyBlock*(sx, sy, w, h, dx, dy, mode: INTEGER);
+	END CopyBlock;
+
+	PROCEDURE CopyPattern*(col: INTEGER; pat: Pattern; x, y, mode: INTEGER);
+	END CopyPattern;
+
+	PROCEDURE ReplPattern*(col: INTEGER; pat: Pattern; x, y, w, h, mode: INTEGER);
+	END ReplPattern;
+
+	PROCEDURE ReplConst*(col, x, y, w, h, mode: INTEGER);
+	END ReplConst;
+
+	PROCEDURE Dot*(col, x, y, mode: INTEGER);
+	END Dot;
+
+	(*raster operations with clipping*)
+
+	PROCEDURE CopyBlockC*(F: Frame; sx, sy, w, h, dx, dy, mode: INTEGER);
+	END CopyBlockC;
+
+	PROCEDURE CopyPatternC*(F: Frame; col: INTEGER; pat: Pattern; x, y, mode: INTEGER);
+	END CopyPatternC;
+
+	PROCEDURE ReplPatternC*(F: Frame; col: INTEGER; pat: Pattern; x, y, w, h, xp, yp, mode: INTEGER);
+	END ReplPatternC;
+
+	PROCEDURE ReplConstC*(F: Frame; col, x, y, w, h, mode: INTEGER);
+	END ReplConstC;
+
+	PROCEDURE DotC*(F: Frame; col, x, y, mode: INTEGER);
+	END DotC;
+
+END Display.

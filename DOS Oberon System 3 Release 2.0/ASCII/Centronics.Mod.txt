@@ -1,0 +1,33 @@
+MODULE Centronics;
+
+IMPORT DOS, SYSTEM;
+
+CONST LPT1* = 0;
+			LPT2* = 1;
+			LPT3* = 2;
+			
+	PROCEDURE Start*(port: INTEGER);
+	BEGIN
+		DOS.InitParallelPort(port);
+	END Start;
+
+	PROCEDURE Send*(port: INTEGER; x: CHAR);
+	VAR stat: SET; 
+	
+		PROCEDURE Status() : SET;
+			VAR stat: INTEGER;
+		BEGIN
+			DOS.GetStatusPar(port, stat); RETURN SYSTEM.VAL(SET, stat)
+		END Status;
+		
+	BEGIN
+		REPEAT UNTIL 7 IN Status();
+		DOS.PrintChar(port, x);
+		REPEAT  stat := Status(); 		
+		UNTIL (6 IN stat) OR (5 IN stat) OR (3 IN  stat) OR (7 IN stat);
+		(* 6  ack, 5 eopaper, 3 i/o error *)
+			
+		IF (3 IN stat) OR (5 IN stat) THEN HALT(100) END;
+	END Send;
+
+END Centronics.

@@ -1,0 +1,548 @@
+MODULE LineServer;  (*NW 18.4.89 / 15.9.93*)
+	IMPORT SYSTEM, Core, V24, FileDir, Files, Texts, Oberon;
+
+(*packet types:  0ttt00rs
+	1 = data,  2 = data ack,
+	3 = open,  4 = open ack,
+	5 = close,  6 = close ack,
+	7 = abort *)
+	
+	CONST PakSize = 256; maxLen = 1000000;
+		T0 = 1500;  (*timeout 5 sec*)
+		ENQ = 40X; SND = 41X; REC = 42X; FDIR = 45X; NPW = 48X; DEL = 49X;
+		MDIR = 4AX; SML = 4BX; RML = 4CX; DML = 4DX;
+		ACK = 10X; NAK = 25X; NPR = 26X; CX = 63X;
+
+	VAR W: Texts.Writer;
+		handler: Oberon.Task;
+		Lstat: INTEGER;  (*1: busy, 0: free*)
+		Lmode: INTEGER;  (*1: master, 0: server*)
+
+		rx, K: INTEGER;  (*receiver buffer index*)
+		rbuf: ARRAY PakSize+4 OF CHAR;  (*receiver buffer*)
+		myR, myS: INTEGER;  (*receiver and sender sequence numbers*)
+
+		mailuno, logcnt: INTEGER;
+		mailTime: LONGINT;
+		MF: Files.File;  (*last mail file accessed*)
+		hdch: ARRAY 2 OF CHAR;
+		cx400: ARRAY 14 OF CHAR;
+		buf: ARRAY 512 OF CHAR;  (*mailbox and filedir commands*)
+
+	PROCEDURE EOL;
+	BEGIN Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END EOL;
+
+	PROCEDURE Log(ch: CHAR);
+	BEGIN Texts.Write(W, ch); INC(logcnt);
+		IF logcnt = 80 THEN Texts.WriteLn(W); logcnt := 0 END ;
+		Texts.Append(Oberon.Log, W.buf)
+	END Log;
+
+	PROCEDURE Rec(VAR ch: CHAR);
+		VAR time: LONGINT; ch1: CHAR;
+	BEGIN time := Oberon.Time() + T0;
+		LOOP
+			IF V24.Available() > 0 THEN V24.Receive(ch1); ch := CHR(ORD(ch1) MOD 80H); EXIT END ;
+			IF Oberon.Time() > time THEN ch := 1X; EXIT END
+		END
+	END Rec;
+
+	PROCEDURE SendPacket(typ, len: INTEGER; VAR data: ARRAY OF CHAR);
+		VAR i, u, x: INTEGER; cs: LONGINT;
+	BEGIN V24.Send(hdch[1-Lmode]);
+		cs := typ + 5; i := 0;
+		WHILE i < len DO
+			cs := (cs*5 + ORD(data[i])) MOD 32767; INC(i)
+		END ;
+		data[len] := CHR(cs); data[len+1] := CHR(cs DIV 100H); INC(len, 2);
+		V24.Send(CHR(typ MOD 64 + 33)); x := typ DIV 64; u := 1; i := 0;
+		WHILE i < len DO  (*encode*)
+			IF u = 0 THEN
+				x := ORD(data[i]); V24.Send(CHR(x MOD 64 + 33)); x := x DIV 64; u := 1
+			ELSIF u = 1 THEN
+				x := ORD(data[i])*4 + x; V24.Send(CHR(x MOD 64 + 33)); x := x DIV 64; u := 2
+			ELSIF u = 2 THEN
+				x := ORD(data[i])*16 + x; V24.Send(CHR(x MOD 64 + 33)); V24.Send(CHR(x DIV 64 + 33)); u := 0
+			END ;
+			INC(i)
+		END ;
+		IF u > 0 THEN V24.Send(CHR(x MOD 64 + 33)) END ;
+		V24.Send(0DX)
+	END SendPacket;
+
+	PROCEDURE ReceivePacket(VAR typ, len: INTEGER);
+		VAR ch: CHAR;
+			i, j, u, x: INTEGER; cs: LONGINT;
+	BEGIN len := 0; typ := 0; rbuf[1] := 0X;
+		REPEAT Rec(ch) UNTIL ch > 0X;
+		IF ch = hdch[Lmode] THEN
+			Rec(ch); i := 0; u := 0;
+			WHILE (ch > 0DX) & (i < 260) DO
+				IF u = 0 THEN
+					x := ORD(ch) - 33; Rec(ch); x := (ORD(ch) - 33) * 64 + x;
+					rbuf[i] := CHR(x); INC(i); x := x DIV 256; u := 2
+				ELSIF u = 1 THEN
+					x := (ORD(ch) - 33) * 4 + x; rbuf[i] := CHR(x); INC(i); u := 0
+				ELSIF u = 2 THEN
+					x := (ORD(ch) - 33) * 16 + x; rbuf[i] := CHR(x); INC(i); x := x DIV 256; u := 1
+				END ;
+				Rec(ch)
+			END ;
+			IF (ch = 0DX) & (i > 2) THEN
+				DEC(i, 2); j := 0; cs := 1;
+				WHILE j < i DO
+					cs := (cs*5 + ORD(rbuf[j])) MOD 32767; INC(j)
+				END ;
+				IF (CHR(cs) = rbuf[i]) & (CHR(cs DIV 256) = rbuf[i+1]) THEN
+					rx := 1; typ := ORD(rbuf[0]); len := i-1
+				END
+			END
+		END
+	END ReceivePacket;
+
+	PROCEDURE Send1(len: INTEGER; VAR buf: ARRAY OF CHAR; VAR res: INTEGER);
+		VAR retries, typ, plen: INTEGER;
+	BEGIN myS := 1 - myS; retries := 3;
+		SendPacket(myR*2+myS+14H, len, buf);
+		LOOP ReceivePacket(typ, plen);
+			IF typ <= 0 THEN (*error*) DEC(retries);
+				IF retries = 0 THEN res := 1; EXIT END ;
+				SendPacket(myR*2+myS+14H, len, buf)
+			ELSIF (typ DIV 10H = 2) & (typ DIV 2 MOD 2 = myS) THEN res := 0; EXIT
+			ELSIF typ DIV 10H = 7 THEN (*abort*) res := 2; Lstat := 0; EXIT
+			END
+		END
+	END Send1;
+
+	PROCEDURE Receive1(VAR len, res: INTEGER);
+		VAR typ: INTEGER; dmy: ARRAY 4 OF CHAR;
+	BEGIN
+		LOOP ReceivePacket(typ, len);
+			IF typ <= 0 THEN (*error*) res := 1; EXIT
+			ELSIF typ DIV 10H = 1 THEN (*data*)
+				IF typ MOD 2 # myR THEN
+					myR := 1 - myR; SendPacket(myR*2+myS+20H, 0, dmy); res := 0; EXIT
+				ELSE SendPacket(myR*2+myS+20H, 0, dmy)
+				END
+			ELSIF typ DIV 10H = 3 THEN (*open*) SendPacket(40H, 0, dmy)
+			END
+		END
+	END Receive1;
+
+	PROCEDURE SendData(F: Files.File; VAR res: INTEGER);
+		VAR  k: INTEGER; x: CHAR;
+			R: Files.Rider;
+			buf: ARRAY PakSize+4 OF CHAR;
+	BEGIN Files.Set(R, F, 0);
+		REPEAT k := 0;
+			LOOP Files.Read(R, x);
+				IF R.eof THEN EXIT END ;
+				buf[k] := x; INC(k);
+				IF k = PakSize THEN EXIT END
+			END ;
+			Send1(k, buf, res);
+		UNTIL (res # 0) OR (k < PakSize)
+	END SendData;
+
+	PROCEDURE SendMail(VAR R: Files.Rider; len: LONGINT; VAR res: INTEGER);
+		VAR  k, m, typ: INTEGER; x: CHAR;
+			buf: ARRAY PakSize+4 OF CHAR;
+	BEGIN
+		REPEAT k := 0;
+			LOOP Files.Read(R, x);
+				IF k = len THEN EXIT END ;
+				buf[k] := SYSTEM.VAL(CHAR, SYSTEM.ROT(x, 3)); INC(k);
+				IF k = PakSize THEN EXIT END
+			END ;
+			Send1(k, buf, res); len := len - k
+		UNTIL (res # 0) OR (k < PakSize)
+	END SendMail;
+
+	PROCEDURE ReceiveData(F: Files.File; VAR L: LONGINT; VAR res: INTEGER);
+		VAR k, len: INTEGER;
+			R: Files.Rider;
+	BEGIN Files.Set(R, F, 0); L := 0;
+		LOOP Receive1(len, res);
+			IF res = 0 THEN
+				L := L + len; k := 0;
+				IF L > maxLen THEN Log("$"); res := 1; EXIT END ;
+				WHILE k < len DO
+					Files.Write(R, rbuf[rx]); INC(rx); INC(k)
+				END ;
+				IF k < 256 THEN EXIT END
+			ELSE EXIT
+			END
+		END
+	END ReceiveData;
+
+	PROCEDURE SendBuffer(VAR res: INTEGER);
+		VAR s, d: INTEGER; B0, B1: CHAR;
+	BEGIN B0 := buf[PakSize]; B1 := buf[PakSize+1];
+		Send1(PakSize, buf, res); buf[PakSize] := B0; buf[PakSize+1] := B1;
+		d := 0; s := PakSize;
+		WHILE s < K DO buf[d] := buf[s]; INC(d); INC(s) END ;
+		K := d
+	END SendBuffer;
+
+	PROCEDURE SendToSun(VAR res: INTEGER);
+		VAR len, uno: INTEGER;
+			id: Core.ShortName;
+			F: Files.File;
+	BEGIN
+		LOOP
+			IF Core.LineQueue.n = 0 THEN Send1(0, id, res); EXIT END ;
+			Core.GetTask(Core.LineQueue, F, id, uno); Log(".");
+			SendData(F, res);
+			IF res # 0 THEN EXIT END ;
+			Receive1(len, res);
+			IF res # 0 THEN EXIT END ;
+			Core.RemoveTask(Core.LineQueue)
+		END
+	END SendToSun;
+
+	PROCEDURE ReceiveFromSun(VAR res: INTEGER);
+	VAR len: LONGINT;
+			ch: CHAR;
+			id: Core.ShortName;
+			F: Files.File;
+	BEGIN id := "sun";
+		LOOP F := Files.New(""); ReceiveData(F, len, res);
+			IF (len = 0) OR (res # 0) THEN EXIT END ;
+			Files.Close(F); Log(".");
+			Core.InsertTask(Core.MailQueue, F, id, -1); Send1(0, id, res)
+		END
+	END ReceiveFromSun;
+
+	PROCEDURE AppendS(VAR s, d: ARRAY OF CHAR; VAR k: INTEGER);
+		VAR i: INTEGER; ch: CHAR;
+	BEGIN i := 0;
+		REPEAT ch := s[i]; d[k] := ch; INC(i); INC(k) UNTIL ch = 0X
+	END AppendS;
+
+	PROCEDURE AppendW(s: LONGINT; VAR d: ARRAY OF CHAR; n: INTEGER; VAR k: INTEGER);
+		VAR i: INTEGER;
+	BEGIN i := 0;
+		REPEAT d[k] := CHR(s); s := s DIV 100H; INC(i); INC(k) UNTIL i = n
+	END AppendW;
+
+	PROCEDURE AppendN(x: LONGINT; VAR d: ARRAY OF CHAR; VAR k: INTEGER);
+		VAR i: INTEGER; u: ARRAY 8 OF CHAR;
+	BEGIN i := 0;
+		REPEAT u[i] := CHR(x MOD 10 + 30H); INC(i); x := x DIV 10 UNTIL x = 0;
+		REPEAT DEC(i); d[k] := u[i]; INC(k) UNTIL i = 0
+	END AppendN;
+
+	PROCEDURE AppendDate(t, d: INTEGER; VAR buf: ARRAY OF CHAR; VAR k: INTEGER);
+
+		PROCEDURE Pair(ch: CHAR; x: LONGINT);
+		BEGIN buf[k] := ch; INC(k);
+			buf[k] := CHR(x DIV 10 + 30H); INC(k); buf[k] := CHR(x MOD 10 + 30H); INC(k)
+		END Pair;
+
+	BEGIN
+		Pair(" ", d MOD 20H); Pair(".", d DIV 20H MOD 10H); Pair(".", d DIV 200H MOD 80H);
+		Pair(" ", t DIV 800H MOD 20H); Pair(":", t DIV 20H MOD 40H); Pair(":", t MOD 20H * 2)
+	END AppendDate;
+
+	PROCEDURE* AppendDirEntry(name: FileDir.FileName; adr: LONGINT; VAR cont: BOOLEAN);
+		VAR i, res: INTEGER;
+	BEGIN i := 0;
+		WHILE name[i] > 0X DO buf[K] := name[i]; INC(K); INC(i) END ;
+		buf[K] := 0DX; INC(K);
+		IF K >= PakSize THEN SendBuffer(res);
+			IF res # 0 THEN cont := FALSE END
+		END
+	END AppendDirEntry;
+
+	PROCEDURE PickS(VAR s: ARRAY OF CHAR);
+		VAR i: INTEGER; ch: CHAR;
+	BEGIN i := 0;
+		REPEAT ch := rbuf[rx]; INC(rx); s[i] := ch; INC(i) UNTIL ch = 0X
+	END PickS;
+
+	PROCEDURE PickW(VAR w: ARRAY OF SYSTEM.BYTE; n: INTEGER);
+		VAR i: INTEGER;
+	BEGIN i := 0;
+		REPEAT w[i] := rbuf[rx]; INC(rx); INC(i) UNTIL i = n
+	END PickW;
+
+(* ---------------------- Kometh communication ------------------------ *)
+
+	PROCEDURE sendV24(s: ARRAY OF CHAR);
+		VAR i: INTEGER;
+	BEGIN i := 0;
+		WHILE s[i] > 0X DO V24.Send(s[i]); INC(i) END ;
+		V24.Send(0DX)
+	END sendV24;
+
+	PROCEDURE wait(t: LONGINT);
+	BEGIN t := Oberon.Time() + t;
+		REPEAT UNTIL Oberon.Time() > t
+	END wait;
+
+	PROCEDURE clearInput;
+		VAR ch: CHAR;
+	BEGIN
+		WHILE V24.Available() > 0 DO V24.Receive(ch) END ;
+		V24.Send(0DX)
+	END clearInput;
+
+	PROCEDURE Reply(repl: ARRAY OF CHAR; term: CHAR; VAR res: INTEGER);
+		VAR i, j, k: INTEGER; ch: CHAR;
+			buf: ARRAY PakSize OF CHAR;
+	BEGIN i := 0; res := 1;
+		REPEAT Rec(ch) UNTIL ch <= 0AX;
+		k := 0;
+		REPEAT Rec(ch); buf[k] := ch; INC(k)
+		UNTIL (ch = term) OR (ch = 1X) OR (k = 128);
+		IF ch = term THEN i := 0;
+			LOOP j := 0;
+				LOOP
+					IF repl[j] = 0X THEN res := 0; EXIT END ;
+					IF buf[i+j] # repl[j] THEN EXIT END ;
+					INC(j)
+				END ;
+				IF res = 0 THEN EXIT END ;
+				INC(i);
+				IF i+j >= k THEN EXIT END
+			END ;
+		END
+	END Reply;
+
+	PROCEDURE CloseMailLine*;
+		VAR res: INTEGER; ch: CHAR;
+	BEGIN V24.Break;
+		REPEAT Rec(ch) UNTIL (ch = "#") OR (ch = 1X);
+		sendV24("do "); Reply("CLOSED", ",", res);
+		wait(200); clearInput
+	END CloseMailLine;
+
+	PROCEDURE CallMailer*;
+		VAR ch: CHAR;
+			typ, plen, res, retries: INTEGER;
+			dmy: ARRAY 4 OF CHAR;
+	BEGIN
+		IF Lstat = 1 THEN RETURN END ;
+		sendV24("CALL 122B,1"); Reply("completed", 0AX, res);
+		IF res = 0 THEN 
+			sendV24("cerestst"); Reply("login", ":", res); Reply("Password", ":", res);
+			IF res = 0 THEN
+				sendV24("ik26ar"); Rec(ch);
+				IF ch = 0DX THEN wait(1200) ELSE res := 3 END
+			END ;
+			IF res # 0 THEN CloseMailLine END
+		END ;
+		Texts.Append(Oberon.Log, W.buf);
+		clearInput;
+		IF res = 0 THEN
+			Log("{"); Lmode := 1; myS := 0; myR := 0; retries := 3;
+			LOOP SendPacket(30H, 11, cx400); ReceivePacket(typ, plen);
+				IF typ DIV 10H = 4 THEN res := 0; EXIT END ;
+				IF typ DIV 10H = 7 THEN res := 2; EXIT END ;
+				DEC(retries);
+				IF retries = 0 THEN res := 1; EXIT END
+			END ;
+			IF res = 0 THEN
+				SendToSun(res);
+				IF res = 0 THEN Log("|") ELSE Log("-") END ;
+				IF res = 0 THEN ReceiveFromSun(res) END ;
+				SendPacket(50H, 0, dmy); ReceivePacket(typ, plen)  (*close*)
+			END ;
+			IF res = 0 THEN Log("}") ELSE Log(")") END ;
+			CloseMailLine; mailTime := Oberon.Time() + 90000;  (*5 min*)
+			Lmode := 0
+		ELSE (*mail line cannot be opened, try again in 5 min*)
+			mailTime := Oberon.Time() + 90000;
+			IF res = 3 THEN Log("-") ELSE Log("~") END
+		END
+	END CallMailer;
+
+(* -------------------------------Server-------------------------------*)
+
+	PROCEDURE* Serve;
+		VAR typ, plen, res, retries, i, j, k, kd, ks, n, uno: INTEGER;
+			ch, B0, B1: CHAR;
+			F: Files.File;
+			R: Files.Rider;
+			pos, len, flen, pw, npw: LONGINT;
+			Id: Core.ShortName;
+			fname: Core.Name;
+			mrtab: Core.MResTab;
+			mdir: Core.MailDir;
+
+		PROCEDURE Reply(ch: CHAR);
+			VAR msg: ARRAY 4 OF CHAR;
+		BEGIN msg[0] := ch; Send1(1, msg, res)
+		END Reply;
+
+	BEGIN
+		IF V24.Available() > 4 THEN
+			Lmode := 0; ReceivePacket(typ, plen);
+			IF typ DIV 10H = 3 THEN  (*open*)
+				Lstat := 1; myS := 0; myR := 0; SendPacket(40H, 0, Id);
+				ch := rbuf[rx]; INC(rx);
+				IF ch = SND THEN (*send file*)
+					PickS(Id); PickW(pw, 4); PickS(fname);
+					IF Core.UserNo(Id, pw) >= 0 THEN
+						F := Files.Old(fname);
+						IF F # NIL THEN Reply(ACK); SendData(F, res) ELSE Reply(NAK) END
+					ELSE Reply(NPR)
+					END
+				ELSIF ch = REC THEN (*receive file*)
+					PickS(Id); PickW(pw, 4); PickS(fname);
+					IF Core.UserNo(Id, pw) >= 0 THEN
+						F := Files.New(fname);
+						Reply(ACK); ReceiveData(F, len, res);
+						IF res = 0 THEN Files.Register(F) END
+					ELSE Reply(NPR)
+					END
+				ELSIF ch = DEL THEN
+					PickS(Id); PickW(pw, 4); PickS(fname);
+					IF Core.UserNo(Id, pw) >= 0 THEN
+						Files.Delete(fname, res);
+						IF res = 0 THEN Reply(ACK) ELSE Reply(NAK) END
+					ELSE Reply(NPR)
+					END
+				ELSIF ch = FDIR THEN
+					PickS(Id); PickW(pw, 4); PickS(fname); uno := Core.UserNo(Id, pw);
+					IF uno >= 0 THEN
+						Reply(ACK); K := 0; FileDir.Enumerate(fname, AppendDirEntry); Send1(K, buf, res)
+					ELSE Reply(NPR)
+					END
+				ELSIF ch = MDIR THEN (*send mail directory*)
+					PickS(Id); PickW(pw, 4); uno := Core.UserNo(Id, pw);
+					IF uno >= 0 THEN
+						IF uno # mailuno THEN
+							Core.GetFileName(uno, fname); MF := Files.Old(fname); mailuno := uno
+						END ;
+						IF MF # NIL THEN
+							Reply(ACK); Files.Set(R, MF, 32); Files.ReadBytes(R, mdir, SIZE(Core.MailDir));
+							K := 0; res := 0; i := mdir[0].next;
+							WHILE (i > 0) & (res = 0) DO
+								AppendN(i, buf, K); AppendDate(mdir[i].time, mdir[i].date, buf, K);
+								buf[K] := " "; INC(K); AppendS(mdir[i].originator, buf, K);
+								buf[K-1] := " "; AppendN(mdir[i].len, buf, K); buf[K] := 0DX; INC(K);
+								IF K >= PakSize THEN SendBuffer(res) END ;
+								i := mdir[i].next
+							END ;
+							Send1(K, buf, res)
+						ELSE Reply(NAK)
+						END
+					ELSE Reply(NPR)
+					END
+				ELSIF ch = SML THEN (*send mail*)
+					PickS(Id); PickW(pw, 4); PickW(n, 2);
+					uno := Core.UserNo(Id, pw);
+					IF uno >= 0 THEN
+						IF uno # mailuno THEN
+							Core.GetFileName(uno, fname); MF := Files.Old(fname); mailuno := uno
+						END ;
+						IF (MF # NIL) & (n > 0) & (n < 31) THEN
+							Files.Set(R, MF, (n+1)*32);
+							Files.ReadBytes(R, pos, 4); pos := (pos MOD 10000H) * 100H;
+							Files.ReadBytes(R, len, 4);
+							IF len > 0 THEN Reply(ACK); Files.Set(R, MF, pos); SendMail(R, len, res)
+							ELSE Reply(NAK)
+							END
+						ELSE Reply(NAK)
+						END
+					ELSE Reply(NPR)
+					END
+				ELSIF ch = RML THEN (*receive mail*)
+					PickS(Id); PickW(pw, 4); uno := Core.UserNo(Id, pw);
+					IF uno >= 0 THEN
+						F := Files.New("");
+						IF F # NIL THEN
+							Reply(ACK); ReceiveData(F, len, res);
+							IF res = 0 THEN Files.Close(F); Core.InsertTask(Core.MailQueue, F, Id, uno) END
+						ELSE Reply(NAK)
+						END
+					ELSE Reply(NPR)
+					END
+				ELSIF ch = DML THEN (*delete mail*)
+					PickS(Id); PickW(pw, 4); PickW(n, 2); uno := Core.UserNo(Id, pw);
+					IF uno >= 0 THEN
+						IF uno # mailuno THEN
+							Core.GetFileName(uno, fname); MF := Files.Old(fname); mailuno := uno
+						END ;
+						IF (MF # NIL) & (n > 0) & (n < 31) THEN
+							Files.Set(R, MF, 0);
+							Files.ReadBytes(R, mrtab, 32); Files.ReadBytes(R, mdir, SIZE(Core.MailDir));
+							i := 0;
+							LOOP k := mdir[i].next;
+								IF k = n THEN
+									j := mdir[n].pos;
+									k := SHORT((mdir[n].len + 255) DIV 256) + j;
+									REPEAT INCL(mrtab[j DIV 32], j MOD 32); INC(j) UNTIL j = k;
+									mdir[n].len := 0; mdir[i].next := mdir[n].next;
+									Files.Set(R, MF, 0); Files.WriteBytes(R, mrtab, 32);
+									Files.WriteBytes(R, mdir, SIZE(Core.MailDir)); Files.Close(MF);
+									Reply(ACK); EXIT
+								END ;
+								IF k = 0 THEN Reply(NAK); EXIT END ;
+								i := k
+							END
+						ELSE Reply(NAK)
+						END
+					ELSE Reply(NPR)
+					END
+				ELSIF ch = NPW THEN
+					PickS(Id); PickW(pw, 4); PickW(npw, 4);
+					IF Core.UserNo(Id, pw) >= 0 THEN Core.SetPassword(uno, npw); Reply(ACK)
+					ELSE Reply(NAK)
+					END
+				ELSIF ch = CX THEN
+					Log("["); ReceiveFromSun(res);
+					IF res = 0 THEN Log("|") ELSE Log("-") END ;
+					IF res = 0 THEN SendToSun(res) END ;
+					IF res = 0 THEN
+						ReceivePacket(typ, plen); Log("]");  (*close*)
+						IF typ DIV 10H = 5 THEN SendPacket(60H, 0, buf) END
+					ELSE Log(")")
+					END ;
+					Lstat := 0
+				END
+			ELSIF typ DIV 10H = 5 THEN  (*close*)
+				SendPacket(60H, 0, buf); Lstat := 0; MF := NIL; mailuno := -2; len := Oberon.Time() + T0;
+				IF len > mailTime THEN mailTime := len END
+			ELSIF typ DIV 10H = 7 THEN  (*abort*) Lstat := 0
+			END ;
+			Core.Collect
+(*		ELSIF (Core.ExportQueue.n >= 4) & (Oberon.Time() > mailTime) THEN CallMailer  *)
+		END
+	END Serve;
+
+	(*------------------------- Commands -------------------------*)
+
+	PROCEDURE Start*;
+	BEGIN Lstat := 0; Lmode := 0; rx := 0; logcnt := 0;
+		Oberon.Remove(handler); Oberon.Install(handler);
+		Texts.WriteString(W, "Line started  (NW 15.9.93)"); EOL
+	END Start;
+
+	PROCEDURE Reset*;
+	BEGIN  Lmode := 0; Lstat := 0; rx := 0; logcnt := 0; mailTime := 0;
+		V24.Start(0BBX, 13X, 7X); Texts.WriteString(W, "Line reset"); EOL
+	END Reset;
+
+	PROCEDURE State*;
+	BEGIN Texts.WriteString(W, "Line queue:"); Texts.WriteInt(W, Core.LineQueue.n, 3); EOL
+	END State;
+
+	PROCEDURE Stop*;
+	BEGIN Oberon.Remove(handler); Texts.WriteString(W, "Line stopped"); EOL
+	END Stop;
+
+	PROCEDURE SendCmd*;
+		VAR ch: CHAR;
+			S: Texts.Reader;
+	BEGIN Texts.OpenReader(S, Oberon.Par.text, Oberon.Par.pos);
+		REPEAT Texts.Read(S, ch) UNTIL ch # " ";
+		WHILE ch >= " " DO V24.Send(ch); Texts.Read(S, ch) END ;
+		V24.Send(0DX) 
+	END SendCmd;
+
+BEGIN Texts.OpenWriter(W); hdch[0] := "{"; hdch[1] := "}"; cx400 := "cx400 pluto";
+	mailuno := -2; V24.Start(0BBX, 13X, 7X); NEW(handler); handler.handle := Serve
+END LineServer.

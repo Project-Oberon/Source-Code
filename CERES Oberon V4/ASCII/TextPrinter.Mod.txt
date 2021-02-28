@@ -1,0 +1,550 @@
+MODULE TextPrinter;	(** CAS/MH/HM 23.9.1993 **)
+	IMPORT
+		Files, Display, Fonts, Printer, Texts, TextFrames;
+
+	CONST
+		Unit* = 3048;	(**unit for a 300 dpi printer**)
+		unit = TextFrames.Unit;
+		mm = TextFrames.mm; Scale = mm DIV 10;
+
+		gridAdj = TextFrames.gridAdj;
+		leftAdj = TextFrames.leftAdj; rightAdj = TextFrames.rightAdj; AdjMask = {leftAdj, rightAdj};
+		pageBreak = TextFrames.pageBreak;
+		twoColumns = TextFrames.twoColumns;
+		AdjustSpan = 30; MinTabWidth = 1 * Scale; StdTabWidth = 4 * mm;
+		ColumnGap = 7*mm;
+
+		TAB = 9X; CR = 0DX;
+		MaxDict = 32;	MaxLine = 512;
+
+	TYPE
+		PrintMsg* = RECORD (Texts.ElemMsg)
+			prepare*: BOOLEAN;
+			indent*: LONGINT;	(**prepare => width already consumed in line, in units**)
+			fnt*: Fonts.Font;
+			col*: SHORTINT;
+			pos*: LONGINT;	(**position in host text**)
+			X0*, Y0*, pno*: INTEGER	(**receiver origin in screen space; page number**)
+		END;
+
+		PrintLine = RECORD
+			eot: BOOLEAN;	(*marked to skip, contains end of text*)
+			indent: LONGINT;
+			w, h, dsr: INTEGER;	(*bounding box clipped to frame*)
+			nob: INTEGER;	(*number of contained blanks; > 0 if text line wraps around*)
+			org, len, span: LONGINT;	(*len w/o; span w/ trailing CR or white space, if any*)
+			pbeg: LONGINT	(*position of corresponding parc*)
+		END;
+
+	VAR
+		P: TextFrames.Parc;
+		pbeg: LONGINT;
+		R: Texts.Reader;
+		nextCh: CHAR;
+		fname: ARRAY 32 OF CHAR;
+
+		fonts: RECORD
+			num: SHORTINT;
+			dict: ARRAY MaxDict OF Fonts.Font;
+			dx: ARRAY MaxDict, 256 OF SHORTINT
+		END;
+		line: RECORD
+			first: BOOLEAN;
+			fno: SHORTINT;
+			px, x, y: INTEGER;
+			len: INTEGER;
+			buf: ARRAY MaxLine OF CHAR
+		END;
+
+
+	PROCEDURE Min (x, y: LONGINT): LONGINT;
+	BEGIN
+		IF x < y THEN RETURN x ELSE RETURN y END
+	END Min;
+
+	PROCEDURE Max (x, y: INTEGER): INTEGER;
+	BEGIN
+		IF x > y THEN RETURN x ELSE RETURN y END
+	END Max;
+
+	PROCEDURE Append (VAR s1: ARRAY OF CHAR; i: INTEGER; s2: ARRAY OF CHAR);
+		VAR j: INTEGER;
+	BEGIN j := 0;	(*s1 large enough*)
+		WHILE s2[j] # 0X DO s1[i] := s2[j]; INC(i); INC(j) END;
+		s1[i] := 0X
+	END Append;
+
+
+	(** Printer Metrics **)
+
+	PROCEDURE SetMetrics (fno: SHORTINT; fnt: Fonts.Font);
+		VAR f: Files.File; r: Files.Rider; pat: Display.Pattern;
+			off, i, j, k, dx, x, y, w, h: INTEGER; size, s: SHORTINT; mod, m: CHAR;
+			name: ARRAY 32 OF CHAR;
+	BEGIN COPY(fnt.name, name);
+		i := 0; WHILE name[i] > "9" DO INC(i) END;
+		j := i; WHILE ("0" <= name[j]) & (name[j] < "9") DO INC(j) END;
+		k := j; WHILE (name[k] # ".") & (name[k] # 0X) DO INC(k) END;
+		IF k > j THEN mod := name[k-1] ELSE mod := " " END;
+		size := 0; k := i; WHILE i < j DO size := 10 * size + SHORT(ORD(name[i]) - 30H); INC(i) END;
+		Append(name, k, ".Lm3.Fnt"); f := Files.Old(name);
+		IF f # NIL THEN Files.Set(r, f, 2); Files.ReadInt(r, off); Files.Set(r, f, 6); i := -1;
+			REPEAT INC(i); Files.Read(r, s); Files.Read(r, m) UNTIL (s = size) & (m = mod) OR (Files.Pos(r) >= off);
+			IF (s = size) & (m = mod) THEN Files.Set(r, f, off + i * 260 + 4); Files.ReadBytes(r, fonts.dx[fno], 256)
+			ELSE f := NIL
+			END
+		END;
+		IF f = NIL THEN i := 0;	(*no printer metrics file found - construct from screen metrics*)
+			WHILE i < 256 DO Display.GetChar(fnt.raster, CHR(i), dx, x, y, w, h, pat);
+				fonts.dx[fno, i] := SHORT(SHORT(LONG(dx) * unit * 12 DIV 10 DIV Unit)); INC(i)
+				(*+20% : heuristical correction*)
+			END
+		END
+	END SetMetrics;
+
+	PROCEDURE FontNo* (fnt: Fonts.Font): SHORTINT;
+		VAR fno: SHORTINT;
+	BEGIN fno := 0; fonts.dict[fonts.num] := fnt;
+		WHILE fonts.dict[fno] # fnt DO INC(fno) END;
+		IF fno = fonts.num THEN SetMetrics(fno, fnt); INC(fonts.num) END;
+		RETURN fno
+	END FontNo;
+
+	PROCEDURE Font* (fno: SHORTINT): Fonts.Font;
+	BEGIN RETURN fonts.dict[fno]
+	END Font;
+
+	PROCEDURE DX* (fno: SHORTINT; ch: CHAR): LONGINT;
+	BEGIN RETURN LONG(LONG(fonts.dx[fno, ORD(ch)])) * Unit
+	END DX;
+
+	PROCEDURE Get* (fno: SHORTINT; ch: CHAR; VAR dx, x, y, w, h: LONGINT);
+		VAR pat: Display.Pattern; dx0, x0, y0, w0, h0: INTEGER;
+	BEGIN Display.GetChar(fonts.dict[fno].raster, ch, dx0, x0, y0, w0, h0, pat);
+		x := LONG(x0) * unit; y := LONG(y0) * unit; h := LONG(h0) * unit;
+		dx := LONG(LONG(fonts.dx[fno, ORD(ch)])) * Unit; w := dx
+	END Get;
+
+	PROCEDURE GetChar* (fno: SHORTINT; targetUnit: LONGINT; ch: CHAR;
+				VAR pdx: LONGINT; VAR dx, x, y, w, h: INTEGER; VAR pat: Display.Pattern);
+	BEGIN Display.GetChar(fonts.dict[fno].raster, ch, dx, x, y, w, h, pat);
+		x := SHORT(x * LONG(unit) DIV targetUnit); y := SHORT(y * LONG(unit) DIV targetUnit);
+		h := SHORT(h * LONG(unit) DIV targetUnit);
+		pdx := LONG(LONG(fonts.dx[fno, ORD(ch)])) * Unit;
+		dx := SHORT(pdx DIV targetUnit); w := dx
+	END GetChar;
+
+	PROCEDURE InitFonts*;
+		VAR fno: SHORTINT;
+	BEGIN fonts.num := 0; fno := FontNo(Fonts.Default)
+	END InitFonts;
+
+	PROCEDURE Width (fno: SHORTINT; VAR s: ARRAY OF CHAR): INTEGER;
+		VAR i, w: INTEGER;
+	BEGIN i := 0; w := 0;
+		WHILE s[i] # 0X DO INC(w, LONG(fonts.dx[fno, ORD(s[i])]) ); INC(i) END;
+		RETURN w
+	END Width;
+
+	PROCEDURE GetPrintChar (fnt: Fonts.Font; ch: CHAR; VAR fno: SHORTINT; VAR dx, x, y, w, h: INTEGER);
+		VAR pat: Display.Pattern;
+	BEGIN Display.GetChar(fnt.raster, ch, dx, x, y, w, h, pat);
+		x := SHORT(x * LONG(unit) DIV Unit); y := -SHORT((-y) * LONG(unit) DIV Unit);
+		h := SHORT(h * LONG(unit) DIV Unit);
+		fno := FontNo(fnt); dx := fonts.dx[fno, ORD(ch)]; w := dx
+	END GetPrintChar;
+
+	PROCEDURE Tab (dw: INTEGER; VAR dx: INTEGER);	(*P set*)
+		VAR i, n: INTEGER; w: LONGINT;
+	BEGIN i := 0; n := P.nofTabs; w := LONG(dw) * Unit + MinTabWidth;
+		IF dw < 0 THEN dx := -dw
+		ELSE
+			WHILE (i < n) & (P.tab[i] < w) DO INC(i) END;
+			IF i < n THEN dx := SHORT((P.tab[i] - LONG(dw) * Unit) DIV Unit)
+			ELSE dx := StdTabWidth DIV Unit
+			END
+		END
+	END Tab;
+
+	PROCEDURE Offset (): INTEGER;	(*R set*)
+	BEGIN
+		IF R.voff = 0 THEN RETURN 0
+		ELSE RETURN SHORT(R.fnt.height * R.voff * LONG(unit) DIV 64 DIV Unit)
+		END
+	END Offset;
+
+	PROCEDURE MeasureSpecial (pno, dw: INTEGER; VAR fno: SHORTINT; VAR dx, x, y, w, h: INTEGER);
+		(*P, R, nextCh set*)
+		VAR e: Texts.Elem; i: INTEGER; msg: PrintMsg;
+	BEGIN
+		IF nextCh = " " THEN GetPrintChar(R.fnt, nextCh, fno, dx, x, y, w, h);
+			x := 0; y := 0; w := dx; h := 0
+		ELSIF nextCh = TAB THEN Tab(dw, dx); x := 0; y := 0; w := dx; h := 0
+		ELSIF R.elem # NIL THEN e := R.elem;
+			msg.prepare := TRUE; msg.indent := LONG(dw) * Unit;
+			msg.fnt := R.fnt; msg.col := R.col; msg.pos := Texts.Pos(R) - 1; msg.pno := pno;
+			msg.Y0 := -SHORT(P.dsr DIV Unit);
+			e.handle(e, msg);
+			w := SHORT(e.W DIV Unit); dx := w; h := SHORT(e.H DIV Unit);
+			x := 0; y := msg.Y0
+		ELSE GetPrintChar(R.fnt, nextCh, fno, dx, x, y, w, h)
+		END
+	END MeasureSpecial;
+
+	PROCEDURE GetSpecial (VAR n: INTEGER; maxW, cn, ddx, dw: INTEGER;
+			VAR fno: SHORTINT; VAR dx, x, y, w, h: INTEGER);	(*P, R, nextCh set*)
+		VAR e: Texts.Elem;
+	BEGIN
+		IF nextCh = " " THEN GetPrintChar(R.fnt, nextCh, fno, dx, x, y, w, h);
+			x := 0; y := 0; INC(dx, ddx); INC(n); IF n <= cn THEN INC(dx) END;	(*space correction for block adjustment*)
+			w := dx; h := 0
+		ELSIF nextCh = TAB THEN Tab(dw, dx); x := 0; y := 0; w := dx; h := 0
+		ELSIF R.elem # NIL THEN e := R.elem;
+				IF e IS TextFrames.Parc THEN w := SHORT(Min(P.width DIV Unit, maxW)); e.W := LONG(w) * Unit
+				ELSE w := SHORT(e.W DIV Unit)
+				END;
+				dx := w; x := 0; y := -SHORT(P.dsr DIV Unit); h := SHORT(e.H DIV Unit)
+		ELSE GetPrintChar(R.fnt, nextCh, fno, dx, x, y, w, h)
+		END
+	END GetSpecial;
+
+	PROCEDURE AdjustMetrics (T: Texts.Text; VAR t: PrintLine; left: INTEGER; VAR pw, tw, ddx, cn: INTEGER);
+		(*sets P, pbeg*)
+	BEGIN pw := left; tw := t.w; ddx := 0; cn := 0;
+		TextFrames.ParcBefore(T, t.org, P, pbeg);
+		IF pbeg # t.org THEN
+			INC(pw, SHORT((P.left + t.indent) DIV Unit));
+			DEC(tw, SHORT(t.indent DIV Unit));
+			IF leftAdj IN P.opts THEN
+				IF (rightAdj IN P.opts) & (t.nob > 0) THEN
+					tw := SHORT((P.width - t.indent) DIV Unit); ddx := (tw - t.w) DIV t.nob; cn := (tw - t.w) MOD t.nob
+				END
+			ELSIF rightAdj IN P.opts THEN INC(pw, SHORT(P.width DIV Unit) - t.w)
+			ELSE (*center*) INC(pw, (SHORT(P.width DIV Unit) - t.w) DIV 2)
+			END
+		END
+	END AdjustMetrics;
+
+
+	(* Printer Line Casting *)
+
+	PROCEDURE MeasureLine (T: Texts.Text; pno, maxW: INTEGER; VAR t: PrintLine);	(*R, nextCh set*)
+		VAR len, bklen, d: LONGINT; eol: BOOLEAN; fno: SHORTINT;
+			nob, bknob, width, minY, bkminY, maxY, bkmaxY, tw, bktw, lsp, dsr, dx, x, y, w, h: INTEGER;
+			R1: Texts.Reader; peekCh: CHAR;
+	BEGIN len := 0; nob := 0; bklen := -999; tw := 0; dx := 0; minY := 0; maxY := 0;
+		TextFrames.ParcBefore(T, t.org, P, pbeg);
+		lsp := SHORT(P.lsp DIV Unit); dsr := SHORT(P.dsr DIV Unit); width := SHORT(P.width DIV Unit);
+		t.indent := 0;
+		IF t.org > 0 THEN Texts.OpenReader(R1, T, t.org - 1); Texts.Read(R1, peekCh);
+			IF (peekCh = CR) OR (R1.elem # NIL) & (R1.elem IS TextFrames.Parc) THEN t.indent := P.first END;
+		END;
+		DEC(width, SHORT(t.indent DIV Unit));
+		LOOP INC(tw, dx);
+			IF R.eot OR (nextCh = CR) THEN nob := 0; eol := ~R.eot; EXIT END;
+			IF nextCh <= " " THEN MeasureSpecial(pno, tw + SHORT(t.indent DIV Unit), fno, dx, x, y, w, h)
+			ELSE GetPrintChar(R.fnt, nextCh, fno, dx, x, y, w, h)
+			END;
+			IF tw + x + dx > width THEN d := len - bklen;
+				IF (0 <= d) & (d < AdjustSpan) & (nextCh > " ") THEN eol := TRUE;
+					Texts.OpenReader(R, T, Texts.Pos(R) - d);
+					nob := bknob; len := bklen; tw := bktw; minY := bkminY; maxY := bkmaxY
+				ELSIF len = 0 THEN	(*force at least one character on each line*)
+					INC(len); INC(y, Offset()); minY := SHORT(Min(minY, y)); maxY := Max(maxY, y + h);
+					Texts.Read(R, nextCh); eol := FALSE
+				ELSE eol := (nextCh <= " ") & (nextCh # Texts.ElemChar)
+				END;
+				EXIT
+			END;
+			IF (nextCh <= " ") & (nextCh # Texts.ElemChar) THEN
+				bknob := nob; bklen := len; bktw := tw; bkminY := minY; bkmaxY := maxY;
+				IF nextCh = " " THEN INC(nob) END
+			END;
+			INC(len); INC(y, Offset()); minY := SHORT(Min(minY, y)); maxY := Max(maxY, y + h);
+			Texts.Read(R, nextCh)
+		END;
+		IF gridAdj IN P.opts THEN
+			WHILE dsr < -minY DO INC(dsr, lsp) END;
+			t.h := Max(lsp, dsr + maxY); INC(t.h, (-t.h) MOD lsp)
+		ELSE dsr := Max(dsr, -minY); t.h := Max(lsp, dsr + maxY)
+		END;
+		t.len := len; t.w := SHORT(Min(tw, maxW)); t.dsr := dsr; t.nob := nob; t.eot := R.eot; t.pbeg := pbeg;
+		IF eol THEN Texts.Read(R, nextCh); t.span := len + 1 ELSE t.span := len END
+	END MeasureLine;
+
+
+	(** Printer Page Placement **)
+
+	PROCEDURE FlushLine;
+	BEGIN
+		IF line.len > 0 THEN line.buf[line.len] := 0X; line.len := 0;
+			IF line.first THEN Printer.String(line.px, line.y, line.buf, fonts.dict[line.fno].name); line.first := FALSE
+			ELSE Printer.ContString(line.buf, fonts.dict[line.fno].name)
+			END
+		END
+	END FlushLine;
+
+	PROCEDURE PlaceChar (ch: CHAR; fno: SHORTINT; x, y, dx: INTEGER);
+	BEGIN
+		IF line.len > 0 THEN
+			IF (x # line.x) OR (y # line.y) THEN FlushLine; line.first := TRUE; line.px := x
+			ELSIF fno # line.fno THEN FlushLine
+			END
+		ELSE line.px := x
+		END;
+		line.fno := fno; line.x := x + dx; line.y := y; line.buf[line.len] := ch; INC(line.len)
+	END PlaceChar;
+
+	PROCEDURE PlaceSpecial (fno: SHORTINT; pno, nob, px, py, x, y, dx: INTEGER);	(*R, nextCh set*)
+		VAR e: Texts.Elem; msg: PrintMsg;
+	BEGIN
+		IF (nextCh = " ") & (P.opts * AdjMask = AdjMask) & (nob > 0) OR (nextCh = TAB) THEN (*skip*)
+		ELSIF R.elem # NIL THEN e := R.elem;
+			FlushLine; line.first := TRUE;
+			msg.prepare := FALSE;
+			msg.fnt := R.fnt; msg.col := R.col; msg.pos := Texts.Pos(R) - 1;
+			msg.X0 := px + x; msg.Y0 := py + y; msg.pno := pno;
+			e.handle(e, msg)
+		ELSE PlaceChar(nextCh, fno, px, py, dx)
+		END
+	END PlaceSpecial;
+
+	PROCEDURE PlaceLine (T: Texts.Text; pno: INTEGER; VAR t: PrintLine; left, width, py: INTEGER);
+		VAR i: LONGINT; n, cn, lm, rm, px, pw, tw, ddx, dx, x, y, w, h: INTEGER; fno: SHORTINT;
+	BEGIN Texts.OpenReader(R, T, t.org); AdjustMetrics(T, t, left, pw, tw, ddx, cn);
+		lm := left + SHORT(P.left DIV Unit); rm := left + width; px := pw; INC(py, t.dsr); i := 0; n := 0;
+		line.first := TRUE; line.len := 0;
+		WHILE i < t.len DO Texts.Read(R, nextCh);
+			IF nextCh <= " " THEN GetSpecial(n, width, cn, ddx, px - lm, fno, dx, x, y, w, h)
+			ELSE GetPrintChar(R.fnt, nextCh, fno, dx, x, y, w, h)
+			END;
+			IF px + x + w <= rm THEN
+				IF nextCh <= " " THEN PlaceSpecial(fno, pno, t.nob, px, py, x, y + Offset(), dx)
+				ELSE PlaceChar(nextCh, fno, px, py + Offset(), dx)
+				END;
+				INC(px, dx); INC(i)
+			ELSE i := t.len
+			END
+		END;
+		FlushLine
+	END PlaceLine;
+
+
+	PROCEDURE PlaceHeader* (headerX, headerY, headerW: INTEGER;
+			pno: INTEGER; fnt: Fonts.Font; VAR header: ARRAY OF CHAR; alt: BOOLEAN);
+		VAR i, j: INTEGER; fno: SHORTINT; digits, pageno: ARRAY 16 OF CHAR;
+	BEGIN alt := alt & ~ODD(pno); fno := FontNo(fnt);
+		IF (pno >= 0) OR (pno < -30) THEN pno := ABS(pno); i := 0; j := 0;
+			REPEAT digits[i] := CHR(pno MOD 10 + 30H); INC(i); pno := pno DIV 10 UNTIL pno = 0;
+			REPEAT DEC(i); pageno[j] := digits[i]; INC(j) UNTIL i = 0;
+			pageno[j] := 0X
+		ELSE pno := ABS(pno); i := 0;
+			WHILE pno >= 10 DO DEC(pno, 10); pageno[i] := "x"; INC(i) END;
+			CASE pno OF
+				0:
+			|   1..3: WHILE pno > 0 DO DEC(pno); pageno[i] := "i"; INC(i) END
+			|   4: pageno[i] := "i"; INC(i); pageno[i] := "v"; INC(i)
+			|   5..8: DEC(pno, 5); pageno[i] := "v"; INC(i);
+					WHILE pno > 0 DO DEC(pno); pageno[i] := "i"; INC(i) END
+			|   9: pageno[i] := "i"; INC(i); pageno[i] := "x"; INC(i)
+			END;
+			pageno[i] := 0X
+		END;
+		IF alt THEN Printer.String(headerX, headerY, pageno, fonts.dict[fno].name);
+			IF header[0] # 0X THEN
+				Printer.String(headerX + headerW - Width(fno, header), headerY, header, fonts.dict[fno].name)
+			END
+		ELSE Printer.String(headerX + headerW - Width(fno, pageno), headerY, pageno, fonts.dict[fno].name);
+			IF header[0] # 0X THEN Printer.String(headerX, headerY, header, fonts.dict[fno].name) END
+		END
+	END PlaceHeader;
+
+
+	PROCEDURE ClaimPrinter;	(*send null-command to keep printer connection alive*)
+		VAR i: INTEGER; dmy: ARRAY 32 OF CHAR;
+	BEGIN dmy[0] := 0X; i := 10;
+		WHILE i > 0 DO Printer.String(0, 0, dmy, fname); DEC(i) END
+	END ClaimPrinter;
+
+	(*PROCEDURE PrintDraft* (t: Texts.Text; header: ARRAY OF CHAR; copies: INTEGER);
+		CONST left = 160; bot = 100; lsp = 32;
+		VAR top, y, pno, i: INTEGER; r: Texts.Reader; ch: CHAR; s: ARRAY 256 OF CHAR;
+	
+		PROCEDURE PrintHeader;
+		BEGIN
+			Printer.String(left, Printer.PageHeight - 125, header, Fonts.Default.name);
+			IF pno < 10 THEN s[0] := " " ELSE s[0] := CHR(30H + pno MOD 100 DIV 10) END;
+			s[1] := CHR(30H + pno MOD 10); s[2] := 0X;
+			Printer.String(Printer.PageWidth - 236, Printer.PageHeight - 125, s, Fonts.Default.name)
+		END PrintHeader;
+	
+	BEGIN
+		pno := 0; top := Printer.PageHeight - 225; y := top;
+		Printer.UseListFont(Fonts.Default.name);
+		PrintHeader;
+		Texts.OpenReader(r, t, 0);
+		REPEAT Texts.Read(r, ch);
+			i := 0; WHILE ~r.eot & (ch # CR) DO s[i] := ch; INC(i); Texts.Read(r, ch) END;
+			s[i] := 0X;
+			Printer.String(left, y, s, Fonts.Default.name);
+			y := y - lsp;
+			IF y < bot THEN Printer.Page(copies); INC(pno); PrintHeader; y := top END
+		UNTIL r.eot;
+		IF y < top THEN Printer.Page(copies) END
+	END PrintDraft;*)
+
+	PROCEDURE PrintDraft* (t: Texts.Text; header: ARRAY OF CHAR; copies: INTEGER);
+		CONST left = 160; bot = 100; lsp = 32; maxLineLen = 120;
+		VAR top, y, pno, i, b: INTEGER; org: LONGINT; r: Texts.Reader; ch: CHAR; s: ARRAY maxLineLen + 1 OF CHAR;
+	
+		PROCEDURE PrintHeader;
+		BEGIN
+			Printer.String(left, Printer.PageHeight - 125, header, Fonts.Default.name);
+			IF pno < 10 THEN s[0] := " " ELSE s[0] := CHR(30H + pno MOD 100 DIV 10) END;
+			s[1] := CHR(30H + pno MOD 10); s[2] := 0X;
+			Printer.String(Printer.PageWidth - 236, Printer.PageHeight - 125, s, Fonts.Default.name)
+		END PrintHeader;
+	
+	BEGIN
+		pno := 0; top := Printer.PageHeight - 225; y := top;
+		Printer.UseListFont(Fonts.Default.name);
+		PrintHeader;
+		Texts.OpenReader(r, t, 0);
+		REPEAT
+			org := Texts.Pos(r); Texts.Read(r, ch); i := 0; b := 0;
+			WHILE ~r.eot & (ch # CR) & (i < maxLineLen) DO
+				IF ch = " " THEN b := i END;
+				s[i] := ch; INC(i); Texts.Read(r, ch)
+			END;
+			IF (i = maxLineLen) & (ch # CR) & ~r.eot THEN
+				IF b > 0 THEN i := b; org := org + i + 1 ELSE org := org + i END;
+				Texts.OpenReader(r, t, org)
+			END;
+			s[i] := 0X;
+			Printer.String(left, y, s, Fonts.Default.name);
+			y := y - lsp;
+			IF y < bot THEN Printer.Page(copies); INC(pno); PrintHeader; y := top END
+		UNTIL r.eot;
+		IF y < top THEN Printer.Page(copies) END
+	END PrintDraft;
+
+(*---version without two-column printing
+	PROCEDURE PlaceBody* (bodyX, bodyY, bodyW, bodyH: INTEGER;
+			T: Texts.Text; VAR pos: LONGINT; pno: INTEGER; place: BOOLEAN);
+		VAR t: PrintLine; org: LONGINT; py: INTEGER; inPage: BOOLEAN;
+	BEGIN py := bodyY + bodyH; inPage := FALSE;
+		LOOP org := pos; Texts.OpenReader(R, T, org); Texts.Read(R, nextCh);
+			t.org := org; MeasureLine(T, pno, bodyW, t);
+			IF pbeg = org THEN
+				IF inPage & (pageBreak IN P.opts) THEN EXIT	(*parc enforced early page break*)
+				ELSIF py - bodyY < SHORT((3 * P.lsp + P.lead) DIV Unit) THEN	(*widow window*)
+					INC(pos, t.span); EXIT
+				ELSIF inPage OR (pageBreak IN P.opts) THEN DEC(py, SHORT(P.lead DIV Unit)); inPage := TRUE
+				END
+			ELSE inPage := inPage OR (t.len > 0);
+				IF inPage THEN DEC(py, t.h) END;
+				IF py < bodyY THEN EXIT END;
+				IF place THEN PlaceLine(T, pno, t, bodyX, bodyW + (5 * mm DIV Unit), py)
+				ELSE ClaimPrinter
+				END
+			END;
+			INC(pos, t.span);
+			IF t.eot THEN EXIT END
+		END
+	END PlaceBody;
+*)
+(*---*)
+	PROCEDURE MeasureColumns (pno, py, y0, w0: INTEGER; T: Texts.Text; VAR pos: LONGINT;
+			VAR t: ARRAY OF PrintLine; VAR nl, nr, bh: INTEGER; VAR eofPage: BOOLEAN);
+		VAR yl, yr, hl, hr, dh: INTEGER; inColumn, break: BOOLEAN;
+
+		PROCEDURE MeasureColumn (VAR inCol, break: BOOLEAN; lastCol: BOOLEAN; VAR py: INTEGER; VAR n: INTEGER);
+			VAR org: LONGINT; eot: BOOLEAN;
+		BEGIN
+			LOOP org := pos; Texts.OpenReader(R, T, org); Texts.Read(R, nextCh);
+				t[n].org := org; MeasureLine(T, pno, w0, t[n]); eot := t[n].eot;
+				IF ~(twoColumns IN P.opts) OR (n = LEN(t)) THEN EXIT END;
+				IF pbeg = org THEN
+					IF inCol & (pageBreak IN P.opts) THEN break := TRUE; EXIT	(*parc enforced early page break*)
+					ELSIF lastCol & (py - y0 < SHORT((3 * P.lsp + P.lead) DIV Unit)) THEN	(*widow window*)
+						t[n].h := SHORT(P.lead DIV Unit); INC(pos, t[n].span); eofPage := TRUE; EXIT
+					ELSIF inCol OR (pageBreak IN P.opts) THEN inCol := TRUE;
+						t[n].h := SHORT(P.lead DIV Unit); DEC(py, t[n].h)
+					END;
+					INC(pos, t[n].span); INC(n)
+				ELSIF inCol OR (t[n].len > 0) THEN inCol := TRUE;
+					IF py - t[n].h >= y0 THEN DEC(py, t[n].h); INC(pos, t[n].span); INC(n)
+					ELSE eofPage := TRUE; EXIT
+					END
+				ELSE INC(pos, t[n].span)
+				END;
+				ClaimPrinter;
+				IF eot THEN EXIT END
+			END
+		END MeasureColumn;
+
+	BEGIN inColumn := FALSE; break := FALSE; dh := 0;
+		yl := py; nl := 0; MeasureColumn(inColumn, break, FALSE, yl, nl); hl := py - yl;
+		yr := py; nr := nl;
+		IF ~break THEN MeasureColumn(inColumn, break, TRUE, yr, nr) END;
+		hr := py - yr;
+		LOOP	(*balance columns*)
+			IF nl = 0 THEN EXIT
+			ELSIF t[nl-1].len = 0 THEN DEC(nl); dh := t[nl].h;
+			ELSIF (hl - t[nl - 1].h > hr) & (yr - t[nl - 1].h >= y0) THEN DEC(nl);
+				DEC(hl, t[nl].h); INC(yl, t[nl].h); INC(hr, t[nl].h + dh); DEC(yr, t[nl].h + dh); dh := 0
+			ELSE EXIT
+			END
+		END;
+		bh := Max(hl, hr)
+	END MeasureColumns;
+
+	PROCEDURE PlaceColumns (T: Texts.Text; VAR t: ARRAY OF PrintLine; pno, px, py, w0, nl, nr: INTEGER);
+		VAR i, x, y, w: INTEGER;
+	BEGIN i := 0;
+		x := px; y := py; w := w0 + (5 * mm DIV Unit);
+		WHILE i < nl DO DEC(y, t[i].h); PlaceLine(T, pno, t[i], x, w, y); INC(i) END;
+		x := px + (w0 + ColumnGap DIV Unit) DIV 2;
+		y := py; w := w0 DIV 2 + (5 * mm DIV Unit);
+		WHILE (i < nr) & ((t[i].len = 0) OR (t[i].pbeg = t[i].org)) DO INC(i) END;
+		WHILE i < nr DO DEC(y, t[i].h); PlaceLine(T, pno, t[i], x, w, y); INC(i) END
+	END PlaceColumns;
+
+	PROCEDURE PlaceBody* (bodyX, bodyY, bodyW, bodyH: INTEGER;
+			T: Texts.Text; VAR pos: LONGINT; pno: INTEGER; place: BOOLEAN);
+		VAR t: PrintLine; org: LONGINT; py, bh, nl, nr: INTEGER; inPage, eofPage: BOOLEAN;
+			bt: ARRAY 254 OF PrintLine;
+	BEGIN py := bodyY + bodyH; inPage := FALSE;
+		LOOP org := pos; Texts.OpenReader(R, T, org); Texts.Read(R, nextCh);
+			t.org := org; MeasureLine(T, pno, bodyW, t);
+			IF pbeg = org THEN
+				IF inPage & (pageBreak IN P.opts) THEN EXIT	(*parc enforced early page break*)
+				ELSIF py - bodyY < SHORT((3 * P.lsp + P.lead) DIV Unit) THEN	(*widow window*)
+					INC(pos, t.span); EXIT
+				ELSIF inPage OR (pageBreak IN P.opts) THEN DEC(py, SHORT(P.lead DIV Unit)); inPage := TRUE
+				END;
+				INC(pos, t.span)
+			ELSIF twoColumns IN P.opts THEN eofPage := FALSE;
+				MeasureColumns(pno, py, bodyY, bodyW, T, pos, bt, nl, nr, bh, eofPage);
+				IF (nl = 0) OR (bh = 0) THEN EXIT END;
+				IF place THEN PlaceColumns(T, bt, pno, bodyX, py, bodyW, nl, nr) END;
+				DEC(py, bh); inPage := TRUE;
+				IF eofPage THEN EXIT END
+			ELSE inPage := inPage OR (t.len > 0);
+				IF inPage THEN DEC(py, t.h) END;
+				IF py < bodyY THEN
+					IF t.h > bodyH THEN INC(pos, t.span) END;	(*line is higher than page: skip*)
+					EXIT
+				END;
+				IF place THEN PlaceLine(T, pno, t, bodyX, bodyW + (5 * mm DIV Unit), py)
+				ELSE ClaimPrinter
+				END;
+				INC(pos, t.span)
+			END;
+			IF t.eot THEN EXIT END
+		END
+	END PlaceBody;
+(*---*)
+
+BEGIN fname := "Syntax10.Scn.Fnt"
+END TextPrinter.

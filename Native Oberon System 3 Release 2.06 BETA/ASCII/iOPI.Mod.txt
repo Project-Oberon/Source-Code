@@ -1,0 +1,621 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE iOPI;	(* NM  12.12.93 *)
+(***************************************************************************
+	OPI - Dump Internal Code of the Intel OP2
+		code generator for Intel i386, i387/ i486 - Diplomarbeit ETH-Zürich WS 92/93
+		by Niklaus Mannhart, 87-913-117I
+		author's address: 	Himmelrich 22
+			6340 Baar, Switzerland
+			e-mail: mannhart@inf.ethz.ch	phone: +41 (0)42 31 40 33
+	
+	This program is distributed in the hope that it will be useful, 
+	but WITHOUT ANY WARRANTY; without even the implied warranty of 
+	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+	
+----------------------------------------------------------------------------	
+	Documentation on this module:
+		code generator for Intel i386, i387/ i486 - Diplomarbeit ETH-Zürich WS 92/93
+---------------------------------------------------------------------------		
+	Created by Niklaus Mannhart (mannhart@inf.ethz.ch) 2-3-1993
+	
+		9.1.96 (prk / reali@inf.ethz.ch)
+			Integrating SYSTEM.CLI, SYSTEM.STI, SYSTEM.PORTOUT, SYSTEM.PORTIN		(* New Functions *)
+			
+		12.1.96 (prk / reali@inf.ethz.ch)
+			Integrating the iASM assembler module 	(* iASM *)
+			
+---------------------------------------------------------------------------*)
+
+	IMPORT OPM := iOPM, OPL := iOPL, OPO := iOPO, OPC := iOPC, OPV := iOPV, OP2 := Compiler,
+		Texts, Oberon, Fonts, MenuViewers,  TextFrames;
+
+	CONST
+		Append = ".cod";
+
+	(* opcode of pseudo machine *)
+	(* integer operations *)
+	ld = OPL.ld DIV 32; 	store = OPL.store DIV 32; 	
+	lea = OPL.lea DIV 32; 	push = OPL.push DIV 32; 
+	pop = OPL.pop DIV 32; 	ldProc = OPL.ldProc DIV 32;	
+	ldXProc = OPL.ldXProc DIV 32;	ldbdw = OPL.ldbdw DIV 32; 
+	ldwdw = OPL.ldwdw DIV 32; 	ldbw = OPL.ldbw DIV 32;
+	     (* sign extended load; b: byte; w: word; dw: dword *)
+	ldbdwu = OPL.ldbdwu DIV 32;	ldwdwu = OPL.ldwdwu DIV 32;
+	ldbwu = OPL.ldbwu DIV 32; (* zero extended load; b: byte; w: word; dw: dword *)
+	putReg = OPL.putReg DIV 32;	getReg = OPL.getReg DIV 32;
+	add = OPL.add DIV 32; 	sub = OPL.sub DIV 32; 	
+	mul = OPL.mul DIV 32; 	div = OPL.div DIV 32; 
+	mod = OPL.mod DIV 32; 	neg = OPL.neg DIV 32; 
+	abs = OPL.abs DIV 32;	cmp = OPL.cmp DIV 32; 
+	je = OPL.je DIV 32; 	jne = OPL.jne DIV 32; 
+	jl = OPL.jl DIV 32; 	jle = OPL.jle DIV 32; 
+	jg = OPL.jg DIV 32; 	jge = OPL.jge DIV 32;
+	ja = OPL.ja DIV 32; 	jae = OPL.jae DIV 32; 
+	jb = OPL.jb DIV 32; 	jbe = OPL.jbe DIV 32;
+	jc = OPL.jc DIV 32; 	jnc = OPL.jnc DIV 32; 
+	jmp = OPL.jmp DIV 32; 	jmpReg = OPL.jmpReg DIV 32;
+	sete = OPL.sete DIV 32; 	setne = OPL.setne DIV 32; 
+	setl = OPL.setl DIV 32; 	setle = OPL.setle DIV 32; 
+	setg = OPL.setg DIV 32; 	setge = OPL.setge DIV 32;
+	seta = OPL.seta DIV 32; 	setae = OPL.setae DIV 32; 
+	setb = OPL.setb DIV 32; 	setbe = OPL.setbe DIV 32;
+	setc = OPL.setc DIV 32; 	setnc = OPL.setnc DIV 32;
+	te = OPL.te DIV 32; 	tne = OPL.tne DIV 32; 
+	tle = OPL.tle DIV 32;
+	ta = OPL.ta DIV 32; 	tae = OPL.tae DIV 32;
+	to = OPL.to DIV 32;	trap = OPL.trap DIV 32;
+	or = OPL.or DIV 32; 	xor = OPL.xor DIV 32; 
+	and = OPL.and DIV 32; 	not = OPL.not DIV 32;
+	bt = OPL.bt DIV 32; 	btr = OPL.btr DIV 32; 
+	bts = OPL.bts DIV 32;	call = OPL.call DIV 32; 
+	callReg = OPL.callReg DIV 32; 	xcall = OPL.xcall DIV 32; 
+	ret = OPL.ret DIV 32; 	enter = OPL.enter DIV 32; 
+	leave = OPL.leave DIV 32;	sal = OPL.sal DIV 32; 
+	sar = OPL.sar DIV 32; 	shr = OPL.shr DIV 32; 
+	rol = OPL.rol DIV 32;	cld = OPL.cld DIV 32; 
+	repMovs = OPL.repMovs DIV 32; 
+	cmpString = OPL.cmpString DIV 32;
+	sti = OPL.sti DIV 32;					(* New Functions *)
+	cli = OPL.cli DIV 32;
+	in = OPL.in DIV 32;
+	out = OPL.out DIV 32;
+	inline = OPL.inline DIV 32;
+
+	(* floating point operations *)
+	fload = OPL.fload DIV 32; 	fstore = OPL.fstore DIV 32; 	
+	fist = OPL.fist DIV 32; 	fild = OPL.fild DIV 32;
+	fadd = OPL.fadd DIV 32; 	fsub = OPL.fsub DIV 32;	
+	fmul = OPL.fmul DIV 32;	fdiv = OPL.fdiv DIV 32; 
+	fabs = OPL.fabs DIV 32; 	fchs = OPL.fchs DIV 32; 	
+	fcmp = OPL.fcmp DIV 32;
+
+	(* special *)
+	phi = OPL.phi DIV 32; 	pushReg = OPL.pushReg DIV 32;
+	popReg = OPL.popReg DIV 32; 	case = OPL.case DIV 32;
+	short = OPL.short DIV 32;	label = OPL.label DIV 32;
+	entier = OPL.entier DIV 32;
+
+	newStat = OPL.newStat DIV 32;
+
+		(* modes *)
+		RegReg = OPO.RegReg; RegMem = OPO.RegMem; MemReg = OPO.MemReg; ImmReg = OPO.ImmReg; 
+
+		(* must be the same as in iOPL.Mod *)
+		none = OPL.none; noBase = none; noInx = none; noImm = 0;
+	
+	VAR
+		T: Texts.Text;
+	
+(* Decode Pseudo Code *)
+
+	PROCEDURE WriteReg (VAR Wr: Texts.Writer; r: LONGINT);
+		VAR size: INTEGER; hint: LONGINT;
+	BEGIN
+		IF r = OPL.RiscFP THEN Texts.WriteString (Wr, "FP")
+		ELSIF r = OPL.RiscESP THEN Texts.WriteString (Wr, "ESP")
+		ELSIF (r < 0) OR (r > OPL.RiscCodeLen) THEN Texts.WriteString (Wr, "ERROR "); Texts.WriteInt (Wr, r, 1)
+		ELSE
+			size:= OPL.Instr[r].op MOD 8;
+			hint:= OPL.Instr[r].hint;
+			IF (hint < 0) OR (hint >= OPL.tryEAX) THEN
+				IF size = OPO.Bit8 DIV 8 THEN Texts.Write (Wr, "B")
+				ELSIF size = OPO.Bit16 DIV 8 THEN Texts.Write (Wr, "W")
+				ELSIF size = OPO.Bit32 THEN Texts.WriteString (Wr, "DW")
+				ELSIF size = 3 THEN Texts.Write (Wr, "F")
+				ELSIF size = 4 THEN Texts.WriteString (Wr, "DF")
+				ELSE Texts.Write (Wr, "?"); Texts.WriteInt (Wr, size, 1)
+				END;
+				Texts.WriteInt (Wr, r, 1)
+			ELSE
+				CASE hint OF
+					OPL.useEAX:
+						CASE size OF 
+							2: Texts.WriteString (Wr, "AL")
+						  | 1: Texts.WriteString (Wr, "AX")
+						  | 0: Texts.WriteString (Wr, "EAX")
+						ELSE Texts.WriteString (Wr, "??"); Texts.WriteInt (Wr, size, 1)
+						END
+				  | OPL.useECX:
+						CASE size OF 
+							2: Texts.WriteString (Wr, "CL")
+						  | 1: Texts.WriteString (Wr, "CX")
+						  | 0: Texts.WriteString (Wr, "ECX")
+						ELSE Texts.WriteString (Wr, "??"); Texts.WriteInt (Wr, size, 1)
+						END
+				  | OPL.useEDX:
+						CASE size OF 
+							2: Texts.WriteString (Wr, "DL")
+						  | 1: Texts.WriteString (Wr, "DX")
+						  | 0: Texts.WriteString (Wr, "EDX")
+						ELSE Texts.WriteString (Wr, "??"); Texts.WriteInt (Wr, size, 1)
+						END
+				  | OPL.useEBX:
+						CASE size OF 
+							2: Texts.WriteString (Wr, "BL")
+						  | 1: Texts.WriteString (Wr, "BX")
+						  | 0: Texts.WriteString (Wr, "EBX")
+						ELSE Texts.WriteString (Wr, "??"); Texts.WriteInt (Wr, size, 1)
+						END
+				  | OPL.useESP:
+						CASE size OF 
+							2: Texts.WriteString (Wr, "AH")
+						  | 1: Texts.WriteString (Wr, "SP")
+						  | 0: Texts.WriteString (Wr, "ESP")
+						ELSE Texts.WriteString (Wr, "??"); Texts.WriteInt (Wr, size, 1)
+						END
+				  | OPL.useEBP:
+						CASE size OF 
+							2: Texts.WriteString (Wr, "CH")
+						  | 1: Texts.WriteString (Wr, "BP")
+						  | 0: Texts.WriteString (Wr, "EBP")
+						ELSE Texts.WriteString (Wr, "??"); Texts.WriteInt (Wr, size, 1)
+						END
+				  | OPL.useESI:
+						CASE size OF 
+							2: Texts.WriteString (Wr, "DH")
+						  | 1: Texts.WriteString (Wr, "SI")
+						  | 0: Texts.WriteString (Wr, "ESI")
+						ELSE Texts.WriteString (Wr, "??"); Texts.WriteInt (Wr, size, 1)
+						END
+				  | OPL.useEDI:
+						CASE size OF
+							2: Texts.WriteString (Wr, "BH")
+						  | 1: Texts.WriteString (Wr, "DI")
+						  | 0: Texts.WriteString (Wr, "EDI")
+						ELSE Texts.WriteString (Wr, "??"); Texts.WriteInt (Wr, size, 1)
+						END
+				  | OPL.useST: Texts.WriteString (Wr, "ST(0)")
+				ELSE 
+					Texts.WriteString (Wr, "hint?? "); Texts.WriteInt (Wr, hint, 6); Texts.WriteString (Wr, "  ");
+					Texts.WriteInt (Wr, size, 6)
+				END;
+				Texts.WriteString (Wr, "(R"); Texts.WriteInt (Wr,r,1); Texts.WriteString (Wr, ")")
+			END
+		END
+	END WriteReg;
+	
+	PROCEDURE OutLoadSX (VAR W: Texts.Writer; i: INTEGER);
+		VAR op, mode, scale, src2form: INTEGER;
+	BEGIN
+		op:= OPL.Instr [i].op DIV 32; mode:= (OPL.Instr [i].op DIV 8) MOD 4; src2form:= OPL.Instr [i].op MOD 8;
+		scale:= OPL.Instr [i].scale;
+		IF (op = ldbdw) OR (op = ldwdw) THEN Texts.WriteString (W, "DW")
+		ELSE Texts.Write (W, "W")
+		END;
+		Texts.WriteInt (W, OPL.Instr [i].dest, 1); Texts.Write (W, ",");
+		IF mode = RegReg THEN WriteReg (W, OPL.Instr[i].src1)
+		ELSE (* mode = MemReg *)
+			IF (op = ldbdw) OR (op = ldbw) THEN Texts.WriteString (W, "BYTE PTR ")
+			ELSE  Texts.WriteString (W, "WORD PTR ")
+			END;
+			IF OPL.Instr [i].src1 # noBase THEN Texts.WriteInt (W, OPL.Instr [i].src2, 1) END;
+			Texts.Write (W, "[");
+			IF OPL.Instr [i].src1 = noBase THEN Texts.WriteInt (W, OPL.Instr [i].src2, 1)
+			ELSE WriteReg (W, OPL.Instr[i].src1)
+			END;
+			IF OPL.Instr [i].inx # noInx THEN
+				Texts.WriteString (W, " + "); Texts.WriteInt (W, scale, 1); Texts.WriteString (W, " * ");
+				WriteReg (W, OPL.Instr [i].inx)
+			END;
+			Texts.Write (W, "]")
+		END
+	END OutLoadSX;
+	
+	PROCEDURE OutLoad (VAR W: Texts.Writer; i: INTEGER);
+		VAR mode, scale, src2form: INTEGER;
+	BEGIN
+		mode:= (OPL.Instr [i].op DIV 8) MOD 4; src2form:= OPL.Instr [i].op MOD 4; scale:= OPL.Instr [i].scale;
+		WriteReg (W, OPL.Instr[i].dest); Texts.Write (W, ",");
+		CASE mode OF
+			ImmReg:
+				Texts.WriteInt (W, OPL.Instr[i].src2, 1)
+		  | RegReg:
+				WriteReg (W, OPL.Instr[i].src1)
+		  | MemReg:
+				CASE src2form OF
+					2: Texts.WriteString (W, "BYTE PTR ")
+				  | 1: Texts.WriteString (W, "WORD PTR ")
+				  | 0: Texts.WriteString (W, "DWORD PTR ")
+				  | 3: Texts.WriteString (W, "FLOAT PTR ")
+				  | 4: Texts.WriteString (W, "DFLOAT PTR ")
+				END;
+				IF OPL.Instr[i].src1 # noBase THEN Texts.WriteInt (W, OPL.Instr[i].src2, 1) END;
+				Texts.Write (W, "["); 
+				IF OPL.Instr[i].src1 = noBase THEN Texts.WriteInt (W, OPL.Instr[i].src2, 1)
+				ELSE WriteReg (W, OPL.Instr[i].src1)
+				END;
+				IF OPL.Instr[i].inx # noInx THEN
+					Texts.WriteString (W, " + "); Texts.WriteInt (W, scale, 1); Texts.WriteString (W, " * ");
+					WriteReg (W, OPL.Instr[i].inx)
+				END;
+				Texts.Write (W, "]")
+		END
+	END OutLoad;
+
+	PROCEDURE OutLoadProc (VAR W: Texts.Writer; i: INTEGER);
+		VAR mode, src2form: INTEGER;
+	BEGIN
+		mode:= (OPL.Instr [i].op DIV 8) MOD 4; src2form:= OPL.Instr [i].op MOD 4;
+		WriteReg (W, OPL.Instr [i].dest); Texts.Write (W, ",");
+		Texts.WriteInt (W, OPL.Instr[i].src1, 1)
+	END OutLoadProc;
+
+	PROCEDURE OutStore (VAR W: Texts.Writer; i: INTEGER);
+		VAR 
+			mode, scale, src2form: INTEGER; 
+			reg, base, inx, disp: LONGINT;
+	BEGIN 
+		reg:= OPL.Instr[i].dest; base:= OPL.Instr[i].src1; inx:= OPL.Instr[i].inx; disp:= OPL.Instr [i].src2;
+		mode:= (OPL.Instr [i].op DIV 8) MOD 4; src2form:= OPL.Instr [i].op MOD 4; scale:= OPL.Instr [i].scale;
+		IF mode IN {RegReg, ImmReg} THEN WriteReg (W, OPL.Instr [i].src1)
+		ELSE
+			CASE src2form OF
+				2: Texts.WriteString (W, "BYTE PTR ")
+			  | 1: Texts.WriteString (W, "WORD PTR ")
+			  | 0: Texts.WriteString (W, "DWORD PTR ")
+			  | 3: Texts.WriteString (W, "FLOAT PTR ")
+			  | 4: Texts.WriteString (W, "DFLOAT PTR ")
+			END;
+			IF OPL.Instr[i].src1 # noBase THEN Texts.WriteInt (W, OPL.Instr[i].src2, 1) END;
+			Texts.Write (W, "[");
+			IF OPL.Instr[i].src1 = noBase THEN Texts.WriteInt (W, OPL.Instr[i].src2, 1) 
+			ELSE WriteReg (W, OPL.Instr[i].src1)
+			END;
+			IF OPL.Instr[i].inx # noInx THEN
+				Texts.WriteString (W, " + "); Texts.WriteInt (W, scale, 1); Texts.WriteString (W, " * ");
+				WriteReg (W, OPL.Instr[i].inx)
+			END;
+			Texts.Write (W, "]")
+		END;
+		Texts.Write (W, ",");
+		IF mode = ImmReg THEN Texts.WriteInt (W, OPL.Instr[i].dest, 1)
+		ELSE WriteReg (W, OPL.Instr[i].dest)
+		END
+END OutStore;
+
+	PROCEDURE OutPushPop (VAR W: Texts.Writer; i: INTEGER);
+		VAR op, mode, src2form: INTEGER;
+	BEGIN
+		op:= OPL.Instr [i].op DIV 32; mode:= (OPL.Instr [i].op DIV 8) MOD 4; src2form:= OPL.Instr [i].op MOD 8;
+		IF (op = push) & (mode = ImmReg) THEN Texts.WriteInt (W, OPL.Instr [i].src2, 1)
+		ELSE
+			ASSERT (mode = RegReg);
+			WriteReg (W, OPL.Instr [i].src1)
+		END
+	END OutPushPop;
+	
+	PROCEDURE OutPortIO (VAR W: Texts.Writer; i: INTEGER);					(* New Functions *)
+		VAR size: INTEGER;
+	BEGIN
+		size:= OPL.Instr [i].op MOD 8;
+		IF OPL.Instr [i].op DIV 32 = out THEN Texts.WriteString(W, " DX, ") END;
+		CASE size OF
+			0: Texts.WriteString(W, "EAX")
+		|  1: Texts.WriteString(W, "AX")
+		|  2: Texts.WriteString(W, "AL")
+		END;
+		IF OPL.Instr [i].op DIV 32 = in THEN Texts.WriteString(W, ", DX") END;
+
+	END OutPortIO;
+	
+	PROCEDURE Out0 (VAR W: Texts.Writer; i: INTEGER);
+	BEGIN
+	END Out0;
+
+	PROCEDURE Out1 (VAR W: Texts.Writer; i: INTEGER);
+		VAR op: INTEGER;
+	BEGIN
+		op:= OPL.Instr [i].op DIV 32;
+		IF (op = jmpReg) OR (op = callReg) THEN WriteReg (W, OPL.Instr[i].src2)
+		ELSE Texts.WriteInt (W, OPL.Instr[i].src2, 1)
+		END
+	END Out1;
+
+	PROCEDURE Out2 (VAR W: Texts.Writer; i: INTEGER);
+	BEGIN
+		WriteReg (W, OPL.Instr[i].dest); Texts.Write (W, ","); WriteReg (W, OPL.Instr[i].src1)
+	END Out2;
+	
+	PROCEDURE Out3 (VAR W: Texts.Writer; i: INTEGER);
+	BEGIN
+		WriteReg (W, OPL.Instr[i].dest); Texts.Write (W, ","); WriteReg (W, OPL.Instr[i].src1); Texts.Write (W, ",");
+		IF (OPL.Instr [i].op DIV 8) MOD 4 = ImmReg THEN Texts.WriteInt (W, OPL.Instr[i].src2, 1)
+		ELSE WriteReg (W, OPL.Instr[i].src2)
+		END
+	END Out3;
+	
+	PROCEDURE OutFlags (VAR W: Texts.Writer; i: INTEGER);
+	BEGIN
+		WriteReg (W, OPL.Instr[i].src1); Texts.Write (W, ",");
+		IF (OPL.Instr [i].op DIV 8) MOD 4 = ImmReg THEN Texts.WriteInt (W, OPL.Instr[i].src2, 1)
+		ELSE WriteReg (W, OPL.Instr[i].src2)
+		END
+	END OutFlags;
+	
+	PROCEDURE OutSetc (VAR W: Texts.Writer; i: INTEGER);
+	BEGIN
+		WriteReg (W, OPL.Instr[i].dest)
+	END OutSetc;
+
+	PROCEDURE Show (VAR T: Texts.Text; pc, entryNr: INTEGER; targetPC: LONGINT; name: ARRAY OF CHAR);
+		VAR i: INTEGER; W: Texts.Writer;
+	BEGIN
+		Texts.OpenWriter (W);
+		Texts.SetFont (W, Fonts.This ("Courier10.Scn.Fnt"));
+		Texts.WriteLn (W); Texts.WriteString (W, name); Texts.WriteString (W, "  pc: "); Texts.WriteInt (W, targetPC, 4);
+		IF entryNr > -1 THEN Texts.WriteString (W, "  entry number: "); Texts.WriteInt (W, entryNr, 4) END;
+		Texts.WriteLn (W);
+		Texts.WriteString (W, "  used  Hints  PC   opcode "); Texts.WriteLn (W);
+		Texts.WriteString (W, "-------------------------"); Texts.WriteLn (W);
+		i:= 0;
+		WHILE i < pc DO
+			Texts.WriteInt (W, OPL.Instr[i].used, 4); Texts.WriteString (W, "   ");
+			Texts.WriteInt (W, OPL.Instr[i].hint, 4); Texts.WriteString (W, "   ");
+			Texts.WriteInt (W, i, 2); Texts.WriteString (W, "   ");
+IF OPL.Instr[i].abs THEN Texts.WriteString (W, "TRUE    ") ELSE Texts.WriteString(W, "FALSE   ") END;
+			CASE OPL.Instr[i].op DIV 32 OF
+				ld, putReg: 
+					Texts.WriteString (W, "load    "); OutLoad (W, i);
+			  | store, getReg:
+					Texts.WriteString (W, "store   "); OutStore (W, i);
+			  | lea:
+					Texts.WriteString (W, "lea     "); OutLoad (W, i);
+			  | push:
+					Texts.WriteString (W, "push    "); OutPushPop (W,  i);
+			  | pop:
+					Texts.WriteString (W, "pop     "); OutPushPop (W, i);
+			  | add:
+					Texts.WriteString (W, "add     "); Out3 (W, i);
+			  | sub:
+					Texts.WriteString (W, "sub     "); Out3 (W, i);
+			  | mul:
+					Texts.WriteString (W, "mul     "); Out3 (W, i);
+			  | div:
+					Texts.WriteString (W, "div     "); Out3 (W, i);
+			  | mod:
+					Texts.WriteString (W, "mod     "); Out3 (W, i);
+			  | neg:
+					Texts.WriteString (W, "neg     "); Out2 (W, i);
+			  | cmp:
+					Texts.WriteString (W, "cmp     "); OutFlags (W, i);
+			  | je:
+					Texts.WriteString (W, "je      "); Out1 (W, i);
+			  | jne:
+					Texts.WriteString (W, "jne     "); Out1 (W, i);
+			  | jl:
+					Texts.WriteString (W, "jl      "); Out1 (W, i);
+			  | jle:
+					Texts.WriteString (W, "jle     "); Out1 (W, i);
+			  | jg:
+					Texts.WriteString (W, "jg      "); Out1 (W, i);
+			  | jge:
+					Texts.WriteString (W, "jge     "); Out1 (W, i);
+			  | ja:
+					Texts.WriteString (W, "ja      "); Out1 (W, i);
+			  | jae:
+					Texts.WriteString (W, "jae     "); Out1 (W, i);
+			  | jb:
+					Texts.WriteString (W, "jb      "); Out1 (W, i)
+			  | jbe:
+					Texts.WriteString (W, "jbe     "); Out1 (W, i)
+			  | jc:
+					Texts.WriteString (W, "jc      "); Out1 (W, i)
+			  | jnc:
+					Texts.WriteString (W, "jnc     "); Out1 (W, i)
+			  | jmp, jmpReg:
+					Texts.WriteString (W, "jmp     "); Out1 (W, i);
+			  | sete:
+			 		Texts.WriteString (W, "sete    "); OutSetc (W,i);
+			  | setne:
+			 		Texts.WriteString (W, "setne    "); OutSetc (W,i);
+			  | setl:
+			 		Texts.WriteString (W, "setl    "); OutSetc (W,i);
+			  | setle:
+			 		Texts.WriteString (W, "setle    "); OutSetc (W,i);
+			  | setg:
+			 		Texts.WriteString (W, "setg    "); OutSetc (W,i);
+			  | setge:
+			 		Texts.WriteString (W, "setge    "); OutSetc (W,i);
+			  | seta:
+					Texts.WriteString (W, "seta    "); OutSetc (W, i);
+			  | setae:
+					Texts.WriteString (W, "setae  "); OutSetc (W, i);
+			  | setb:
+					Texts.WriteString (W, "setb    "); OutSetc (W, i);
+			  | setbe:
+					Texts.WriteString (W, "setbe   "); OutSetc (W, i);
+			  | setc:
+					Texts.WriteString (W, "setc    "); OutSetc (W, i);
+			  | setnc:
+					Texts.WriteString (W, "setnc   "); OutSetc (W, i);
+			  | te:
+					Texts.WriteString (W, "te      "); Out1 (W, i);
+			  | tne:
+					Texts.WriteString (W, "tne     "); Out1 (W, i);
+			  | tle:
+					Texts.WriteString (W, "tle     "); Out1 (W, i);
+			  | ta:
+					Texts.WriteString (W, "ta      "); Out1 (W, i);
+			  | tae:
+					Texts.WriteString (W, "tae     "); Out1 (W, i);
+			  | to:
+					Texts.WriteString (W, "to      "); Out1 (W, i);
+			  | trap:
+					Texts.WriteString (W, "trap    "); Out1 (W, i);
+			  | or:
+					Texts.WriteString (W, "or      "); Out3 (W, i);
+			  | xor:
+					Texts.WriteString (W, "xor     "); Out3 (W, i);
+			  | and:
+					Texts.WriteString (W, "and     "); Out3 (W, i);
+			  | not:
+					Texts.WriteString (W, "not     "); Out2 (W, i);
+			  | abs:
+					Texts.WriteString (W, "abs     "); Out2 (W, i);
+			  | bt:
+					Texts.WriteString (W, "bt      "); OutFlags (W, i);
+			  | btr:
+					Texts.WriteString (W, "btr     "); Out3 (W, i);
+			  | bts:
+					Texts.WriteString (W, "bts     "); Out3 (W, i);
+			  | call:
+					Texts.WriteString (W, "call    "); Out1 (W, i);
+			  | ret:
+					Texts.WriteString (W, "ret     "); Out1 (W, i);
+			  | enter:
+					Texts.WriteString (W, "enter   "); Out1 (W, i);
+			  | leave:
+					Texts.WriteString (W, "leave   "); Out1 (W, i);
+			  | sal:
+					Texts.WriteString (W, "sal     "); Out3 (W, i);
+			  | sar:
+					Texts.WriteString (W, "sar     "); Out3 (W, i);
+			  | shr:
+					Texts.WriteString (W, "shr     "); Out3 (W, i);
+			  | rol:
+					Texts.WriteString (W, "rol     "); Out3 (W, i);
+			  | cld:
+					Texts.WriteString (W, "cld     "); Out0 (W, i);
+			  | repMovs:
+					Texts.WriteString (W, "rep movs "); Out3 (W, i);
+			  | fload:
+					Texts.WriteString (W, "fload   "); OutLoad (W, i);
+			  | fstore:
+					Texts.WriteString (W, "fstore  "); OutStore (W, i);
+			  | fild:
+					Texts.WriteString (W, "fild    "); OutLoad (W, i);
+			  | fist:
+					Texts.WriteString (W, "fist   "); OutStore (W, i);
+			  | fadd:
+					Texts.WriteString (W, "fadd    "); Out3 (W, i);
+			  | fsub:
+					Texts.WriteString (W, "fsub    "); Out3 (W, i);
+			  | fmul:
+					Texts.WriteString (W, "fmul    "); Out3 (W, i);
+			  | fdiv:
+					Texts.WriteString (W, "fdiv    "); Out3 (W, i);
+			  | fabs:
+					Texts.WriteString (W, "fabs    "); Out2 (W, i);
+			  | fchs:
+					Texts.WriteString (W, "fchs    "); Out2 (W, i);
+			  | fcmp:
+					Texts.WriteString (W, "fcmp    "); OutFlags (W, i);
+			  | short:
+					Texts.WriteString (W, "short   "); Out2 (W, i);
+			 | entier:
+					Texts.WriteString (W, "entier  "); Out2 (W, i);
+			  | phi:
+					Texts.WriteString (W, "phi     "); OutFlags (W, i)
+			  | pushReg:
+					Texts.WriteString (W, "pushReg"); Out0 (W, i)
+			  | popReg:
+					Texts.WriteString (W, "popReg"); Out0 (W, i)
+			  | ldbdw, ldwdw, ldbw:
+					Texts.WriteString (W, "ldsx    "); OutLoadSX (W, i)
+			  | ldbdwu, ldwdwu, ldbwu:
+					Texts.WriteString (W, "ldsz    "); OutLoadSX (W, i)
+			  | case:
+					Texts.WriteString (W, "case    ");
+					Texts.WriteInt (W, OPL.Instr [i].src1, 1); Texts.WriteString (W, " : ");
+					Texts.WriteInt (W, OPL.Instr [i].src2, 1); Texts.WriteString (W, " : ");
+					Texts.WriteInt (W, OPL.Instr [i].inx, 1)
+			  | ldProc:
+					Texts.WriteString (W, "ldProc "); OutLoadProc (W, i)
+			  | ldXProc:
+					Texts.WriteString (W, "ldXProc "); OutLoadProc (W, i)
+			  | callReg:
+					Texts.WriteString (W, "call    "); Out1 (W, i)
+			  | xcall:
+					Texts.WriteString (W, "xcall   ");
+					Texts.WriteInt (W, OPL.Instr [i].src2 DIV 1000000H, 1); Texts.WriteString (W, " : ");
+					Texts.WriteInt (W, (OPL.Instr [i].src2 DIV 10000H) MOD 100H, 1); Texts.WriteString (W, " : ");
+					Texts.WriteInt (W, OPL.Instr [i].src2 MOD 10000H, 1)
+			  | cmpString:
+					Texts.WriteString (W, "cmpString ");
+					WriteReg (W, OPL.Instr [i].src1); Texts.WriteString (W, ","); WriteReg (W, OPL.Instr [i].src2)
+			  | label:
+					Texts.WriteString (W, "label"); Out0 (W, i)
+			  | newStat:
+					Texts.WriteString (W, "newStat "); Texts.WriteInt (W, OPL.Instr [i].src1, 1)
+			  | cli:
+			  	  Texts.WriteString (W, "cli    "); Out0 (W, i)
+			  | sti:
+			  	  Texts.WriteString (W, "sti    "); Out0 (W, i)
+			  | in:
+			  	  Texts.WriteString (W, "in      "); OutLoad(W, i)
+			  | out:
+			  	  Texts.WriteString (W, "out    "); OutLoad(W, i)
+			  | inline:
+			  	  Texts.WriteString (W, "inline "); Out0 (W, i)
+			ELSE 
+				Texts.WriteString (W, "wrong op code ");
+				Texts.WriteInt (W, OPL.Instr[i].op, 1); Texts.WriteLn (W);
+				Texts.Append (T, W.buf); HALT (100)
+			END;
+			Texts.WriteLn (W);
+			INC (i)
+		END;
+		Texts.Append (T, W.buf)
+	END Show;
+
+	PROCEDURE DumpCode*;
+		VAR
+			i, j: INTEGER;
+			V: MenuViewers.Viewer; par: Oberon.ParList; X, Y: INTEGER;
+			append: ARRAY 5 OF CHAR;
+	BEGIN
+		IF T = NIL THEN (* open viewer *)
+			i := 0;
+			WHILE (i < 31) & (OP2.ModName[i] # 0X) DO INC (i) END;
+			COPY (Append, append);
+			j := 0;
+			WHILE (i < 31) & (j < 5) DO
+				OP2.ModName [i] := append [j]; INC (i); INC (j)
+			END;
+			OP2.ModName [i] := 0X;
+			T:= TextFrames.Text ("");
+			Oberon.AllocateUserViewer (Oberon.Par.vwr.X, X, Y);
+			V:= MenuViewers.New (TextFrames.NewMenu (OP2.ModName, "System.Close System.Copy System.Grow Edit.Search  Edit.Store"),
+						TextFrames.NewText (T, 0), TextFrames.menuH, X, Y)
+		END;
+		Show (T, OPC.pc, OPV.EntryNr, OPO.pc, OPV.ProcName)
+	END DumpCode;
+
+	PROCEDURE Init*;
+	BEGIN
+		T:= NIL
+	END Init;
+
+END iOPI.

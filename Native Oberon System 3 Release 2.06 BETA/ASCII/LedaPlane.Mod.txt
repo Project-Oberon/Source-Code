@@ -1,0 +1,441 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaPlane;	(* uh, Mon, 18-Oct-1993 *)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaBox, LedaIO, LedaAdjust, LedaRules, LedaLines, LedaText;
+	
+CONST
+	ModName = "LedaPlane";
+	PlaneName = "plane";
+	Anon = "anonymous";
+	NotDef = -1;
+	
+	DefW = 5 * LedaBase.CM;	DefH = 2 * LedaBase.CM;
+	StyleInd = 0;	FormatInd = 1;	(* used for LedaCtrl.TextBasics *)
+	
+	ColumnPat = LedaSys.Mark2;	ColumnClr = 12;	(* dark grey *)
+	
+	Ext0Tag = 0ABX;	Ext1Tag = 0ACX;
+	
+	(*--- dialog ---*)
+	Raster = "raster";	Variable = "variable";
+	Def = "default";	Color = "color";
+	Stat = TRUE;	Dyn = FALSE;
+
+TYPE
+	Box* = POINTER TO BoxDsc;
+	BoxDsc* = RECORD
+		(LedaLines.BoxDsc)
+		wdt*, hgt*: LONGINT;	(* original width and height *)
+		fc*, fl*, fh*, fv*: INTEGER;	(* original field values *)
+	END;
+	
+VAR
+	(*--- box type control ---*)
+	typeDoOp: LedaBase.CtrlProc;
+	
+	PROCEDURE NewLn(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR);
+	BEGIN
+		a.typ := LedaBox.NewLn; a.stat := TRUE; a.i := 0;
+		IF s # "" THEN COPY(s, a.s) ELSE a.s := "" END
+	END NewLn;
+	
+	PROCEDURE StrAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Str; COPY(s, a.s); a.stat := stat; a.i := 0;
+	END StrAt;
+	
+	PROCEDURE IntAt(VAR a: LedaBox.ParaDsc; i: LONGINT; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Int; a.i := i; a.stat := stat; a.s := ""
+	END IntAt;
+	
+	PROCEDURE EnumAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; i: LONGINT);
+	BEGIN
+		a.typ := LedaBox.Enum; COPY(s, a.s); a.i := i
+	END EnumAt;
+	
+	PROCEDURE Execute(pB: Box; eX, eY: LONGINT; P: LedaSys.Port; VAR res: INTEGER);
+	(* execute command according parameters *)
+		VAR s: LedaSys.String;
+	BEGIN
+		LedaBox.ParPopStr(s);
+		IF LedaSys.EqualStr("plane", s) THEN
+			LedaBox.ParPopStr(s);
+			IF LedaSys.EqualStr("data", s) THEN res := LedaBase.Done;
+				LedaSys.OutT(" - field values of plane: ", 0);
+				LedaSys.OutI(pB.fc, 0); LedaSys.OutC("/", 0); LedaSys.OutI(pB.fl, 0); LedaSys.OutC("/", 0);
+				LedaSys.OutI(pB.fh, 0); LedaSys.OutC("/", 0); LedaSys.OutI(pB.fv, 1)
+			ELSE LedaBox.ParReset(LedaBox.Str)
+			END
+		ELSE LedaBox.ParReset(LedaBox.Str)
+		END 
+	END Execute;
+
+	PROCEDURE NewSequence(ctrl: LedaBase.Control; next: LedaCtrl.Sequence): LedaCtrl.Sequence;
+		VAR seq: LedaCtrl.Sequence;
+	BEGIN
+		NEW(seq); seq.ctrl := ctrl; seq.next := next; RETURN seq
+	END NewSequence;
+
+	PROCEDURE SortStyles(VAR list: LedaCtrl.List);
+	(* orders the sequence of given list control list; *)
+	(* creates new sequence and list control with figure style at the beginning *)
+		VAR seq, new, cur: LedaCtrl.Sequence;	
+	BEGIN
+		seq := list.seq; new := NIL; cur := NIL;
+		WHILE seq # NIL DO
+			IF (seq.ctrl IS LedaBase.Style) & (seq.ctrl(LedaBase.Style).name = "figure") THEN
+				new := NewSequence(seq.ctrl, new); IF cur = NIL THEN cur := new END
+			ELSIF new = NIL THEN new := NewSequence(seq.ctrl, new); cur := new
+			ELSE cur.next := NewSequence(seq.ctrl, NIL); cur := cur.next
+			END;
+			seq := seq.next
+		END;
+		list := LedaCtrl.NewList(new)
+	END SortStyles;
+
+	PROCEDURE GetPlaneFormat(pB: LedaBase.Box; docFB: LedaBase.FormBase): LedaBase.FormBase;
+	(* gets the plane box format for box pB *)
+	(* the plane box format has an own setting for column [number, space] *)
+		VAR fB: LedaBase.FormBase;
+	BEGIN
+		IF pB.do.data # NIL THEN fB := pB.do.data(LedaBase.FormBase)	(* defined for instance [document] *)
+		ELSE
+			fB := LedaBase.NewFormBase(docFB);
+			fB.name := "illustration";
+			fB.data.cols := "1"; fB.data.sCols := "1";
+			fB.data.colDX := LONG(LedaBase.MM DIV 2) * LedaRules.FontSize(fB.data.width);
+			fB.data.sDX := "o";
+			pB.do.data := fB	(* defined for instance [document] *)
+		END;
+		RETURN fB
+	END GetPlaneFormat;
+
+	PROCEDURE NewText(caller: LedaBase.Box; pB: LedaLines.Box): LedaCtrl.Text;
+		VAR text: LedaCtrl.Text;	ctrl: LedaBase.Control;	fB: LedaBase.FormBase;
+			list: LedaCtrl.List;	m: LedaBox.Msg;
+	BEGIN
+		m.id := LedaBox.TextId; m.op := 1; m.text := NIL; m.ctrl := NIL;	(* ask reference data of text *)
+		LedaBox.GetInfo(caller, m);	(* returns reference text or linked controls [format, style list] *)
+		IF m.text # NIL THEN	(* continue flow of reference text *)
+			LedaSys.Halt("LedaPlane: text flow error")
+		ELSE		(* create new text based on linked controls *)
+			fB := NIL; list := NIL;
+			text := LedaCtrl.NewText(pB, NIL);
+			IF m.ctrl # NIL THEN
+				ctrl := m.ctrl; m.ctrl := m.ctrl.link; ctrl.link := NIL;
+				IF ctrl IS LedaBase.FormBase THEN fB := ctrl(LedaBase.FormBase) END
+			END;		(* fB: format base to refer to *)
+			fB := GetPlaneFormat(pB, fB);
+			ctrl := fB; LedaCtrl.TextBasics(text, LedaCtrl.SetId, FormatInd, ctrl);	(* set basic formatting *)
+			IF m.ctrl # NIL THEN
+				ctrl := m.ctrl; m.ctrl := m.ctrl.link; ctrl.link := NIL;
+				IF ctrl IS LedaCtrl.List THEN list := ctrl(LedaCtrl.List) END
+			END;	(* list: list of styles [character, format, tabs] *)
+			IF list = NIL THEN list := LedaRules.DefStyleList("", fB, pB.W) END;
+			SortStyles(list);
+			ctrl := list; LedaCtrl.TextBasics(text, LedaCtrl.SetId, StyleInd, ctrl);	(* set basic styles *)
+		END;
+		RETURN text
+	END NewText;
+	
+	PROCEDURE SetHgtClrValue(VAR nbr, hgt, clr: INTEGER; VAR M: LedaBox.AttributeMsg);
+	(* handles the attribute message with M.id = LedaBox.SetValue *)
+	(* processes the height and color entry at nbr in the message M; advances index nbr *)
+	(* out: hgt = 0 -> invalid specification; hgt < 0 -> exclude flag; hgt > 0 -> include flag *)
+	(* out: clr = -1 -> invalid specification; clr >= 0 -> color number *)
+	BEGIN
+		hgt := 0; clr := -1;
+		IF M.a[nbr].typ = LedaBox.Str THEN
+			IF M.a[nbr].s = Raster THEN hgt := -1	(* exclude height flag *)
+			ELSIF M.a[nbr].s = Variable THEN hgt := 1	(* include height flag *)
+			END;
+			INC(nbr)
+		END;
+		IF (M.a[nbr].typ = LedaBox.Str) & (M.a[nbr].s = Def) THEN clr := NotDef; INC(nbr)
+		ELSIF (M.a[nbr].typ = LedaBox.Int) & (M.a[nbr].i >= 0) THEN clr := SHORT(M.a[nbr].i); INC(nbr)
+		END
+	END SetHgtClrValue;
+
+	PROCEDURE AdjustBox(pB: LedaLines.Box; hgt, clr: INTEGER; fB: LedaBase.FormBase);
+	(* adjust the attributes of plane box pB to hgt and fB *)
+		VAR m: LedaBox.PlaneMsg;	flags: SET;	ctrl: LedaBase.Control;
+	BEGIN
+		IF (hgt # 0) & (clr >= -1) & (fB # NIL) THEN	(* new settings are valid *)
+			flags := pB.flags;
+			IF hgt > 0 THEN INCL(pB.flags, LedaBox.Height) ELSE EXCL(pB.flags, LedaBox.Height) END;
+			pB.bgClr := clr;	(* set background color *)
+			ctrl := fB; LedaCtrl.TextBasics(pB.text, LedaCtrl.SetId, FormatInd, ctrl);	(* set format base *)
+			IF (flags # pB.flags) & ({LedaBox.Height} * pB.flags = {}) THEN	(* box height fits to raster *)
+				pB.lines := NIL;	(* to validate format changes *)
+				m.id := LedaBox.PlAttr; m.plane := NIL; m.box := pB; m.avail := TRUE;	(* to draw plane *)
+				pB.anc.do.handle(pB.anc, m)	(* notification about change *)
+			ELSE	(* no change in pB.flags or variable box height *)
+				LedaText.FormBaseValidate(pB)
+			END
+		END
+	END AdjustBox;
+
+	PROCEDURE FormBaseNotify(pB: LedaBase.Box; fB: LedaBase.FormBase);
+	(* notifies the change of fromat base fB with a broadcast in the document *)
+	(* a format base style can not be in different documents [copy not possible] *)
+		VAR m: LedaBox.Msg;	P: LedaSys.Port;
+	BEGIN
+		LedaBox.GetPort(pB, P);
+		IF P # NIL THEN INCL(P.state, LedaSys.DrawFlag) END;	(* no drawing; redraw after change *)
+		m.id := LedaBox.FormId; m.op := 2; m.ctrl := fB;	(* 2 = notify the change of fB *)
+		LedaBox.Broadcast(LedaBox.Root(pB), {}, m)	(* broadcast in document *)
+	END FormBaseNotify;
+	
+	PROCEDURE GetAttributes(pB: LedaLines.Box; VAR M: LedaBox.AttributeMsg);
+	(* handles the attribute message M [M.id has to be correct] *)
+	(* sets M.nbr = 0 if the message is not processed *)
+		VAR ctrl: LedaBase.Control;	i, clr: INTEGER;
+	BEGIN	(* M.id:  LedaBox.GetValue or LedaBox.GetStyle *)
+		IF (pB.selLoc # NIL) & (pB.selLen = 0) THEN	(* box selection *)
+			LedaCtrl.TextBasics(pB.text, LedaCtrl.GetId, FormatInd, ctrl);	(* get format base *)
+			IF M.id = LedaBox.GetStyle THEN
+				LedaAdjust.FormGetStyle(ctrl(LedaBase.FormBase), M)
+			ELSE M.name := PlaneName; M.nbr := 8;
+				IF LedaBox.Height IN pB.flags THEN i := 1 ELSE i := 0 END;
+				NewLn(M.a[0], "height"); EnumAt(M.a[1], "-|-", i);
+				StrAt(M.a[2], Raster, Stat); StrAt(M.a[3], Variable, Stat);
+				IF pB.bgClr = NotDef THEN i := 0; clr := LedaSys.bg ELSE i := 1; clr := pB.bgClr END;
+				NewLn(M.a[4], "color"); EnumAt(M.a[5], "-|-", i);
+				StrAt(M.a[6], Def, Stat); IntAt(M.a[7], clr, Dyn); M.a[7].s := Color;
+				LedaAdjust.FormGetValue(LedaBox.Root(pB), ctrl(LedaBase.FormBase), M)
+			END
+		ELSE M.nbr := 0
+		END
+	END GetAttributes;
+	
+	PROCEDURE SetAttributes(pB: LedaLines.Box; VAR M: LedaBox.AttributeMsg);
+	(* handles the attribute message M [M.id has to be correct] *)
+	(* sets M.nbr = 0 if the message is successfully handled *)
+		VAR ctrl: LedaBase.Control;	fB: LedaBase.FormBase;	nbr, hgt, clr: INTEGER;
+	BEGIN	(* M.id:  LedaBox.SetValue or LedaBox.SetStyle or LedaBox.NewStyle *)
+		IF (pB.selLoc # NIL) & (pB.selLen = 0) THEN	(* box selection *)
+			LedaCtrl.TextBasics(pB.text, LedaCtrl.GetId, FormatInd, ctrl);	(* get format base *)
+			fB := ctrl(LedaBase.FormBase);
+			IF M.id = LedaBox.SetValue THEN
+				IF M.name # PlaneName THEN M.id := NotDef
+				ELSE nbr := 0; SetHgtClrValue(nbr, hgt, clr, M);
+					IF nbr < M.nbr THEN LedaAdjust.FormSetValue(LedaBox.Root(pB), nbr, fB, M) END
+				END
+			ELSE LedaAdjust.FormSetStyle(fB, M)
+			END;	(* M.id could have changed *)
+			IF M.id = LedaBox.SetValue THEN AdjustBox(pB, hgt, clr, fB)
+			ELSIF (M.id = LedaBox.SetStyle) & (fB # NIL) THEN FormBaseNotify(pB, fB)
+			ELSIF (M.id = LedaBox.NewStyle) & (fB # NIL) THEN
+				ctrl := fB; LedaCtrl.TextBasics(pB.text, LedaCtrl.SetId, FormatInd, ctrl);	(* set format base *)
+				LedaText.FormBaseValidate(pB)
+			END;
+			M.nbr := 0
+		END
+	END SetAttributes;
+
+	PROCEDURE PlaneGetValue(pB: Box; VAR m: LedaBox.PlaneMsg);
+	BEGIN
+		IF pB.fc >= 0 THEN m.c := pB.fc END;
+		IF pB.fl >= 0 THEN m.l := pB.fl END;
+		IF pB.fh > 0 THEN m.h := pB.fh; m.wdt := pB.wdt END;
+		IF pB.fv > 0 THEN m.v := pB.fv; m.hgt := pB.hgt END
+	END PlaneGetValue;
+	
+	PROCEDURE PlaneSetValue(pB: Box; VAR m: LedaBox.PlaneMsg);
+	BEGIN
+		IF m.c >= 0 THEN pB.fc := m.c END;
+		IF m.l >= 0 THEN pB.fl := m.l END;
+		IF m.h > 0 THEN pB.fh := m.h; pB.wdt := m.wdt END;
+		IF m.v > 0 THEN pB.fv := m.v; pB.hgt := m.hgt END
+	END PlaneSetValue;
+	
+(*--- procedures attached to boxType ---*)
+	
+	PROCEDURE New*(bT: LedaBase.BoxType; caller, ref: LedaBase.Box): LedaBase.Box;
+	(** ref = NIL: create default box;  ref # NIL: copy box ref *)
+		VAR pB, rB: Box;	len: LONGINT;	newFrm, mask: BOOLEAN;
+	BEGIN
+		NEW(pB); LedaText.InitBox(pB, bT, {LedaBox.NoFlow});
+		IF ref # NIL THEN
+			pB.W := ref.W; pB.H := ref.H; pB.flags := ref.flags; 
+			rB := ref(Box); pB.asr := rB.asr; pB.bgClr := rB.bgClr;
+			(* pB.lines, pB.colW, pB.colDX set in LedaLines.FormatText *)
+			pB.text := LedaText.CopyText(pB, rB);
+			pB.wdt := rB.wdt; pB.hgt := rB.hgt
+		ELSE
+			LedaBox.GetSize(caller, DefW, DefH, pB.W, pB.H);
+			pB.text := NewText(caller, pB);
+			LedaText.ValidateFormat(pB);
+			INCL(pB.flags, LedaBox.NoFlow)	(* text stream not shared *)
+		END;
+		pB.fc := 0; pB.fl := 0; pB.fh := 1; pB.fv := 1;
+		pB.anc := caller;	(* to allow access to caller during formatting [example: to get page number] *)
+		mask := FALSE; LedaLines.FormatText(pB, len, newFrm, mask);	(* builds the block structure for the box pB *)
+		pB.anc := NIL;	(* to prevent call to pB because of unpoured text *)
+		LedaCtrl.TextChangeFlow(pB.text, len);
+			(* LedaCtrl.TextChangeFlow(...) can cause call to pB if there is unpoured text *)
+			(* however call is not processed because pB.anc = NIL *)
+			(* caller has to take care that all unpoured text will be poured *)
+		RETURN pB
+	END New;
+	
+	PROCEDURE Load*(VAR r: LedaBase.Rider; bT: LedaBase.BoxType; flags: SET; caller: LedaBase.Box): LedaBase.Box;
+		VAR pB: Box;	ch: CHAR;
+	BEGIN
+		NEW(pB); LedaText.InitBox(pB, bT, flags);
+		LedaBase.Load(r, ch);
+		IF ch = Ext1Tag THEN LedaBase.LoadI(r, pB.bgClr) END;
+		IF (ch = Ext1Tag) OR (ch = Ext0Tag) THEN
+			LedaBase.LoadVal(r, pB.wdt); LedaBase.LoadVal(r, pB.hgt);
+			LedaBase.LoadI(r, pB.fc); LedaBase.LoadI(r, pB.fl);
+			LedaBase.LoadI(r, pB.fh); LedaBase.LoadI(r, pB.fv)
+		ELSE
+			pB.wdt := -1; pB.hgt := -1;
+			pB.fc := -1; pB.fl := -1; pB.fh := 0; pB.fv := -1
+		END;
+		LedaBase.LoadVal(r, pB.asr); 
+		LedaCtrl.TextLoad(r, pB, pB.text);
+		(* formatting delayed [pB.lines = NIL] *)
+		(* overlapping planes not available yet *)
+		RETURN pB
+	END Load;
+	
+	PROCEDURE Store*(self: LedaBase.Box; VAR r: LedaBase.Rider);
+		VAR pB: Box;
+	BEGIN
+		pB := self(Box);
+		IF pB.bgClr = NotDef THEN LedaBase.Store(r, Ext0Tag)
+		ELSE LedaBase.Store(r, Ext1Tag); LedaBase.StoreI(r, pB.bgClr)
+		END; 
+		LedaBase.StoreVal(r, pB.wdt); LedaBase.StoreVal(r, pB.hgt);
+		LedaBase.StoreI(r, pB.fc); LedaBase.StoreI(r, pB.fl);
+		LedaBase.StoreI(r, pB.fh); LedaBase.StoreI(r, pB.fv);
+		LedaBase.StoreVal(r, pB.asr);
+		LedaCtrl.TextStore(r, pB.text);
+	END Store;
+	
+	PROCEDURE Mouse*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port;
+											mX, mY: LONGINT; keys: SET; VAR res: INTEGER);
+	BEGIN	(* mX, mY within box *)
+		IF keys = {LedaSys.MX} THEN
+			Execute(self(Box), eX, eY, P, res);
+			IF res # LedaBase.Done THEN LedaText.Mouse(self, eX, eY, P, mX, mY, keys, res) END
+		ELSE LedaText.Mouse(self, eX, eY, P, mX, mY, keys, res)
+		END
+	END Mouse;
+	
+	PROCEDURE Handle*(self: LedaBase.Box; VAR m: LedaBase.Msg);
+		VAR handle: BOOLEAN;
+	BEGIN
+		handle := TRUE;
+		IF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.TypeInstId THEN handle := FALSE;
+					IF (m.name = ModName) & (m.s = "DC") THEN	(* return box type instance *) 
+						m.ctrl := self.do; INCL(LedaBox.bcFlags, LedaBox.BcMsg)	(* stop broadcast *)
+					END
+				END
+			END
+		ELSIF m IS LedaBox.PlaneMsg THEN
+			WITH m: LedaBox.PlaneMsg DO
+				IF m.id = LedaBox.PlSetValue THEN
+					PlaneSetValue(self(Box), m); handle := FALSE
+				ELSIF m.id = LedaBox.PlGetValue THEN
+					PlaneGetValue(self(Box), m); handle := FALSE
+				END
+			END
+		ELSIF m IS LedaBox.AttributeMsg THEN	(* pB has selection *)
+			WITH m: LedaBox.AttributeMsg DO
+				IF m.id IN {LedaBox.GetValue, LedaBox.GetStyle} THEN
+					GetAttributes(self(LedaLines.Box), m); handle := m.nbr = 0
+				ELSIF m.id IN {LedaBox.SetValue, LedaBox.SetStyle, LedaBox.NewStyle} THEN 
+					SetAttributes(self(LedaLines.Box), m); handle := m.nbr # 0
+				END
+			END
+		END;
+		IF handle THEN LedaText.Handle(self, m) END
+	END Handle;
+	
+(*--- box type control ---*)
+	
+	(*--- remark:
+		- because planes are an extension of text boxes the box type
+			control of planes should refer (point) to the box type control
+			of text boxes to be able to call the standard method for the
+			standard handling;
+		- for simplicity the box type control of planes calls the appropriate
+			procedures for standard handling directly in modul LedaText
+	---*)
+
+	PROCEDURE NewType(ctrl: LedaBase.Control): LedaBase.BoxHandler;
+	(* return new instance of box type *)
+	(* ctrl: plane box format for document *)
+		VAR nT: LedaBase.BoxHandler;
+	BEGIN
+		NEW(nT);
+		LedaBase.InitControl(nT, typeDoOp);
+		LedaBox.InitType(nT);
+		nT.handle := Handle;
+		nT.new := New;	(* <--- own *)
+		nT.load := Load;	(* <--- own *)
+		nT.store := Store;	(* <--- own *)
+		nT.draw := LedaText.Draw;
+		nT.mark := LedaText.Mark;
+		nT.mouse := Mouse;	(* <--- own *)
+		nT.key := LedaText.Key;
+		nT.insert := LedaText.Insert;
+		nT.size := LedaText.Size;
+		nT.data := ctrl;	(* data of box type control *)
+		RETURN nT
+	END NewType;
+	
+	PROCEDURE PutType(bT: LedaBase.BoxType; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		IF bT.data # NIL THEN cM.id := LedaBase.RegisterId; bT.data.doOp(bT.data, cM) END;
+		LedaBase.PutToList(bT, refId)
+	END PutType;
+	
+	PROCEDURE *TypeDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* implements the basic behaviour of the box type control: *)
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.RegisterId:  PutType(ctrl(LedaBase.BoxType), m.ctrlId)
+				| LedaBase.StoreId:  LedaBase.StoreCtrl(m.r, ctrl(LedaBase.BoxType).data)
+				| LedaBase.LoadId:  
+					IF LedaBase.version = 0X THEN ctrl := NIL ELSE LedaBase.LoadCtrl(m.r, ctrl) END;
+					m.ctrl := NewType(ctrl)
+				| LedaBase.StoreModCmd:  LedaBase.StoreStr(m.r, ModName); LedaBase.StoreStr(m.r, "DC")
+				ELSE
+				END
+			END
+		ELSIF m IS LedaLines.ColMarkMsg THEN
+			WITH m: LedaLines.ColMarkMsg DO m.pNr := ColumnPat; m.clr := ColumnClr END	(* specifies column mark *)
+		END
+	END TypeDoOp;
+	
+	PROCEDURE DC*;
+	(** deposits own box type in the module LedaCtrl *)
+	BEGIN
+		LedaBase.depositedCtrl := NewType(NIL)
+	END DC;
+	
+BEGIN
+	(*--- box type control ---*)
+	typeDoOp := TypeDoOp
+		
+END LedaPlane.

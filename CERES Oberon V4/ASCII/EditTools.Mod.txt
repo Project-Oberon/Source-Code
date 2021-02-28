@@ -1,0 +1,795 @@
+MODULE EditTools;	(** CAS/HM 3.12.93 **)
+	IMPORT
+		Files, Fonts, Modules, Texts, Viewers, Oberon, MenuViewers, TextFrames, ParcElems, Display;
+
+	CONST
+		mm = TextFrames.mm; MonsterW = 250*mm; MonsterH = 200*mm; TAB = 9X; CR = 0DX;
+		elem = 0; fnt = 1; col = 2; voff = 3;
+		OptionChar = "/";
+
+	TYPE
+		Node = POINTER TO NodeDesc;
+		NodeDesc = RECORD
+			l, r: Node;
+			mod: ARRAY 32 OF CHAR;
+			fnt: Fonts.Font;
+			col, voff: SHORTINT
+		END;
+
+	VAR
+		W, WR: Texts.Writer;
+		lastTime: LONGINT;
+		search: RECORD
+			set: SET;
+			node: Node
+		END;
+
+
+	(* output primitives *)
+
+	PROCEDURE Ch (ch: CHAR);
+	BEGIN Texts.Write(W, ch)
+	END Ch;
+
+	PROCEDURE Str (s: ARRAY OF CHAR);
+	BEGIN Texts.WriteString(W, s)
+	END Str;
+
+	PROCEDURE Int (n: LONGINT);
+	BEGIN Ch(" "); Texts.WriteInt(W, n, 0)
+	END Int;
+
+	PROCEDURE Ln;
+	BEGIN Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END Ln;
+
+	PROCEDURE Plural (n: LONGINT; s: ARRAY OF CHAR);
+	BEGIN Int(n); Ch(" "); Str(s);
+		IF n # 1 THEN Ch("s") END
+	END Plural;
+
+
+	(* generic frame primitives *)
+
+	PROCEDURE Unmark (f: TextFrames.Frame);
+		VAR m: Oberon.ControlMsg;
+	BEGIN Oberon.RemoveMarks(f.X, f.Y, f.W, f.H); m.id := Oberon.neutralize; f.handle(f, m)
+	END Unmark;
+
+	PROCEDURE Show (f: TextFrames.Frame; pos: LONGINT);
+		VAR F: TextFrames.Frame; beg, end, delta: LONGINT;
+	BEGIN delta := 200; Unmark(f);
+		LOOP beg := f.org; end := TextFrames.Pos(f, f.X + f.W, f.Y);
+			IF (beg <= pos) & (pos < end) OR (delta = 0) THEN EXIT END;
+			TextFrames.Show(f, pos - delta); delta := delta DIV 2
+		END
+	END Show;
+
+
+	(* argument primitives *)
+
+	PROCEDURE HoldsTF (V: Viewers.Viewer): BOOLEAN;
+	BEGIN
+		RETURN (V IS MenuViewers.Viewer) & (V.dsc.next IS TextFrames.Frame)
+	END HoldsTF;
+
+	PROCEDURE MarkedFrame (): TextFrames.Frame;
+		VAR V: Viewers.Viewer;
+	BEGIN V := Oberon.MarkedViewer();
+		IF HoldsTF(V) THEN RETURN V.dsc.next(TextFrames.Frame) ELSE RETURN NIL END
+	END MarkedFrame;
+
+	PROCEDURE FocusFrame (): TextFrames.Frame;
+		VAR V: Viewers.Viewer;
+	BEGIN V := Oberon.FocusViewer;
+		IF HoldsTF(V) THEN RETURN V.dsc.next(TextFrames.Frame) ELSE RETURN NIL END
+	END FocusFrame;
+
+	PROCEDURE GetMainArg (VAR S: Texts.Scanner; VAR beg, end: LONGINT);
+		VAR text: Texts.Text; sbeg, send, time: LONGINT;
+	BEGIN beg := Oberon.Par.pos; end := Oberon.Par.text.len;
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.line = 0) & (S.c = "^") THEN Oberon.GetSelection(text, sbeg, send, time);
+			IF time >= 0 THEN beg := sbeg; end := send; Texts.OpenScanner(S, text, beg); Texts.Scan(S) END
+		END
+	END GetMainArg;
+
+	PROCEDURE SkipArrow (VAR S: Texts.Scanner);
+	BEGIN Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "=") THEN Texts.Scan(S);
+			IF (S.class = Texts.Char) & (S.c = ">") THEN Texts.Scan(S) ELSE S.class := Texts.Inval END
+		ELSE S.class := Texts.Inval 
+		END
+	END SkipArrow;
+
+
+	(* string primitives *)
+
+	PROCEDURE SplitFontName (fn: ARRAY OF CHAR; VAR i, j, size: INTEGER);
+		VAR k: INTEGER;
+	BEGIN i := 0; size := 0;
+		WHILE (fn[i] # 0X) & ((fn[i] < "0") OR ("9" < fn[i])) DO INC(i) END;
+		j := i; WHILE ("0" <= fn[j]) & (fn[j] <= "9") DO INC(j) END;
+		k := i; WHILE k < j DO size := size * 10 + ORD(fn[k]) - 30H; INC(k) END
+	END SplitFontName;
+
+	PROCEDURE CombineFontName (prefix, suffix: ARRAY OF CHAR; i, j, size: INTEGER; VAR fn: ARRAY OF CHAR);
+		VAR k: INTEGER; ch: CHAR; dig: ARRAY 10 OF CHAR;
+	BEGIN COPY(prefix, fn); k := 0;
+		REPEAT dig[k] := CHR(size MOD 10 + 30H); size := size DIV 10; INC(k) UNTIL size = 0;
+		REPEAT DEC(k); fn[i] := dig[k]; INC(i) UNTIL k = 0;
+		REPEAT ch := suffix[j]; fn[i] := ch; INC(i); INC(j) UNTIL ch = 0X
+	END CombineFontName;
+
+	PROCEDURE ReadName (t: Texts.Text; pos: LONGINT; VAR name: ARRAY OF CHAR);	(*ww 21 Aug 91/mh 6 Nov 92*)
+		VAR i: INTEGER; r: Texts.Reader; ch: CHAR;
+	BEGIN Texts.OpenReader(r, t, pos); i := 0;
+		REPEAT Texts.Read(r, ch) UNTIL (ch > " ") OR (ch = 0AX) OR (ch = 0DX);
+		IF ~r.eot & (ch = 22X) THEN HALT(99); Texts.Read(r, ch) END;
+		WHILE ~r.eot & (ch > " ") DO name[i] := ch; Texts.Read(r, ch); INC(i) END;
+		IF (i > 0) & (name[i-1] = 22X) THEN DEC(i) END;
+		name[i] := 0X
+	END ReadName;
+
+
+	(* attribute extraction / searching *)
+
+	PROCEDURE SetNode (n: Node; VAR R: Texts.Reader);
+		VAR msg: Texts.IdentifyMsg;
+	BEGIN n.fnt := R.fnt; n.col := R.col; n.voff := R.voff;
+		IF R.elem # NIL THEN R.elem.handle(R.elem, msg); COPY(msg.mod, n.mod)
+		ELSE n.mod[0] := 0X
+		END
+	END SetNode;
+
+	PROCEDURE Less (x, y: Node): BOOLEAN;
+	BEGIN
+		IF x.mod < y.mod THEN RETURN TRUE
+		ELSIF x.mod = y.mod THEN
+			IF x.fnt.name < y.fnt.name THEN RETURN TRUE
+			ELSIF x.fnt.name = y.fnt.name THEN
+				IF x.col < y.col THEN RETURN TRUE
+				ELSIF x.col = y.col THEN
+					IF x.voff < y.voff THEN RETURN TRUE END
+				END
+			END
+		END;
+		RETURN FALSE
+	END Less;
+
+	PROCEDURE Insert (t, x: Node);
+		VAR p, c: Node;
+	BEGIN p := t; c := NIL;
+		WHILE t # NIL DO p := t;
+			IF Less(x, t) THEN t := t.l ELSE c := t; t := t.r END
+		END;
+		IF (c = NIL) OR Less(c, x) THEN
+			IF Less(x, p) THEN NEW(p.l); c := p.l ELSE NEW(p.r); c := p.r END;
+			c^ := x^
+		END
+	END Insert;
+
+	PROCEDURE List (t: Node);
+	BEGIN
+		IF t # NIL THEN
+			List(t.l);
+			Ln;
+			IF t.mod[0] # 0X THEN Str("  elem "); Str(t.mod) END;
+			Str("  font "); Str(t.fnt.name); Str("  col"); Int(t.col); Str("  off"); Int(t.voff);
+			List(t.r)
+		END
+	END List;
+
+	PROCEDURE ScanText (text: Texts.Text; beg, end: LONGINT);
+		VAR tree, cand: Node; R: Texts.Reader; pos: LONGINT; ch0, ch: CHAR;
+	BEGIN  pos := beg;
+		Texts.OpenReader(R, text, beg); Texts.Read(R, ch0); INC(pos);
+		IF pos > end THEN Str("  end of text")
+		ELSE NEW(tree); SetNode(tree, R); tree.l := NIL; tree.r := NIL;
+			IF pos = end THEN List(tree); Str(" ascii"); Int(ORD(ch0))
+			ELSE Texts.Read(R, ch); INC(pos);
+				NEW(cand); cand.l := NIL; cand.r := NIL;
+				WHILE pos <= end DO SetNode(cand, R); Insert(tree, cand);
+					Texts.Read(R, ch); INC(pos)
+				END;
+				List(tree)
+			END
+		END;
+		Ln
+	END ScanText;
+
+
+	PROCEDURE Scan (VAR S: Texts.Scanner; beg, end: LONGINT; n: Node; VAR set: SET);
+	BEGIN set := {};
+		WHILE (beg < end) & (S.line = 0) & (S.class = Texts.Name) DO beg := Texts.Pos(S);
+			IF S.s = "elem" THEN Texts.Scan(S);
+				IF (S.line = 0) & (S.class = Texts.Name) THEN
+					INCL(set, elem); COPY(S.s, n.mod); Texts.Scan(S)
+				END
+			ELSIF S.s = "font" THEN Texts.Scan(S);
+				IF (S.line = 0) & (S.class = Texts.Name) THEN n.fnt := Fonts.This(S.s);
+					IF n.fnt.name = S.s THEN INCL(set, fnt); Texts.Scan(S) END
+				END
+			ELSIF S.s = "col" THEN Texts.Scan(S);
+				IF (S.line = 0) & (S.class = Texts.Int) & (-128 <= S.i) & (S.i <= 127) THEN
+					INCL(set, col); n.col := SHORT(SHORT(S.i)); Texts.Scan(S)
+				END
+			ELSIF S.s = "off" THEN Texts.Scan(S);
+				IF (S.line = 0) & (S.class = Texts.Int) & (-128 <= S.i) & (S.i <= 127) THEN
+					INCL(set, voff); n.voff := SHORT(SHORT(S.i)); Texts.Scan(S)
+				END
+			ELSE beg := end
+			END
+		END
+	END Scan;
+
+	PROCEDURE Equal (x, y: Node; set: SET): BOOLEAN;
+	BEGIN
+		IF (elem IN set) & (x.mod # y.mod) THEN RETURN FALSE END;
+		IF (fnt IN set) & (x.fnt # y.fnt) THEN RETURN FALSE END;
+		IF (col IN set) & (x.col # y.col) THEN RETURN FALSE END;
+		RETURN ~(voff IN set) OR (x.voff = y.voff)
+	END Equal;
+
+
+	(** text manipulation **)
+
+	PROCEDURE IncFontSize* (T: Texts.Text; beg, end: LONGINT; delta: INTEGER);
+		VAR R: Texts.Reader; fnt: Fonts.Font; fn: Fonts.Name; org: LONGINT; i, j, size: INTEGER; ch: CHAR;
+	BEGIN Texts.OpenReader(R, T, beg); Texts.Read(R, ch);
+		WHILE ~R.eot & (beg < end) DO org := beg; fnt := R.fnt;
+			WHILE ~R.eot & (beg < end) & (R.fnt = fnt) DO INC(beg); Texts.Read(R, ch) END;
+			SplitFontName(fnt.name, i, j, size);
+			IF i < j THEN CombineFontName(fnt.name, fnt.name, i, j, size + delta, fn); fnt := Fonts.This(fn);
+				IF fnt.name = fn THEN Texts.ChangeLooks(T, org, beg, {0}, fnt, 0, 0) END
+			END
+		END
+	END IncFontSize;
+
+	PROCEDURE ChangeFontSize* (T: Texts.Text; beg, end: LONGINT; old, new: INTEGER);
+		VAR R: Texts.Reader; fnt: Fonts.Font; fn: Fonts.Name; org: LONGINT; i, j, size: INTEGER; ch: CHAR;
+	BEGIN Texts.OpenReader(R, T, beg); Texts.Read(R, ch);
+		WHILE ~R.eot & (beg < end) DO org := beg; fnt := R.fnt;
+			WHILE ~R.eot & (beg < end) & (R.fnt = fnt) DO INC(beg); Texts.Read(R, ch) END;
+			SplitFontName(fnt.name, i, j, size);
+			IF (i < j) & ((size = old) OR (old = -1)) THEN
+				CombineFontName(fnt.name, fnt.name, i, j, new, fn); fnt := Fonts.This(fn);
+				IF fnt.name = fn THEN Texts.ChangeLooks(T, org, beg, {0}, fnt, 0, 0) END
+			END
+		END
+	END ChangeFontSize;
+
+	PROCEDURE ChangeFontFamily* (T: Texts.Text; beg, end: LONGINT; old, new: ARRAY OF CHAR);
+		VAR R: Texts.Reader; fnt: Fonts.Font; fn: Fonts.Name; org: LONGINT; i, i1, j, j1, size, size1: INTEGER; ch: CHAR;
+	BEGIN Texts.OpenReader(R, T, beg); Texts.Read(R, ch);
+		WHILE ~R.eot & (beg < end) DO org := beg; fnt := R.fnt;
+			WHILE ~R.eot & (beg < end) & (R.fnt = fnt) DO INC(beg); Texts.Read(R, ch) END;
+			SplitFontName(fnt.name, i, j, size); COPY(fnt.name, fn); fn[i] := 0X;
+			IF (i < j) & ((fn = old) OR (old[0] = "?")) THEN SplitFontName(new, i1, j1, size1);
+				CombineFontName(new, fnt.name, i1, j, size, fn); fnt := Fonts.This(fn);
+				IF fnt.name = fn THEN Texts.ChangeLooks(T, org, beg, {0}, fnt, 0, 0) END
+			END
+		END
+	END ChangeFontFamily;
+
+	PROCEDURE ChangeFontStyle* (T: Texts.Text; beg, end: LONGINT; old, new: CHAR);
+		VAR R: Texts.Reader; fnt: Fonts.Font; fn: Fonts.Name; org: LONGINT; i, j, k, size: INTEGER; ch: CHAR;
+	BEGIN Texts.OpenReader(R, T, beg); Texts.Read(R, ch);
+		WHILE ~R.eot & (beg < end) DO org := beg; fnt := R.fnt;
+			WHILE ~R.eot & (beg < end) & (R.fnt = fnt) DO INC(beg); Texts.Read(R, ch) END;
+			SplitFontName(fnt.name, i, j, size);
+			IF (i < j) & ((fnt.name[j] = old) OR (old = "?")) & (fnt.name[j] # new) THEN COPY(fnt.name, fn);
+				IF fn[j] = "." THEN k := j+1;
+					WHILE fn[k] # 0X DO INC(k) END;
+					WHILE k >= j DO fn[k+1] := fn[k]; DEC(k) END
+				ELSIF new = "." THEN k := j;
+					REPEAT fn[k] := fn[k+1]; INC(k) UNTIL fn[k] = 0X
+				END;
+				fn[j] := new; fnt := Fonts.This(fn);
+				IF fnt.name = fn THEN Texts.ChangeLooks(T, org, beg, {0}, fnt, 0, 0) END
+			END
+		END
+	END ChangeFontStyle;
+
+	PROCEDURE ChangeFont* (T: Texts.Text; beg, end: LONGINT; old, new: ARRAY OF CHAR);
+		VAR R: Texts.Reader; fnt: Fonts.Font; org: LONGINT; ch: CHAR;
+	BEGIN Texts.OpenReader(R, T, beg); Texts.Read(R, ch);
+		WHILE ~R.eot & (beg < end) DO org := beg; fnt := R.fnt;
+			WHILE ~R.eot & (beg < end) & (R.fnt = fnt) DO INC(beg); Texts.Read(R, ch) END;
+			IF fnt.name = old THEN fnt := Fonts.This(new);
+				IF fnt.name = new THEN Texts.ChangeLooks(T, org, beg, {0}, fnt, 0, 0) END
+			END
+		END
+	END ChangeFont;
+
+
+	PROCEDURE Count* (T: Texts.Text; beg, end: LONGINT; VAR wc, pc, ec: LONGINT);
+		VAR R: Texts.Reader; ch: CHAR;
+	BEGIN wc := 0; pc := 0; ec := 0;
+		Texts.OpenReader(R, T, beg); Texts.Read(R, ch); INC(beg);
+		WHILE beg <= end DO
+			WHILE (beg <= end) & (ch <= " ") DO
+				IF R.elem # NIL THEN INC(ec)
+				ELSIF ch = CR THEN INC(pc)
+				END;
+				Texts.Read(R, ch); INC(beg)
+			END;
+			IF beg <= end THEN INC(wc);
+				WHILE (beg <= end) & (ch > " ") DO Texts.Read(R, ch); INC(beg) END
+			END
+		END
+	END Count;
+
+	PROCEDURE DeleteMonsters* (T: Texts.Text; monsterW, monsterH: LONGINT; VAR mc: LONGINT);
+		VAR e: Texts.Elem; R: Texts.Reader; pos: LONGINT;
+			msg: TextFrames.DisplayMsg;
+	BEGIN Texts.OpenReader(R, T, 0); Texts.ReadElem(R); mc := 0;
+		WHILE R.elem # NIL DO e := R.elem;
+			IF ~(e IS TextFrames.Parc) THEN pos := Texts.Pos(R)-1;
+				msg.prepare := TRUE; msg.fnt := R.fnt; msg.col := R.col; msg.pos := pos; msg.indent := 0;
+				e.handle(e, msg);
+				IF (e.W > monsterW) OR (e.H > monsterH) THEN
+					Texts.Delete(T, pos, pos + 1); INC(mc); Texts.OpenReader(R, T, pos)
+				END
+			END;
+			Texts.ReadElem(R)
+		END
+	END DeleteMonsters;
+
+	PROCEDURE DeleteElems* (T: Texts.Text; beg, end: LONGINT);
+		VAR R: Texts.Reader; ch: CHAR;
+	BEGIN Texts.OpenReader(R, T, beg); Texts.Read(R, ch);
+		WHILE beg < end DO
+			IF R.elem # NIL THEN Texts.Delete(T, beg, beg + 1); Texts.OpenReader(R, T, beg); DEC(end)
+			ELSE INC(beg)
+			END;
+			Texts.Read(R, ch)
+		END
+	END DeleteElems;
+
+	PROCEDURE SelectedFrame* (): TextFrames.Frame;
+		VAR time: LONGINT; v: Viewers.Viewer; x: INTEGER; f, F: TextFrames.Frame;
+	BEGIN
+		time := -1; x := 0; F := NIL;
+		WHILE x < Viewers.curW DO
+			v := Viewers.This(x, 0);
+			WHILE v.state > 1 DO
+				IF v.dsc.next IS TextFrames.Frame THEN
+					f := v.dsc.next(TextFrames.Frame); 
+					IF f.hasSel & (f.time > time) THEN F := f; time := f.time END;
+				END;
+				v := Viewers.Next(v)
+			END;
+			x := x + v.W
+		END;
+		RETURN F
+	END SelectedFrame;
+
+	PROCEDURE ConvertToAscii* (T: Texts.Text; beg, end: LONGINT);	(* mh 27.10.92 *)
+		CONST doubleS = 0ABX;
+		VAR R: Texts.Reader; ch: CHAR;
+
+		PROCEDURE repl (by: ARRAY OF CHAR);
+			VAR i: LONGINT;
+		BEGIN i := 0;
+			WHILE by[i] # 0X DO INC(i) END;
+			Texts.Delete(T, beg, beg+1); DEC(end);
+			IF i > 0 THEN Texts.SetFont(WR, R.fnt); Texts.SetColor(WR, R.col); Texts.SetOffset(WR, R.voff);
+				Texts.WriteString(WR, by); Texts.Insert(T, beg, WR.buf); INC(beg, i); INC(end, i)
+			END;
+			Texts.OpenReader(R, T, beg)
+		END repl;
+
+		PROCEDURE replch (by: CHAR);	(* needed because compiler does not allow open arrays of length 1 *)
+		BEGIN
+			Texts.Delete(T, beg, beg+1); DEC(end);
+			Texts.SetFont(WR, R.fnt); Texts.SetColor(WR, R.col); Texts.SetOffset(WR, R.voff);
+			Texts.Write(WR, by); Texts.Insert(T, beg, WR.buf); INC(beg); INC(end);
+			Texts.OpenReader(R, T, beg)
+		END replch;
+
+	BEGIN Texts.OpenReader(R, T, beg); Texts.Read(R, ch);
+		WHILE beg < end DO
+			IF ch = TAB THEN repl("  ")
+			ELSIF ch = "ƒ" THEN repl("ae") ELSIF ch = "„" THEN repl("oe") ELSIF ch = "…" THEN repl("ue")
+			ELSIF ch = "€" THEN repl("Ae") ELSIF ch = "" THEN repl("Oe") ELSIF ch = "‚" THEN repl("Ue")
+			ELSIF ch = doubleS THEN repl("ss")
+			ELSIF (ch = "”") OR (ch = "‹") OR (ch = "†") THEN replch("a")
+			ELSIF (ch = "") OR (ch = "Œ") OR (ch = "‡") OR (ch = "‘") THEN replch("e")
+			ELSIF (ch = "") OR (ch = "ˆ") OR (ch = "’") THEN replch("i")
+			ELSIF (ch = "Ž") OR (ch = "‰") THEN replch("o")
+			ELSIF (ch = "") OR (ch = "Š") THEN replch("u")
+			ELSIF (ch = "“") THEN replch("c")
+			ELSIF (ch = "•") THEN replch("n")
+			ELSE INC(beg)
+			END;
+			Texts.Read(R, ch)
+		END
+	END ConvertToAscii;
+
+
+	PROCEDURE UnmarkMenu* (V: Viewers.Viewer);
+		VAR R: Texts.Reader; text: Texts.Text; ch: CHAR;
+	BEGIN
+		IF (V IS MenuViewers.Viewer) & (V.dsc IS TextFrames.Frame) THEN
+			text := V.dsc(TextFrames.Frame).text;
+			IF text.len > 0 THEN Texts.OpenReader(R, text, text.len - 1); Texts.Read(R, ch);
+				IF ch = "!" THEN Texts.Delete(text, text.len - 1, text.len) END
+			END
+		END
+	END UnmarkMenu;
+
+	PROCEDURE ReadNonWhiteSp (VAR R: Texts.Reader; VAR ch: CHAR);
+	BEGIN
+		REPEAT Texts.Read(R, ch) UNTIL (ch > " ") OR R.eot;
+	END ReadNonWhiteSp;
+
+	(** commands **)
+
+	PROCEDURE SearchDiff*;	(** takes the two most recent selections **)
+		VAR f0, f1: TextFrames.Frame; R0, R1: Texts.Reader; ch0, ch1: CHAR; pos: LONGINT;
+			S: Texts.Scanner; whiteSp: BOOLEAN;
+	BEGIN
+		whiteSp := TRUE;
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.line = 0) & (S.class = Texts.Char) & (S.c = OptionChar) THEN Texts.Scan(S);
+			IF (S.class = Texts.Name) & (CAP(S.s[0]) = "W") THEN whiteSp := FALSE END;
+		END;
+		f0 := SelectedFrame(); IF f0 # NIL THEN TextFrames.RemoveSelection(f0) END;
+		f1 := SelectedFrame();
+		IF f1 # NIL THEN
+			Texts.OpenReader(R0, f0.text, f0.selbeg.pos); Texts.OpenReader(R1, f1.text, f1.selbeg.pos);
+			IF whiteSp THEN
+				REPEAT Texts.Read(R0, ch0); Texts.Read(R1, ch1) UNTIL (ch0 # ch1) OR (ch0 = 0X)
+			ELSE
+				REPEAT ReadNonWhiteSp(R0, ch0); ReadNonWhiteSp(R1, ch1) UNTIL (ch0 # ch1) OR (ch0 = 0X)
+			END;
+			pos := Texts.Pos(R0)-1; Show(f0, pos); TextFrames.SetSelection(f0, pos, pos + 1);
+			pos := Texts.Pos(R1)-1; Show(f1, pos); TextFrames.SetSelection(f1, pos, pos + 1);
+		END
+	END SearchDiff;
+
+
+	PROCEDURE GetAttr*;	(** ("*" | "@") **)
+		VAR F: TextFrames.Frame; S: Texts.Scanner; text: Texts.Text; beg, end, time: LONGINT;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.line = 0) THEN Str("EditTools.GetAttr");
+			F := MarkedFrame(); Oberon.GetSelection(text, beg, end, time);
+			IF (S.c = "*") & (F # NIL) THEN ScanText(F.text, 0, F.text.len)
+			ELSIF (S.c = "@") & (time >= 0) THEN ScanText(text, beg, end)
+			END
+		END
+	END GetAttr;
+
+	PROCEDURE SearchAttr*;	(** selection, caret **)
+		VAR f: TextFrames.Frame; S: Texts.Scanner; R: Texts.Reader;
+			org, beg, end: LONGINT; ch: CHAR;
+			x, n: Node; set: SET;
+	BEGIN f := FocusFrame();
+		IF f # NIL THEN GetMainArg(S, beg, end);
+			NEW(n); Scan(S, beg, end, n, set);
+			IF (set = {}) & (search.set # {}) THEN set := search.set; n := search.node END;
+			IF set # {} THEN search.set := set; search.node := n;
+				IF f.hasCar THEN org := f.carloc.pos ELSE org := 0 END;
+				Texts.OpenReader(R, f.text, org); Texts.Read(R, ch);
+				NEW(x); SetNode(x, R);
+				WHILE ~R.eot & ~Equal(x, n, set) DO Texts.Read(R, ch); SetNode(x, R) END;
+				IF ~R.eot THEN Show(f, Texts.Pos(R)); TextFrames.SetCaret(f, Texts.Pos(R))
+				ELSE TextFrames.RemoveCaret(f)
+				END
+			END
+		END
+	END SearchAttr;
+
+
+	PROCEDURE IncSize*;	(** size; selection **)
+		VAR S: Texts.Scanner; text: Texts.Text; beg, end, time: LONGINT;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		Oberon.GetSelection(text, beg, end, time);
+		IF (time >= lastTime) & (S.class = Texts.Int) & (S.line = 0) & (-1000 <= S.i) & (S.i < 1000) THEN lastTime := time;
+			IncFontSize(text, beg, end, SHORT(S.i))
+		END
+	END IncSize;
+
+	PROCEDURE ChangeSize*;	(** {old "=>" new}, selection **)
+		VAR S: Texts.Scanner; text: Texts.Text; beg, end, time: LONGINT; old: INTEGER;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		Oberon.GetSelection(text, beg, end, time);
+		IF (time >= lastTime) & (S.line = 0) THEN
+			WHILE ~S.eot & ((S.class = Texts.Int) & (-1000 <= S.i) & (S.i < 1000) OR (S.class = Texts.Char) & (S.c = "?")) DO
+				IF (S.class = Texts.Char) & (S.c = "?") THEN old := -1 ELSE old := SHORT(S.i) END;
+				SkipArrow(S);
+				IF (S.class = Texts.Int) & (-1000 <= S.i) & (S.i < 1000) THEN lastTime := time;
+					ChangeFontSize(text, beg, end, old, SHORT(S.i)); Texts.Scan(S)
+				END
+			END
+		END
+	END ChangeSize;
+
+	PROCEDURE ChangeStyle*;	(** {old "=>" new}, selection **)
+		VAR S: Texts.Scanner; text: Texts.Text; beg, end, time: LONGINT; old, new: CHAR;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		Oberon.GetSelection(text, beg, end, time);
+		IF (time >= lastTime) & (S.line = 0) THEN
+			WHILE ~S.eot & ((S.class = Texts.Name) OR (S.class = Texts.Char)) DO
+				IF S.class = Texts.Char THEN old := S.c ELSE old := S.s[0] END;
+				SkipArrow(S);
+				IF (S.class = Texts.Name) OR (S.class = Texts.Char) THEN lastTime := time;
+					IF S.class = Texts.Char THEN new := S.c ELSE new := S.s[0] END;
+					ChangeFontStyle(text, beg, end, old, new); Texts.Scan(S)
+				END
+			END
+		END
+	END ChangeStyle;
+
+	PROCEDURE ChangeFamily*;	(** {old "=>" new}, selection **)
+		VAR S: Texts.Scanner; text: Texts.Text; beg, end, time: LONGINT; old: Fonts.Name;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		Oberon.GetSelection(text, beg, end, time);
+		IF (time >= lastTime) & (S.line = 0) THEN
+			WHILE ~S.eot & ((S.class = Texts.Name) OR (S.class = Texts.Char) & (S.c = "?")) DO
+				IF (S.class = Texts.Char) & (S.c = "?") THEN old[0] := "?"; old[1] := 0X ELSE COPY(S.s, old) END;
+				SkipArrow(S);
+				IF S.class = Texts.Name THEN lastTime := time;
+					ChangeFontFamily(text, beg, end, old, S.s); Texts.Scan(S)
+				END
+			END
+		END
+	END ChangeFamily;
+
+	PROCEDURE Change*;	(** {old "=>" new}, selection **)
+		VAR S: Texts.Scanner; text: Texts.Text; beg, end, time: LONGINT; old: Fonts.Name;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		Oberon.GetSelection(text, beg, end, time);
+		IF (time >= lastTime) & (S.line = 0) THEN
+			WHILE S.class = Texts.Name DO COPY(S.s, old); SkipArrow(S);
+				IF S.class = Texts.Name THEN lastTime := time;
+					ChangeFont(text, beg, end, old, S.s); Texts.Scan(S)
+				END
+			END
+		END
+	END Change;
+
+	PROCEDURE Words*;	(** "@" | ("^" | "*" | {name} "~") **)
+		VAR S: Texts.Scanner; frame: TextFrames.Frame; text: Texts.Text;
+			cc, ct, wc, wt, pc, pt, ec, et, beg1, end1, beg, end, time: LONGINT;
+	BEGIN GetMainArg(S, beg1, end1); frame := MarkedFrame(); Oberon.GetSelection(text, beg, end, time);
+		ct := 0; wt := 0; pt := 0; et := 0;
+		IF (S.class = Texts.Char) & (S.c = "*") & (frame # NIL) THEN Str("EditTools.Words  *");
+			cc := frame.text.len; Count(frame.text, 0, cc, wc, pc, ec);
+			Plural(pc, "CR"); Ch(","); Plural(wc, "word"); Ch(","); Plural(cc, "char"); Ch(","); Plural(ec, "element"); Ln
+		ELSIF (S.class = Texts.Char) & (S.c = "@") & (time >= 0) THEN Str("EditTools.Words  @");
+			cc := end - beg; Count(text, beg, end, wc, pc, ec);
+			Plural(pc, "CR"); Ch(","); Plural(wc, "word"); Ch(","); Plural(cc, "char"); Ch(","); Plural(ec, "element"); Ln
+		ELSIF S.class = Texts.Name THEN Str("EditTools.Words");
+			REPEAT text := TextFrames.Text(S.s);
+				Str("  "); Str(S.s); cc := text.len; Count(text, 0, cc, wc, pc, ec);
+				Plural(pc, "CR"); Ch(","); Plural(wc, "word"); Ch(","); Plural(cc, "char"); Ch(","); Plural(ec, "element"); Ln;
+				INC(ct, cc); INC(wt, wc); INC(pt, pc); INC(et, ec); Texts.Scan(S)
+			UNTIL S.eot OR (S.class # Texts.Name) OR (Texts.Pos(S) > end1);
+			Str("  total");
+			Plural(pt, "CR"); Ch(","); Plural(wt, "word"); Ch(","); Plural(ct, "char"); Ch(","); Plural(et, "element"); Ln
+		END
+	END Words;
+
+	PROCEDURE Cleanup*;	(** "*" | ("^" | {name} "~") **)
+		VAR S: Texts.Scanner; frame: TextFrames.Frame; text: Texts.Text; mc, beg, end, len: LONGINT; res: INTEGER;
+	BEGIN GetMainArg(S, beg, end); frame := MarkedFrame();
+		IF (S.class = Texts.Char) & (S.c = "*") & (frame # NIL) THEN Str("EditTools.Cleanup  *");
+			DeleteMonsters(frame.text, MonsterW, MonsterH, mc);
+			Ch(" "); Plural(mc, "elem"); Str(" deleted"); Ln
+		ELSIF S.class = Texts.Name THEN Str("EditTools.Cleanup"); Ln;
+			REPEAT text := TextFrames.Text(S.s);
+				Str("  "); Str(S.s); DeleteMonsters(text, MonsterW, MonsterH, mc);
+				IF mc # 0 THEN Texts.Close(text, S.s) ELSE Str(" not changed") END;
+				Ln; Texts.Scan(S)
+			UNTIL S.eot OR (S.class # Texts.Name) OR (Texts.Pos(S) > end)
+		END
+	END Cleanup;
+
+	PROCEDURE Refresh*;	(** "*" **)
+		VAR frame: TextFrames.Frame; f: Files.File; text: Texts.Text; r: Files.Rider;
+	BEGIN frame := MarkedFrame();
+		IF frame # NIL THEN Str("EditTools.Refresh"); Texts.Append(Oberon.Log, W.buf);
+			text := frame.text; f := Files.New("");
+			Files.Set(r, f, 0); Texts.Store(r, text);
+			Files.Set(r, f, 0); Texts.Load(r, text);
+			Texts.ChangeLooks(text, 0, text.len, {}, NIL, 0, 0);
+			Int(Files.Length(f)); Ln
+		END
+	END Refresh;
+
+	PROCEDURE RemoveElems*;	(** "*" | "@" **)
+		VAR S: Texts.Scanner; frame: TextFrames.Frame; text: Texts.Text; beg, end, time: LONGINT;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.line = 0) & (S.class = Texts.Char) THEN
+			Oberon.GetSelection(text, beg, end, time); frame := MarkedFrame();
+			IF (S.c = "*") & (frame # NIL) THEN DeleteElems(frame.text, 0, frame.text.len)
+			ELSIF (S.c = "@") & (time >= lastTime) THEN lastTime := time;
+				DeleteElems(text, beg, end)
+			END
+		END
+	END RemoveElems;
+
+	PROCEDURE ToAscii*;	(** "*" | "@" **)
+		VAR S: Texts.Scanner; frame: TextFrames.Frame; text: Texts.Text; beg, end, time: LONGINT;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.line = 0) & (S.class = Texts.Char) THEN
+			Oberon.GetSelection(text, beg, end, time); frame := MarkedFrame();
+			IF (S.c = "*") & (frame # NIL) THEN ConvertToAscii(frame.text, 0, frame.text.len)
+			ELSIF (S.c = "@") & (time >= lastTime) THEN lastTime := time;
+				ConvertToAscii(text, beg, end)
+			END
+		END
+	END ToAscii;
+
+
+	PROCEDURE NoNotify (text: Texts.Text; op: INTEGER; beg, end: LONGINT);
+	END NoNotify;
+
+	PROCEDURE InsertCR*;	(** int ( "*" | "@") **)
+		VAR S: Texts.Scanner; text: Texts.Text; R: Texts.Reader; oldNotify: Texts.Notifier; ch: CHAR;
+			beg, beg0, end, lineEnd, time: LONGINT; frame: TextFrames.Frame;
+		
+		PROCEDURE GetLineEnd (pos, len: LONGINT; VAR end: LONGINT; VAR ch: CHAR);
+			VAR R: Texts.Reader; pos0: LONGINT;
+		BEGIN end := pos; pos0 := pos;
+			Texts.OpenReader(R, text, pos);
+			LOOP  (*end = pos0 or position after last read blank*)
+				Texts.Read(R, ch); INC(pos); DEC(len);
+				IF R.eot THEN end := text.len; EXIT
+				ELSIF ch = CR THEN end := pos; EXIT
+				ELSIF ch = " " THEN end := pos
+				ELSIF len <= 0 THEN
+					IF end = pos0 THEN end := pos ELSE ch := " " END;
+					EXIT
+				END
+			END
+		END GetLineEnd;
+		
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Int) THEN Texts.Scan(S); text := NIL;
+			IF (S.line = 0) & (S.class = Texts.Char) THEN
+				IF S.c = "*" THEN frame := MarkedFrame(); text := frame.text; beg := 0; end := text.len; time := 1;
+				ELSIF S.c = "@" THEN Oberon.GetSelection(text, beg, end, time);
+				END;
+			END;
+			IF text # NIL THEN beg0 := beg; ch := " ";
+				oldNotify :=  text.notify; text.notify := NoNotify;
+				WHILE (beg > 0) & (ch # CR) DO
+					DEC(beg); Texts.OpenReader(R, text, beg); Texts.Read(R, ch);
+					IF ch = CR THEN INC(beg) END
+				END;
+				LOOP GetLineEnd(beg, S.i, lineEnd, ch);
+					IF lineEnd >= end THEN EXIT
+					ELSIF ch = CR THEN (*line already terminated by CR*)
+					ELSIF ch = " " THEN (*replace blank by CR*)
+						Texts.Delete(text, lineEnd - 1, lineEnd);
+						Texts.WriteLn(W); Texts.Insert(text, lineEnd - 1, W.buf)
+					ELSE (*the whole line is one word; break it*)
+						Texts.WriteLn(W); Texts.Insert(text, lineEnd, W.buf); INC(lineEnd); INC(end)
+					END;
+					beg := lineEnd
+				END;
+				text.notify := oldNotify;
+				text.notify(text, Texts.replace, beg0, end)
+			END
+		END
+	END InsertCR;
+
+	PROCEDURE RemoveCR*; 	(** "*" | "@" **)
+		VAR text: Texts.Text; R: Texts.Reader; beg, beg0, end, time: LONGINT; ch, lastCh, nextCh: CHAR;
+		oldNotify: Texts.Notifier; frame: TextFrames.Frame; S: Texts.Scanner;
+	BEGIN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S); text := NIL;
+		IF (S.line = 0) & (S.class = Texts.Char) THEN
+			IF S.c = "*" THEN frame := MarkedFrame(); text := frame.text; beg := 0; end := text.len; time := 1;
+			ELSIF S.c = "@" THEN Oberon.GetSelection(text, beg, end, time);
+			END
+		END;
+		IF text # NIL THEN
+			IF time >= 0 THEN beg0 := beg; lastCh := 0X;
+				oldNotify :=  text.notify; text.notify := NoNotify;
+				Texts.OpenReader(R, text, beg);
+				WHILE beg < end DO
+					Texts.Read(R, ch); INC(beg);
+					IF ch = CR THEN
+						Texts.Read(R, nextCh);
+						IF (lastCh # CR) & (nextCh # CR) THEN
+							Texts.Delete(text, beg-1, beg); Texts.Write(W, " "); Texts.Insert(text, beg-1, W.buf)
+						END;
+						Texts.OpenReader(R, text, beg)
+					END;
+					lastCh := ch
+				END;
+				text.notify := oldNotify;
+				text.notify(text, Texts.replace, beg0, end)
+			END
+		END
+	END RemoveCR;
+
+	PROCEDURE ShowAliens*;
+		VAR F: TextFrames.Frame; R: Texts.Reader; none: BOOLEAN; identify: Texts.IdentifyMsg;
+	BEGIN F := MarkedFrame();
+		IF (F # NIL) THEN Str("EditTools.ShowAliens"); none := TRUE;
+			Texts.OpenReader(R, F.text, 0); Texts.ReadElem(R);
+			WHILE ~R.eot DO identify.mod[31] := 0X; R.elem.handle(R.elem, identify);
+				IF identify.mod[31] = 1X THEN none := FALSE; Ln; Str("pos"); Int(Texts.Pos(R) - 1);
+					Str("  unknown element allocator: "); Str(identify.mod); Ch("."); Str(identify.proc)
+				END;
+				Texts.ReadElem(R)
+			END;
+			IF none THEN Str("  none") END;
+			Ln
+		END
+	END ShowAliens;
+
+	PROCEDURE StoreAscii*;	(*ww 21 Aug 91 / CAS 5-Nov-91*)
+		VAR r: Texts.Reader; t: Texts.Text; f: Files.File; fr: Files.Rider; v: Viewers.Viewer;
+			name, bak: ARRAY 64 OF CHAR; ch: CHAR; beg, end, time: LONGINT; i, res: INTEGER;
+	BEGIN t := NIL;
+		IF Oberon.Par.frame = Oberon.Par.vwr.dsc THEN v := Oberon.Par.vwr;
+			ReadName(Oberon.Par.frame(TextFrames.Frame).text, 0, name);
+			t := Oberon.Par.frame.next(TextFrames.Frame).text
+		ELSE ReadName(Oberon.Par.text, Oberon.Par.pos, name); v := Oberon.MarkedViewer();
+			IF (name[0] = "^") & (name[1] = 0X) THEN Oberon.GetSelection(t, beg, end, time);
+				IF time > 0 THEN ReadName(t, beg, name) ELSE name := "" END
+			END;
+			IF (name[0] = "*") & (name[1] = 0X) THEN ReadName(v.dsc(TextFrames.Frame).text, 0, name) END;
+			t := v.dsc.next(TextFrames.Frame).text
+		END;
+		IF (t # NIL) & (name # "") THEN UnmarkMenu(v);
+			Str("EditTools.StoreAscii "); Str(name); Ch(" ");
+			f := Files.New(name); Files.Set(fr, f, 0); Texts.OpenReader(r, t, 0); Texts.Read(r, ch);
+			WHILE ~r.eot DO
+				IF ch = 0DX THEN ch := 0AX END;
+				Files.Write(fr, ch); Texts.Read(r, ch)
+			END;
+			COPY(name, bak); i := 0;
+			WHILE bak[i] # 0X DO INC(i) END;
+			bak[i] := "."; bak[i+1] := "B"; bak[i+2] := "a"; bak[i+3] := "k"; bak[i+4] := 0X;
+			Files.Rename(name, bak, res);
+			Files.Register(f); Int(Files.Pos(fr)); Ln
+		END
+	END StoreAscii;
+
+	PROCEDURE LocateLine*;
+		VAR f: TextFrames.Frame;
+			S: Texts.Scanner; R: Texts.Reader; line, beg, end: LONGINT; ch: CHAR;
+	BEGIN f := MarkedFrame(); GetMainArg(S, beg, end);
+		WHILE ~S.eot & (S.class < Texts.Int) & (S.line = 0) DO Texts.Scan(S) END ;	(*skip names*)
+	    IF (S.class = Texts.Int) & (f # NIL) THEN
+			Texts.OpenReader(R, f.text, 0); line := 1; Texts.Read(R, ch);
+			WHILE ~R.eot & (line < S.i) DO
+				IF ch = CR THEN INC(line) END;
+				Texts.Read(R, ch)
+			END;
+			Show(f, Texts.Pos(R)-1); TextFrames.SetCaret(f, Texts.Pos(R)-1)
+		END
+	END LocateLine;
+
+BEGIN Texts.OpenWriter(W); Texts.OpenWriter(WR); lastTime := 0; search.set := {}
+END EditTools.
+
+(*
+	EditTools.GetAttr *
+	EditTools.SearchAttr font Syntax10b.Scn.Fnt  off 0
+	EditTools.IncSize 4
+	EditTools.ChangeSize ? => 12 ~
+	EditTools.ChangeFamily ? => Syntax ~
+	EditTools.ChangeStyle b => . ~
+	EditTools.Change Syntax12.Scn.Fnt => Courier10.Scn.Fnt ~
+
+	EditTools.Words * EditTools.Mod ~
+	EditTools.Cleanup ~
+
+	EditTools.RemoveElems *
+	EditTools.ToAscii *
+	EditTools.InsertCR 80 @
+	EditTools.RemoveCR @
+
+	EditTools.StoreAscii 
+	EditTools.LocateLine 15
+
+	test text using some mixed fonts
+*)

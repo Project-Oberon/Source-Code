@@ -1,0 +1,144 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE MemDisk;	(* pmuller 06.06.95 *)
+
+(* Disk driver for native Oberon (Memory version) *)
+
+IMPORT SYSTEM;
+
+TYPE
+	Sector* = RECORD END;	(** 2k Oberon Sector *)
+
+CONST
+	SS = 2048;	(* Oberon sector size *)
+
+VAR
+	disk*: POINTER TO ARRAY OF ARRAY SS OF CHAR;
+	nummax*: LONGINT;	(* total number of Sectors *)
+		(* sector management *)
+	numused: LONGINT;	(* number of used Sectors *)
+	map: POINTER TO ARRAY OF SET;
+
+(* Init - Initialise *)
+
+PROCEDURE Init*(size: INTEGER);
+VAR s, err, x: LONGINT;  b: ARRAY 512 OF CHAR;
+BEGIN
+	disk := NIL;  map := NIL;  nummax := 0;
+		(* set up sector reservation table *)
+	nummax := LONG(size)*1024 DIV SS;  numused := 0;
+	s := (nummax+31) DIV 32;
+	IF s # 0 THEN
+		NEW(map, s);
+		WHILE s # 0 DO DEC(s); map[s] := {} END;
+		INCL(map[0], 0);	(* reserve sector 0 (illegal to use) *)
+			(* set up the disk image *)
+		NEW(disk, nummax)
+	ELSE
+		map := NIL;  disk := NIL
+	END;
+END Init;
+
+(* ---- Ceres-like interface ---- *)
+
+(* InSector - "Decode" and check an Oberon sector number. *)
+
+PROCEDURE InSector(VAR sec: LONGINT);                
+BEGIN
+	IF (sec < 29) OR (sec MOD 29 # 0) THEN
+		HALT(21) (* Illegal sector address *)
+	END;
+	sec := sec DIV 29
+END InSector;
+
+(** AllocSector - Allocate a new Sector.  "hint" can be previously allocated
+	Sector to preserve adjacency, or 0 if previous Sector not known *)
+
+PROCEDURE AllocSector*(hint: LONGINT; VAR sec: LONGINT);
+VAR i : LONGINT;
+BEGIN
+	i := hint+29;
+	InSector(i);  hint := i-1;
+	IF hint >= nummax THEN hint := 0 END;
+	LOOP
+		IF i >= nummax THEN i := 0 END;
+		IF (i MOD 32) IN map[i DIV 32] THEN INC(i)	(* in use *)
+		ELSE
+			sec := i;  INCL(map[i DIV 32], i MOD 32);  INC(numused);
+			sec := sec*29;	(* "Encode" sector number. *)
+			EXIT
+		END;
+		IF i = hint THEN HALT(22) (* Disk full *) END
+	END
+END AllocSector;
+
+(** MarkSector - Mark a Sector as used *)
+
+PROCEDURE MarkSector*(sec: LONGINT);
+BEGIN
+	InSector(sec);
+	INCL(map[sec DIV 32], sec MOD 32);
+	INC(numused)
+END MarkSector;
+
+(** FreeSector - Mark a Sector as unused *)
+
+PROCEDURE FreeSector*(sec: LONGINT);
+BEGIN
+	InSector(sec);
+	EXCL(map[sec DIV 32], sec MOD 32);
+	DEC(numused)
+END FreeSector;
+
+(** GetSector - Read a 2k Sector from disk *)
+
+PROCEDURE GetSector*(src: LONGINT; VAR dest: Sector);
+BEGIN
+	InSector(src);
+	IF (src < 1) OR (src > nummax) THEN HALT(20) END;
+	SYSTEM.MOVE(SYSTEM.ADR(disk[src-1]), SYSTEM.ADR(dest), SS)
+END GetSector;
+
+(** PutSector - Write a 2k Sector to disk *)
+
+PROCEDURE PutSector*(dest: LONGINT; VAR src: Sector);
+BEGIN
+	InSector(dest);
+	IF (dest < 1) OR (dest > nummax) THEN HALT(20) END;
+	SYSTEM.MOVE(SYSTEM.ADR(src), SYSTEM.ADR(disk[dest-1]), SS)
+END PutSector;
+
+(** Available - Return number of 2k Sectors available on disk *)
+
+PROCEDURE Available*(): LONGINT;
+BEGIN
+	RETURN nummax - numused
+END Available;
+
+(** Used - Return number of 2k sectors used, counting from start of disk *)
+
+PROCEDURE Used*(): LONGINT;
+VAR i: LONGINT;
+BEGIN
+	i := nummax-1;
+	LOOP
+		IF (i MOD 32) IN map[i DIV 32] THEN RETURN i
+		ELSE DEC(i)
+		END
+	END
+END Used;
+
+BEGIN
+	disk := NIL;  nummax := 0;  numused := 0;  map := NIL
+END MemDisk.

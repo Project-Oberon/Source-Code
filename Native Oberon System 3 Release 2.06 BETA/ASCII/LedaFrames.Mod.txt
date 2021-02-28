@@ -1,0 +1,1292 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaFrames;	(* uh, Fri, 10-Dec-1993 *)
+
+	(*--- remarks:
+		_ provides the functionality for the main output device: the screen
+		_ screen coordinate system: 
+			-> position [0,0]: lower left
+			-> rectangle: lower left, width, height
+		_ Display.arrow:  x = 0, y = 0, w = 16, h = 16
+		_ definition of rectangles in leda:	X, Y, W, H
+			-> X, Y:  upper left / W:  width /  H:  height
+			-> horizontal inside regtangle:  X..X+(W-1)
+			-> vertical inside rectangle:  Y..Y+(H-1)
+	---*) 
+	
+	IMPORT LedaSys, LedaBase, LedaCtrl, Objects, Texts, Fonts, Display, Oberon, TextFrames;
+	
+CONST
+	(*--- mouse keys ---*)
+	ML = LedaSys.ML;	MM = LedaSys.MM;	MR = LedaSys.MR;
+	
+	(*--- id's for FrameMsg ---*)
+	RedrawId = -2;	ResetMarksId = -1;
+	VisibleId* = 0;	SelectionId* = 1;	ResetSelectionId* = 2;	BoxId* = 3;
+	FocusId* = 4;	ResetFocusId* = 5;
+	
+	(*--- special id's for FrameMsg [used by trailer frames] ---*)
+	TrailerId* = 6;	AddCtrlId* = 7;	RemCtrlId* = 8;	AddBoxId* = 9;	RemBoxId* = 10;
+	
+	VarHeight* = -99999;	(* used for mark in scrollbar *)
+	
+	(*--- flags used in LedaCtr.BoxDsc ---*)
+	SysMsg* = 0;	(* to receive system messages [reexported in LedaBox] *)
+	
+	MarkW = 8;	MarkH = 16;	BarW = 14;	BarMarg = 6;
+	NotDef = -1;
+
+	
+TYPE
+	(*--- masks ---*)
+	Mask* = POINTER TO MaskDsc;
+	MaskDsc* = RECORD
+		next*: Mask;
+		X*, Y*, W*, H*: INTEGER
+	END;
+
+	(*--- frame ---*)
+	Frame* = POINTER TO FDsc;
+	FDsc* = RECORD
+		(Display.FrameDesc)	(* dsc field -> clip view of frame [for containers with gadgets] *)
+		box*: LedaBase.Box;	(* document box *)
+		visNext*: Frame;	(* list of visible frames displaying the same document *)
+		trailer*: Frame;	(* document trailer *)
+		mask*: Mask;	(* mask of frame *)
+		refX*, refY*: LONGINT;	(* reference point [upper left corner of frame] *)
+		refH*: LONGINT;	(* reference height for mark in scrollbar; refH = VarHeight --> regard doc.H *)
+		caretX*, caretY*, margW*, markH*, mark*: INTEGER;
+		focus*, unmarked*: BOOLEAN;
+	END;
+		
+		(*--- remarks:
+			- LedaSys provides access to all documents in use [GetDocuments and NewDocument]
+			- a unique document trailer exists for every document in use
+			- the document trailer is referenced by all frames displaying the same document
+			- the document trailer lists all frames currently visible in a circular list [visNext field]
+			- the document trailer provides a circular message list to send broadcast messages to;
+				this message list contains frames of type CtrlFrame and BoxFrame; a control or box
+				can be added/removed from the message list by sending an according frame message
+				to the document trailer [message id's: AddCtrlId, RemCtrlId, AddBoxId, RemBoxId]
+		---*)
+		
+	(*--- message frames ---*)
+	CtrlFrame = POINTER TO CFDsc;
+	CFDsc = RECORD
+		(Display.FrameDesc)
+		ctrl: LedaBase.Control
+	END;
+	BoxFrame = POINTER TO MFDsc;
+	MFDsc = RECORD
+		(Display.FrameDesc)
+		box: LedaBase.Box
+	END;
+	
+	(*--- drawing/update mechanism ---*)
+	Port* = POINTER TO PortDsc;
+	PortDsc* = RECORD
+		(LedaSys.PortDsc)	(* specifies visible area and unit of screen *)
+		box*: LedaBase.Box;	(* document box *)
+		begF*, endF*: Frame;	(* frames to be handled; endF not included *)
+		fadeMarks*: BOOLEAN;	(* fade system marks [Oberon.Mouse, Oberon.Pointer] *)
+		setClip*: BOOLEAN;	(* true: set clipping before drawing / false: clipping already set *)
+		next*: Port;	(* to build list of ports *)
+	END;
+	
+	(*--- messages ---*)
+	FrameMsg* = RECORD
+		(Display.FrameMsg)
+		id*: INTEGER;
+		box*: LedaBase.Box;
+		ctrl*: LedaBase.Control;
+		frm*: Frame;
+		on*: BOOLEAN;
+	END;
+	
+	TextMsg = RECORD
+		(Oberon.SelectMsg)
+		lTime: LONGINT;
+		lText: LedaCtrl.Text;
+		lBeg, lLen: LONGINT
+	END;
+	
+	(*--- points ---*)
+	Point = RECORD
+		X, Y: LONGINT;	(* point coordinates [document space] *)
+		dX, dY: LONGINT;	(* length adjustment [converted length added to converted point] *)
+		px, py: INTEGER	(* pixel adjustment [added to fully converted point] *)
+	END;
+	
+	
+VAR
+	editF*: Frame;	(* current frame with a edit event [key, mouse, message broadcast] *)
+	outF*: Frame;	(* current frame with output operation *)
+	keyHandler*: LedaBase.KeyProc;	(* installed key handler [used Key] *)
+	menu: RECORD
+		H: INTEGER;	
+		F: Display.Frame;
+		title: LedaSys.String;
+		cmds: ARRAY 128 OF CHAR
+	END;	(* used in GetMenu and SetMenu [for external menus] *)
+	scnUnit: LONGINT;	(* initalized to LedaSys.scnUnit *)
+	freePort: Port;	(* free list for ports [recycling] *)
+	portList: Port;	(* list of document ports *)
+	freeMask: Mask;	(* free list for masks [recycling] *)
+	stdW: Texts.Writer;
+	W: LedaCtrl.Writer;
+	B: LedaCtrl.Buffer;
+	p: ARRAY 12 OF Point;	(* predefined points; set in DefinePoint *)
+	clip: Display.Frame;	(* used in trailer handle *)
+	
+	PROCEDURE Min(i0, i1: INTEGER): INTEGER;
+	BEGIN
+		IF i0 < i1 THEN RETURN i0 ELSE RETURN i1 END
+	END Min;
+	
+	PROCEDURE Max(i0, i1: INTEGER): INTEGER;
+	BEGIN
+		IF i0 > i1 THEN RETURN i0 ELSE RETURN i1 END
+	END Max;
+	
+	PROCEDURE ExtRef(box: LedaBase.Box; VAR eX, eY: LONGINT);
+	BEGIN
+		eX := box.X; eY := box.Y;
+		WHILE box.anc # NIL DO box := box.anc; INC(eX, box.X); INC(eY, box.Y) END
+	END ExtRef;
+
+(*--- text conversions ---*)
+	
+	PROCEDURE OwnToStdText(VAR R: LedaCtrl.Reader; len: LONGINT; VAR text: Texts.Text);
+		VAR ctrl, lastCtrl: LedaBase.PieceCtrl;	fName: LedaSys.String;
+			fnt: Fonts.Font;	ch: CHAR;	i: INTEGER;
+	BEGIN
+		IF stdW.buf.len > 0 THEN Texts.OpenBuf(stdW.buf) END;	(* clear buffer *)
+		lastCtrl := NIL; LedaCtrl.ReadChar(R, ch, ctrl);
+		WHILE ~ R.eot & (len > 0) DO
+			DEC(len);
+			IF ctrl IS LedaBase.Style THEN
+				IF ctrl # lastCtrl THEN
+					WITH ctrl: LedaBase.Style DO
+						LedaBase.FntInfo(ctrl.font, 1, fName, i);	(* get screen font name *)
+						fnt := Fonts.This(fName);
+						IF stdW.lib # fnt THEN Texts.SetFont(stdW, fnt) END;
+						IF stdW.col # ctrl.clr THEN Texts.SetColor(stdW, SHORT(ctrl.clr)) END;
+						IF stdW.voff # ctrl.voff THEN Texts.SetOffset (stdW, SHORT(ctrl.voff)) END
+					END;
+					lastCtrl := ctrl
+				END;
+				Texts.Write(stdW, ch)
+			END;				
+			LedaCtrl.ReadChar(R, ch, ctrl)
+		END;
+		IF stdW.buf.len > 0 THEN
+			text := TextFrames.Text(""); Texts.Insert(text, 0, stdW.buf)
+		ELSE text := NIL
+		END
+	END OwnToStdText;
+	
+	PROCEDURE StdToOwnText(VAR stdR: Texts.Reader; len: LONGINT; VAR W: LedaCtrl.Writer);
+		VAR ctrl: LedaBase.PieceCtrl;	c: LedaBase.Control;	ch: CHAR;
+	BEGIN
+		LedaCtrl.InitBuffer(W);	(* clear buffer *)
+		IF LedaBase.inCtrl IS LedaBase.Style THEN ctrl := LedaBase.inCtrl
+		ELSE c := LedaBase.CreateControl("", "DefStyle"); ctrl := c(LedaBase.PieceCtrl)
+		END;
+		Texts.Read(stdR, ch);
+		WHILE ~ stdR.eot & (len > 0) DO
+			DEC(len);
+			IF stdR.lib IS Fonts.Font THEN LedaCtrl.WriteChar(W, ch, ctrl) END;
+			Texts.Read(stdR, ch)
+		END
+	END StdToOwnText; 
+	
+(*--- handling of the scrollbars mark --*)
+
+	PROCEDURE MrkH(F: Frame): INTEGER;
+		VAR H, refH: LONGINT;	markH: INTEGER;
+	BEGIN	(* valid range of markH:	0 <= markH < F.H *)
+		H := F.H * scnUnit;
+		IF F.refH = VarHeight THEN refH := F.box.H ELSE refH := F.refH END;
+		IF refH > H THEN H := refH - H END;
+		IF F.refY < 0 THEN markH := 0
+		ELSE markH :=  SHORT(((F.refY DIV 1000) * F.H) DIV (H DIV 1000))
+		END;
+		IF markH >= F.H THEN markH := F.H - 1 ELSIF markH < 0 THEN markH := 0 END;
+		RETURN markH
+	END MrkH;
+	
+	PROCEDURE FlipMark(F: Frame);
+	BEGIN
+		IF F.mark > 0 THEN	(* F.Y + F.H - 1 --> upmost point within frame *)
+			Display.ReplConst(LedaSys.fg, F.X + 1, F.Y + F.H - 1 - F.markH, MarkW, 1, Display.invert)
+		END
+	END FlipMark;
+	
+	PROCEDURE Mark*(F: Frame; mark: INTEGER);
+	(** mark:	< 0: arrow mark / = 0: no mark / > 0: position mark *)
+	BEGIN
+		IF ((mark >= 0) = (F.mark < 0)) & (F.H >= MarkH) THEN
+			Display.CopyPattern(LedaSys.fg, Display.downArrow, F.X, F.Y, Display.invert)
+		END;
+		IF ((mark > 0) = (F.mark <= 0)) & (F.H > 0) THEN
+			Display.ReplConst(LedaSys.fg, F.X + 1, F.Y + F.H - F.markH, MarkW, 1, Display.invert)
+		END;
+		F.mark := mark
+	END Mark;
+
+(*--- coordinate and length conversions ---*)
+	
+	PROCEDURE FrmToDoc*(F: Frame; X, Y: INTEGER; VAR dX, dY: LONGINT);
+	BEGIN
+		dX := F.refX + (X - F.margW - F.X) * scnUnit; dY := F.refY + (F.Y + F.H -1 - Y) * scnUnit
+	END FrmToDoc;
+	
+	PROCEDURE FrmToDocLen*(F: Frame; L: INTEGER; VAR dL: LONGINT);
+	(** returns in dL the document length of L *)
+	BEGIN
+		dL := L * scnUnit
+	END FrmToDocLen;
+	
+	PROCEDURE DocToFrm*(F: Frame; dX, dY: LONGINT; VAR X, Y: INTEGER);
+	(** returns in X, Y the frame coordinates of dX, dY *)
+	BEGIN
+		X  := SHORT((dX - F.refX) DIV scnUnit) + F.margW + F.X;
+		Y := SHORT((dY - F.refY) DIV scnUnit); Y := F.Y + F.H - 1- Y
+	END DocToFrm;
+	
+	PROCEDURE DocToFrmLen*(F: Frame; dL: LONGINT; VAR L: INTEGER);
+	(** returns in L the frame length of dL *)
+	BEGIN
+		L  := SHORT(dL DIV scnUnit)
+	END DocToFrmLen;
+	
+	PROCEDURE DocToFrmArea*(F: Frame; X, Y, W, H: LONGINT; VAR x, y, w, h: INTEGER);
+	(** converts and clips the area given by X, Y, W, H to the frame F *)
+	(** X, Y -> upper left; x, y -> lower left *)
+		VAR x1, y1, x2, y2: LONGINT;
+	BEGIN	(* convert lower left and upper right point *)
+		x1 := ((X - F.refX) DIV scnUnit) + F.margW + F.X;
+		y1 := (Y + H - F.refY) DIV scnUnit; y1 := F.Y + F.H - y1;	(* lower left; inside area *)
+		(* note:  y1 := F.Y + F.H - 1 - y1; INC(y1) [y1 is inside area] *)
+		x2 := ((X + W - F.refX) DIV scnUnit) + F.margW + F.X - 1;	(* note x2 := ... - 1 [x2 is inside area] *)
+		y2 := (Y - F.refY) DIV scnUnit; y2 := F.Y + F.H - 1 - y2;	(* upper right; inside area *)
+		IF (x2 <= x1) OR (y2 <= y1) THEN w := 0; h := 0	(* empty area *)
+		ELSIF (x2 < F.X + F.margW) OR (F.X + F.W <= x1) OR (F.Y + F.H <=  y1) OR (y2 < F.Y) THEN 
+			w := 0; h := 0	(* area outside frame [empty area] *)
+		ELSE
+			IF y1 < F.Y THEN y1 := F.Y END;
+			IF y2 >= F.Y + F.H THEN y2 := F.Y + F.H - 1 END;
+			IF x1 < F.X + F.margW THEN x1 := F.X + F.margW END;
+			IF x2 >= F.X + F.W THEN x2 := F.X + F.W - 1 END;
+			x := SHORT(x1); y := SHORT(y1);
+			w := SHORT(x2) - x + 1; h := SHORT(y2) - y + 1	(* w, h adjust *)
+		END
+	END DocToFrmArea;
+	
+	PROCEDURE DefinePoint*(n: INTEGER; X, Y, dX, dY: LONGINT; px, py: INTEGER);
+	(** defines the point number n given by X, Y adjusted by dX, dY and px, py *)
+	(** specification of point parameters see definition Point *)
+	BEGIN
+		p[n].X := X; p[n].dX := dX; p[n].px := px; 
+		p[n].Y := Y; p[n].dY := dY; p[n].py := py
+	END DefinePoint;
+	
+	PROCEDURE ConvertPoint(F: Frame; n: INTEGER; VAR x, y: LONGINT);
+	BEGIN
+		x  :=((p[n].X - F.refX) DIV scnUnit) + F.margW + F.X;
+		y := (p[n].Y - F.refY) DIV scnUnit; y := F.Y + F.H - 1 - y;
+		IF p[n].dX # 0 THEN
+			IF p[n].dX > 0 THEN INC(x, p[n].dX DIV scnUnit) ELSE DEC(x, -p[n].dX DIV scnUnit) END
+		END;
+		IF p[n].dY # 0 THEN
+			IF p[n].dY > 0 THEN DEC(y, p[n].dY DIV scnUnit) ELSE INC(y, -p[n].dY DIV scnUnit) END
+		END;
+		INC(x, LONG(p[n].px)); DEC(y, LONG(p[n].py))
+	END ConvertPoint;
+	
+	PROCEDURE DocToFrmPointArea*(F: Frame; VAR x, y, w, h: INTEGER);
+	(** converts the area specified by the predefined points and clips it to the frame F *)
+		VAR x1, y1, x2, y2: LONGINT;
+	BEGIN	(* p[0] -> lower left; inside area / p[1] -> upper right; inside area *)
+		ConvertPoint(F, 0, x1, y1);	(* lower left; inside area *)
+		ConvertPoint(F, 1, x2, y2);	(* upper right; inside area *)
+		IF (x2 <= x1) OR (y2 <= y1) THEN w := 0; h := 0	(* empty area *)
+		ELSIF (x2 < F.X + F.margW) OR (F.X + F.W <= x1) OR (F.Y + F.H <=  y1) OR (y2 < F.Y) THEN 
+			w := 0; h := 0	(* area outside frame [empty area] *)
+		ELSE
+			IF y1 < F.Y THEN y1 := F.Y END;
+			IF y2 >= F.Y + F.H THEN y2 := F.Y + F.H - 1 END;
+			IF x1 < F.X + F.margW THEN x1 := F.X + F.margW END;
+			IF x2 >= F.X + F.W THEN x2 := F.X + F.W - 1 END;
+			x := SHORT(x1); y := SHORT(y1);
+			w := SHORT(x2) - x + 1; h := SHORT(y2) - y + 1;	(* w, h adjust *)
+		END
+	END DocToFrmPointArea;
+	
+(*--- masks ---*)
+
+	(*--- 
+		- masks allow to describe any area composed of rectangles
+		- output operations may take masks into consideration [example: OutErase]
+		- masks can be defined with the output operation OutMask
+		- masks differ for different frames because every frame displays
+			an other part of the document; therefore every frame has
+			an own mask field
+	---*)
+	
+	PROCEDURE MaskNew*(X, Y, W, H: INTEGER; next: Mask): Mask;
+		VAR m: Mask;
+	BEGIN
+		IF freeMask = NIL THEN NEW(m) ELSE m := freeMask; freeMask := freeMask.next END;
+		m.X := X; m.Y := Y; m.W := W; m.H := H; m.next := next;
+		RETURN m
+	END MaskNew;
+	
+	PROCEDURE MaskDispose*(VAR M: Mask);
+		VAR m: Mask;
+	BEGIN
+		IF M # NIL THEN
+			m := M; WHILE m.next # NIL DO m := m.next END;
+			m.next := freeMask; freeMask := M;
+			M := NIL
+		END 
+	END MaskDispose;
+	
+	PROCEDURE MaskSet*(M: Mask; X, Y, W, H: INTEGER);
+	BEGIN
+		M.X := X; M.Y := Y; M.W := W; M.H := H
+	END MaskSet;
+
+	PROCEDURE MaskExcl*(M: Mask; X, Y, W, H: INTEGER);
+	(** excludes from the mask area M.X, M.Y, M.W, M.H the area X, Y, W, H *)
+	(** causes splitting of mask area to a sequence of areas [new areas are added to M] *) 
+		VAR lt, rt, lo, hi, mX, mY, mW, mH: INTEGER;	m: Mask; 
+	BEGIN
+		m := NIL; mX := M.X; mY := M.Y; mW := M.W; mH := M.H;
+		lt := Max(X, mX); rt := Min(X + W, mX + mW);	(* range: [lt..rt[ *)
+		lo := Max(Y, mY); hi := Min(Y + H, mY + mH);	(* range: [lo..hi[ *)
+		IF (lt >= rt) OR (lo >= hi) THEN RETURN END;	(*###*)	(* no intersection *)
+		IF lt > mX THEN
+			IF m = NIL THEN MaskSet(M, mX, lo, lt - mX, hi - lo); m := M
+			ELSE m.next := MaskNew(mX, lo, lt - mX, hi - lo, m.next); m := m.next
+			END	(* old y range: Y, H *)
+		END;
+		IF hi < mY + mH THEN
+			IF m = NIL THEN MaskSet(M, mX, hi, mW, mY + mH - hi); m := M
+			ELSE m.next := MaskNew(mX, hi, mW, mY + mH - hi, m.next); m := m.next
+			END
+		END;
+		IF rt < mX + mW THEN
+			IF m = NIL THEN MaskSet(M, rt, lo, mX + mW - rt, hi - lo); m := M
+			ELSE m.next := MaskNew(rt, lo, mX + mW - rt, hi - lo, m.next); m := m.next
+			END	(* old y range: Y, H *)
+		END;
+		IF lo > mY THEN
+			IF m = NIL THEN MaskSet(M, mX, mY, mW, lo - mY); m := M
+			ELSE m.next := MaskNew(mX, mY, mW, lo - mY, m.next); m := m.next
+			END
+		END
+	END MaskExcl;
+
+(*--- drawing/update mechanism ---*)
+
+	(*--- 
+		- actions like button, key or copyover events can cause changes
+			to be displayed; updating the display can occur either immeditaly
+			[for dragging] or after the event as one update
+		- every document involved during an event/action has to have a port;
+			all ports currently used are in a list [portList]
+		- a single port specifies a document and a list of frames displaying
+			this document on the screen
+		- the port is used for drawing and updating a document
+		- GetPort returns a port for a document; the level parameter is bigger than 0
+			for nested calls; its purpose is to prevent an update before the first
+			action has terminated 
+		- UpdatePorts causes the needed updates at the end of an event/action;
+			the update takes only place at level 0 when the starting action has terminated
+	---*)
+	
+	PROCEDURE PortNew(VAR p: Port);
+	BEGIN
+		IF freePort = NIL THEN NEW(p)
+		ELSE p := freePort; freePort := freePort.next	(* get port from free list *)
+		END;
+		p.next := NIL
+	END PortNew;
+	
+	PROCEDURE PortDispose(VAR p: Port);
+	BEGIN
+		p.box := NIL; p.begF := NIL; p.endF := NIL;	(* cut references to document *)
+		p.next := freePort; freePort := p;	(* put port to free list *)
+		p := NIL
+	END PortDispose; 
+	
+	PROCEDURE ShowFocus(p: Port; box: LedaBase.Box; mode: SHORTINT);
+		VAR foc: LedaBase.Box;	eX, eY: LONGINT;
+	BEGIN
+		foc := box.next;
+		IF (p # NIL) & (foc # NIL) THEN
+			ExtRef(foc, eX, eY);
+			foc.do(LedaBase.BoxHandler).mark(foc, eX, eY, p, LedaBase.FocMark, mode)
+		END
+	END ShowFocus;
+	
+	PROCEDURE ShowSelection(p: Port; box: LedaBase.Box; mode: SHORTINT);
+		VAR sel: LedaBase.Box;	eX, eY: LONGINT;
+	BEGIN
+		sel := box.sel;
+		WHILE sel # NIL DO
+			IF p # NIL THEN
+				ExtRef(sel, eX, eY);
+				sel.do(LedaBase.BoxHandler).mark(sel, eX, eY, p, LedaBase.SelMark, mode)
+			END;
+			IF sel = box THEN sel := NIL ELSE sel := sel.next END
+		END
+	END ShowSelection;
+	
+	PROCEDURE PortNotOk(P: LedaSys.Port): BOOLEAN;
+	BEGIN
+		RETURN (P = NIL) OR (LedaSys.DrawFlag IN P.state) OR ~ (P IS Port)
+	END PortNotOk;
+	
+	PROCEDURE PortOpen(VAR p: Port; trailer, visible: Frame);
+	(* opens a new port p for document specified by trailer *)
+	(* visible = NIL: all frames of document visible; visble # NIL: only frame visble is visble *)
+	BEGIN
+		PortNew(p);	(* get new port *)
+		p.X := 0; p.Y := 0; p.W := MAX(LONGINT); p.H := MAX(LONGINT);	(* visible area *)
+		p.unit := scnUnit; p.state := {}; p.eraseCol := LedaSys.bg;
+		p.box := trailer.box; 
+		IF visible = NIL THEN p.begF := trailer.visNext; p.endF := trailer	(* all frames visible *)
+		ELSE p.begF := visible; p.endF := visible.visNext	(* visibility set to frame visble *)
+		END;
+		p.fadeMarks := TRUE; p.setClip := TRUE
+	END PortOpen;
+	
+	PROCEDURE UpdateArea*(F: Frame; X, Y, W, H: INTEGER; frame, marks: BOOLEAN;
+												draw: LedaBase.DrawProc; updBox: LedaBase.Box);
+	(* updates the area specified by X, Y, W, H by calling draw with updBox *)
+	(* frame = true -> clears the frame area and draws the scrollbar *)
+	(* marks = true -> highlights the marks [selection, focus] within the area *)
+		VAR p: Port;	box: LedaBase.Box;	eX, eY: LONGINT;	sx, sy, sw, sh: INTEGER;
+	BEGIN
+		IF frame THEN
+			Display.ReplConst(LedaSys.bg, F.X, F.Y, F.W, F.H, Display.replace);	(* clear frame area *)
+			Display.ReplConst(LedaSys.fg, F.X + BarW - 1, F.Y, 1, F.H, Display.replace);	(* draw scrollbar *)
+			F.markH := MrkH(F); F.mark := 1; FlipMark(F)	(* draw mark in scrollbar *)
+		END;
+		box := F.box;
+		PortOpen(p, F.trailer, F);	(* visibility set to frame F *)
+		p.fadeMarks := FALSE; p.setClip := FALSE; INCL(p.state, LedaSys.UpdateFlag);
+		FrmToDoc(F, X, Y+H-1, p.X, p.Y); p.W := W * scnUnit; p.H := H * scnUnit;	(* visible area in document units *)
+		Display.GetClip(sx, sy, sw, sh); Display.SetClip(X, Y, W, H);
+		IF (draw # NIL) & (updBox # NIL) THEN
+			ExtRef(updBox, eX, eY); draw(updBox, eX, eY, p)
+		ELSE
+			box.do(LedaBase.BoxHandler).draw(box, 0, 0, p)	(* call document to update area *)
+		END;
+		IF marks THEN
+			ShowFocus(p, box, LedaBase.On);	(* highlite focus *)
+			ShowSelection(p, box, LedaBase.On)	(* highlite selection *)
+		END;
+		Display.SetClip(sx, sy, sw, sh);
+		PortDispose(p)	(* no call needed to PortClose because no updates allowed during update *)
+	END UpdateArea;
+	
+	PROCEDURE PortClose(VAR p: Port);
+	(* takes care that updates of port p are displayed and closes the port p *)
+		VAR q: Port;	F, endF: Frame;
+	BEGIN
+		IF (p.state * {LedaSys.DrawFlag, LedaSys.FocFlag, LedaSys.SelFlag}) # {} THEN
+			IF LedaSys.DrawFlag IN p.state THEN	(* redraw needed *)
+				F := p.begF; endF := p.endF;
+				WHILE F # endF DO
+					Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);	(* fade system marks [Oberon.Mouse, Oberon.Pointer] *)
+					UpdateArea(F, F.X + F.margW, F.Y, F.W - F.margW, F.H, TRUE, TRUE, NIL, NIL);
+					F := F.visNext
+				END
+			ELSE
+				IF LedaSys.FocFlag IN p.state THEN ShowFocus(p, p.box, LedaBase.On) END;	(* highlite focus *)
+				IF LedaSys.SelFlag IN p.state THEN ShowSelection(p, p.box, LedaBase.On) END;	(* highlite selection *)
+			END
+		END;
+		IF p = portList THEN portList := portList.next
+		ELSE
+			q := portList; WHILE (q # NIL) & (q.next # p) DO q := q.next END;
+			IF q # NIL THEN (* q.next = p *) q.next := p.next END
+		END	(* port  p removed from port list *)
+	END PortClose;
+
+	PROCEDURE GetTrailer(box: LedaBase.Box; VAR trailer: Frame);
+	(* gets the document trailer for document box *)
+		VAR access: LedaSys.Access;
+	BEGIN
+		LedaSys.GetDocuments(access);
+		LOOP
+			IF access = NIL THEN trailer := NIL; EXIT END;	(*###*)
+			trailer := access.trailer(Frame);
+			IF box = trailer.box THEN EXIT END;	(*###*)
+			access := access.next
+		END
+	END GetTrailer;
+	
+	PROCEDURE ResetMasks(p : Port);
+		VAR F, endF: Frame;
+	BEGIN
+		F := p.begF; endF := p.endF;
+		WHILE F # endF DO MaskDispose(F.mask); F := F.visNext END
+	END ResetMasks;
+
+	PROCEDURE GetPort*(trailer: Frame; box: LedaBase.Box; VAR p: Port; VAR level: INTEGER);
+	(** returns a port for the document specified by trailer and box *)
+		VAR q: Port;
+	BEGIN
+		p := portList; WHILE (p # NIL) & (p.box # box) DO p := p.next END;
+		IF p = NIL THEN	(* no existing port for this document *)
+			IF trailer = NIL THEN GetTrailer(box, trailer) END;
+			IF trailer # NIL THEN
+				PortOpen(p, trailer, NIL);	(* visibility set to all frames *)
+				ResetMasks(p);
+				IF portList = NIL THEN level := 0; portList := p
+				ELSE
+					level := 1; q := portList; WHILE q.next # NIL DO q := q.next END; q.next := p
+				END	(* port p appended to port list *)
+			ELSE level := 9
+			END
+		ELSE level := 2
+		END
+	END GetPort;
+	
+	PROCEDURE UpdatePort*(p: Port; level: INTEGER);
+	(** takes care that updates of the port list are displayed and all ports are closed *)
+		VAR q: Port;
+	BEGIN
+		IF level = 0 THEN	(* update all ports *)
+			p := portList;
+			WHILE p # NIL DO
+				q := p; p := p.next;
+				PortClose(q);	(* removes port q from port list *)
+				ResetMasks(q); PortDispose(q)
+			END
+		ELSIF level = 1 THEN
+			PortClose(p);	(* removes port p from port list *)
+			ResetMasks(p); PortDispose(p)
+		END
+	END UpdatePort;
+	
+(*--- focus and selection ---*)
+
+	(*---
+		_ the selection belongs to the document [not to the frame]
+		_ the focus belongs also to the document; but since only one
+			focus [caret] is visible there exists a single focus frame
+		_ access of selected boxes by root box [=document]:
+			-> root.sel: first selected box
+			-> root.bL: time stamp of selection
+		_ access of focus box by root box [=document]:
+			-> root.next: focus box	
+	---*)
+	
+	PROCEDURE Focus*(): Frame;
+	(** returns the frame having the box with the focus *)
+		VAR M: FrameMsg;
+	BEGIN
+		M.id := FocusId; M.frm := NIL; M.F := NIL; Display.Broadcast(M);
+		IF M.frm # NIL THEN RETURN M.frm ELSE RETURN NIL END
+	END Focus;
+	
+	PROCEDURE Selection*(): Frame;
+	(** returns the frame with the most recent box selection *)
+		VAR M: FrameMsg;
+	BEGIN
+		M.id := SelectionId; M.frm := NIL; M.box := NIL; M.F := NIL;
+		Display.Broadcast(M); RETURN M.frm
+	END Selection;
+	
+	PROCEDURE Marked*(): Frame;
+	(** returns the marked frame *)
+		VAR f: Display.Frame;	F: Frame;
+	BEGIN
+		F := NIL; f := Oberon.MarkedViewer();
+		IF (f # NIL) & (f.dsc # NIL) THEN
+			f := f.dsc.next; IF (f # NIL) & (f IS Frame) THEN F := f(Frame) END
+		END;
+		RETURN F
+	END Marked;
+		
+	PROCEDURE InMain*(VAR F: Frame): BOOLEAN;
+	(** checks if the Oberon.Par.frame is in the main frame [menu] and returns the body frame *)
+		VAR v, main, f: Display.Frame;	inmain: BOOLEAN;
+	BEGIN
+		v := Oberon.Par.vwr; f := Oberon.Par.frame;
+		IF (v = NIL) OR (f = NIL) OR (v.dsc = NIL) THEN inmain := FALSE
+		ELSIF ~ (f IS TextFrames.Frame) THEN	(* jm's buggy gadget menu panel *)
+			main := v.dsc; inmain := (main.next # NIL) & (main.next IS Frame)
+		ELSE main := v.dsc; inmain := (main = f)
+		END;
+		IF inmain THEN F := main.next(Frame) ELSE F := NIL END;
+		RETURN inmain
+	END InMain;
+		
+	PROCEDURE DeselectDoc(doc: LedaBase.Box);
+		VAR sel, h: LedaBase.Box;
+	BEGIN
+		sel := doc.sel;
+		WHILE sel # NIL DO
+			sel.do(LedaBase.BoxHandler).mark(sel, 0, 0, NIL, LedaBase.SelMark, LedaBase.Off);	(* notify about deselect *)
+			IF sel = doc THEN sel := NIL ELSE h := sel; sel := sel.next; h.sel := NIL END
+		END;
+		doc.sel := NIL; doc.bL := NotDef	(* reset selection in document *)
+	END DeselectDoc;
+		
+	PROCEDURE DefocusDoc(doc: LedaBase.Box);
+		VAR foc: LedaBase.Box;
+	BEGIN
+		foc := doc.next;
+		foc.do(LedaBase.BoxHandler).mark(foc, 0, 0, NIL, LedaBase.FocMark, LedaBase.Off);	(* notify about defocus *)
+		doc.next := NIL	(* reset focus in document *)
+	END DefocusDoc;
+	
+	PROCEDURE ControlMarks*(F: Frame; VAR M: Oberon.ControlMsg);
+		VAR sF: Frame;	p: Port;	box: LedaBase.Box;	level: INTEGER;
+	BEGIN
+		sF := editF; editF := F; F.trailer.handle(F.trailer, M); editF := sF;	(* broadcast in message list *)
+		box := F.box;
+		IF (M.id = Oberon.defocus) OR (M.id = Oberon.neutralize) THEN
+			IF (box.next # NIL) OR (box.sel # NIL) THEN
+				GetPort(F.trailer, F.box, p, level);
+				IF F.focus & (box.next # NIL) THEN	(* defocus *)
+					ShowFocus(p, box, LedaBase.Off); 	(* unhighlite focus *)
+					DefocusDoc(box)
+				END;
+				F.focus := FALSE;
+				IF (box.sel # NIL) & (M.id = Oberon.neutralize) THEN		(* deselect *)
+					ShowSelection(p, box, LedaBase.Off); 	(* unhighlite selection *)
+					DeselectDoc(box)
+				END;
+				UpdatePort(p, level)
+			END	(* IF (box.next... *)
+		END	(* IF (M.id = Oberon... *)
+	END ControlMarks;
+	
+	PROCEDURE ResetSelection(F: Frame);
+		VAR p: Port;	box: LedaBase.Box;	level: INTEGER;
+	BEGIN
+		box := F.box;
+		IF box.sel # NIL THEN	(* deselect *)
+			GetPort(F.trailer, box, p, level);
+			ShowSelection(p, box, LedaBase.Off); 	(* unhighlite selection *)
+			DeselectDoc(box);
+			UpdatePort(p, level)
+		END
+	END ResetSelection;
+	
+	PROCEDURE SetFocus*(box: LedaBase.Box);
+	(** passes the focus to a frame displaying the document box causing previously a defocus *)
+	(** focus frame becomes either editF [if editF # NIL] or first frame displaying document box *)
+		VAR M: FrameMsg;
+	BEGIN
+		Oberon.Defocus;
+		IF (editF # NIL) & (editF.box = box) THEN editF.focus := TRUE
+		ELSE
+			M.id :=  BoxId; M.box := box; M.frm := NIL; M.F := NIL;
+			Display.Broadcast(M);	(* get first frame displaying document box *)
+			IF M.frm # NIL THEN M.frm.focus := TRUE END
+		END
+	END SetFocus;
+	
+	PROCEDURE ResetFocus*(box: LedaBase.Box);
+	(** resets the focus field if the document box is displayed in a focus frame *)
+		VAR M: FrameMsg;
+	BEGIN
+		M.id :=  ResetFocusId; M.box := box; M.frm := NIL; M.F := NIL;
+		Display.Broadcast(M);	(* to reset all focus fields *)
+	END ResetFocus;
+
+	PROCEDURE PutTextSel(F: Frame; VAR sM: Oberon.SelectMsg);
+	(** put the text selection to the parameter sM *)
+		VAR tM: LedaCtrl.TextMsg;	h: LedaBase.Box;	R: LedaCtrl.Reader;
+	BEGIN	(* F.box.sel # NIL *)
+		tM.id := LedaCtrl.SelectedTextId; tM.text := NIL;
+		h := F.box.sel;
+		WHILE (h # NIL) & (tM.text = NIL) DO
+			h.do.handle(h, tM);
+			IF h = F.box THEN h := NIL ELSE h := h.sel END
+		END;
+		IF (tM.text # NIL) & (tM.len > 0) THEN
+			IF sM IS TextMsg THEN
+				WITH sM: TextMsg DO
+					sM.sel := F; sM.time := F.box.bL; sM.lTime := F.box.bL; 
+					sM.lText := tM.text; sM.lBeg := tM.beg; sM.lLen := tM.len
+				END
+			ELSE
+				LedaCtrl.InitReader(R, tM.text); LedaCtrl.SetReader(R, tM.beg);
+				OwnToStdText(R, tM.len, sM.text);
+				IF sM.text # NIL THEN 
+					sM.sel := F; sM.time := F.box.bL; sM.beg := 0; sM.end := sM.text.len
+				END
+			END
+		END
+	END PutTextSel;
+	
+	PROCEDURE GetTextSel*(VAR time: LONGINT; VAR B: LedaCtrl.Buffer);
+	(* gets the text selection to the buffer B *)
+		VAR tM: TextMsg;	R: Texts.Reader;
+	BEGIN
+		IF B.len > 0 THEN LedaCtrl.InitBuffer(B) END; 	(* clear buffer *)
+		tM.id := Oberon.get; tM.time := -1; tM.text := NIL;
+		tM.lTime := -1; tM.lText := NIL; tM.F := NIL;
+		Display.Broadcast(tM);	(* get text selection [standard or leda] *)
+		time := tM.time;
+		IF tM.time # -1 THEN
+			IF (tM.lTime < tM.time) & (tM.text # NIL) THEN	(* standard text selection *)
+				IF tM.end > tM.text.len THEN tM.end := tM.text.len END;
+				IF tM.end > tM.beg THEN
+					Texts.OpenReader(R, tM.text, tM.beg);
+					StdToOwnText(R, tM.end - tM.beg, W); B := W
+				END
+			ELSIF (tM.lTime = tM.time) & (tM.lText # NIL) THEN		(* leda text selection *)
+				LedaCtrl.SaveText(tM.lText, tM.lBeg, tM.lLen, B)
+			END
+		END
+	END GetTextSel;
+	
+	PROCEDURE InsTextExt*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; VAR B: LedaBase.Buffer);
+	(** inserts text at an external focus outside Leda *)
+	(** serves as insert procedure [used in LedaBox] *)
+		VAR text: LedaCtrl.Text;	R: LedaCtrl.Reader;	
+			cM: Oberon.ConsumeMsg;	len: LONGINT;
+	BEGIN
+		IF (B IS LedaCtrl.Buffer) & (B.len > 0) THEN
+			len := B.len; text := LedaCtrl.NewText(self, NIL);
+			LedaCtrl.TextInsert(text, 0, B(LedaCtrl.Buffer));
+			LedaCtrl.InitReader(R, text); LedaCtrl.SetReader(R, 0);
+			OwnToStdText(R, len, cM.text);
+			IF cM.text # NIL THEN
+				cM.beg := 0; cM.end := cM.text.len; cM.F := NIL;
+				Display.Broadcast(cM)
+			END
+		END
+	END InsTextExt;
+	
+	PROCEDURE *StdTextCopy(foc: LedaBase.Box; P: LedaSys.Port);
+	(* copy procedure to insert converted standard text contained in writer W *)
+		VAR eX, eY: LONGINT;	doc: LedaBase.Box;
+	BEGIN
+		IF B.len > 0 THEN
+			doc := foc; WHILE doc.anc # NIL DO doc := doc.anc END;
+			IF P IS Port THEN
+				ShowSelection(P(Port), doc, LedaBase.Off); DeselectDoc(doc);		(* remove any selection *)
+				ShowFocus(P(Port), doc, LedaBase.Off); INCL(P.state, LedaSys.FocFlag)	(* unhighlite focus *)
+			END;
+			ExtRef(foc, eX, eY); 
+			foc.do(LedaBase.BoxHandler).insert(foc, eX, eY, P, B)
+		END
+	END StdTextCopy;
+	
+	PROCEDURE SelTextCopy*(): LedaBase.CopyProc;
+	(** returns copy procedure for standard text selection [outside a document] or nil *)
+		VAR time: LONGINT;
+	BEGIN
+		GetTextSel(time, B);	(* get text selection *)
+		IF B.len > 0 THEN RETURN StdTextCopy ELSE RETURN NIL END
+	END SelTextCopy;
+	
+	PROCEDURE InsertSelText(F: Frame; VAR cM: Oberon.ConsumeMsg);
+	(** insert text selection specified by cM at focus *)
+		VAR stdR: Texts.Reader;	p: Port;	foc: LedaBase.Box;	eX, eY: LONGINT;	level: INTEGER;
+	BEGIN	(* frame has focus *)
+		IF cM.end > cM.text.len THEN cM.end := cM.text.len END;
+		IF cM.end <= cM.beg THEN RETURN END;	(*###*)
+		Texts.OpenReader(stdR, cM.text, cM.beg);
+		StdToOwnText(stdR, cM.end - cM.beg, W);
+		GetPort(F.trailer, F.box, p, level);
+		ShowSelection(p, F.box, LedaBase.Off); DeselectDoc(F.box);		(* remove any selection *)
+		ShowFocus(p, F.box, LedaBase.Off); INCL(p.state, LedaSys.FocFlag);	(* unhighlite focus *)
+		foc := F.box.next; ExtRef(foc, eX, eY);
+		foc.do(LedaBase.BoxHandler).insert(foc, eX, eY, p, W);	
+		UpdatePort(p, level)
+	END InsertSelText;
+	
+	PROCEDURE GetStdChars(text: Texts.Text; beg, len: LONGINT; VAR s: ARRAY OF CHAR);
+		VAR R: Texts.Reader;	i: LONGINT;	ch: CHAR;
+	BEGIN
+		i := 0; IF len > LEN(s) - 1 THEN len := LEN(s) - 1 END;
+		Texts.OpenReader(R, text, beg);
+		REPEAT
+			Texts.Read(R, ch); DEC(len);
+			IF R.lib IS Fonts.Font THEN s[i] := ch; INC(i) END
+		UNTIL (len = 0) OR R.eot;
+		s[i] := 0X
+	END GetStdChars;
+	
+	PROCEDURE GetOwnChars(text: LedaCtrl.Text; beg, len: LONGINT; VAR s: ARRAY OF CHAR);
+		VAR R: LedaCtrl.Reader;	ctrl: LedaBase.PieceCtrl;	i: LONGINT;	ch: CHAR;
+	BEGIN
+		i := 0; IF len > LEN(s) - 1 THEN len := LEN(s) - 1 END;
+		LedaCtrl.InitReader(R, text); LedaCtrl.SetReader(R, beg);
+		REPEAT	
+			LedaCtrl.ReadChar(R, ch, ctrl); DEC(len);
+			IF ctrl IS LedaBase.Style THEN s[i] := ch; INC(i) END
+		UNTIL (len = 0) OR R.eot;
+		s[i] := 0X
+	END GetOwnChars;
+	
+	PROCEDURE GetCharSel*(VAR time: LONGINT; VAR s: ARRAY OF CHAR);
+		VAR tM: TextMsg;
+	BEGIN
+		tM.id := Oberon.get; tM.time := -1; tM.text := NIL;
+		tM.lTime := -1; tM.lText := NIL; tM.F := NIL;
+		Display.Broadcast(tM);	(* get text selection [standard or leda] *)
+		time := tM.time; s[0] := 0X;
+		IF tM.time # -1 THEN
+			IF (tM.lTime < tM.time) & (tM.text # NIL) THEN	(* standard text selection *)
+				IF tM.end > tM.text.len THEN tM.end := tM.text.len END;
+				IF tM.end > tM.beg THEN GetStdChars(tM.text, tM.beg, tM.end - tM.beg, s) END
+			ELSIF (tM.lTime = tM.time) & (tM.lText # NIL) THEN	(* leda text selection *)
+				IF tM.lLen > 0 THEN GetOwnChars(tM.lText, tM.lBeg, tM.lLen, s) END
+			END
+		END
+	END GetCharSel;
+	
+	(* GetTextSel available above *)
+	
+(*--- basic frame handling ---*)
+
+	PROCEDURE NewCtrlFrame(ctrl: LedaBase.Control; next: Display.Frame): Display.Frame;
+		VAR d: CtrlFrame;
+	BEGIN
+		IF ctrl = NIL THEN RETURN next 
+		ELSE NEW(d); d.ctrl := ctrl; d.next := next; RETURN d
+		END
+	END NewCtrlFrame;
+
+	PROCEDURE NewBoxFrame(box: LedaBase.Box; next: Display.Frame): Display.Frame;
+		VAR d: BoxFrame;
+	BEGIN
+		IF box = NIL THEN RETURN next
+		ELSE NEW(d); d.box := box; d.next := next; RETURN d
+		END
+	END NewBoxFrame;
+	
+	PROCEDURE TrailerHandle*(f: Objects.Object; VAR M: Objects.ObjMsg);
+		VAR F, curF: Frame;	d: Display.Frame;	box: LedaBase.Box;	ctrl: LedaBase.Control;
+	BEGIN
+		F := f(Frame);
+		IF M IS FrameMsg THEN
+			WITH M: FrameMsg DO
+				CASE M.id OF TrailerId:  d := F.dsc.next; M.res := 0;
+						WHILE d # F.dsc DO INC(M.res); d := d.next END	(* count frames in message list *)
+				| AddCtrlId:  d := F.dsc; 
+						LOOP
+							IF d.next = F.dsc THEN d.next := NewCtrlFrame(M.ctrl, F.dsc); EXIT ELSE d := d.next END;
+							IF (d IS CtrlFrame) & (d(CtrlFrame).ctrl = M.ctrl) THEN EXIT END	(* control already in list *)
+						END
+				| RemCtrlId:  d := F.dsc;
+						LOOP
+							IF d.next = F.dsc THEN EXIT END;	(* control not in list *)
+							IF (d.next IS CtrlFrame) & (d.next(CtrlFrame).ctrl = M.ctrl) THEN d.next := d.next.next; EXIT END;
+							d := d.next
+						END
+				| AddBoxId:  d := F.dsc;
+						LOOP
+							IF d.next = F.dsc THEN d.next := NewBoxFrame(M.box, F.dsc); EXIT ELSE d := d.next END;
+							IF (d IS BoxFrame) & (d(BoxFrame).box = M.box) THEN EXIT END	(* box already in list **)
+						END
+				| RemBoxId:  d := F.dsc;
+						LOOP
+							IF d.next = F.dsc THEN EXIT END;	(* box not in list *)
+							IF (d.next IS BoxFrame) & (d.next(BoxFrame).box = M.box) THEN d.next := d.next.next; EXIT END;
+							d := d.next
+						END
+				ELSE
+				END
+			END	(* WITH M: Frame... *)
+		ELSIF M IS Display.FrameMsg THEN	(* broadcast in message list *)
+			WITH M: Display.FrameMsg DO
+				curF := editF; d := F.dsc.next;
+				clip.X := curF.X + curF.margW; clip.Y := curF.Y; clip.W := curF.W - curF.margW; clip.H := curF.H;
+				WHILE (d # F.dsc) & (M.res < 0) DO
+					editF := curF; M.dlink := clip;	(* could be changed during previous call *)
+					IF d IS CtrlFrame THEN ctrl := d(CtrlFrame).ctrl; ctrl.doOp(ctrl, M)
+					ELSIF d IS BoxFrame THEN box := d(BoxFrame).box; box.do.handle(box, M)
+					END;
+					d := d.next
+				END
+			END	(* 	WITH M: Disp... *)
+		END
+	END TrailerHandle;
+
+	PROCEDURE AddVisList(F: Frame);
+	(* adds the frame F to the circular visible list *)
+		VAR f, trailer: Frame;
+	BEGIN
+		MaskDispose(F.mask);	(* for safety; F.mask should be NIL*)
+		trailer := F.trailer; f := trailer;
+		WHILE f.visNext # trailer DO f := f.visNext END;
+		f.visNext := F; F.visNext := trailer
+	END AddVisList;
+	
+	PROCEDURE RemVisList(F: Frame);
+	(* removes the frame F from the circular visible list *)
+		VAR f, trailer: Frame;
+	BEGIN
+		trailer := F.trailer; f := trailer;
+		WHILE f.visNext # F DO f := f.visNext END;
+		f.visNext := F.visNext; F.visNext := NIL;
+		MaskDispose(F.mask)	(* for safety; F.mask should be NIL*)
+	END RemVisList;
+	
+	PROCEDURE NewFrame(VAR F: Frame; box: LedaBase.Box; trailer: Frame; refX, refY, refH: LONGINT);
+	BEGIN
+		NEW(F); F.next := NIL; F.dsc := NIL;
+		F.lib := NIL; F.handle := NIL;
+		F.box := box; F.trailer := trailer; F.mask := NIL;
+		F.W := 0; F.H := 0; F.visNext := NIL;	(* closed frame *)
+		F.refX := refX; F.refY := refY; F.refH := refH;
+		F.caretX := NotDef; F.caretY := NotDef;
+		F.margW := BarW + BarMarg; F.markH := 0; F.mark := 0;
+		F.focus := FALSE; F.unmarked := TRUE;
+	END NewFrame;
+	
+	PROCEDURE New*(handle: Objects.Handler; box: LedaBase.Box; refX, refY, refH: LONGINT): Frame;
+	(** creates a new frame and a new document trailer for document box *)
+		VAR F, trailer: Frame;	d: Display.Frame;
+	BEGIN
+		NewFrame(trailer, box, NIL, 0, 0, 0); trailer.visNext := trailer;
+		NEW(d); d.next := d; d.handle := NIL; trailer.dsc := d;	(* message list *)
+		trailer.handle := TrailerHandle;
+		LedaSys.NewDocument(trailer);
+		NewFrame(F, box, trailer, refX, refY, refH);
+		F.handle := handle;
+		RETURN F
+	END New;
+	
+	PROCEDURE Copy*(F: Frame): Frame;
+		VAR nF: Frame;
+	BEGIN
+		NewFrame(nF, F.box, F.trailer, F.refX, F.refY, F.refH);
+		nF.handle := F.handle; nF.W := F.W; nF.unmarked := F.unmarked;
+		RETURN nF
+	END Copy;
+
+	PROCEDURE Modify*(F: Frame; id, dY, Y, H: INTEGER);
+		VAR p: Port;
+	BEGIN
+		F.dsc := NIL;	(* reset clip view *)
+		IF id = Display.extend THEN	(* frame becomes larger *)
+			IF F.H = 0 THEN AddVisList(F) END;	(* frame was not visible before *)
+			IF (dY # 0) OR (F.H = 0) THEN	(* shift upwards and extend *)
+				F.Y := Y; F.H := H;
+				UpdateArea(F, F.X + F.margW, F.Y, F.W - F.margW, F.H, TRUE, TRUE, NIL, NIL)	(* restore frame *)
+			ELSE	(* extend at bottom *)
+				FlipMark(F);	(* unhighlite mark in scrollbar *)
+				dY := F.Y - Y; F.Y := Y; F.H := H;
+				Display.ReplConst(LedaSys.fg, F.X + BarW - 1, F.Y, 1, dY, Display.replace);	(* extend scrollbar *)
+				UpdateArea(F, F.X + F.margW, F.Y, F.W - F.margW, dY, FALSE, TRUE, NIL, NIL);
+				F.markH := MrkH(F); FlipMark(F)		(* highlite mark in scrollbar *)
+			END
+		ELSIF id = Display.reduce THEN	(* frame becomes smaller *)
+			FlipMark(F);		(* unhighlite mark in scrollbar *)
+			IF H > 0 THEN	(* frame will be visible *)
+				PortOpen(p, F.trailer, F);	(* visibility set to frame F *)
+				ShowFocus(p, F.box, LedaBase.Off); ShowSelection(p, F.box, LedaBase.Off);
+				F.Y := Y; F.H := H;		(* new sizes *)
+				IF dY > 0 THEN	(* translation of the frame *)
+					Display.CopyBlock(F.X, F.Y + dY + 1, F.W, F.H - 1, F.X, F.Y + 1, Display.replace)
+				END;
+				F.markH := MrkH(F); FlipMark(F);		(* highlite mark in scrollbar *)
+				ShowFocus(p, F.box, LedaBase.On); ShowSelection(p, F.box, LedaBase.On);
+				PortClose(p); PortDispose(p)
+			ELSE	(* frame is no longer visible *)
+				RemVisList(F);
+				IF F.focus & (F.box.next # NIL) THEN DefocusDoc(F.box) END;
+				F.focus := FALSE; F.Y := Y; F.H := H;		(* new sizes *)
+				LedaCtrl.Reset	(* clear caches; cut references to document *)
+			END
+		END
+	END Modify;
+
+	PROCEDURE ResetMarks*(F: Frame);
+		VAR M: Oberon.ControlMsg;	m: FrameMsg;
+	BEGIN
+		IF F # NIL THEN	(* reset marks in frame *)
+			Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);	(* fade system marks *)
+			M.id := Oberon.neutralize;
+			M.res := -1; M.x := 0; M.y := 0; Objects.Stamp(M); M.F := NIL;	(* init Display.FrameMsg *)
+			ControlMarks(F, M)	(* remove any selection or focus in document *)
+		ELSE
+			m.id :=  ResetMarksId; m.box := NIL;  m.frm := NIL; m.F := NIL;
+			Display.Broadcast(m)	(* to reset marks in all frames *)
+		END
+	END ResetMarks;
+
+	PROCEDURE Show*(F: Frame; refX, refY: LONGINT);
+	BEGIN
+		ResetMarks(F);
+		F.refX := refX; F.refY := refY;	(* frame mark is drawn by UpdateArea *)
+		UpdateArea(F, F.X + F.margW, F.Y, F.W - F.margW, F.H, TRUE, TRUE, NIL, NIL);	(* restore frame *)
+	END Show;
+	
+	PROCEDURE Scroll(F: Frame; keys: SET);
+	(* scroll frame up or down [vertical] or by relative positioning *)
+		VAR sM: LedaBase.BoxMsg;	ml, mm, mr: BOOLEAN;
+			refY, refH, dY, H: LONGINT;	x, y: INTEGER;
+	BEGIN	(* (keys = {ML} OR (keys = {MR}) OR (keys = {MM}) *)
+		LedaSys.TrackKeys(keys, ml, mm, mr, x, y);
+		IF ((keys = {MM}) & ~ (ml & mr)) THEN	(* relative positioning *)
+			IF mr THEN refY := 0	(* scroll to begin *)
+			ELSIF ml THEN	(* scroll to end *)
+				IF F.refH = VarHeight THEN refY := F.box.H ELSE refY := F.refH END;
+				DEC(refY, scnUnit * (F.H - BarMarg));
+				IF refY < 0 THEN refY := 0 END
+			ELSE
+				IF y < F.Y THEN y := F.Y ELSIF F.Y + F.H < y THEN y := F.Y + F.H END;	(* clip y to frame *)
+				H := F.H * scnUnit;
+				IF F.refH = VarHeight THEN refH := F.box.H ELSE refH := F.refH END;
+				IF refH > H THEN H := refH - H END;
+				refY := (H DIV F.H) * (F.Y + F.H - y)	(* like in MrkH *)
+			END;
+			IF refY # F.refY THEN Show(F, F.refX, refY) END
+		ELSIF ((keys = {ML}) & ~ mm & ~ mr) OR ((keys = {MR}) & ~ mm & ~ ml) THEN	(* scroll up or down *)
+			refY := F.refY;
+			IF y < F.Y THEN y := F.Y ELSIF F.Y + F.H < y THEN y := F.Y + F.H END;	(* clip y to frame *)
+			FrmToDocLen(F, F.Y + F.H - y, dY);	(* document can adjust y coordinate [to line] *)
+			sM.id := LedaBase.AdjustYId; sM.l1 := F.refY + dY; sM.l2 := sM.l1;	(* absolute y coordinate *)
+			F.box.do.handle(F.box, sM);
+			IF keys = {ML} THEN refY := sM.l1 - 2 * scnUnit
+			ELSIF keys = {MR} THEN refY := sM.l2 - F.H * scnUnit + 3 * scnUnit
+			END;
+			IF refY # F.refY THEN Show(F, F.refX, refY) END
+		END
+	END Scroll;
+	
+	PROCEDURE FreeScroll(F: Frame);
+	(* scroll frame by moving document in any direction *)
+		VAR x, y, u, v: INTEGER;	ml, mr: BOOLEAN;	m: LedaBase.BoxMsg;
+			
+		PROCEDURE ClipXY(F: Frame; VAR x, y: INTEGER);
+		BEGIN
+			IF x < F.X + F.margW THEN x := F.X + F.margW ELSIF F.X + F.W < x THEN x := F.X + F.W END;
+			IF y < F.Y THEN y := F.Y ELSIF F.Y + F.H < y THEN y := F.Y + F.H END
+		END ClipXY;
+
+	BEGIN	(* MM is pressed *)
+		LedaSys.TrackHand(u, v, x, y, ml, mr);
+		IF ~ (ml & mr) THEN	(* ml & mr -> scrolling canceled *)
+			ClipXY(F, u, v); ClipXY(F, x, y); DEC(x, u); DEC(y, v);
+			IF ml OR mr THEN
+				m.id := LedaBase.DocOriginId; m.l1 := 0; m.l2 := 0; F.box.do.handle(F.box, m);	(* gets the origin [upper left] *)
+				IF ml THEN	(* scroll to end *)
+					IF F.refH = VarHeight THEN m.l2 := F.box.H ELSE m.l2 := F.refH END;
+					DEC(m.l2, scnUnit * (F.H - BarMarg));
+					IF m.l2 < 0 THEN m.l2 := 0 END
+				END;
+				Show(F, m.l1, m.l2)
+			ELSIF (x # 0) OR (y # 0) THEN
+				Show(F, F.refX - x * scnUnit, F.refY + y * scnUnit)
+			END
+		END
+	END FreeScroll;
+	
+	PROCEDURE KeyHandler*(foc: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; nbr: SHORTINT; VAR keys: LedaSys.String);
+	(* call key method of box foc *)
+	BEGIN
+		foc.do(LedaBase.BoxHandler).key(foc, eX, eY, P, nbr, keys)
+	END KeyHandler;
+	
+	PROCEDURE Key*(F: Frame; ch: CHAR);
+		VAR sF: Frame;	p: Port;	foc: LedaBase.Box;	
+			s: LedaSys.String;	eX, eY: LONGINT;	level: INTEGER;	nbr: SHORTINT;
+	BEGIN	(* frame has focus *)
+		sF := editF; editF := F;
+		GetPort(F.trailer, F.box, p, level);
+		IF F.box.sel # NIL THEN		(* remove any selection *)
+			ShowSelection(p, F.box, LedaBase.Off); DeselectDoc(F.box)
+		END;
+		ShowFocus(p, F.box, LedaBase.Off); INCL(p.state, LedaSys.FocFlag);	(* unhighlite focus *)
+		foc := F.box.next; ExtRef(foc, eX, eY);
+		LedaSys.GetChars(ch, nbr, s);
+		keyHandler(foc, eX, eY, p, nbr, s);
+		UpdatePort(p, level);
+		editF := sF
+	END Key;
+	
+	PROCEDURE Redraw*(F: Frame);
+		VAR M: FrameMsg;
+	BEGIN
+		IF F # NIL THEN	(* redraw frame *)
+			Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);	(* fade system marks [Oberon.Mouse, Oberon.Pointer] *)
+			UpdateArea(F, F.X + F.margW, F.Y, F.W - F.margW, F.H, TRUE, TRUE, NIL, NIL)
+		ELSE
+			M.id :=  RedrawId; M.box := NIL;  M.frm := NIL; M.F := NIL;
+			Display.Broadcast(M);	(* to redraw all frames *)
+		END
+	END Redraw;
+	
+	PROCEDURE Button*(F: Frame; VAR M: Oberon.InputMsg);
+		VAR sF: Frame;	p: Port;	mX, mY: LONGINT;	level: INTEGER;
+	BEGIN	(* M.res < 0 & M.id = Oberon.track *)
+		sF := editF; editF := F;
+		IF M.keys # {LedaSys.MX} THEN F.trailer.handle(F.trailer, M) END;	(* broadcast in message list *)
+		IF M.res < 0 THEN	(* not handled yet *)
+			FrmToDoc(F, M.X, M.Y, mX, mY);
+			GetPort(F.trailer, F.box, p, level);
+			F.box.do(LedaBase.BoxHandler).mouse(F.box, 0, 0, p, mX, mY, M.keys, M.res);
+			UpdatePort(p, level)
+		END;
+		editF := sF
+	END Button;
+	
+	PROCEDURE Handle*(f: Objects.Object; VAR M: Objects.ObjMsg);
+		VAR F, sF: Frame;	pass: BOOLEAN;
+	BEGIN	(* editF set in Key, Button *)
+		F := f(Frame); pass := TRUE;
+		IF M IS Oberon.InputMsg THEN
+		(*--- key and mouse events ---*)
+			WITH M: Oberon.InputMsg DO
+				IF M.id = Oberon.consume THEN
+					IF F.focus THEN Key(F, M.ch); M.res := LedaBase.Done; pass := FALSE END
+				ELSIF M.id = Oberon.track THEN pass := FALSE;
+					Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, M.X, M.Y);
+					IF M.keys # {} THEN
+						IF M.X <= F.X + BarW THEN Scroll(F, M.keys)	(* cursor in scrollbar *)
+						ELSE Button(F, M);
+							IF (M.res < 0) & (M.keys = {MM}) THEN FreeScroll(F) END
+						END
+					END
+				END	(* IF M.id = Oberon.consume *)
+			END		(* WITH M: Oberon.InputMsg *)
+		ELSIF M IS FrameMsg THEN pass := FALSE;
+		(*--- own events [port, marks] ---*)
+			WITH M: FrameMsg DO
+				CASE M.id OF RedrawId:  Redraw(F)
+				| ResetMarksId:  ResetMarks(F)
+				| VisibleId:	AddVisList(F)
+				| SelectionId:
+						IF F.box.sel # NIL THEN
+							IF M.frm = NIL THEN M.frm := F	(* first document selection *)
+							ELSIF M.frm.box.bL < F.box.bL THEN M.frm := F	(* more recent selection *)
+							END
+						END
+				| ResetSelectionId:	IF (M.box = NIL) OR (M.box = F.box) THEN ResetSelection(F) END	
+				| BoxId:	IF M.box = F.box THEN M.frm := F; M.res := LedaBase.Done END
+				| FocusId:	IF F.focus & (F.box.next # NIL) THEN M.frm := F; M.res := LedaBase.Done END
+				| ResetFocusId:	IF M.box = F.box THEN F.focus := FALSE END
+				END
+			END	(* WITH M: FrameMsg *)
+		ELSIF M IS Display.ModifyMsg THEN
+		(*--- viewer events [restore, size change] ---*)
+			WITH M: Display.ModifyMsg DO
+				IF M.F = F THEN Modify(F, M.id, M.dY, M.Y, M.H); pass := FALSE END
+			END
+		ELSIF M IS Objects.CopyMsg THEN 
+		(*--- return a copy of frame ---*)
+			M(Objects.CopyMsg).obj := Copy(F); pass := FALSE;
+		ELSIF M IS Oberon.ControlMsg THEN
+		(*--- mark events [neutralize, defocus] ---*)
+			ControlMarks(F, M(Oberon.ControlMsg)); pass := FALSE
+		ELSIF M IS Oberon.SelectMsg THEN
+		(*---  get text selection ---*)
+			WITH M: Oberon.SelectMsg DO
+				IF M.id = Oberon.get THEN
+					IF (F.box.sel # NIL) & (F.box.bL > M.time) THEN PutTextSel(F, M) END
+				END
+			END
+		ELSIF M IS Oberon.ConsumeMsg THEN
+		(*--- insert text selection at focus ---*)
+			IF F.focus THEN pass := FALSE;
+				WITH M: Oberon.ConsumeMsg DO InsertSelText(F, M); M.res := LedaBase.Done END
+			END
+		END;
+		IF pass THEN		(* broadcast in message list *)
+			sF := editF; editF := F; F.trailer.handle(F.trailer, M); editF := sF
+		END
+	END Handle;
+	
+(*--- special services ---*)
+
+	PROCEDURE NewMenu*(title, cmds: ARRAY OF CHAR; VAR menuH: INTEGER): Display.Frame;
+	(** returns a new menu frame having name title; menuH -> needed height of new menu *)
+	BEGIN	
+		menuH := TextFrames.menuH; RETURN TextFrames.NewMenu(title, cmds)
+	END NewMenu;
+	
+	PROCEDURE SetMenu*(F: Display.Frame; menuH: INTEGER; VAR title, cmds: ARRAY OF CHAR);
+	BEGIN
+		IF F = NIL THEN COPY(menu.title, title); COPY(menu.cmds, cmds)	(* return title and commands of menu *)
+		ELSE menu.F := F; menu.H := menuH	(* set menu frame and menu height *)
+		END
+	END SetMenu;
+
+	PROCEDURE GetMenu*(mod, cmd, title, cmds: ARRAY OF CHAR; VAR menuH: INTEGER): Display.Frame;
+	(** returns an external defined menu by calling mod.cmd to deposit a menu  *)
+	(** if no external menu is available a standard menu is returned *)
+		VAR F: Display.Frame;
+	BEGIN
+		menu.H := 0; menu.F := NIL; COPY(title, menu.title); COPY(cmds, menu.cmds);
+		IF mod # "" THEN LedaSys.Execute(mod, cmd) END;
+		IF menu.F = NIL THEN F := NewMenu(title, cmds, menuH)
+		ELSE menuH := menu.H; F := menu.F
+		END;	(* menuH and F set *)
+		menu.H := 0; menu.F := NIL; menu.title := ""; menu.cmds := "";
+		RETURN F
+	END GetMenu;
+
+	PROCEDURE NewText*(text: Texts.Text): Display.Frame;
+	(** returns a new text frame containing text text *)
+	BEGIN
+		RETURN TextFrames.NewText(text, 0)
+	END NewText;
+	
+	PROCEDURE Inside*(F: Frame; x1, y1, x2, y2: INTEGER): BOOLEAN;
+	BEGIN
+		RETURN ~ ((x1 >= F.X + F.W) OR (y1 >= F.Y + F.H) OR (x2 < F.X + F.margW) OR (y2 < F.Y))
+	END Inside;
+	
+	PROCEDURE TrailerOf*(P: LedaSys.Port): Frame;
+	(** returns the trailer frame for given port P *)
+		VAR p: Port;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN NIL
+		ELSE p := P(Port);
+			IF p.begF # p.endF THEN RETURN p.begF.trailer ELSE RETURN NIL END
+		END
+	END TrailerOf;
+	
+	PROCEDURE Reset*;
+		VAR M: FrameMsg;	access: LedaSys.Access;	trailer: Frame;
+	BEGIN
+		editF := NIL; outF := NIL;
+		portList := NIL; freePort := NIL; freeMask := NIL;
+		LedaSys.GetDocuments(access);
+		WHILE access # NIL DO
+			trailer := access.trailer(Frame);
+			trailer.visNext := trailer;	(* reset visible list *)
+			access := access.next
+		END ;
+		M.id := VisibleId; M.F := NIL; Display.Broadcast(M)	(* build new visible lists *)
+	END Reset;
+	
+
+BEGIN
+	editF := NIL; outF := NIL;
+	NEW(clip); clip.handle := NIL;	(* clip frame; used in trailer handle *)
+	keyHandler := KeyHandler;	(* standard key handler *)
+	scnUnit := LedaSys.scnUnit;	(* for efficency *)
+	freePort := NIL; portList := NIL; freeMask := NIL;
+	LedaCtrl.InitWriter(W); LedaCtrl.InitBuffer(B);
+	Texts.OpenWriter(stdW);
+	menu.H := 0; menu.F := NIL; menu.title := ""; menu.cmds := ""
+END LedaFrames.

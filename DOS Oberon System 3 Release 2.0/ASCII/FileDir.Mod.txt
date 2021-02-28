@@ -1,0 +1,56 @@
+MODULE FileDir; (* DOS-Version ARD, 4. 2. 93 *)
+
+(* Sentinel Version 26. 6. 93 *)
+
+TYPE FileName* = ARRAY 32 OF CHAR;
+		DiskAdr = LONGINT;
+		EntryHandler* = PROCEDURE (name: FileName; sec: LONGINT; VAR continue: BOOLEAN);
+		Path* = ARRAY 64 OF CHAR;
+		
+		NodePtr* = POINTER TO Node;
+		Node = RECORD
+						Ceres*, Dos*: FileName;
+						path*: Path;
+						next*: NodePtr;
+						main*: BOOLEAN;
+					END;
+					
+	VAR First*: NodePtr;
+			main*, current*: Path;		(* environment variables *)
+
+PROCEDURE Enumerate*(prefix : ARRAY OF CHAR; proc : EntryHandler);
+	VAR base: NodePtr; adr: LONGINT; cont: BOOLEAN; i: SHORTINT;
+	BEGIN
+		base := First.next;
+		WHILE base # First DO 
+			i := 0;
+			WHILE (i < 31) & (prefix[i] # 0X) & (prefix[i] = base.Ceres[i]) DO INC(i) END;
+			IF (prefix[i] = 0X) OR (prefix = base.Ceres) THEN 
+				IF (base.Ceres # "") & (base.Ceres[0] # "1") THEN
+					proc(base.Ceres, adr, cont);
+				END;
+				IF base.next.Ceres = base.Ceres THEN base := base.next END;		(* SAME NAME IN CURRENT AND MAIN *)
+			END; 
+			base := base.next;
+		END;
+END Enumerate;
+
+PROCEDURE EnumerateCurrent*(prefix : ARRAY OF CHAR; proc : EntryHandler);
+	VAR base: NodePtr; adr: LONGINT; cont: BOOLEAN; i: SHORTINT;
+	BEGIN
+		base := First.next;
+		WHILE base # First DO 
+			i := 0;
+			WHILE (i < 31) & (prefix[i] # 0X) & (prefix[i] = base.Ceres[i]) DO INC(i) END;
+			IF (prefix[i] = 0X) OR (prefix = base.Ceres) THEN 
+				IF (base.Ceres # "") & (base.Ceres[0] # "1")  THEN
+					IF base.path = current THEN proc(base.Ceres, adr, cont) END;
+				END;
+				IF base.next.Ceres = base.Ceres THEN base := base.next END;		(* SAME NAME IN CURRENT AND MAIN *)
+			END; 
+			base := base.next;
+		END;
+END EnumerateCurrent;
+
+BEGIN NEW(First); First.Ceres[0] := 0FFX; First.Dos[0] := 0FFX; First.path[0] := 0FFX; First.main := TRUE; First.next := First 
+END FileDir.

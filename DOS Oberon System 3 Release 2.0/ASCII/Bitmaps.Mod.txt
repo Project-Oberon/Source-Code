@@ -1,0 +1,52 @@
+MODULE Bitmaps;
+
+IMPORT Display, BM := Bitmaps0, SYSTEM; (* assembler module *)
+
+TYPE	
+	Bitmap* = POINTER TO BitmapDesc;
+	BitmapDesc* = RECORD
+		width*, height*, depth* : INTEGER;
+		wth*, address* : LONGINT;
+	END;
+
+
+PROCEDURE Copy*(sB,dB:Bitmap;SX,SY,SW,SH,DX,DY,DW,DH,mode:INTEGER);
+BEGIN BM.Copy END Copy;
+
+PROCEDURE CopyBlock*(sB,dB:Bitmap;SX,SY,W,H,DX,DY,mode:INTEGER);
+BEGIN BM.CopyBlock END CopyBlock;
+
+PROCEDURE CopyPattern*(B:Bitmap;col:INTEGER;pat:LONGINT;X,Y,mode:INTEGER);
+BEGIN BM.CopyPattern END CopyPattern;
+
+PROCEDURE Define*(B:Bitmap;width,height,depth:INTEGER;address:LONGINT);
+BEGIN BM.Define END Define;
+
+PROCEDURE Dot*(B:Bitmap;col,X,Y,mode:INTEGER);
+BEGIN  BM.Dot END Dot;
+
+PROCEDURE Get*(B:Bitmap;X,Y:INTEGER):INTEGER;
+BEGIN BM.Get END Get;
+
+PROCEDURE ReplConst*(B:Bitmap;col,X,Y,W,H,mode:INTEGER);
+BEGIN BM.ReplConst END ReplConst;
+
+PROCEDURE ReplPattern*(B:Bitmap;col:INTEGER;pat:LONGINT;X,Y,W,H,mode:INTEGER);
+BEGIN BM.ReplPattern END ReplPattern;
+
+PROCEDURE DisplayBlock*(B:Bitmap;DX,DY,W,H,SX,SY,mode:INTEGER);
+BEGIN Display.DisplayBlock(SYSTEM.VAL(LONGINT, B), DX,DY,W,H,SX,SY,mode) END DisplayBlock;
+
+PROCEDURE Clear*(B:Bitmap);
+BEGIN BM.Clear END Clear;
+
+PROCEDURE GetPix*(VAR addr:LONGINT; VAR buf:SYSTEM.BYTE; depth:INTEGER);
+BEGIN BM.GetPix END GetPix;
+
+PROCEDURE PutPix*(VAR addr:LONGINT; border:LONGINT; buf:SYSTEM.BYTE; depth:INTEGER);
+BEGIN BM.PutPix END PutPix;
+
+BEGIN
+(*	BM.InitMod(553376,640,480)*)
+BM.InitMod(Display.Map(0), Display.Width, Display.Height);
+END Bitmaps.

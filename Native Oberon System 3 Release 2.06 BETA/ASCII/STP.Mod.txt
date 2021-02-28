@@ -1,0 +1,496 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE STP;
+
+IMPORT
+	SYSTEM, Oberon, Input, Texts, Out, V24;
+ 
+CONST
+	cDataSize = 128;
+	cPacketSize = 131;
+	cTimeOut = 2000;	(* ms *)
+	cLogSize = 2 (*1000*);	(* Minimum 2 for correct compilation *)
+	
+	COM1* = 0;
+	COM2* = 1;
+	
+	cHeaderSize* = 124;
+	
+	eLowest = 6500;
+	eTimeOut* = eLowest + 0;
+	eBufferOverFlow* = eLowest + 1;
+	eHighest = 6599;
+	eOK = 0;
+	
+TYPE
+	tData = ARRAY cDataSize OF CHAR;
+	tPacket = RECORD
+		seq : SHORTINT;
+		data  : tData;
+		len,
+		check : LONGINT;
+	END;
+
+	tSTPHeader = RECORD
+	(* 128 bytes *)
+		bufLen : LONGINT;
+		header : ARRAY cHeaderSize OF SYSTEM.BYTE
+	END;
+	
+	Buffer = ARRAY 1024 OF CHAR;
+	
+	LogRecord = RECORD
+		action : CHAR;
+		t : LONGINT
+	END;
+	
+VAR
+	gPort : INTEGER;
+	gSeq : SHORTINT;
+	gStartTime, gEndTime, gLen, gNumPackets, gRecTimeOut : LONGINT;
+	gBuffer : Buffer;
+	gLog : ARRAY cLogSize OF LogRecord;
+	gLogIdx : LONGINT;
+
+(* --------------------------------------------------------- *)
+(* Time in ms *)
+PROCEDURE Time() : LONGINT;
+BEGIN
+	RETURN Input.Time() DIV Input.TimeUnit * 1000
+END Time;
+
+(* --------------------------------------------------------- *)
+PROCEDURE Log(c : CHAR);
+CONST cShow = FALSE;
+BEGIN
+	IF cShow THEN Out.Char(c) END;
+	IF (cLogSize > 1) THEN gLog[gLogIdx].action := c END
+END Log;
+
+(* --------------------------------------------------------- *)
+PROCEDURE LogTime;
+BEGIN
+	IF (cLogSize > 1) THEN
+		gLog[gLogIdx].t := Time();
+		IF (gLogIdx < cLogSize-1) THEN 
+			INC(gLogIdx); gLog[gLogIdx].action := " "
+		END
+	END
+END LogTime;
+
+(* --------------------------------------------------------- *)
+PROCEDURE PrintLog*;
+VAR i : LONGINT;
+BEGIN
+	IF (cLogSize > 1) THEN
+		Out.String("Sender timeout = "); Out.Int(cTimeOut, 0); Out.Ln;
+		Out.String("Receiver timeout = "); Out.Int(gRecTimeOut, 0); Out.Ln;
+		Out.String("Number of bytes transferred: ");
+		Out.Int((gLen + cDataSize - 1) DIV cDataSize * cPacketSize, 10); Out.Char(" "); Out.Ln;
+		Out.String("Total time: "); Out.Int(gEndTime - gStartTime, 10); Out.Char(" "); Out.Ln;
+		Out.String("Bytes per second: "); 
+		Out.Int(ENTIER((((gLen DIV cDataSize) + 1) * cPacketSize)
+									/ (gEndTime - gStartTime) * 1000.0), 10); Out.Ln;
+	
+		FOR i := 1 TO gLogIdx-1 DO
+			Out.Char(gLog[i].action); Out.Int(gLog[i].t, 10);
+			Out.Int(gLog[i].t - gLog[i-1].t, 10); 
+			Out.Int(gLog[i].t - gLog[1].t, 10); Out.Ln
+		END;
+		Out.Ln
+	END
+END PrintLog;
+
+(* --------------------------------------------------------- *)
+PROCEDURE DumpPacket(packet : tPacket);
+VAR
+	W : Texts.Writer;
+	i : LONGINT;
+BEGIN
+	Texts.OpenWriter(W);
+	Texts.WriteInt(W, packet.seq, 0); Texts.WriteLn(W);
+	FOR i := 0 TO cDataSize-1 DO
+		Texts.WriteInt(W, ORD(packet.data[i]), 0); Texts.Write(W, " ")
+	END; Texts.WriteLn(W);
+	Texts.WriteInt(W, packet.len, 0); Texts.Write(W, " ");
+	Texts.WriteInt(W, packet.check, 0); Texts.WriteLn(W);Texts.WriteLn(W);
+	Texts.Append(Oberon.Log, W.buf)
+END DumpPacket;
+	
+(* --------------------------------------------------------- *)
+PROCEDURE Close*;
+BEGIN
+	V24.Stop(gPort)
+END Close;
+
+(* --------------------------------------------------------- *)
+PROCEDURE Halt;
+BEGIN
+	Close;
+	HALT(100)
+END Halt;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE Assert(cond : BOOLEAN);
+BEGIN
+	IF ~cond THEN
+		Out.String("Run-time assertion failed."); Out.Ln;
+		Halt
+	END
+END Assert;
+
+(* --------------------------------------------------------- *)
+PROCEDURE Init*(port: INTEGER; baud : LONGINT) : LONGINT;
+VAR t: LONGINT;
+BEGIN
+	IF (baud = 9600) THEN gRecTimeOut := 250
+	ELSIF (baud = 19200) THEN gRecTimeOut := 150
+	ELSIF (baud = 38400) THEN gRecTimeOut := 150
+	ELSIF (baud = 57600) THEN gRecTimeOut := 150
+	ELSIF (baud = 115200) THEN gRecTimeOut := 150
+	ELSE Halt
+	END;
+	gPort := port;  gSeq := 0;
+	V24.Start(port, baud, 8, V24.ParNo, V24.Stop1, t);
+	IF t # 0 THEN HALT(99) END;
+	RETURN eOK
+END Init;
+
+(* --------------------------------------------------------- *)
+(* Flush read buffer *)
+PROCEDURE FlushBuffer;
+VAR avail: LONGINT;  ch: CHAR;  t: LONGINT;
+BEGIN
+	avail := V24.Available(gPort);
+	IF avail > 0 THEN
+		Log("F"); LogTime;
+		WHILE avail > 0 DO
+			V24.Receive(gPort, ch, t);  DEC(avail)
+		END
+	END
+END FlushBuffer;
+
+(* --------------------------------------------------------- *)
+PROCEDURE SendPacket(packet : tPacket);
+VAR i: INTEGER;  t: LONGINT;
+BEGIN (* Pre: 0 <= packet.len <= 255, 0 <= packet.check <= 255 *)
+	LogTime;
+	Assert((packet.len >= 0) & (packet.len <= 255)
+				& (packet.check >= 0) & (packet.check <= 255));
+	gBuffer[0] := SYSTEM.VAL(CHAR, packet.seq);
+	gBuffer[cDataSize+1] := CHR(packet.len);
+	gBuffer[cDataSize+2] := CHR(packet.check);
+	SYSTEM.MOVE(SYSTEM.ADR(packet.data[0]),
+							SYSTEM.ADR(gBuffer[1]), cDataSize);
+	FOR i := 0 TO cPacketSize-1 DO
+		V24.Send(gPort, gBuffer[i], t)
+	END
+END SendPacket;
+
+(* --------------------------------------------------------- *)
+PROCEDURE Flip(seq : SHORTINT) : SHORTINT;
+BEGIN
+	IF (seq > 0) THEN RETURN (-seq - 1)
+	ELSE RETURN -(seq+1) END
+END Flip;
+
+(* --------------------------------------------------------- *)
+PROCEDURE CheckSum(
+		  packet : tPacket;
+	VAR check  : LONGINT);
+VAR
+	i : LONGINT;
+BEGIN
+	check := packet.seq; IF (check < 0) THEN INC(check, 100H) END;
+	FOR i := 1 TO cDataSize DO
+		check := (check + ORD(packet.data[i-1])) MOD 100H
+	END;
+	check := (check + packet.len) MOD 100H
+END CheckSum;
+
+PROCEDURE ReadnBytes(port: INTEGER;  timeout: LONGINT;  VAR buf: ARRAY OF SYSTEM.BYTE;  VAR len: LONGINT): LONGINT;
+VAR i, t: LONGINT;
+BEGIN
+	i := 0;  timeout := (timeout*Input.TimeUnit) DIV Input.TimeUnit + Input.Time();
+	LOOP
+		WHILE (V24.Available(gPort) # 0) & (i # len) DO
+			V24.Receive(port, SYSTEM.VAL(CHAR, buf[i]), t);  INC(i)
+		END;
+		IF i = len THEN RETURN eOK END;
+		IF Input.Time() > timeout THEN RETURN eTimeOut END
+	END
+END ReadnBytes;
+
+(* --------------------------------------------------------- *)
+PROCEDURE Send(
+	VAR buf : ARRAY OF SYSTEM.BYTE;
+			len : LONGINT;
+	VAR seq : SHORTINT) : LONGINT;
+VAR
+	pos, i, j : LONGINT;
+	byte : SHORTINT;
+	next : tPacket;
+BEGIN
+	(* Pre: COM port has been opened and baud has been set with Init(). *)
+	(* This is for stats. *)
+	IF (cLogSize > 1) THEN gLogIdx := 1; gLog[0].t := 0; gLog[1].action := " " END;
+	gLen := len;
+	gStartTime := Time(); gEndTime := 0;
+	WHILE (gStartTime MOD 20 # 0) DO gStartTime := Time() END;
+	
+	IF (len > LEN(buf)) THEN RETURN eBufferOverFlow END;
+	pos := 0;
+	WHILE (pos < len) DO
+		next.seq := seq;
+		IF ((len - pos) < cDataSize) THEN
+			(* Zero not-used part of data *)
+			next.len := len - pos;
+			FOR i := next.len TO cDataSize-1 DO next.data[i] := 0X END
+		ELSE
+			next.len := cDataSize
+		END;
+		SYSTEM.MOVE(SYSTEM.ADR(buf[pos]), SYSTEM.ADR(next.data[0]), next.len);
+		CheckSum(next, next.check);
+		(* Wait for ACK. *)
+		LOOP
+			FlushBuffer;
+			SendPacket(next);
+			j := 1; i := ReadnBytes(gPort, cTimeOut, byte, j);
+			IF (i = eOK) THEN 
+				IF (byte = seq) THEN EXIT
+				ELSE Log("!") END
+			ELSIF (i = eTimeOut) THEN RETURN eTimeOut
+			ELSE RETURN i
+			END
+		END;
+		Log(".");
+		INC(pos, cDataSize);
+		seq := Flip(seq)
+	END;
+	(* Send null packet *)
+	next.seq := seq; next.len := 0;
+	CheckSum(next, next.check);
+	FlushBuffer;
+	SendPacket(next);
+(*Out.String("Terminated send."); Out.Ln;*)
+	gEndTime := Time();
+	RETURN 0
+END Send;
+
+(* --------------------------------------------------------- *)
+(* Reads a packet from the serial port. If full packet is read, TRUE is returned.
+	If a timeout occurs, received contains the number of bytes actually read
+	(it will be less than the packet size), and FALSE is returned. *)
+PROCEDURE ReadPacket(
+	VAR packet : tPacket;
+	VAR received : LONGINT) : BOOLEAN;
+VAR
+	bufSize, avail, d, res, i : LONGINT;
+	buf : Buffer;
+BEGIN
+	received := cPacketSize;
+	res := ReadnBytes(gPort, gRecTimeOut, gBuffer, received);
+	IF (res = eTimeOut) THEN
+		avail := V24.Available(gPort);
+		IF (avail > 0) THEN
+			bufSize := cPacketSize - received;
+			res := ReadnBytes(gPort, gRecTimeOut, buf, bufSize);
+			IF (res = 0) THEN
+				FOR i := 0 TO bufSize-1 DO
+					gBuffer[received+i] := buf[i]
+				END;
+				INC(received, bufSize)
+			END
+		ELSE RETURN FALSE
+		END
+	END;
+	IF (res = 0) THEN
+		IF (received # cPacketSize) THEN Halt END;
+		packet.seq := SYSTEM.VAL(SHORTINT, gBuffer[0]);
+		SYSTEM.MOVE(SYSTEM.ADR(gBuffer[1]),
+								 SYSTEM.ADR(packet.data[0]), cDataSize);
+		packet.len := ORD(gBuffer[cDataSize + 1]);
+		packet.check := ORD(gBuffer[cDataSize + 2]);
+		RETURN TRUE
+	ELSIF (res = eTimeOut) THEN RETURN FALSE
+	ELSE Halt	
+	END
+END ReadPacket;
+
+(* --------------------------------------------------------- *)
+PROCEDURE Ack(seq : SHORTINT);
+VAR res : LONGINT;
+BEGIN
+	V24.Send(gPort, SYSTEM.VAL(CHAR, seq), res)
+END Ack;
+
+(* --------------------------------------------------------- *)
+(* Receives a stream of bytes from the serial port, sent with the same
+	protocol.
+	timeOut : the maximum time that must be waited for any one packet. *)
+PROCEDURE Receive(
+	VAR buf : ARRAY OF SYSTEM.BYTE;
+			len : LONGINT;
+	VAR seq : SHORTINT;
+	timeOut : LONGINT) : LONGINT;
+VAR
+	check, pos, numBytes, t : LONGINT;
+	next : tPacket;
+	ok : BOOLEAN;
+BEGIN
+	(* Pre: COM port has been opened and baud has been set with Init(). *)
+	(* This is for stats. *)
+	IF (cLogSize > 1) THEN gLogIdx := 1; gLog[0].t := 0; gLog[1].action := " " END;
+	gLen := len;
+	gStartTime := Time(); gEndTime := 0;
+	WHILE (gStartTime MOD 20 # 0) DO gStartTime := Time() END;
+	
+	IF (len > LEN(buf)) THEN HALT(99); RETURN eBufferOverFlow END;
+	pos := 0;
+	WHILE (pos < len) DO
+		ok := FALSE;
+		IF (timeOut > 0) THEN t := Time() + timeOut
+		ELSE t := MAX(LONGINT) END;
+		WHILE ~ok & (Time() < t) DO
+			IF ReadPacket(next, numBytes) THEN
+				CheckSum(next, check);
+				IF (check = next.check) THEN
+					IF (next.seq = seq) THEN
+						IF (((len-pos) <= cDataSize) & (next.len # (len-pos)))
+						OR (((len-pos) > cDataSize) & (next.len # cDataSize)) THEN
+							Halt
+						ELSE
+							ok := TRUE;
+							SYSTEM.MOVE(SYSTEM.ADR(next.data[0]),
+													 SYSTEM.ADR(buf[pos]), next.len);
+							INC(pos, cDataSize);
+							Ack(seq); Log(".");
+							seq := Flip(seq)
+						END
+					ELSIF (next.seq = Flip(seq)) THEN
+						(* Already received - ACK was lost *)
+						Ack(next.seq); Log("?")
+					ELSE (* valid packet with invalid sequence number! *)
+						Ack(Flip(seq)); Log("#")
+					END
+				ELSE (* Invalid packet *)
+					Log("+")
+				END
+			ELSE (* Timeout *)
+				Ack(Flip(seq)); Log("!")
+			END
+		END (* WHILE *);
+		IF ~ok THEN RETURN eTimeOut END
+	END; (* WHILE *)
+	(* Terminate receive *)
+(*Out.String("Terminating receive."); Out.Ln;*)
+	t := Time() + cTimeOut;
+	REPEAT
+		IF ReadPacket(next, numBytes) THEN
+			CheckSum(next, check);
+			IF (check = next.check) & (next.seq = Flip(seq)) THEN
+				Ack(next.seq); Log("?")
+			ELSIF (check = next.check) THEN
+				t := Time() (* Finito! *)
+			ELSE (* Invalid packet *)
+				Log("+")
+			END
+		ELSE (* Timeout *)
+			Ack(Flip(seq)); Log("!")
+		END
+	UNTIL (Time() >= t);
+	gEndTime := Time();
+	RETURN 0
+END Receive;
+
+(* --------------------------------------------------------- *)
+PROCEDURE Minimum(a, b : LONGINT) : LONGINT;
+BEGIN
+	IF (a <= b) THEN RETURN a ELSE RETURN b END
+END Minimum;
+
+(* --------------------------------------------------------- *)
+PROCEDURE Transaction*(
+						VAR rqh, rqb : ARRAY OF SYSTEM.BYTE; rqlen : LONGINT;
+						VAR rph, rpb : ARRAY OF SYSTEM.BYTE; VAR rplen : LONGINT
+						) : LONGINT;
+VAR
+	hdr : tSTPHeader;
+	res : LONGINT;
+BEGIN
+	gSeq := 0;
+	hdr.bufLen := rqlen;
+	SYSTEM.MOVE(SYSTEM.ADR(rqh), SYSTEM.ADR(hdr.header),
+							 Minimum(LEN(rqh), 124));
+(*Out.String("Sending request."); Out.Ln;*)
+	res := Send(hdr, 128, gSeq);
+	IF (res =  0) & (rqlen > 0) THEN res := Send(rqb, rqlen, gSeq) END;
+	IF (res = 0) THEN
+(*Out.String("Waiting for reply."); Out.Ln;*)
+		(* Transaction() must wait a little longer for the reply header, because
+			it may take cTimeOut time on the Server side to terminate the
+			Receive(). *)
+		res := Receive(hdr, 128, gSeq, cTimeOut + 250) END;
+	IF (res = 0) THEN
+		SYSTEM.MOVE(SYSTEM.ADR(hdr.header), SYSTEM.ADR(rph),
+								Minimum(LEN(rph), 124));
+		rplen := hdr.bufLen;
+		IF (rplen > 0) THEN res := Receive(rpb, rplen, gSeq, cTimeOut) END
+	END;
+	RETURN res
+END Transaction;
+
+(* --------------------------------------------------------- *)
+PROCEDURE ReceiveRequest*(
+						VAR rqh, rqb : ARRAY OF SYSTEM.BYTE;
+						VAR rqlen : LONGINT) : LONGINT;
+VAR
+	hdr : tSTPHeader;
+	res : LONGINT;
+BEGIN
+	gSeq := 0;
+	res := Receive(hdr, 128, gSeq, 0);
+	IF (res = 0) THEN
+(*Out.String("Received request."); Out.Ln;*)
+		SYSTEM.MOVE(SYSTEM.ADR(hdr.header), SYSTEM.ADR(rqh),
+								 Minimum(LEN(rqh), 124));
+		rqlen := hdr.bufLen;
+		IF (rqlen > 0) THEN res := Receive(rqb, rqlen, gSeq, cTimeOut) END
+	END;
+	RETURN res
+END ReceiveRequest;
+
+(* --------------------------------------------------------- *)
+PROCEDURE SendReply*(
+						VAR rph, rpb : ARRAY OF SYSTEM.BYTE;
+						rplen : LONGINT) : LONGINT;
+VAR
+	hdr : tSTPHeader;
+	res : LONGINT;
+BEGIN
+(*Out.String("Send reply header"); Out.Ln;*)
+	hdr.bufLen := rplen;
+	SYSTEM.MOVE(SYSTEM.ADR(rph), SYSTEM.ADR(hdr.header),
+							 Minimum(LEN(rph), 124));
+	res := Send(hdr, 128, gSeq);
+	IF (res =  0) & (rplen > 0) THEN res := Send(rpb, rplen, gSeq) END;
+	RETURN res
+END SendReply;
+
+(* ========================================================= *)
+
+END STP.
+
+(* ========================================================= *)
+UX.CopyToUnix STP.Mod=> /tmp/STP.Mod ~

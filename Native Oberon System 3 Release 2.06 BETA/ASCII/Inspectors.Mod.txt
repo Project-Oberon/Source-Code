@@ -1,0 +1,797 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Inspectors; (** jm 1.2.95 *)
+
+(** Module not intended to be extended or reused *)
+
+(*
+	JM 3.2.93 - Inspector opens by default on the system track
+	jm 9.10.93 - removed some rubbish
+	15.4.93 - upgraded functionality
+	16.4.93 - /d option opens the detail mode
+	6.5.94 - added support for the lock children flag
+	- optionChar fix
+	25.4.95 - fixed locking problem
+	16.11.95 - Detail Inspector: show Add Attribute added.
+		- Opens with inspected gadget now.
+*)
+
+IMPORT
+	Display, Objects, Gadgets, Oberon, Texts, BasicGadgets, Panels, Files, Attributes, TextFields,
+	Effects, Documents;
+
+CONST
+	ModName = "Inspectors"; VersionNo = 1; border = 7;
+	
+TYPE
+	Attr = POINTER TO AttrDesc;
+	AttrDesc = RECORD
+		next: Attr;
+		name: ARRAY 32 OF CHAR;
+		obj: Objects.Object;
+	END;
+	
+	Layout = RECORD
+		align: INTEGER; (* 0 top, 1 middle, 2 bottom *)
+		X, Y, maxH: INTEGER;
+		flags: SET;
+		frames: Display.Frame;
+		attrs: Attr;
+	END;
+	
+	(* new gadgets *)
+	
+	InspectorP = POINTER TO InspectorPDesc;
+	InspectorPDesc = RECORD (Panels.PanelDesc);
+		attrs: Attr;
+	END;
+	
+VAR
+	W: Texts.Writer;
+	obj: Objects.Object;
+	tmpL: Layout;
+	bcount: INTEGER;
+	hasattr: Attr;
+	
+PROCEDURE Log;
+BEGIN Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+END Log;
+
+PROCEDURE WriteVersion(VAR R: Files.Rider);
+BEGIN Files.WriteNum(R, VersionNo);
+END WriteVersion;
+
+PROCEDURE ReadVersion(VAR R: Files.Rider);
+VAR x: LONGINT;
+BEGIN Files.ReadNum(R, x);
+	IF x # VersionNo THEN
+		Texts.WriteString(W, "Version "); Texts.WriteInt(W, VersionNo, 3); Texts.WriteString(W, " of ");
+		Texts.WriteString(W, ModName);
+		Texts.WriteString(W, " cannot read version "); Texts.WriteInt(W, x, 3); Texts.WriteLn(W); Log;
+		HALT(42);
+	END;
+END ReadVersion;
+
+(* new gadgets *)
+
+PROCEDURE ^BuildInspectorP(o: Objects.Object; VAR F: InspectorP; detail: BOOLEAN);
+
+(* ================= document stuff ============== *)
+
+PROCEDURE Load(D: Documents.Document);
+VAR f: InspectorP; objs: Objects.Object; time: LONGINT;
+BEGIN
+	Gadgets.GetSelection(objs, time); IF (objs # NIL) & (objs.slink # NIL) THEN objs := NIL END;
+	f := NIL; BuildInspectorP(objs, f, FALSE);
+	IF D.name = "" THEN D.name := "Inspector" END;
+	D.W := f.W; D.H := f.H;
+	Documents.Init(D, f)
+END Load;
+
+PROCEDURE Store(D: Documents.Document);
+VAR f: Files.File; R: Files.Rider;
+BEGIN
+	Texts.WriteString(W, "Store "); Texts.Append(Oberon.Log, W.buf);
+	IF D.name # "" THEN
+		f := Files.New(D.name);
+		IF f = NIL THEN HALT(99) END;
+		Files.Set(R, f, 0); Files.WriteInt(R, Documents.Id); Files.WriteString(R, "Inspectors.NewDoc");
+		Files.WriteInt(R, D.X); Files.WriteInt(R, D.Y); Files.WriteInt(R, D.W); Files.WriteInt(R, D.H);
+		Files.Register(f);
+		
+		Texts.Write(W, 22X); Texts.WriteString(W, D.name); Texts.Write(W, 22X)
+	ELSE Texts.WriteString(W, "[Untitled document]");
+	END;
+	Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+END Store;
+
+PROCEDURE LoadDetail(D: Documents.Document);
+VAR f: InspectorP; objs: Objects.Object; time: LONGINT;
+BEGIN
+	Gadgets.GetSelection(objs, time); IF (objs # NIL) & (objs.slink # NIL) THEN objs := NIL END;
+	f := NIL; BuildInspectorP(objs, f, TRUE);
+	IF D.name = "" THEN D.name := "Detail Inspector" END;
+	D.W := f.W; D.H := f.H;
+	Documents.Init(D, f)
+END LoadDetail;
+
+PROCEDURE StoreDetail(D: Documents.Document);
+VAR f: Files.File; R: Files.Rider;
+BEGIN
+	Texts.WriteString(W, "Store "); Texts.Append(Oberon.Log, W.buf);
+	IF D.name # "" THEN
+		f := Files.New(D.name);
+		IF f = NIL THEN HALT(99) END;
+		Files.Set(R, f, 0); Files.WriteInt(R, Documents.Id); Files.WriteString(R, "Inspectors.NewDetailDoc");
+		Files.WriteInt(R, D.X); Files.WriteInt(R, D.Y); Files.WriteInt(R, D.W); Files.WriteInt(R, D.H);
+		Files.Register(f);
+		Texts.Write(W, 22X); Texts.WriteString(W, D.name); Texts.Write(W, 22X)
+	ELSE Texts.WriteString(W, "[Untitled document]");
+	END;
+	Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+END StoreDetail;
+
+PROCEDURE DocHandle(D: Objects.Object; VAR M: Objects.ObjMsg);
+BEGIN
+	WITH D: Documents.Document DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF M.id = Objects.get THEN
+					IF M.name = "Gen" THEN M.class := Objects.String; M.s := "Inspectors.NewDoc"; M.res := 0
+					ELSIF M.name = "Adaptive" THEN M.class := Objects.Bool; M.b := FALSE; M.res := 0
+					ELSIF M.name = "Icon" THEN M.class := Objects.String; M.s := "Icons.MagGlass"; M.res := 0
+					ELSIF M.name = "Menu" THEN M.class := Objects.String; M.s := ""; M.res := 0
+					ELSE Documents.Handler(D, M)
+					END
+				ELSE Documents.Handler(D, M)
+				END
+			END
+		ELSE Documents.Handler(D, M)
+		END
+	END
+END DocHandle;
+
+PROCEDURE NewDoc*;
+VAR D: Documents.Document;
+BEGIN NEW(D); D.Load := Load; D.Store := Store; D.handle := DocHandle;
+	D.W := 200; D.H := 200; D.Load(D);
+	Objects.NewObj := D
+END NewDoc;
+
+PROCEDURE NewDetailDoc*;
+VAR D: Documents.Document;
+BEGIN NEW(D); D.Load := LoadDetail; D.Store := StoreDetail; D.handle := DocHandle;
+	D.W := 200; D.H := 200; D.Load(D);
+	Objects.NewObj := D
+END NewDetailDoc;
+
+(* ================= end document stuff ============== *)
+
+PROCEDURE InspectorPHandler*(F: Objects.Object; VAR M: Objects.ObjMsg);
+VAR F0: InspectorP; a: Attr; s: ARRAY 32 OF CHAR;
+BEGIN
+	WITH F: InspectorP DO
+		IF M IS  Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF (M.id = Objects.get) & (M.name = "Gen") THEN
+					M.class := Objects.String; COPY("Inspectors.NewInspectorP", M.s); M.res := 0
+				ELSE Panels.PanelHandler(F, M)
+				END
+			END
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO F0 := NIL; BuildInspectorP(NIL, F0, FALSE); F0.state := F.state; M.obj := F0 END
+		ELSIF M IS Objects.FileMsg THEN
+			WITH M: Objects.FileMsg DO
+				IF M.id = Objects.store THEN
+					WriteVersion(M.R);
+					a := F.attrs;
+					WHILE a # NIL DO
+						IF a.name # "" THEN
+							Files.WriteString(M.R, a.name); Gadgets.WriteRef(M.R, F.lib, a.obj);
+						END;
+						a := a.next
+					END;
+					Files.Write(M.R, 0X);
+					Panels.PanelHandler(F, M)
+				ELSIF M.id = Objects.load THEN
+					ReadVersion(M.R);
+					Files.ReadString(M.R, s);
+					IF s # "" THEN
+						NEW(F.attrs); a := F.attrs;
+						REPEAT
+							COPY(s, a.name);
+							Gadgets.ReadRef(M.R, F.lib, a.obj);
+							Files.ReadString(M.R, s);
+							IF s # "" THEN NEW(a.next); a := a.next END;
+						UNTIL s = "";
+					ELSE F.attrs := NIL;
+					END;
+					Panels.PanelHandler(F, M)
+				END
+			END
+		ELSE
+			Panels.PanelHandler(F, M)
+		END;
+	END;
+END InspectorPHandler;
+
+PROCEDURE NewInspectorP*;
+VAR P: Panels.Panel; F: InspectorP; C: Objects.CopyMsg;
+BEGIN
+	C.id := Objects.deep; Objects.Stamp(C);
+	Panels.NewPanel; P := Objects.NewObj(Panels.Panel);
+	NEW(F); Panels.CopyPanel(C, P, F); F.handle := InspectorPHandler;
+	Objects.NewObj := F;
+END NewInspectorP;
+
+(* ------ Layout routines ----- *)
+
+PROCEDURE Min(x, y: INTEGER): INTEGER;
+BEGIN IF x < y THEN RETURN x; ELSE RETURN y; END;
+END Min;
+
+PROCEDURE Max(x, y: INTEGER): INTEGER;
+BEGIN IF x > y THEN RETURN x; ELSE RETURN y; END;
+END Max;
+
+PROCEDURE AddAttr(VAR L: Layout; name: ARRAY OF CHAR; obj: Objects.Object);
+VAR A: Attr;
+BEGIN
+	NEW(A); COPY(name, A.name); A.obj := obj;
+	A.next := L.attrs; L.attrs := A;
+END AddAttr;
+
+PROCEDURE OpenLayout*(VAR L: Layout);
+BEGIN
+	L.X := 0; L.Y := 0; L.maxH := 0; L.frames := NIL; L.attrs := NIL; L.flags := {};
+END OpenLayout;
+
+PROCEDURE WriteLn*(VAR L: Layout);
+VAR o: Objects.Object;
+BEGIN
+	o := L.frames;
+	WHILE o # NIL DO
+		WITH o: Display.Frame DO
+			IF o.Y + o.H - 1= L.Y THEN (* on the same line *)
+				IF L.align = 0 THEN (* top *)
+				ELSIF L.align = 1 THEN (* middle *)
+					o.Y := L.Y - L.maxH DIV 2 - o.H DIV 2;
+				ELSIF L.align = 2 THEN (* bottom *)
+					o.Y := L.Y - L.maxH + 1;
+				END;
+			END;
+		END;
+		o := o.slink;
+	END;
+	DEC(L.Y, L.maxH); L.maxH := 0; L.X := 0;
+END WriteLn;
+
+PROCEDURE WriteHSpace*(VAR L: Layout; w: INTEGER);
+BEGIN INC(L.X, w);
+END WriteHSpace;
+
+PROCEDURE WriteTab*(VAR L: Layout);
+VAR w: INTEGER;
+BEGIN
+	w := ((L.X+20) DIV 20) * 20 - L.X;
+	INC(L.X, w);
+END WriteTab;
+
+PROCEDURE WriteVSpace*(VAR L: Layout; h: INTEGER);
+BEGIN DEC(L.Y, h);
+END WriteVSpace;
+
+PROCEDURE WriteCaption*(VAR L: Layout; s: ARRAY OF CHAR);
+VAR F: TextFields.Caption; nolines: INTEGER;
+BEGIN
+	TextFields.NewCaption; F := Objects.NewObj(TextFields.Caption);
+	F.state := F.state + L.flags;
+	Attributes.StrToTxt(s, F.text); (* Texts.ChangeLooks(F.text, 0, F.text.len, {1}, NIL, 0, 0); *)
+	TextFields.CalcSize(F, F.W, F.H, nolines, TRUE);
+	F.X := L.X; F.Y := L.Y - F.H + 1; INC(L.X, F.W); L.maxH := Max(F.H + 4, L.maxH);
+	F.slink := L.frames; L.frames := F;
+END WriteCaption;
+
+PROCEDURE WriteBoolean*(VAR L: Layout; name: ARRAY OF CHAR; val: BOOLEAN);
+VAR F: BasicGadgets.CheckBox;
+BEGIN
+	BasicGadgets.NewCheckBox; F := Objects.NewObj(BasicGadgets.CheckBox);
+	BasicGadgets.NewBoolean; F.obj := Objects.NewObj;
+	F.obj(BasicGadgets.Boolean).val := val; F.val := val;
+	F.state := F.state + L.flags;
+	F.X := L.X; F.Y := L.Y - F.H + 1; INC(L.X, F.W); L.maxH := Max(F.H, L.maxH);
+	F.slink := L.frames; L.frames := F;
+	AddAttr(L, name, F.obj);
+END WriteBoolean;
+
+PROCEDURE WriteString*(VAR L: Layout; name, val: ARRAY OF CHAR);
+VAR F: TextFields.TextField;
+BEGIN
+	TextFields.NewTextField; F := Objects.NewObj(TextFields.TextField);
+	BasicGadgets.NewString; F.obj := Objects.NewObj;
+	COPY(val, F.obj(BasicGadgets.String).val); COPY(val, F.val);
+	F.state := F.state + L.flags;
+	F.W := F.W * 3;
+	F.X := L.X; F.Y := L.Y - F.H + 1; INC(L.X, F.W); L.maxH := Max(F.H, L.maxH);
+	F.slink := L.frames; L.frames := F;
+	AddAttr(L, name, F.obj)
+END WriteString;
+
+PROCEDURE WriteInteger*(VAR L: Layout; name: ARRAY OF CHAR; val: LONGINT);
+VAR F: TextFields.TextField;
+BEGIN
+	TextFields.NewTextField; F := Objects.NewObj(TextFields.TextField);
+	BasicGadgets.NewInteger; F.obj := Objects.NewObj;
+	F.obj(BasicGadgets.Integer).val := val; Attributes.IntToStr(val, F.val);
+	F.state := F.state + L.flags;
+	F.X := L.X; F.Y := L.Y - F.H + 1; INC(L.X, F.W); L.maxH := Max(F.H, L.maxH);
+	F.slink := L.frames; L.frames := F;
+	AddAttr(L, name, F.obj)
+END WriteInteger;
+
+PROCEDURE WriteReal*(VAR L: Layout; name: ARRAY OF CHAR; val: LONGREAL);
+VAR F: TextFields.TextField;
+BEGIN
+	TextFields.NewTextField; F := Objects.NewObj(TextFields.TextField);
+	BasicGadgets.NewReal; F.obj := Objects.NewObj;
+	F.obj(BasicGadgets.Real).val := val; Attributes.RealToStr(val, F.val);
+	F.state := F.state + L.flags;
+	F.X := L.X; F.Y := L.Y - F.H + 1; INC(L.X, F.W); L.maxH := Max(F.H, L.maxH);
+	F.slink := L.frames; L.frames := F;
+	AddAttr(L, name, F.obj)
+END WriteReal;
+
+PROCEDURE WriteFrame*(VAR L: Layout; name: ARRAY OF CHAR; F: Display.Frame);
+BEGIN
+	IF F IS Gadgets.Frame THEN 
+		WITH F: Gadgets.Frame DO
+			F.state := F.state + L.flags
+		END
+	END;
+	F.X := L.X; F.Y := L.Y - F.H + 1; INC(L.X, F.W); L.maxH := Max(F.H, L.maxH);
+	F.slink := L.frames; L.frames := F;
+	AddAttr(L, name, F)
+END WriteFrame;
+
+PROCEDURE WriteCmd*(VAR L: Layout; caption, cmd: ARRAY OF CHAR);
+VAR F: BasicGadgets.Button; A: Objects.AttrMsg;
+BEGIN
+	BasicGadgets.NewButton; F := Objects.NewObj(BasicGadgets.Button);
+	COPY(caption, F.caption); F.val := FALSE; F.popout := TRUE; 
+	A.id := Objects.set; A.name := "Cmd"; COPY(cmd, A.s); A.class := Objects.String; A.res := -1;
+	F.handle(F, A);
+	F.state := F.state + L.flags;
+	F.X := L.X; F.Y := L.Y - F.H + 1; INC(L.X, F.W); L.maxH := Max(F.H, L.maxH);
+	F.slink := L.frames; L.frames := F;
+END WriteCmd;
+
+(* ------------------------------ *)
+
+PROCEDURE *EnumAttr(name: ARRAY OF CHAR);
+VAR M: Objects.AttrMsg; s: ARRAY 64 OF CHAR; a: Attr;
+BEGIN
+	IF name = "Name" THEN RETURN END;
+	(* check if name already in list *)
+	a := tmpL.attrs;
+	WHILE (a # NIL) & (a.name # name) DO a := a.next END;
+	IF a # NIL THEN RETURN END;
+	
+	M.id := Objects.get; COPY(name, M.name); M.class := Objects.Inval; M.res := -1;
+	obj.handle(obj, M);
+	
+	IF (M.class # Objects.Bool) & (bcount > 0) THEN WriteLn(tmpL) END;
+	
+	IF (M.res = -1) OR (M.class =Objects.Inval) THEN
+		bcount := 0;
+		WriteCaption(tmpL, name); WriteTab(tmpL); WriteCaption(tmpL, "has no value"); WriteLn(tmpL);
+	ELSIF M.class = Objects.Bool THEN
+		WriteCaption(tmpL, name); WriteTab(tmpL); WriteBoolean(tmpL, name, M.b); WriteTab(tmpL);
+		INC(bcount); IF bcount = 4 THEN bcount := 0; WriteLn(tmpL) END;
+	ELSIF M.class = Objects.String THEN
+		bcount := 0;
+		WriteCaption(tmpL, name); WriteTab(tmpL); WriteString(tmpL, name, M.s); WriteLn(tmpL);
+	ELSIF M.class = Objects.Int THEN
+		bcount := 0;
+		WriteCaption(tmpL, name); WriteTab(tmpL); WriteInteger(tmpL, name, M.i); WriteLn(tmpL);
+	ELSIF M.class = Objects.Real THEN
+		bcount := 0;
+		WriteCaption(tmpL, name); WriteTab(tmpL); WriteReal(tmpL, name, M.x); WriteLn(tmpL);
+	ELSIF M.class = Objects.LongReal THEN
+		bcount := 0;
+		WriteCaption(tmpL, name); WriteTab(tmpL); WriteReal(tmpL, name, M.y); WriteLn(tmpL);
+	ELSIF M.class = Objects.Char THEN
+		bcount := 0;
+		s[0] := M.c; s[1] := 0X;
+		WriteCaption(tmpL, name); WriteHSpace(tmpL, 10); WriteString(tmpL, name, s); WriteLn(tmpL);
+	ELSE
+		bcount := 0;
+		WriteCaption(tmpL, name); WriteHSpace(tmpL, 10); WriteCaption(tmpL, "has unknown type"); WriteLn(tmpL);
+	END;
+END EnumAttr;
+
+PROCEDURE BoundingBox(list: Display.Frame; VAR x, y, w, h: INTEGER);
+VAR f: Display.Frame; r, t: INTEGER;
+BEGIN
+	x := 32000; y := 32000; r := -32000; t := -32000;
+	f := list;  
+	WHILE f # NIL DO
+		x := Min(x, f.X); y := Min(y, f.Y); r := Max(r, f.X + f.W - 1); t := Max(t, f.Y + f.H - 1); w := r - x + 1; h := t - y + 1;
+		IF f.slink # NIL THEN f := f.slink(Display.Frame); ELSE f := NIL; END;
+	END;
+END BoundingBox;
+
+PROCEDURE BuildInspectorP(o: Objects.Object; VAR F: InspectorP; detail: BOOLEAN);
+VAR I: Objects.AttrMsg; A: Objects.AttrMsg; s: ARRAY 32 OF CHAR; C: Display.ConsumeMsg; x, y, w, h: INTEGER;
+	new: BOOLEAN; M: Display.ModifyMsg; RM: Display.ControlMsg; obj0: Objects.Object;
+BEGIN
+	new := FALSE;
+	IF F = NIL THEN
+		NewInspectorP; F := Objects.NewObj(InspectorP); new := TRUE;
+	END;
+	
+	OpenLayout(tmpL); tmpL.align := 1; bcount := 0;
+	IF detail THEN WriteCmd(tmpL, "Inspect", "Inspectors.Inspect %d"); WriteHSpace(tmpL, 5)
+	ELSE WriteCmd(tmpL, "Inspect", "Inspectors.Inspect"); WriteHSpace(tmpL, 5)
+	END;
+	WriteCmd(tmpL, "Apply", "Inspectors.Apply"); WriteHSpace(tmpL, 20);
+	IF detail THEN WriteCmd(tmpL, "Inspect Model", "Inspectors.InspectModel %d"); WriteHSpace(tmpL, 5)
+	ELSE WriteCmd(tmpL, "Inspect Model", "Inspectors.InspectModel"); WriteHSpace(tmpL, 5)
+	END;
+	WriteCmd(tmpL, "Apply Model", "Inspectors.ApplyModel"); WriteHSpace(tmpL, 10);
+	IF detail THEN
+		WriteCmd(tmpL, "Inspect *", "Inspectors.InspectXY %d"); WriteHSpace(tmpL, 5);
+		WriteCmd(tmpL, "Apply *", "Inspectors.ApplyXY"); WriteHSpace(tmpL, 10);
+	END;
+	
+	(* extend/ reduce buttons
+	IF detail THEN WriteCmd(tmpL, "Reduce ...", "Inspectors.Inspect"); WriteHSpace(tmpL, 10)
+	ELSE WriteCmd(tmpL, "Extend ...", "Inspectors.Inspect %d"); WriteHSpace(tmpL, 10)
+	END;
+	*)
+	
+	WriteLn(tmpL);
+	WriteVSpace(tmpL, 5); 
+	IF o # NIL THEN
+		obj := o; I.id := Objects.get; I.name := "Gen"; I.class := Objects.Inval; I.res := -1; I.s := "";
+		o.handle(o, I);
+		WriteCaption(tmpL, "Generator: "); WriteCaption(tmpL, I.s); WriteTab(tmpL);
+		WriteCaption(tmpL, "Library: ");
+		IF o.lib = NIL THEN
+			WriteCaption(tmpL, "(Free)");
+		ELSE
+			IF o.lib.name = "" THEN WriteCaption(tmpL, "(Private)");
+			ELSE WriteCaption(tmpL, o.lib.name);
+			END;
+		END;
+		WriteLn(tmpL);
+		Gadgets.GetObjName(o, s);
+		WriteCaption(tmpL, "Name"); WriteTab(tmpL); WriteString(tmpL, "Name", s); WriteLn(tmpL);
+
+		A.id := Objects.enum; A.Enum := EnumAttr; o.handle(o, A);
+		
+		IF bcount < 4 THEN WriteLn(tmpL); bcount := 0 END;
+		
+		IF detail THEN
+			WriteLn(tmpL); WriteLn(tmpL);
+			WriteCaption(tmpL, "Add Attribute:"); WriteLn(tmpL);
+			WriteTab(tmpL); WriteCaption(tmpL, "Name"); WriteTab(tmpL); WriteString(tmpL, "$AName", ""); WriteLn(tmpL);
+			WriteTab(tmpL); WriteCaption(tmpL, "Value"); WriteTab(tmpL); WriteString(tmpL, "$AValue", ""); WriteLn(tmpL);
+
+			IF o IS Gadgets.Frame THEN
+				WITH o: Gadgets.Frame DO
+					WriteCaption(tmpL, "Gadget Control Flags:"); WriteLn(tmpL);
+					WriteCaption(tmpL, "Selected  "); WriteTab(tmpL); WriteBoolean(tmpL, "@Selected", Gadgets.selected IN o.state); WriteTab(tmpL);
+					WriteCaption(tmpL, "Transparent"); WriteTab(tmpL); WriteBoolean(tmpL, "@Transparent", Gadgets.transparent IN o.state);
+					WriteLn(tmpL);
+					WriteCaption(tmpL, "Locked Contents"); WriteTab(tmpL); WriteBoolean(tmpL, "@LockChildren", Gadgets.lockedcontents IN o.state); WriteTab(tmpL);
+					WriteCaption(tmpL, "Locked Size"); WriteTab(tmpL); WriteBoolean(tmpL, "@LockSize", Gadgets.lockedsize IN o.state);
+					WriteLn(tmpL);
+					WriteCaption(tmpL, "Ref No"); WriteTab(tmpL); WriteInteger(tmpL, "!!", o.ref); WriteLn(tmpL);
+					WriteLn(tmpL); WriteLn(tmpL);
+					
+					WriteCaption(tmpL, "Change Coordinates"); WriteTab(tmpL); WriteBoolean(tmpL, "@SetXYWH", FALSE);  WriteLn(tmpL);
+					WriteCaption(tmpL, "X    "); WriteTab(tmpL); WriteInteger(tmpL, "!X", o.X);  WriteTab(tmpL);
+					WriteCaption(tmpL, "Y     "); WriteTab(tmpL); WriteInteger(tmpL, "!Y", o.Y); WriteLn(tmpL);
+					WriteCaption(tmpL, "W    "); WriteTab(tmpL); WriteInteger(tmpL, "!W", o.W); WriteTab(tmpL);
+					WriteCaption(tmpL, "H    "); WriteTab(tmpL); WriteInteger(tmpL, "!H", o.H); WriteLn(tmpL)
+				END
+			END
+		END
+	END;
+	
+	F.attrs := tmpL.attrs;
+
+	BoundingBox(tmpL.frames, x, y, w, h);
+	F.state0 := {};
+	
+	(* kill all the frame contents ! should free here too !*)
+	(* F.dsc := NIL; F.mask := NIL; *)
+	RM.F := NIL; RM.id := Display.remove;
+	obj0 := F.dsc;
+	WHILE obj0 # NIL DO
+		obj0.slink := RM.F; RM.F := obj0(Display.Frame);
+		obj0 := obj0(Display.Frame).next
+	END;
+	Display.Broadcast(RM);
+	
+	IF new THEN
+		F.W := w + border * 2; F.H := h + border * 2 ;
+	ELSE
+		M.id := Display.extend; M.F := F; M.mode := Display.display;
+		M.X := F.X; M.dX := 0; M.Y := F.Y + F.H - (h + border * 2); M.dY := M.Y - F.Y; M.H := h + border * 2; M.dH := M.H - F.H;
+		M.W := w + border * 2; M.dW := M.W - F.W; 
+		Display.Broadcast(M);
+	END;
+	C.id := Display.drop; C.obj := tmpL.frames; C.x := 0; C.y := 0; C.F := F;
+	C.u := border; C.v := (*-F.H + 1 + border*) - border - h; C.res := -1;
+	C.dlink := NIL;
+	F.handle(F, C);
+	(*
+	INCL(F.state, Gadgets.lockedcontents); INCL(F.state, Gadgets.lockedsize);
+	*)
+	I.id := Objects.set; I.class := Objects.Bool; I.name := "Locked"; I.b := TRUE; I.res := -1;
+	F.handle(F, I)
+END BuildInspectorP;
+
+PROCEDURE Detail(): BOOLEAN;
+VAR S: Attributes.Scanner;
+BEGIN
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF (S.class = Attributes.Char) & ((S.c = Oberon.OptionChar) OR (S.c = "%")) THEN
+		Attributes.Scan(S);
+		RETURN (S.class = Attributes.Name) & (S.s[0] = "d")
+	ELSE RETURN FALSE
+	END
+END Detail;
+
+PROCEDURE Insert*;
+VAR F: InspectorP;
+BEGIN
+	F := NIL; BuildInspectorP(NIL, F, Detail()); Gadgets.Integrate(F)
+END Insert;
+
+PROCEDURE Find(): InspectorP;
+VAR v: Objects.Object;
+BEGIN
+	v := Gadgets.context;
+	WHILE (v # NIL) & ~(v IS InspectorP) DO v := v.dlink END;
+	IF v = NIL THEN RETURN NIL ELSE RETURN v(InspectorP) END;
+END Find;
+	
+PROCEDURE Inspect*;
+VAR F: InspectorP; M: Display.SelectMsg;
+BEGIN
+	F := Find();
+	IF F # NIL THEN
+		M.id := Display.get; M.time := 0; M.F := NIL; M.obj := NIL; Display.Broadcast(M);
+		IF (M.time > 0) & (M.obj # NIL) & (M.obj.slink = NIL) THEN
+			BuildInspectorP(M.obj, F, Detail())
+		ELSE
+			Texts.WriteString(W, "[More than one or no selection]");  Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+			(* BuildInspectorP(NIL, F, Detail()) *)
+		END;
+	END;
+END Inspect;
+
+PROCEDURE InspectModel*;
+VAR M: Display.SelectMsg; F: InspectorP; MM: Objects.LinkMsg; obj: Objects.Object;
+BEGIN
+	F := Find();
+	IF F # NIL THEN
+		M.id := Display.get; M.time := 0; M.F := NIL; M.obj := NIL; Display.Broadcast(M);
+		IF (M.time > 0) & (M.obj # NIL) & (M.obj.slink = NIL) THEN
+			obj := NIL;
+			MM.id := Objects.get; MM.name := "Model"; MM.obj := NIL; 
+			IF M.obj # NIL THEN
+				M.obj.handle(M.obj, MM);
+				obj := MM.obj
+			END;
+			IF (obj = NIL) & (M.obj # NIL) & (M.obj IS Gadgets.Frame) & (M.obj(Gadgets.Frame).obj # NIL) THEN
+				obj := M.obj(Gadgets.Frame).obj;
+			END;
+			BuildInspectorP(obj, F, Detail())
+		ELSE Texts.WriteString(W, "[More than one or no selection]");  Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+		END
+	END
+END InspectModel;
+
+PROCEDURE* enumproc(name: ARRAY OF CHAR);
+VAR a: Attr;
+BEGIN NEW(a); COPY(name, a.name); a.next := hasattr; hasattr := a
+END enumproc;
+
+PROCEDURE BuildAttrList(obj: Objects.Object);
+VAR A: Objects.AttrMsg;
+BEGIN
+	hasattr := NIL;
+	IF obj # NIL THEN
+		A.id := Objects.enum; A.Enum := enumproc; A.res := -1; obj.handle(obj, A);
+	END
+END BuildAttrList;
+
+PROCEDURE HasAttribute(name: ARRAY OF CHAR): BOOLEAN;
+VAR a: Attr;
+BEGIN
+	a := hasattr;
+	WHILE (a # NIL) & (a.name # name) DO a := a.next END;
+	RETURN a # NIL
+END HasAttribute;
+
+PROCEDURE Update(F: InspectorP; o: Objects.Object);
+VAR a: Attr; A: Objects.AttrMsg; b, setc: BOOLEAN; X, Y, WW, H, val: INTEGER; M: Display.ModifyMsg;
+	name, value: ARRAY 32 OF CHAR; T: Texts.Text; S: Attributes.Scanner;
+BEGIN
+	setc := FALSE;
+	IF o IS Gadgets.Frame THEN
+		WITH o: Gadgets.Frame DO
+			X := o.X; Y := o.Y; WW := o.W; H := o.H;
+			name[0] := 0X; value[0] := 0X;
+		END
+	END;
+	
+	BuildAttrList(o); (* identify all attributes of the object *)
+	
+	a := F.attrs;
+	WHILE a # NIL DO
+		IF a.name[0] = "@" THEN (* special attributes *)
+			IF o IS Gadgets.Frame THEN
+				WITH o: Gadgets.Frame DO
+					b := a.obj(BasicGadgets.Boolean).val;
+					IF a.name = "@Selected" THEN
+						IF b THEN INCL(o.state, Gadgets.selected) ELSE EXCL(o.state, Gadgets.selected) END
+					ELSIF a.name = "@Transparent" THEN
+						IF b THEN INCL(o.state, Gadgets.transparent) ELSE EXCL(o.state, Gadgets.transparent) END
+					ELSIF a.name = "@LockChildren" THEN
+						IF b THEN INCL(o.state, Gadgets.lockedcontents) ELSE EXCL(o.state, Gadgets.lockedcontents) END
+					ELSIF a.name = "@LockSize" THEN
+						IF b THEN INCL(o.state, Gadgets.lockedsize) ELSE EXCL(o.state, Gadgets.lockedsize) END
+					ELSIF a.name = "@SetXYWH" THEN
+						setc := b
+					ELSE
+					END
+				END
+			END
+		ELSIF a.name[0] = "$" THEN
+			IF a.name = "$AName" THEN COPY(a.obj(BasicGadgets.String).val, name)
+			ELSIF a.name = "$AValue" THEN COPY(a.obj(BasicGadgets.String).val, value)
+			END
+		ELSIF a.name[0] = "!" THEN
+			IF a.name[1] # "!" THEN
+				val := SHORT(a.obj(BasicGadgets.Integer).val);
+				IF a.name = "!X" THEN X := val
+				ELSIF a.name = "!Y" THEN Y := val
+				ELSIF a.name = "!W" THEN WW := val
+				ELSIF a.name = "!H" THEN H := val
+				END
+			END
+		ELSIF HasAttribute(a.name) THEN (* only set the attribute if the gadget has such an attribute *)
+			A.id := Objects.set; COPY(a.name, A.name); A.class := Objects.Inval; A.res := MIN(INTEGER);
+			IF a.obj = NIL THEN
+			ELSIF a.obj IS BasicGadgets.Boolean THEN A.class := Objects.Bool; A.b := a.obj(BasicGadgets.Boolean).val
+			ELSIF a.obj IS BasicGadgets.Integer THEN A.class := Objects.Int; A.i := a.obj(BasicGadgets.Integer).val
+			ELSIF a.obj IS BasicGadgets.String THEN A.class := Objects.String; COPY(a.obj(BasicGadgets.String).val, A.s)
+			ELSIF a.obj IS BasicGadgets.Real THEN A.class := Objects.LongReal; A.y := a.obj(BasicGadgets.Real).val
+			END;
+			IF A.class # Objects.Inval THEN
+				o.handle(o, A);
+				IF A.res < 0 THEN
+					Texts.WriteString(W, a.name);  Texts.WriteString(W, " could not be set");
+					Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+				END;
+			END
+		END;
+		a := a.next
+	END;
+	IF o IS Gadgets.Frame THEN
+		WITH o: Gadgets.Frame DO
+			IF setc & ((X # o.X) OR (Y # o.Y) OR (WW # o.W) OR (H # o.H)) THEN
+				M.id := Display.move; M.mode := Display.display; M.F := o;
+				M.X := X; M.Y := Y; M.W := WW; M.H := H;
+				M.dX := M.X - o.X; M.dY := M.Y - o.Y; M.dW := M.W - o.W; M.dH := M.H - o.H;
+				Display.Broadcast(M)
+			END;
+			IF (name # "") THEN
+				A.id := Objects.set; COPY(name, A.name); Attributes.StrToTxt(value, T);
+				Attributes.OpenScanner(S, T, 0); Attributes.Scan(S);
+				A.class := Objects.String; A.s := "";
+				IF S.class = Attributes.Int THEN A.class := Objects.Int; A.i := S.i;
+				ELSIF S.class = Attributes.Name THEN A.class := Objects.String; COPY(S.s, A.s);
+				ELSIF S.class = Attributes.String THEN A.class := Objects.String; COPY(S.s, A.s);
+				END;
+				IF (A.s = "Yes") OR (A.s = "No") THEN Attributes.StrToBool(A.s, A.b); A.class := Objects.Bool END;
+				IF A.class # Objects.Inval THEN
+					A.res := -1; o.handle(o, A);
+					IF A.res < 0 THEN
+						Texts.WriteString(W, name);  Texts.WriteString(W, " could not be set");
+						Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+					END;
+				END
+			END
+		END
+	END
+	(* Gadgets.Update(o); *)
+END Update;
+
+PROCEDURE Apply*;
+VAR M: Display.SelectMsg; o: Objects.Object; F: InspectorP; U: Gadgets.UpdateMsg;
+BEGIN
+	F := Find();
+	IF F # NIL THEN
+		Oberon.Defocus;
+		M.id := Display.get; M.time := 0; M.F := NIL; M.obj := NIL; Display.Broadcast(M);
+		IF (M.time > 0) THEN
+			o := M.obj;
+			WHILE o # NIL DO
+				Update(F, o);
+				o := o.slink
+			END;
+			U.obj := M.obj; U.F := NIL; Display.Broadcast(U);
+		END;
+	END;
+END Apply;
+
+PROCEDURE InspectXY*;
+VAR F: InspectorP; f: Display.Frame; u, v: INTEGER;
+BEGIN
+	F := Find();
+	IF F # NIL THEN
+		Gadgets.ThisFrame(Oberon.Pointer.X, Oberon.Pointer.Y, f, u, v);
+		IF (f # NIL) & (f IS Gadgets.Frame) THEN BuildInspectorP(f, F, Detail())
+		ELSE BuildInspectorP(NIL, F, Detail())
+		END;
+	END;
+END InspectXY;
+
+PROCEDURE ApplyXY*;
+VAR F: InspectorP; U: Gadgets.UpdateMsg; f: Display.Frame; u, v: INTEGER;
+BEGIN
+	F := Find();
+	IF F # NIL THEN
+		Oberon.Defocus;
+		Gadgets.ThisFrame(Oberon.Pointer.X, Oberon.Pointer.Y, f, u, v);
+		IF (f # NIL) & (f IS Gadgets.Frame) THEN
+			Update(F, f);
+			U.obj := f; U.F := NIL; Display.Broadcast(U);
+		END;
+	END;
+END ApplyXY;
+
+PROCEDURE ApplyModel*;
+VAR M: Display.SelectMsg; o, obj: Objects.Object; F: InspectorP; MM: Objects.LinkMsg; U: Gadgets.UpdateMsg;
+BEGIN
+	F := Find();
+	IF F # NIL THEN
+		Oberon.Defocus;
+		M.id := Display.get; M.time := 0; M.F := NIL; M.obj := NIL; Display.Broadcast(M);
+		IF (M.time > 0) THEN
+			o := M.obj;
+			WHILE o # NIL DO
+				MM.id := Objects.get; MM.name := "Model"; MM.obj := NIL; 
+				o.handle(o, MM);
+				obj := MM.obj;
+				IF (obj = NIL) & (o IS Gadgets.Frame) & (o(Gadgets.Frame).obj # NIL) THEN
+					obj := o(Gadgets.Frame).obj
+				END;
+				IF obj # NIL THEN Update(F, obj); U.obj := obj; U.F := NIL; Display.Broadcast(U); END;
+				o := o.slink
+			END;
+		END;
+	END;
+END ApplyModel;
+
+BEGIN Texts.OpenWriter(W);
+END Inspectors.

@@ -1,0 +1,410 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Display;
+
+(* Native Oberon trace display driver, pmuller 28.09.95 *)
+
+	IMPORT Kernel, SYSTEM, Objects;
+	
+	CONST
+		black* = 0; white* = 15; 
+		BG* = 0; FG* = 15; (*background, foreground*)
+		replace* = 0; paint* = 1; invert* = 2; (*operation modes*)
+		
+		remove* = 0; suspend* = 1; restore* = 2; (*ControlMsg id*)
+		reduce* = 0; extend* = 1; move* = 2; (*ModifyMsg id*)
+		display* = 0; state* = 1; (*ModifyMsg mode*)
+		frame* = 0; area* = 1; (*DisplayMsg id*)
+		contents* = 0; view* = 1; (*PrintMsg id*)
+		get* = 0; set* = 1; reset* = 2; (*SelectMsg id*)
+		drop* = 0; integrate* = 1; (*ConsumeMsg id*)
+		
+	TYPE Pattern* = LONGINT;
+			PatternPtr = POINTER TO RECORD w, h, pixmap: SHORTINT END;
+			List = POINTER TO ListDesc;
+			ListDesc = RECORD
+				next: List;
+				pat: PatternPtr
+			END;
+
+			Frame* = POINTER TO FrameDesc;
+			FrameDesc* = RECORD (Objects.ObjDesc)
+				next*, dsc*: Frame;
+				X*, Y*, W*, H*: INTEGER
+			END;
+  
+			FrameMsg* = RECORD (Objects.ObjMsg)
+				F*: Frame; (*target*)
+				x*, y*, res*: INTEGER
+			END;
+		
+			ControlMsg* = RECORD (FrameMsg)
+				id*: INTEGER
+			END;
+		
+			ModifyMsg* = RECORD (FrameMsg)
+				id*, mode*: INTEGER;
+				dX*, dY*, dW*, dH*: INTEGER;
+				X*, Y*, W*, H*: INTEGER
+			END;
+		
+			DisplayMsg* = RECORD (FrameMsg)
+				id*: INTEGER;
+				u*, v*, w*, h*: INTEGER
+			END;
+		
+			PrintMsg* = RECORD (FrameMsg)
+				id*, pageno*: INTEGER
+			END;
+
+			LocateMsg* = RECORD (FrameMsg)
+				loc*: Frame;
+				X*, Y*, u*, v*: INTEGER
+			END;
+		
+			SelectMsg* = RECORD (FrameMsg)
+				id*: INTEGER;
+				time*: LONGINT;
+				sel*: Frame;
+				obj*: Objects.Object
+			END;
+		
+			ConsumeMsg* = RECORD (FrameMsg)
+				id*: INTEGER;
+				u*, v*: INTEGER;
+				obj*: Objects.Object
+			END;
+		
+			MsgProc* = PROCEDURE (VAR M: FrameMsg);
+
+	VAR
+		Unit*: LONGINT; (* RasterUnit = Unit/36000 mm *)
+		Left*, (* left margin of black-and-white maps *)
+		ColLeft*, (* left margin of color maps *)
+		Bottom*, (* bottom of primary map *)
+		UBottom*, (* bottom of secondary map *)
+		Width*, (* map width *)
+		Height*: (* map hight*)
+			INTEGER;
+			
+		arrow*, star*, cross*, downArrow*, hook*: Pattern;
+		grey0*, grey1*, grey2*, ticks*, solid*: Pattern;
+
+		Broadcast*: MsgProc;
+
+		Pat: List;
+
+	PROCEDURE Map*(X: INTEGER): LONGINT;
+	BEGIN
+		Kernel.WriteString("Map(");  Kernel.WriteInt(X, 1);  Kernel.WriteString(") ");
+		RETURN 0
+	END Map;
+	
+	PROCEDURE AdjustClip*(X, Y, W, H: INTEGER);
+	BEGIN
+		Kernel.WriteString("AdjustClip(");  Kernel.WriteInt(X, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(Y, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(W, 1);
+		Kernel.WriteChar(",");  Kernel.WriteInt(H, 1);  Kernel.WriteString(") ")
+	END AdjustClip;
+
+	PROCEDURE GetDim*(pat: Pattern; VAR w, h: INTEGER);
+	VAR s: SHORTINT;
+	BEGIN SYSTEM.GET(pat, s); w := s; SYSTEM.GET(pat+1, s); h := s;
+		Kernel.WriteString("GetDim(");  Kernel.WriteHex(pat, 8);  Kernel.WriteString(") ")
+	END GetDim;
+
+	PROCEDURE ResetClip*;
+	BEGIN 
+		Kernel.WriteString("ResetClip ")
+	END ResetClip;
+	
+	PROCEDURE SetClip*(x, y, w, h: INTEGER);
+	BEGIN
+		Kernel.WriteString("SetClip(");  Kernel.WriteInt(x, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(y, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(w, 1);  
+		Kernel.WriteChar(",");  Kernel.WriteInt(h, 1);  Kernel.WriteString(") ")
+	END SetClip;
+	
+	PROCEDURE GetClip*(VAR x, y, w, h: INTEGER);
+	BEGIN
+		Kernel.WriteString("GetClip ");
+		x := 0;  y := 0;  w := Width;  h := Height
+	END GetClip;
+	
+	PROCEDURE SetColor*(col, red, green, blue: INTEGER);	(* 0 <= col, red, green, blue < 256 *)
+	BEGIN
+		Kernel.WriteString("SetColor(");  Kernel.WriteInt(col, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(red, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(green, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(blue, 1);  Kernel.WriteString(") ")
+	END SetColor;
+
+	PROCEDURE GetColor*(col: INTEGER; VAR red, green, blue: INTEGER);
+	BEGIN
+		Kernel.WriteString("GetColor(");  Kernel.WriteInt(col, 1);  Kernel.WriteString(") ");
+		red := 0;  green := 0;  blue := 0
+	END GetColor;
+
+	PROCEDURE Dot*(col, x, y, mode: INTEGER);
+	BEGIN
+		Kernel.WriteString("Dot(");  Kernel.WriteInt(col, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(x, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(y, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(mode, 1);  Kernel.WriteString(") ")
+	END Dot;
+	
+	PROCEDURE CopyBlock*(SX, SY, W, H, DX, DY, mode: INTEGER);
+	BEGIN 
+		Kernel.WriteString("CopyBlock(");  Kernel.WriteInt(SX, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(SY, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(W, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(H, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(DX, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(DY, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(mode, 1);  Kernel.WriteString(") ")
+	END CopyBlock;
+	
+	PROCEDURE SetMode*(X: INTEGER; s: SET);
+	BEGIN
+		Kernel.WriteString("SetMode(");  Kernel.WriteInt(X, 1);  Kernel.WriteChar(",");
+		Kernel.WriteHex(SYSTEM.VAL(LONGINT, s), 8);  Kernel.WriteString(") ")
+	END SetMode;
+	
+	PROCEDURE CopyPattern*(col: INTEGER; pat: Pattern; X, Y, mode: INTEGER);
+	BEGIN
+		Kernel.WriteString("CopyPattern(");  Kernel.WriteInt(col, 1);  Kernel.WriteChar(",");
+		Kernel.WriteHex(pat, 8);  Kernel.WriteChar(",");  Kernel.WriteInt(X, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(Y, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(mode, 1);  Kernel.WriteString(") ")
+	END CopyPattern;
+	
+	PROCEDURE ReplConst*(col, X, Y, W, H, mode: INTEGER);	(* col not used if mode is invert *)
+	BEGIN
+		Kernel.WriteString("ReplConst(");  Kernel.WriteInt(col, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(X, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(Y, 1);  
+		Kernel.WriteChar(",");  Kernel.WriteInt(W, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(H, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(mode, 1);  
+		Kernel.WriteString(") ")
+	END ReplConst;
+	
+	PROCEDURE FillPattern*(col: INTEGER; pat: Pattern; pX, pY, X, Y, W, H, mode: INTEGER);
+	BEGIN
+		Kernel.WriteString("FillPattern(");  Kernel.WriteInt(col, 1);  Kernel.WriteChar(",");
+		Kernel.WriteHex(pat, 8);  Kernel.WriteChar(",");  Kernel.WriteInt(pX, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(pY, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(X, 1);  
+		Kernel.WriteChar(",");  Kernel.WriteInt(Y, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(W, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(H, 1);  
+		Kernel.WriteChar(",");  Kernel.WriteInt(mode, 1);  Kernel.WriteString(") ")
+	END FillPattern;
+
+	PROCEDURE ReplPattern*(col: INTEGER; pat: Pattern; X, Y, W, H, mode: INTEGER);
+	BEGIN
+		Kernel.WriteString("Repl/");
+		FillPattern(col, pat, 0, 0, X, Y, W, H, mode)
+	END ReplPattern;
+	
+	PROCEDURE NewPattern*(width, height: INTEGER; VAR image: ARRAY OF SET): Pattern;
+	VAR len, src, dest: LONGINT; i: INTEGER; p: PatternPtr; inter: SET;  pl: List;
+	BEGIN
+		Kernel.WriteString("NewPattern(");  Kernel.WriteInt(width, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(height, 1);  Kernel.WriteString(") ");
+		len := (width+7) DIV 8;
+		SYSTEM.NEW(p, 4+len*height); p.w := SHORT(width); p.h := SHORT(height);
+		src := SYSTEM.ADR(image); dest := SYSTEM.ADR(p.pixmap);
+		i := 0;
+		WHILE i < height DO SYSTEM.MOVE(src, dest, len); INC(src, 4); INC(dest, len); INC(i) END;
+		NEW(pl);  pl.pat := p;  pl.next := Pat;  Pat := pl;	(* put in list to avoid GC *)
+		RETURN SYSTEM.ADR(p.w)
+	END NewPattern;
+	
+	PROCEDURE CreatePatterns;
+	VAR image: ARRAY 16 OF SET;
+	BEGIN
+		image[0] := {13};
+		image[1] := {12..14};
+		image[2] := {11..13};
+		image[3] := {10..12};
+		image[4] := {9..11};
+		image[5] := {8..10};
+		image[6] := {7..9};
+		image[7] := {0, 6..8};
+		image[8] := {0, 1, 5..7};
+		image[9] := {0..2, 4..6};
+		image[10] := {0..5};
+		image[11] := {0..4};
+		image[12] := {0..5};
+		image[13] := {0..6};
+		image[14] := {0..7};
+		arrow := NewPattern(15, 15, image);
+		
+		image[0] := {0, 10};
+		image[1] := {1, 9};
+		image[2] := {2, 8};
+		image[3] := {3, 7};
+		image[4] := {4, 6};
+		image[5] := {};
+		image[6] := {4, 6};
+		image[7] := {3, 7};
+		image[8] := {2, 8};
+		image[9] := {1, 9};
+		image[10] := {0, 10};
+		cross := NewPattern(11, 11, image); 
+		
+		image[0] := {6};
+		image[1] := {5..7};
+		image[2] := {4..8};
+		image[3] := {3..9};
+		image[4] := {2..10};
+		image[5] := {5..7};
+		image[6] := {5..7};
+		image[7] := {5..7};
+		image[8] := {5..7};
+		image[9] := {5..7};
+		image[10] := {5..7};
+		image[11] := {5..7};
+		image[12] := {5..7};
+		image[13] := {5..7};
+		image[14] := {};
+		downArrow := NewPattern(15, 15, image);
+		
+		image[0] := {0, 4, 8, 12};
+		image[1] := {};
+		image[2] := {2, 6, 10, 14};
+		image[3] := {};
+		image[4] := {0, 4, 8, 12};
+		image[5] := {};
+		image[6] := {2, 6, 10, 14};
+		image[7] := {};
+		image[8] := {0, 4, 8, 12};
+		image[9] := {};
+		image[10] := {2, 6, 10, 14};
+		image[11] := {};
+		image[12] := {0, 4, 8, 12};
+		image[13] := {};
+		image[14] := {2, 6, 10, 14};
+		image[15] := {};
+		grey0 := NewPattern(16, 16, image);
+		
+		image[0] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[1] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[2] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[3] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[4] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[5] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[6] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[7] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[8] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[9] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[10] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[11] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[12] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[13] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[14] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[15] := {1, 3, 5, 7, 9, 11, 13, 15};
+		grey1 := NewPattern(16, 16, image);
+		
+		image[0] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[1] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[2] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[3] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[4] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[5] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[6] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[7] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[8] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[9] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[10] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[11] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[12] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[13] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[14] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[15] := {2, 3, 6, 7, 10, 11, 14, 15};
+		grey2 := NewPattern(16, 16, image);
+		
+		image[0] := {0..2, 8..11};
+		image[1] := {0..2, 7..10};
+		image[2] := {0..2, 6..9};
+		image[3] := {0..2, 5..8};
+		image[4] := {0..2, 4..7};
+		image[5] := {0..6};
+		image[6] := {0..5};
+		image[7] := {0..4};
+		image[8] := {0..3};
+		image[9] := {0..2};
+		image[10] := {0, 1};
+		image[11] := {0};
+		hook := NewPattern(12, 12, image);
+		
+		image[0] := {7};
+		image[1] := {7};
+		image[2] := {2, 7, 12};
+		image[3] := {3, 7, 11};
+		image[4] := {4, 7, 10};
+		image[5] := {5, 7, 9};
+		image[6] := {6..8};
+		image[7] := {0..6, 8..14};
+		image[8] := {6..8};
+		image[9] := {5, 7, 9};
+		image[10] := {4, 7, 10};
+		image[11] := {3, 7, 11};
+		image[12] := {2, 7, 12};
+		image[13] := {7};
+		image[14] := {7};
+		star := NewPattern(15, 15, image);
+		
+		image[0] := {};
+		image[1] := {};
+		image[2] := {0};
+		image[3] := {};
+		image[4] := {};
+		image[5] := {};
+		image[6] := {};
+		image[7] := {};
+		image[8] := {};
+		image[9] := {};
+		image[10] := {};
+		image[11] := {};
+		image[12] := {};
+		image[13] := {};
+		image[14] := {};
+		image[15] := {};
+		ticks := NewPattern(16, 16, image);
+		
+		image[0] := -{};
+		image[1] := -{};
+		solid := NewPattern(16, 2, image);
+		
+	END CreatePatterns;
+	
+	PROCEDURE Depth*(X: INTEGER): INTEGER;
+	BEGIN
+		Kernel.WriteString("Depth(");  Kernel.WriteInt(X, 1);  Kernel.WriteString(") ");
+		RETURN 4
+	END Depth; 
+	
+	PROCEDURE DisplayBlock*(B:LONGINT; DX, DY, W, H, SX, SY, mode:INTEGER);
+	BEGIN
+		Kernel.WriteString("DisplayBlock(");  Kernel.WriteHex(B, 8);  Kernel.WriteChar(",");
+		Kernel.WriteInt(DX, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(DY, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(W, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(H, 1);  
+		Kernel.WriteChar(",");  Kernel.WriteInt(SX, 1);  Kernel.WriteChar(",");
+		Kernel.WriteInt(SY, 1);  Kernel.WriteChar(",");  Kernel.WriteInt(mode, 1);  
+		Kernel.WriteString(") ")
+	END DisplayBlock;
+
+BEGIN
+	Width := 640;
+	Height := 480;
+	Left:= 0;
+	ColLeft:= 0;
+	Bottom:= 0;
+	UBottom:= -330; 
+	Pat := NIL;
+	CreatePatterns;
+	Unit := 10000
+END Display.

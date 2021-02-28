@@ -1,0 +1,618 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaPrinter;	(* uh, Tue, 16-Nov-1993 *)
+
+	(* eos 21.Dec.95  removed Oberon.User and Oberon.Password (native version) *)
+	
+	(*---
+		special support for the Macintosh [search for MAC]:
+		_ implements the functionality of the printer port
+			for the standard printer
+		_ implements the output procedures for the standard printer
+		_ module will be called by the leda system when needed
+			to avoid a direct import of module Printer in the leda system
+	---*)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaIO, Display, Objects, Oberon, Printer, Pictures, Out;
+	
+CONST
+	Unit* = 3048;	(* LedaBase.Point * 72 DIV 300 *)
+  	DemoVersion = FALSE; (* jm. The demo version can only print 1 page *)
+	
+	ColSubDiv = 6;	(* subdivision of color range in black and white printing *)
+	LightColOff = MAX(INTEGER);
+	UnDefCol = MAX(INTEGER);
+	
+	ModName = "LedaPrinter";
+	NotDef = -1;	CharRange = 32;	(* used for String *)
+
+TYPE
+	String = POINTER TO StringDsc;
+	StringDsc = RECORD
+		next: String;
+		sep: CHAR;		(* separator after string *)
+		len, x, y, clr: INTEGER;
+		dY: LONGINT;	(* print ch: vertical offset *)
+		font: LedaBase.Control;	(* print ch: font *)
+		ctrl: LedaBase.PieceCtrl;	(* print own *)
+		c: ARRAY CharRange OF CHAR	(* characters *)
+	END;
+		(*---
+			- x, y:  absolute coordinates
+			- sep:  separator after string
+			- len = NotDef:  string element not used
+			- ctrl # NIL: own printing of control
+		--- *)
+		
+	Run = POINTER TO RunDsc;
+	RunDsc = RECORD
+		next, prev: Run;
+		x, y, w, h, col: INTEGER
+	END;
+		(*---
+			- x, y:  absolute coordinates
+			- col:  color of run
+		---*)
+		
+		
+VAR
+	string: String;	(* list of string elements used for PrtText *)
+	free: Run;	(* free list of runs; listed with field prev *)
+	curP: LedaSys.PrtPort;
+	Pict: Pictures.Picture;	(* current picture [used in picture support] *)
+	
+	pageCount: INTEGER; (* jm *)
+	
+	PROCEDURE Max(i1, i2: INTEGER): INTEGER;
+	BEGIN
+		IF i1 > i2 THEN RETURN i1 ELSE RETURN i2 END
+	END Max;
+	
+(*--- functionality of standard printer ---*)
+
+	(*---
+		- procedures of the device descriptor:
+			- they provide basic functionality for printing
+			- they use the printer interface of module Printer
+			- they provide an accurate color support
+		- procedures of the device control descriptor:
+			- they control the general printing process
+	---*)
+	
+	(*--- black and white support ---*)
+
+	PROCEDURE RGBToPatNr(red, green, blue: INTEGER; VAR pNr: INTEGER);
+	(* pNr: 0..ColSubdiv-1  [white, light ...dark, black] *)
+		CONST ColNrRange = 2550 DIV ColSubDiv;
+		VAR val: INTEGER;
+	BEGIN
+		pNr := 10 * 255 - 3 * red - 6 * green - blue;	(* 10 * 255 -> invert value *)
+		pNr := pNr DIV ColNrRange;
+		IF pNr >= ColSubDiv THEN pNr := ColSubDiv - 1 ELSIF pNr < 0 THEN pNr := 0 END
+	END RGBToPatNr;
+	
+	PROCEDURE *WriteBW(D: LedaSys.Device; X, Y: INTEGER; VAR s, fName: ARRAY OF CHAR; col, mode: INTEGER);
+	BEGIN
+		IF Printer.res # 0 THEN RETURN END;	(*###*)
+		IF D.col = UnDefCol THEN D.col := LedaSys.fg; (*-MAC-*) Printer.UseColor(0, 0, 0) (*-MAC-*) END; 
+		IF col # LedaSys.bg THEN Printer.String(X, Y, s, fName) END
+	END WriteBW;
+	
+	PROCEDURE *ReplConstBW(D: LedaSys.Device; X, Y, W, H, col, mode: INTEGER);
+	(* col < 0: take lighter rgb values *)
+		VAR red, green, blue, pNr: INTEGER;
+	BEGIN
+		IF Printer.res # 0 THEN RETURN END;	(*###*)
+		IF D.col = UnDefCol THEN D.col := LedaSys.fg; (*-MAC-*) Printer.UseColor(0, 0, 0) (*-MAC-*) END;
+		IF col < 0 THEN INC(col, LightColOff) END;	(* ignore lighter values *)
+		D.getColor(col, red, green, blue);
+		RGBToPatNr(red, green, blue, pNr);
+		IF pNr = ColSubDiv - 1 THEN Printer.ReplConst(X, Y, W, H)
+		ELSE Printer.ReplPattern(X, Y, W, H, LedaSys.prtPat[pNr])
+		END
+	END ReplConstBW;
+	
+	PROCEDURE *ReplPatternBW(D: LedaSys.Device; X, Y, W, H, col, pNr, mode: INTEGER);
+	BEGIN
+		IF Printer.res # 0 THEN RETURN END;	(*###*)
+		IF D.col = UnDefCol THEN D.col := LedaSys.fg; (*-MAC-*) Printer.UseColor(0, 0, 0) (*-MAC-*) END;
+		IF col # LedaSys.bg THEN
+			Printer.ReplPattern(X, Y, W, H, LedaSys.prtPat[pNr])
+		END
+	END ReplPatternBW;
+	
+	(*--- color support ---*)
+	
+	PROCEDURE SetColor(D: LedaSys.Device; col: INTEGER);
+	(* col < 0: take lighter rgb values *)
+		VAR r, g, b: INTEGER;
+	BEGIN
+		IF D.col # col THEN	(* change color *)
+			D.col := col;	(* new current vlaue *)
+			IF col < 0 THEN
+				D.getColor(col + LightColOff, r, g, b);
+				r := 128 + r DIV 2; g := 128 + g DIV 2; b := 128 + b DIV 2
+			ELSE D.getColor(col, r, g, b)
+			END;
+			(*-MAC-*)	Printer.UseColor(r, g, b)	(*-MAC-*)
+		END
+	END SetColor;
+	
+	PROCEDURE *WriteCol(D: LedaSys.Device; X, Y: INTEGER; VAR s, fName: ARRAY OF CHAR; col, mode: INTEGER);
+	BEGIN
+		IF Printer.res # 0 THEN RETURN END;	(*###*)
+		SetColor(D, col); Printer.String(X, Y, s, fName)
+	END WriteCol;
+	
+	PROCEDURE *ReplConstCol(D: LedaSys.Device; X, Y, W, H, col, mode: INTEGER);
+	BEGIN
+		IF Printer.res # 0 THEN RETURN END;	(*###*)
+		SetColor(D, col); Printer.ReplConst(X, Y, W, H)
+	END ReplConstCol;
+	
+	PROCEDURE *ReplPatternCol(D: LedaSys.Device; X, Y, W, H, col, pNr, mode: INTEGER);
+	BEGIN
+		IF Printer.res # 0 THEN RETURN END;	(*###*)
+		SetColor(D, col); Printer.ReplPattern(X, Y, W, H, LedaSys.prtPat[pNr])
+	END ReplPatternCol;
+	
+	(*--- picture support ---*)
+	
+	PROCEDURE *PictGetColor(col: INTEGER; VAR red, green, blue: INTEGER);
+	BEGIN
+		Pictures.GetColor(Pict, col, red, green, blue)
+	END PictGetColor;
+	
+	PROCEDURE *Picture(D: LedaSys.Device; X, Y, W, H: INTEGER; pict: Objects.Object; wdt, hgt, mode: INTEGER);
+	(* prints the picture P to the printer rectangle X, Y, W, H by scaling *)
+	(* the picture size given with wth and hgt to the printer rectangle *) 
+		CONST Shift = 20000H;	(* max device distance: MAX(LONGINT) DIV Shift *)
+		VAR trailer, run: Run;	scaleX, scaleY: LONGINT;	dvcGetColor: LedaSys.DvcColorProc;
+			x0, x, y, col, sCol: INTEGER;	colored: BOOLEAN;
+
+		PROCEDURE Scale(pixel, scale: LONGINT): INTEGER;
+		BEGIN
+			RETURN SHORT(pixel * scale DIV Shift)
+		END Scale;
+		
+		PROCEDURE PrintRun(VAR run: Run);
+			VAR red, green, blue: INTEGER;
+		BEGIN
+			run.w := Scale(run.x + run.w, scaleX); run.x := Scale(run.x, scaleX);	(* scale right and left *)
+			run.h := Scale(run.y + run.h, scaleY); run.y := Scale(run.y, scaleY);	(* scale top and bottom *)
+			DEC(run.w, run.x); DEC(run.h, run.y);		(* scaled width and height *)
+			IF (run.w > 0) & (run.h > 0) THEN	(* run visible *)
+				D.replConst(D, X + run.x, Y + run.y, run.w, run.h, run.col - LightColOff, mode)
+			END;
+			run.prev.next := run.next; run.next.prev := run.prev;	(* remove from run list *)
+			run.prev := free; free := run;				(* recycle printed run *)
+			run := run.next; free.next := NIL		(* advance in run list *)
+		END PrintRun;
+		
+		PROCEDURE InsertRun(run: Run; x, y, w, col: INTEGER);
+		(* inserts a new run before run *)
+			VAR r: Run;
+		BEGIN	(* x + w <= run.x *)
+			IF free # NIL THEN r := free; free := free.prev ELSE NEW(r) END;
+			r.x := x; r.y := y; r.w := w; r.h := 1; r.col := col;
+			r.next := run; r.prev := run.prev; run.prev.next := r; run.prev := r	(* add r to run list *)
+		END InsertRun;
+		
+		PROCEDURE EnlargeRun(trailer: Run; VAR run: Run; x, y, w, col: INTEGER);
+		BEGIN
+			WHILE (run # trailer) & (run.x < x) DO PrintRun(run) END;	(* print runs before x *)
+			IF run = trailer THEN InsertRun(run, x, y, w, col)
+			ELSIF (run.x = x) & (run.w = w) & (run.col = col) THEN INC(run.h); run := run.next	(* enlarge run height *)
+			ELSE	(* run.x >= x *)
+				WHILE (run # trailer) & (run.x < x + w) DO PrintRun(run) END;
+				InsertRun(run, x, y, w, col)
+			END
+		END EnlargeRun;
+
+	BEGIN
+		Pict := pict(Pictures.Picture);
+		IF (wdt > Pict.width) OR (hgt > Pict.height) THEN Pict := NIL; RETURN END;	(*###*)
+		dvcGetColor := D.getColor;	(* save method *)
+		D.getColor := PictGetColor;	(* set own method *)
+		scaleX := W * Shift DIV wdt; scaleY := H * Shift DIV hgt;
+		NEW(trailer); trailer.next := trailer; trailer.prev := trailer;
+		y := 0; colored := Pict.depth > 1;
+		WHILE y < hgt DO
+			x := 0; run := trailer.next;
+			WHILE x <  wdt DO
+				x0 := x; Pictures.GetRun(Pict, col, x, y);
+				IF x > wdt THEN x := wdt END;	(* clip to wdt *)
+				IF colored OR (col # LedaSys.bg) THEN EnlargeRun(trailer, run, x0, y, x-x0, col) END
+			END;
+			WHILE run # trailer DO PrintRun(run) END;
+			INC(y)
+		END;
+		run := trailer.next; WHILE run # trailer DO PrintRun(run) END;
+		D.getColor := dvcGetColor;	(* restore method *)
+		Pict := NIL
+	END Picture;
+	
+	(*--- print process support ---*)
+	
+	PROCEDURE InitDeviceDsc(VAR D: LedaSys.DeviceDsc);
+	BEGIN
+		(*-CERES-*)	D.depth := Printer.Depth;
+		(*-MAC-	D.depth := 1;	-MAC-*)
+		D.col := UnDefCol; D.getColor := Display.GetColor;
+		IF D.depth > 1 THEN	(* color printing *)
+			D.replConst := ReplConstCol;
+			D.replPattern := ReplPatternCol;
+			D.string := WriteCol
+		ELSE
+			D.replConst := ReplConstBW; 
+			D.replPattern := ReplPatternBW;
+			D.string := WriteBW
+		END;
+		D.picture := Picture
+	END InitDeviceDsc;
+
+	PROCEDURE InitPortData(VAR P: LedaSys.PrtPortDsc; pageW, pageH, mrgnX, mrgnY: LONGINT);
+		VAR prtW, prtH: INTEGER;
+	BEGIN
+		P.status := "";	(* no error *)
+		prtW := SHORT(LedaBase.WA4 DIV P.unit); prtH := SHORT(LedaBase.HA4 DIV P.unit);
+		P.deltaX := 0; P.deltaY := 0;	(* displacement because of smaller page size *)
+		IF pageW > LedaBase.WA4 THEN P.status := "width too large"; RETURN	(*###*)
+		ELSIF pageW < LedaBase.WA4 THEN P.deltaX := SHORT(((LedaBase.WA4 - pageW) DIV 2) DIV P.unit)
+		END;
+		IF pageH > LedaBase.HA4 THEN P.status := "height too large"; RETURN	(*###*)
+		ELSIF pageH < LedaBase.HA4 THEN P.deltaY := SHORT(((LedaBase.HA4 - pageH) DIV 2) DIV P.unit)
+		END;
+		P.refX := 0; P.refY := 0;
+		P.mrgnX := SHORT(mrgnX DIV P.unit); P.mrgnY := SHORT(mrgnY DIV P.unit);
+		(* printing frame -> page concidering displacement of the printer bitmap *)
+		IF mrgnX > 0 THEN P.fX := 0; P.fW := prtW - P.mrgnX
+		ELSIF mrgnX < 0 THEN P.fX := ABS(P.mrgnX); P.fW := prtW
+		ELSE P.fX := 0; P.fW := prtW
+		END;
+		IF mrgnY > 0 THEN P.fY := 0; P.fH := prtH - P.mrgnY
+		ELSIF mrgnY < 0 THEN P.fY := ABS(P.mrgnY); P.fH := prtH
+		ELSE P.fY := 0; P.fH := prtH
+		END
+	END InitPortData;
+
+	PROCEDURE *Open(P: LedaSys.Port; pageW, pageH, mrgnX, mrgnY: LONGINT);
+	BEGIN
+	    	pageCount := 0; (* jm *)
+		WITH P: LedaSys.PrtPort DO
+			Printer.Open(P.name, "" (*, Oberon.User, Oberon.Password*));	(* eos 21.Dec.95 *)
+			IF Printer.res # 0 THEN
+				IF Printer.res = 1 THEN P.status := "printer not found [busy ?]"
+				ELSIF Printer.res = 2 THEN P.status := "printer busy"
+				ELSIF Printer.res = 3 THEN P.status := "bad response"
+				ELSIF Printer.res = 4 THEN P.status := "no permission"
+				ELSE P.status := "printer not found"
+				END
+			ELSE	(* initialize P with the given values pageW, pageH, mrgnX, mrgnY *)
+				NEW(P.out); InitDeviceDsc(P.out^);
+				InitPortData(P^, pageW, pageH, mrgnX, mrgnY)
+			END
+		END
+	END Open;
+	
+	PROCEDURE *InitPage(P: LedaSys.Port; refX, refY: LONGINT);
+	BEGIN
+		WITH P: LedaSys.PrtPort DO
+			P.refX := refX; P.refY := refY
+		END
+	END InitPage;
+	
+	PROCEDURE *TermPage(P: LedaSys.Port; nbrOfCopies: INTEGER);
+	BEGIN
+		WITH P: LedaSys.PrtPort DO
+			IF P.status = "" THEN
+						INC(pageCount); (* jm *)
+						IF DemoVersion & (pageCount >= 2) THEN
+							RETURN
+						END;
+				Printer.Page(nbrOfCopies);
+				IF Printer.res = 1 THEN P.status := "timeout"
+				ELSIF Printer.res = 2 THEN P.status := "no link"
+				ELSIF Printer.res # 0 THEN P.status := "print error"
+				END
+			END
+		END
+	END TermPage;
+	
+	PROCEDURE *Close(P: LedaSys.Port);
+	BEGIN
+		Printer.Close
+	END Close;
+	
+	PROCEDURE SetPrinter*;
+	(** command called to create and install *)
+	(** printer port for the standard printer *)
+		VAR P: LedaSys.PrtPort;
+	BEGIN
+		NEW(P); P.unit := Unit;
+		P.name := ""; P.status := "";
+		P.X := 0; P.Y := 0; P.W := MAX(LONGINT); P.H := MAX(LONGINT);	(* unspecified area *)
+		P.out := NIL;	(* device procedures set in Open *)
+		(*- control of printing -*)
+		NEW(P.printer);
+		P.printer.open := Open;
+		P.printer.initPage := InitPage;
+		P.printer.termPage := TermPage;
+		P.printer.close := Close;
+		LedaSys.SetPrtPort(P)
+	END SetPrinter;
+	
+(*--- output procedures for the standard printer ---*)
+	
+	PROCEDURE DocToPrt*(P: LedaSys.Port; dX, dY: LONGINT; VAR X, Y: INTEGER);
+	(* returns in X, Y the print frame coordinates of dX, dY *)
+		VAR p: LedaSys.PrtPort;
+	BEGIN
+		p := P(LedaSys.PrtPort);
+		X  := SHORT((dX - p.refX) DIV p.unit); X  := X - p.mrgnX + p.deltaX;
+		Y := SHORT((LedaBase.HA4 - dY + p.refY) DIV p.unit); Y := Y - p.mrgnY + p.deltaY
+	END DocToPrt;
+	
+	PROCEDURE DocToPrtLen*(P: LedaSys.Port; dL: LONGINT; VAR L: INTEGER);
+	(* returns in L the print frame length of dL *)
+	BEGIN
+		L  := SHORT(dL DIV P.unit)
+	END DocToPrtLen;
+	
+	PROCEDURE PrtNotOk(P: LedaSys.Port; VAR p: LedaSys.PrtPort): BOOLEAN;
+	BEGIN
+		IF (P = NIL) OR ~ (P IS LedaSys.PrtPort) THEN RETURN TRUE END;	(*###*)
+		p := P(LedaSys.PrtPort); RETURN p.status # ""
+	END PrtNotOk;
+	
+	PROCEDURE PrtRect*(P: LedaSys.Port; X, Y, W, H, lineW: LONGINT; pNr, col, mode: INTEGER);
+	(** negative pattern number pNr -> uses a black pattern *)
+		VAR p: LedaSys.PrtPort;	x1, y1, x2, y2, w, h, l, d: INTEGER;	noBottom, noTop, noLeft, noRight: BOOLEAN;
+	BEGIN
+		IF PrtNotOk(P, p) THEN RETURN END;	(*###*)
+		DEC(W, p.unit); DEC(H, p.unit);	(* adjust W/H -> X+W/Y+H outside rectangle *)
+		DocToPrtLen(p, lineW + p.unit DIV 2, l);	(* l -> printer line width *)
+		IF l = 0 THEN d := 0; pNr := LedaSys.TxtrUp ELSE d := (l-1) DIV 2 END;	(* d -> half printer line width *)
+		DocToPrt(p, X, Y + H, x1, y1); DocToPrt(p, X + W, Y, x2, y2);
+		DEC(x1, d); DEC(y1, d); INC(x2, d); INC(y2, d);	(* x1/y1 and x2/y2 -> outermost points of rectangle *)
+		IF ~ ((x1 >= p.fX + p.fW) OR (y1 >= p.fY + p.fH) OR (x2 < p.fX) OR (y2 < p.fY)) THEN
+			noBottom := y1 < p.fY; IF noBottom THEN y1 := p.fY END;
+			noTop := y2 >= p.fY + p.fH; IF noTop THEN y2 := p.fY + p.fH - 1 END;
+			noLeft := x1 < p.fX; IF noLeft THEN x1 := p.fX END;
+			noRight := x2 >= p.fX + p.fW; IF noRight THEN x2 := p.fX + p.fW - 1 END;
+			w := x2 - x1 + 1; h := y2 - y1 + 1;		(* adjust w/h *)
+			IF pNr < 0 THEN
+				IF ~ noBottom THEN p.out.replConst(p.out, x1, y1, w, l, col, mode) END;
+				IF ~ noRight THEN p.out.replConst(p.out, x1 + w - l, y1 + l, l, h - 2*l, col, mode) END;
+				IF ~ noTop THEN p.out.replConst( p.out, x1, y1 + h - l, w, l, col, mode) END;
+				IF ~ noLeft THEN p.out.replConst( p.out, x1 , y1 + l, l, h - 2*l, col, mode) END
+			ELSE 
+				pNr := LedaSys.prtPat[pNr]; 
+				IF ~ noBottom THEN p.out.replPattern( p.out, x1, y1, w, l, col, pNr, mode) END;
+				IF ~ noRight THEN p.out.replPattern( p.out, x1 + w - l, y1, l, h - 2*l, col, pNr, mode) END;
+				IF ~ noTop THEN p.out.replPattern( p.out, x1, y1 + h - l, w, l, col, pNr, mode) END;
+				IF ~ noLeft  THEN p.out.replPattern( p.out, x1 , y1 + l, l, h - 2*l, col, pNr, mode) END
+			END
+		END;
+	END PrtRect;
+	
+	PROCEDURE PrtArea*(P: LedaSys.Port; X, Y, W, H: LONGINT; pNr, col, mode: INTEGER);
+	(** negative pattern number pNr -> uses a black pattern *)
+	(* negative color number col -> draw only on color display *)
+		VAR p: LedaSys.PrtPort;	x1, y1, x2, y2, w, h: INTEGER;
+	BEGIN
+		IF PrtNotOk(P, p) THEN RETURN END;	(*###*)
+		IF (W < p.unit) OR (H < p.unit) THEN	(* empty area *)
+		ELSE
+			DEC(W, p.unit); DEC(H, p.unit);	(* adjust W/H -> X+W/Y+H outside rectangle *)
+			DocToPrt(p, X, Y + H, x1, y1); DocToPrt(p, X + W, Y, x2, y2);
+			IF ~ ((x1 >= p.fX + p.fW) OR (y1 >= p.fY + p.fH) OR (x2 < p.fX) OR (y2 < p.fY)) THEN
+				IF y1 < p.fY THEN y1 := p.fY END;
+				IF y2 >= p.fY + p.fH THEN y2 := p.fY + p.fH - 1 END;
+				IF x1 < p.fX THEN x1 := p.fX END;
+				IF x2 >= p.fX + p.fW THEN x2 := p.fX + p.fW - 1 END;
+				w := x2 - x1 + 1; h := y2 - y1 + 1;		(* adjust w/h *)
+				IF col < 0 THEN col := - col END;
+				IF pNr < 0 THEN p.out.replConst(p.out, x1, y1, w, h, col - LightColOff, mode)
+				ELSE  p.out.replPattern(p.out, x1, y1, w, h, col - LightColOff, LedaSys.prtPat[pNr], mode)
+				END	(* - LightColOff:  take lighter rgb values *)
+			END
+		END
+	END PrtArea;
+	
+	PROCEDURE *PrtStretch(x, y, w, pNr, col, mode: INTEGER);
+		VAR d: INTEGER;
+	BEGIN
+		IF (y < curP.fY) OR (curP.fY + curP.fH <= y) THEN RETURN END;	(*### *)
+		IF (x + w <= curP.fX) OR (curP.fX + curP.fW <= x) THEN RETURN END;	(*###*)
+		IF x < curP.fX THEN d := curP.fX - x; x := curP.fX; DEC(w, d) END;
+		IF x + w > curP.fX + curP.fW THEN w := curP.fX + curP.fW - x END;
+		IF pNr < 0 THEN curP.out.replConst(curP.out, x, y, w, 1, col, mode)
+		ELSE curP.out.replPattern(curP.out, x, y, w, 1, col, LedaSys.prtPat[pNr], mode)
+		END
+	END PrtStretch;
+	
+	PROCEDURE PrtLine*(P: LedaSys.Port; X, Y, W, H, Width: LONGINT; dir, pNr, col, mode: INTEGER);
+	(** direction of drawing:  left to right; dir>=0: top_bottom / dir<0: bottom_top *)
+	(** negative pattern number pNr -> uses a black pattern *)
+		VAR p: LedaSys.PrtPort;	x1, y1, x2, y2, w, h, d, dt: INTEGER;
+	BEGIN
+		IF PrtNotOk(P, p) THEN RETURN END;	(*###*)
+		IF Width >= p.unit THEN DocToPrtLen(p, Width, d) ELSE d := 1; pNr := LedaSys.TxtrUp END;
+		IF W < 2 * p.unit THEN W := 0 ELSE DEC(W, p.unit) END;	(* adjust W -> X+W outside *)
+		IF H < 2 * p.unit THEN H := 0 ELSE DEC(H, p.unit) END;	(* adjust H -> Y+H outside *)
+		IF (W = 0) & (H = 0) THEN RETURN	(*###*)
+		ELSIF (W = 0) OR (H = 0) THEN	(* dir -> no meaning *)
+			DocToPrt(p, X, Y+H, x1, y1); DocToPrt(p, X+W, Y, x2, y2);
+			dt := (d-1) DIV 2; DEC(x1, dt);
+			IF W = 0 THEN DEC(y1, dt); INC(y2, dt); x2 := x1 + d - 1
+			ELSE INC(y2, dt); INC(x2, dt); y1 := y2 - d + 1
+			END;	(* x1, y1 and x2, y2 -> outermost points of line [area to fill] *)
+			IF ~ ((x2 < p.fX) OR (p.fX + p.fW <= x1) OR (y1 >= p.fY + p.fH) OR (y2 < p.fY)) THEN
+				IF y1 < p.fY THEN y1 := p.fY END;
+				IF y2 >= p.fY + p.fH THEN y2 := p.fY + p.fH - 1 END;
+				IF x1 < p.fX THEN x1 := p.fX END;
+				IF x2 >= p.fX + p.fW THEN x2 := p.fX + p.fW - 1 END;
+				w := x2 - x1 + 1; h := y2 - y1 + 1;	(* adjust w/h*)
+				IF pNr < 0 THEN p.out.replConst(p.out, x1, y1, w, h, col, mode)
+				ELSE p.out.replPattern(p.out, x1, y1, w, h, col, LedaSys.prtPat[pNr], mode)
+				END
+			END
+		ELSE
+			IF dir >= 0 THEN	(* top_bottom drawing *)
+				DocToPrt(p, X, Y, x1, y1); DocToPrt(p, X+W, Y+H, x2, y2)
+			ELSE	(* bottom_top drawing *)
+				DocToPrt(p, X, Y+H, x1, y1); DocToPrt(p, X+W, Y, x2, y2)
+			END;	(* x1, y1 and x2, y2 -> end_points  of line *)
+			curP := p; 
+			LedaSys.DrawLine(x1, y1, x2, y2, d, PrtStretch, pNr, col, mode);
+			curP := NIL
+		END;
+	END PrtLine;
+	
+	PROCEDURE NewString(x, y, clr: INTEGER; dY: LONGINT; font: LedaBase.Control; ctrl: LedaBase.PieceCtrl): String;
+		VAR s: String;	
+	BEGIN
+		IF string = NIL THEN
+			NEW(string); s := string; s.next := NIL
+		ELSE
+			s := string; WHILE (s.len # NotDef) & (s.next # NIL) DO s := s.next END;
+			IF s.len # NotDef THEN NEW(s.next); s := s.next; s.next := NIL END
+		END;	(* s -> new string element *)
+		s.len := 0; s.sep := 0X; s.x := x; s.y := y; s.clr := clr; 
+		s.dY := dY; s.font := font; s.ctrl := ctrl;
+		RETURN s
+	END NewString;
+	
+	PROCEDURE TermString(VAR s: String; sepKind: CHAR; last: BOOLEAN);
+	BEGIN
+		IF s = NIL THEN
+			IF (sepKind = LedaCtrl.GapSep) & ~ last THEN	(* add empty string for space adjustment *)
+				s := NewString(0, 0, 0, 0, NIL, NIL); s.sep := LedaCtrl.GapSep
+			END
+		ELSE s.c[s.len] := 0X;
+			IF (sepKind # LedaCtrl.GapSep) OR ~ last THEN s.sep := sepKind END
+		END;
+		s := NIL
+	END TermString;
+
+	PROCEDURE PrintStrings(p: LedaSys.PrtPort; blkw, strw, gaps, mode: INTEGER; blkAdj: CHAR);
+		VAR s: String;	fName: LedaSys.String;	dx, dy, pxInc, pxNbr, gapSpc, z: INTEGER;
+			M: LedaBase.PrintMsg;
+	BEGIN
+		pxInc := 0; pxNbr := 0; dx := 0;
+		IF CAP(blkAdj) = "C" THEN dx := Max(blkw - strw, 0) DIV 2
+		ELSIF CAP(blkAdj) = "R" THEN dx := Max(blkw - strw, 0)
+		ELSIF (CAP(blkAdj) = "A") & (gaps > 0) THEN		(* distribute  space to gaps *)
+			IF blkw > strw THEN
+				pxInc := (blkw - strw) DIV gaps; pxNbr := (blkw - strw) MOD gaps	(* enlarge every gap *)
+			ELSIF strw > blkw THEN
+				pxInc := -((strw - blkw) DIV gaps); pxNbr := -((strw - blkw) MOD gaps)	(* reduce every gap *)
+			END
+		END;
+		s := string; gapSpc := 0;
+		WHILE (s # NIL) & (s.len # NotDef) DO
+			IF s.len > 0 THEN	(* not empty *)
+				IF s.ctrl # NIL THEN	(* print own *)
+					M.id := 2; M.ch := s.c[0];
+					M.x := s.x + dx + gapSpc; M.y := s.y; M.mode := mode; M.p := p;	(* print own data *)
+					M.font := NIL; M.sepKind := LedaCtrl.NoSep; M.W := 0; M.last := FALSE;	(* print character data unused *)
+					s.ctrl.doOp(s.ctrl, M);
+					p.out.col := UnDefCol	(* to reset color before next printing *)
+				ELSIF s.font # NIL THEN
+					IF s.dY = 0 THEN dy := 0
+					ELSE dy := SHORT(ABS(s.dY) DIV p.unit); IF s.dY < 0 THEN dy := -dy END
+					END;
+					LedaBase.FntInfo(s.font(LedaBase.Font), 1, fName,  z);
+					p.out.string(p.out, s.x + dx + gapSpc, s.y + dy, s.c, fName, s.clr, mode)	(* print string *)
+				END
+			END;
+			IF s.sep = LedaCtrl.GapSep THEN INC(gapSpc, pxInc);
+				IF pxNbr > 0 THEN DEC(pxNbr); INC(gapSpc) ELSIF pxNbr < 0 THEN INC(pxNbr); DEC(gapSpc) END
+			END;
+			s.len := NotDef; s := s.next
+		END
+	END PrintStrings;
+	
+	PROCEDURE PrtText*(P: LedaSys.Port; X, Y: LONGINT;
+											VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block; mode: INTEGER);
+	(** prints block blk using mode mode; reader R is advanced about blk.len characters *)
+		VAR p: LedaSys.PrtPort;	M: LedaBase.PrintMsg;	ctrl: LedaBase.PieceCtrl;
+			s: String;	x, y, w, h, i, curx: INTEGER;
+	BEGIN
+		IF PrtNotOk(P, p) OR (blk.len = 0) THEN RETURN END;	(*###*)
+		DocToPrt(p, X, Y, x, y); DocToPrtLen(p, blk.H, h); DocToPrtLen(p, blk.W, w);
+		IF (p.fX <= x) & (x + w <= p.fX + p.fW) & (p.fY <= y) & (y + h <= p.fY + p.fH) THEN	(* inside *)
+			DocToPrtLen(p, - blk.bH, h); INC(y, h);	(* y -> base line *)
+			i := 0; curx := x; s := NIL;
+			M.x := -1; M.y := -1; M.mode := -1; M.p := NIL;	(* print own data unused *)
+			M.font := NIL; M.dY := 0; M.clr := LedaSys.fg;
+			LOOP
+				LedaCtrl.ReadChar(R, M.ch, ctrl); INC(i);
+				IF R.eot THEN TermString(s, LedaCtrl.NoSep, TRUE); EXIT END;		(*###*)
+				M.id := 0; M.sepKind := LedaCtrl.NoSep; M.W := 0; M.last := i = blk.len;
+				ctrl.doOp(ctrl, M);
+				IF M.id = 1 THEN		(* 1 = print character *)
+					IF s = NIL THEN s := NewString(curx, y, M.clr, M.dY, M.font, NIL)
+					ELSIF (M.dY # s.dY) OR (M.clr # s.clr) OR (M.font # s.font) THEN	(* attribute change *)
+						TermString(s, LedaCtrl.NoSep, M.last); s := NewString(curx, y, M.clr, M.dY, M.font, NIL)
+					END;
+					IF s.len = CharRange - 1 THEN
+						TermString(s, LedaCtrl.NoSep, FALSE); s := NewString(curx, y, M.clr, M.dY, M.font, NIL)
+					END;
+					s.c[s.len] := M.ch; INC(s.len)
+				ELSIF M.id = 2 THEN		(* 2 = print own *)
+					TermString(s, LedaCtrl.NoSep, FALSE);
+					s := NewString(curx, y, 0, 0, NIL, ctrl); s.c[s.len] := M.ch; INC(s.len);
+					TermString(s, M.sepKind, M.last)
+				ELSIF M.id = 3 THEN		(* 3 = do not print character*)
+					TermString(s, M.sepKind, M.last)
+				ELSE
+					LedaSys.Halt("print msg answer")
+				END;
+				INC(curx, SHORT(M.W DIV p.unit));
+				IF i = blk.len THEN TermString(s, M.sepKind, M.last); EXIT END		(*###*)
+			END;
+			PrintStrings(p, w, curx - x, blk.gaps, mode, blk.mode)	(* print strings *)
+		ELSE
+			LedaCtrl.SetReader(R, LedaCtrl.ReaderPos(R) + blk.len)	(* advance rider *)
+		END
+	END PrtText;
+
+	PROCEDURE Screen*;
+	(** direct the output to the main device [screen] -> is done in LedaIO *)
+	BEGIN
+	END Screen;
+	
+	PROCEDURE StdPrinter*;
+	(** sets the output procedures for the standard printer *)
+	BEGIN
+		LedaIO.out.rectangle := PrtRect;
+		LedaIO.out.area := PrtArea;
+		LedaIO.out.line := PrtLine;
+		LedaIO.out.text := PrtText;
+		(* out.erase, out.update, out.pattern, out.pos, out.caret, out.select:  not supported for printer *)
+	END StdPrinter;
+	
+BEGIN
+	LedaIO.IsOutHandler(ModName);
+	string := NIL; free := NIL; curP := NIL; Pict := NIL;
+	IF DemoVersion THEN
+		Out.String("This demo version of Leda only prints the first page."); Out.Ln;
+		Out.String("The complete Leda version can be ordered from"); Out.Ln;
+		Out.String("  A+L AG, Dƒderiz 61, CH-2540 Grenchen, Switzerland"); Out.Ln;
+		Out.String("  Tel. +41/65/52 03 11"); Out.Ln;
+		Out.String("  Fax. +41/65/52 03 79"); Out.Ln;
+	END
+END LedaPrinter.

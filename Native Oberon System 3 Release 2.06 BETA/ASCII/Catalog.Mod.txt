@@ -1,0 +1,215 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Catalog;	(* pjm 10.06.96 *)
+
+(** Generate a visual catalog of Gadgets. *)
+
+IMPORT Display, Display3, Objects, Oberon, Texts, Effects, Gadgets, Panels, Documents, Desktops, PanelDocs;
+
+VAR
+	methods*: Panels.Methods;	(** Catalog panel methods *)
+	
+PROCEDURE Integrate(f: Display.Frame);
+VAR C: Display.ConsumeMsg;
+BEGIN
+	C.id := Display.integrate; C.obj := f; C.F := NIL; Display.Broadcast(C)
+END Integrate;
+
+PROCEDURE Generate(F: Display.Frame);
+VAR a: Objects.AttrMsg;  f: Display.Frame;
+BEGIN
+	Objects.Stamp(a);  a.id := Objects.get;  a.name := "Gen";  a.res := -1;
+	F.handle(F, a);  ASSERT((a.res >= 0) (*& (a.class = Objects.String)*) );
+	f := Gadgets.CreateViewModel(a.s, "");
+	IF f # NIL THEN Integrate(f) END
+END Generate;
+
+PROCEDURE TrackChild(F: Display.Frame;  VAR M: Oberon.InputMsg;  px, py: INTEGER);
+VAR keysum: SET;  x, y, w, h: INTEGER;  Q: Display3.Mask;  on, in: BOOLEAN;
+	
+	PROCEDURE Flip;
+	VAR d: Display.DisplayMsg;
+	BEGIN
+		Oberon.RemoveMarks(x, y, w, h);  on := ~on;
+		IF on THEN
+			Display3.FillPattern(Q, Display3.red, Display3.selectpat, x, y, x, y-1, w, h, Display.paint)
+		ELSE
+			d.F := F;  d.id := Display.frame;  Display.Broadcast(d)
+		END
+	END Flip;
+	
+BEGIN
+	x := px+F.X;  y := py+F.Y;  w := F.W;  h := F.H;
+	Gadgets.MakeMask(F(Gadgets.Frame), x, y, M.dlink, Q);
+	M.res := 0;  keysum := M.keys;  on := FALSE;  Flip;
+	REPEAT
+		Effects.TrackMouse(M.keys, M.X, M.Y, Effects.Arrow);  keysum := keysum + M.keys;
+		in := Effects.Inside(M.X, M.Y, x, y, w, h);
+		IF (on & (M.keys = {})) OR (in # on) THEN Flip END
+	UNTIL M.keys = {};
+	IF in & (keysum = {1}) THEN Generate(F) END
+END TrackChild;
+
+(** TrackMouse - Mouse tracking method for Catalog panel *)
+
+PROCEDURE TrackMouse*(F: Panels.Panel;  VAR M: Oberon.InputMsg);
+VAR x, y: INTEGER;  c: Display.Frame;
+BEGIN
+	x := M.x + F.X;  y := M.y + F.Y;
+	IF M.keys = {1} THEN
+		c := Panels.ThisChild(F, x, y, M.X, M.Y);
+		IF c # NIL THEN TrackChild(c, M, x, y+F.H) END
+	END
+END TrackMouse;
+
+(** Handler - Handler for Catalog panel *)
+
+PROCEDURE Handler*(F: Objects.Object; VAR M: Objects.ObjMsg);
+BEGIN
+	WITH F: Panels.Panel DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF (M.id = Objects.get) & (M.name = "Gen") THEN
+					M.s := "Catalog.NewPanel";  M.class := Objects.String;  M.res := 0
+				ELSE Panels.PanelHandler(F, M)
+				END
+			END
+		ELSE Panels.PanelHandler(F, M)
+		END
+	END
+END Handler;
+
+(** InitPanel - Initialiser for Catalog panel *)
+
+PROCEDURE InitPanel*(F: Panels.Panel);
+BEGIN
+	Panels.InitPanel(F);  F.handle := Handler;  F.do := methods
+END InitPanel;
+
+(** NewPanel - Generator for Catalog panel *)
+
+PROCEDURE NewPanel*;
+VAR p: Panels.Panel;
+BEGIN
+	NEW(p);  InitPanel(p);  Objects.NewObj := p
+END NewPanel;
+
+PROCEDURE Place(list: Display.Frame;  space: INTEGER;  VAR width, height: INTEGER);
+VAR x, y, maxwidth: INTEGER;  this, prev: Display.Frame;
+BEGIN
+	height := 0;  width := Display.Width DIV 8 * 5;
+	maxwidth := 0;
+	x := space;  y := -space;	(* x,y is current top left pos *)
+	prev := list;  this := prev.slink(Display.Frame);
+	WHILE this # NIL DO
+		IF this.W + 2*space > width THEN	(* too wide, ignore *)
+			prev.slink := this.slink
+		ELSE
+			IF x + this.W + space > width THEN	(* skip to next line *)
+				x := space;  y := -height
+			END;
+			this.X := x;  this.Y := y-this.H;	(* bottom left corner *)
+			INC(x, this.W + space);
+			IF -this.Y + space > height THEN height := -this.Y + space END;
+			IF x > maxwidth THEN maxwidth := x END
+		END;
+		prev := this;
+		IF this.slink = NIL THEN this := NIL ELSE this := this.slink(Display.Frame) END
+	END;
+	width := maxwidth
+END Place;
+
+PROCEDURE MakePanel(list: Display.Frame;  space, width, height: INTEGER);
+VAR
+	p: Display.Frame;  mm: Display.ModifyMsg;  c: Display.ConsumeMsg;
+	d: Documents.Document;
+BEGIN
+		(* generate a panel document *)
+	NEW(d);  PanelDocs.InitDoc(d, width, height);
+	p := d.dsc;  InitPanel(p(Panels.Panel));	(* insert our functionality *)
+	d.name := "Catalog.Panel";
+		(* change size of panel *)
+	Objects.Stamp(mm);  mm.F := p;  mm.res := -1;
+	mm.id := Display.extend;  mm.mode := Display.state;
+	mm.X := p.X;  mm.Y := p.Y;  mm.W := width;  mm.H := height;
+	mm.dX := 0;  mm.dY := 0;  mm.dW := mm.W-p.W;  mm.dH := mm.H-p.H;
+	p.handle(p, mm);
+		(* drop list of gadgets into panel *)
+	Objects.Stamp(c);  c.F := p;  c.x := 0;  c.y := 0;  c.res := -1;
+	c.id := Display.drop;  c.u := space;  c.v := -height+space;  c.obj := list.slink;
+	p.handle(p, c);
+		(* display the document *)
+	Desktops.ShowDoc(d)
+END MakePanel;
+
+(** Open - Command to generate a new Catalog panel.  Parameter is a list of Gadget generators. *)
+
+PROCEDURE Open*;	(* {gen} ~ *)
+VAR
+	list, last, f: Display.Frame;  width, height: INTEGER;
+	s: Texts.Scanner;
+BEGIN
+	NEW(list);  list.slink := NIL;  last := list;
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);  Texts.Scan(s);
+	IF s.class # Texts.Name THEN
+		Oberon.OpenScanner(s, "Gadgets.Catalog")
+	END;
+	WHILE s.class = Texts.Name DO
+		f := Gadgets.CreateViewModel(s.s, "");
+		IF f # NIL THEN last.slink := f;  f.slink := NIL;  last := f END;
+		Texts.Scan(s)
+	END;
+	IF list.slink # NIL THEN
+		Place(list, 10, width, height);
+		MakePanel(list, 10, width, height)
+	END
+END Open;
+
+BEGIN
+	NEW(methods);  methods^ := Panels.methods^;
+	methods.TrackMouse := TrackMouse
+END Catalog.
+
+System.Free Catalog ~
+
+Catalog.Open ~
+
+Catalog.Open BasicGadgets.NewButton BasicGadgets.NewCheckBox BasicGadgets.NewSlider 
+	TextFields.NewTextField Views.NewView Icons.NewIcon Icons.NewIconizer Lists.NewList
+	ColorTools.NewColorPicker Panels.NewPanel NamePlates.NewNamePlate TextGadgets.New
+	TextGadgets.NewNote TextGadgets.NewControl TextGadgets.NewStyleProc TextFields.NewCaption
+	Navigators.NewNavigator NoteBooks.New Clocks.NewClock Clocks.NewDigiClock Clocks.NewCalendar
+	Organizers.NewPanel Sisiphus.New Outlines.New PanelDocs.NewDoc TextDocs.NewDoc Inspectors.NewDoc
+	Inspectors.NewDetailDoc RembrandtDocs.NewDoc TextDocs.NewLog TimeStamps.New Finder.NewDocList
+	BasicFigures.NewLine BasicFigures.NewCircle BasicFigures.NewRect BasicFigures.NewSpline ~
+
+Catalog.Open Views.NewView Lists.NewList Panels.NewPanel TextGadgets.New TextGadgets.NewNote NoteBooks.New 
+	BasicGadgets.NewButton BasicGadgets.NewCheckBox BasicGadgets.NewSlider TextFields.NewTextField Icons.NewIcon 
+	Icons.NewIconizer ColorTools.NewColorPicker NamePlates.NewNamePlate Clocks.NewClock Clocks.NewDigiClock 
+	Clocks.NewCalendar TimeStamps.New Finder.NewDocList BasicFigures.NewLine BasicFigures.NewCircle 
+	BasicFigures.NewRect BasicFigures.NewSpline ~
+	
+Catalog.Open BasicGadgets.NewButton BasicGadgets.NewCheckBox BasicGadgets.NewSlider TextFields.NewTextField 
+	Icons.NewIcon Icons.NewIconizer ColorTools.NewColorPicker NamePlates.NewNamePlate Clocks.NewClock 
+	Clocks.NewDigiClock Clocks.NewCalendar TimeStamps.New Finder.NewDocList BasicFigures.NewLine 
+	BasicFigures.NewCircle BasicFigures.NewRect BasicFigures.NewSpline ~
+	
+Catalog.Open BasicGadgets.NewButton BasicGadgets.NewCheckBox BasicGadgets.NewSlider ~
+
+Catalog.Open 
+	View ScrollView List Panel TextGadget NoteBook Organizer 
+	Slider Iconizer ColorPicker Button CheckBox TextField Icon NamePlate 
+	Clock DigitalClock Calendar TimeStamp Finder Navigator RefFrame SetFrame 
+	Line Circle Rectangle Rectangle3D Spline  
+~

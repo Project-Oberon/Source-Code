@@ -1,0 +1,378 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+(*
+ * Cybernetic entomology!
+ *  Remote Debugging Interface via serial RS232 link for standalone
+ *  applications like the Gneiss kernel
+ * de Villiers de Wet
+ *)
+
+MODULE RDIserial;
+
+IMPORT
+	Out, Files, SYSTEM, STP, Scope;
+
+CONST
+(* Error numbers
+	6600 eFileNotExist
+	6601 eMachineNotAvail
+	6602 eObjectTooBig
+	6603 eInitCodeCrash
+	6604 eTimeOut while loading
+	6605 eNotHalted
+	6606 eHaltAtBreakPoint
+	6607 eMayNotExecute
+	6608 Not enough memory
+	6609 Not implemented *)
+
+	TrapFlagBit = 8;
+	
+	(* Monitor operations *)
+	oRead = 1;
+	oWrite = 2;
+	oGetState = 3;
+	oSetState = 4;
+	oResume = 5;
+	
+TYPE	
+	BreakPoint = POINTER TO BreakPointDesc;
+	BreakPointDesc = RECORD
+		pc : LONGINT;
+		code : SHORTINT;	(* original byte of code at breakpoint *)
+		link : BreakPoint
+	END;
+	
+	TransHeader = RECORD
+	(* 124 bytes *)
+		operation,
+		returnCode,
+		adr, len : LONGINT;
+		state : Scope.StateDesc;
+		data : ARRAY 10 OF LONGINT
+	END;
+	
+VAR
+	gActive : BOOLEAN;
+	gBreakPointList : BreakPoint;
+	gMainCode : LONGINT;	(* address of main module's code *)
+	(* current breakpoint that was removed after the halt, 
+		before executing again. *)
+	gCurrentBP : BreakPoint;
+	gINT3 : SHORTINT;
+
+(* ---------------------------------------------------- *)
+PROCEDURE Resume() : LONGINT;
+VAR
+	h : TransHeader;
+	res, dummy : LONGINT;
+BEGIN
+	h.operation := oResume;
+	res := STP.Transaction(h, dummy, 0, h, dummy, dummy);
+	IF (res = 0) THEN res := h.returnCode END;
+	RETURN res
+END Resume;
+
+(* ---------------------------------------------------- *)
+PROCEDURE GetMachines*(
+	VAR machines : ARRAY OF ARRAY OF CHAR;
+	VAR num : LONGINT);
+BEGIN
+	COPY("com1", machines[0]);
+	COPY("com2", machines[1]);
+	COPY("com1.19200", machines[2]);
+	COPY("com2.19200", machines[3]);
+	COPY("com1.38400", machines[4]);
+	COPY("com2.38400", machines[5]);
+	COPY("com1.57600", machines[6]);
+	COPY("com2.57600", machines[7]);
+	COPY("com1.115200", machines[8]);
+	COPY("com2.115200", machines[9]);
+	num := 10
+END GetMachines;
+
+(* ---------------------------------------------------- *)
+PROCEDURE GetState* (VAR state : Scope.StateDesc) : LONGINT;
+VAR
+	h : TransHeader;
+	res, dummy : LONGINT;
+BEGIN
+	res := 0;
+	IF gActive THEN
+		h.operation := oGetState;
+		res := STP.Transaction(h, dummy, 0, h, dummy, dummy);
+		IF (res = 0) THEN res := h.returnCode END;
+		IF (res = 0) THEN state := h.state END
+	ELSE
+		HALT(100)
+	END;
+	RETURN res
+END GetState;
+
+(* ---------------------------------------------------- *)
+PROCEDURE SetState* (state : Scope.StateDesc) : LONGINT;
+VAR
+	h : TransHeader;
+	res, dummy : LONGINT;
+BEGIN
+	IF gActive THEN
+		h.operation := oSetState;
+		h.state := state;
+		res := STP.Transaction(h, dummy, 0, h, dummy, dummy);
+		IF (res = 0) THEN res := h.returnCode END;
+		RETURN res
+	ELSE
+		HALT(100)
+	END
+END SetState;
+
+(* ---------------------------------------------------- *)
+(* Reads values from the address space. *)
+PROCEDURE Read*(
+				adr : LONGINT;
+		VAR val : ARRAY OF SYSTEM.BYTE;
+				len : LONGINT) : LONGINT;
+VAR
+	h : TransHeader;
+	res, dummy : LONGINT;
+BEGIN
+	IF gActive THEN
+		h.operation := oRead;
+		h.adr := adr;
+		h.len := len;
+		res := STP.Transaction(h, dummy, 0, h, val, dummy);
+		IF (res = 0) THEN res := h.returnCode END;
+		RETURN res
+	ELSE
+		HALT(100)
+	END
+END Read;
+
+(* ---------------------------------------------------- *)
+(* Writes values to the VM's address space. *)
+PROCEDURE Write* (
+				adr : LONGINT;
+		VAR val : ARRAY OF SYSTEM.BYTE;
+				len : LONGINT) : LONGINT;
+VAR
+	h : TransHeader;
+	res, dummy : LONGINT;
+BEGIN
+	IF gActive THEN
+		h.operation := oWrite;
+		h.adr := adr;
+		h.len := len;
+		res := STP.Transaction(h, val, len, h, dummy, dummy);
+		IF (res = 0) THEN res := h.returnCode END;
+		RETURN res
+	ELSE
+		HALT(100)
+	END
+END Write;
+
+(* ---------------------------------------------------- *)
+(*  Initialises the relevant comm port, and global variables. *)
+PROCEDURE Init*(machine, object : ARRAY OF CHAR;
+								  mainCode : LONGINT) : LONGINT;
+VAR res : LONGINT;
+BEGIN
+	IF gActive THEN HALT(100) END;
+	IF (machine = "com1") THEN res := STP.Init(STP.COM1, 38400)
+	ELSIF (machine = "com2") THEN res := STP.Init(STP.COM2, 38400)
+	ELSIF (machine = "com1.19200") THEN res := STP.Init(STP.COM1, 19200)
+	ELSIF (machine = "com2.19200") THEN res := STP.Init(STP.COM2, 19200)
+	ELSIF (machine = "com1.38400") THEN res := STP.Init(STP.COM1, 38400)
+	ELSIF (machine = "com2.38400") THEN res := STP.Init(STP.COM2, 38400)
+	ELSIF (machine = "com1.57600") THEN res := STP.Init(STP.COM1, 57600)
+	ELSIF (machine = "com2.57600") THEN res := STP.Init(STP.COM2, 57600)
+	ELSIF (machine = "com1.115200") THEN res := STP.Init(STP.COM1, 115200)
+	ELSIF (machine = "com2.115200") THEN res := STP.Init(STP.COM2, 115200)
+	ELSE RETURN 6601 (* Machine not available *)
+	END;
+	IF (res # 0) THEN RETURN res END;
+	gMainCode := mainCode;
+	gCurrentBP := NIL;
+	NEW(gBreakPointList);
+	gBreakPointList.pc := -1; gBreakPointList.link := NIL;
+	gActive := TRUE;
+	RETURN 0
+END Init;
+
+(* ---------------------------------------------------- *)
+PROCEDURE SetBreakPoint*(pc : LONGINT) : LONGINT;
+VAR
+	state : Scope.StateDesc;
+	p : BreakPoint;
+	res : LONGINT;
+BEGIN
+	res := GetState(state); IF (res # 0) THEN RETURN res END;
+	IF (state.CS = 0) THEN RETURN 6605 (* Not halted *) END;
+	NEW(p);
+	p.pc := pc;
+	res := Read(pc, p.code, 1); IF (res # 0) THEN RETURN res END;
+	IF (p.code # gINT3) THEN
+		p.link := gBreakPointList.link; gBreakPointList.link := p;
+		res := Write(pc, gINT3, 1); IF (res # 0) THEN RETURN res END;
+	ELSE (* already a breakpoint there *)
+	END;
+	RETURN 0
+END SetBreakPoint;
+
+(* ---------------------------------------------------- *)
+PROCEDURE ClearBreakPoint*(pc : LONGINT) : LONGINT;
+VAR
+	state : Scope.StateDesc;
+	p : BreakPoint;
+	res : LONGINT;
+BEGIN
+	res := GetState(state); IF (res # 0) THEN RETURN res END;
+	IF (state.CS = 0) THEN RETURN 6605 (* Not halted *) END;
+	p := gBreakPointList;
+	WHILE (p.link # NIL) & (p.link.pc # pc) DO p := p.link END;
+	IF (p.link # NIL) THEN
+		res := Write(pc, p.link.code, 1); IF (res # 0) THEN RETURN res END;
+		IF (state.INT = 3) & (state.EIP-1 = pc) THEN
+			(* Program is currently halted at a breakpoint at this instruction *)
+			DEC(state.EIP);
+			res := SetState(state); IF (res # 0) THEN RETURN res END;
+			res := 6606; (* Halted at a breakpoint *)
+			gCurrentBP := p.link
+		END;
+		p.link := p.link.link;
+		RETURN res
+	END;
+	RETURN 0
+END ClearBreakPoint;
+
+(* ---------------------------------------------------- *)
+(* Continue execution. If step = TRUE the processor TRAP flag is set,
+	otherwise it is cleared. Returns error code - 0 if everything OK.
+	Execution may only continue after a user breakpoint. *)
+PROCEDURE Continue(step : BOOLEAN) : LONGINT;
+VAR
+	state : Scope.StateDesc;
+	p : BreakPoint;
+	res, error, x : LONGINT;
+BEGIN
+	res := GetState(state); IF (res # 0) THEN RETURN res END;
+	IF (state.CS = 0) THEN RETURN 6605 (* Not halted *) END;
+	IF (state.INT = 3) THEN
+		(* Check if halt was at a user breakpoint *)
+		p := gBreakPointList.link;
+		WHILE (p # NIL) & (p.pc # state.EIP-1) DO p := p.link END;
+		IF (p # NIL) THEN
+			(* Halted at a user breakpoint *)
+			DEC(state.EIP);
+			(* restore code *)
+			res := Write(p.pc, p.code, 1); IF (res # 0) THEN RETURN res END;
+			(* Set TRAP flag in FLAGS register *)
+			INCL(SYSTEM.VAL(SET, state.EFLAGS), TrapFlagBit);
+			res := SetState(state); IF (res # 0) THEN RETURN res END;
+			res := Resume(); IF (res # 0) THEN RETURN res END;
+			x := 100;
+			res := GetState(state); 
+			WHILE (res = 0) & (state.CS = 0) & (x # 0) DO
+				res := GetState(state);
+				DEC(x)
+			END;
+			IF (res # 0) THEN RETURN res END;
+			(* restore breakpoint *)
+			res := Write(p.pc, gINT3, 1); IF (res # 0) THEN RETURN res END
+		ELSIF (gCurrentBP # NIL) THEN
+			(* currently halted at a breakpoint that has been removed since *)
+		ELSIF (state.EIP  = gMainCode) THEN
+			(* This should only be true just after object was loaded, when
+				 halted at start of main module's code *)
+		ELSE	(* Assume it was an Oberon HALT() *)
+			res := Read(state.ESP, error, 4); IF (res # 0) THEN RETURN res END;
+			IF (error = MAX(INTEGER)) THEN
+				(* Compile-time breakpoint *)
+				INC(state.ESP, 4); (* MAX(INTEGER) was pushed onto stack *)
+				res := SetState(state);  IF (res # 0) THEN RETURN res END
+			ELSE
+				RETURN 6607 (* May not execute *)
+			END
+		END
+	ELSIF (state.INT # 1) THEN (* Debug interrupt = 1 - used for single stepping *)
+		RETURN 6607 (* May not execute *)
+	END;
+	IF step THEN
+		(* Check if TRAP flag is set. *)
+		IF (SYSTEM.VAL(SET, state.EFLAGS) * {TrapFlagBit} = {}) THEN
+			(* Set TRAP flag in FLAGS register *)
+			INCL(SYSTEM.VAL(SET, state.EFLAGS), TrapFlagBit);
+			res := SetState(state); IF (res # 0) THEN RETURN res END
+		END
+	ELSE (* execute *)
+		(* Check if TRAP flag is set (after a Step()). *)
+		IF (SYSTEM.VAL(SET, state.EFLAGS) * {TrapFlagBit} # {}) THEN
+			(* Clear TRAP flag in FLAGS register *)
+			EXCL(SYSTEM.VAL(SET, state.EFLAGS), TrapFlagBit);
+			res := SetState(state); IF (res # 0) THEN RETURN res END
+		END
+	END;
+	gCurrentBP := NIL;
+	RETURN Resume()
+END Continue;
+
+(* ---------------------------------------------------- *)
+PROCEDURE Step*() : LONGINT;
+BEGIN
+	RETURN Continue(TRUE)
+END Step;
+
+(* ---------------------------------------------------- *)
+PROCEDURE Execute*() : LONGINT;
+BEGIN
+	RETURN Continue(FALSE)
+END Execute;
+
+(* ---------------------------------------------------- *)
+PROCEDURE Terminate*() : LONGINT;
+VAR
+	state : Scope.StateDesc;
+	res : LONGINT;
+BEGIN
+	res := GetState(state);
+	IF res = 0 THEN
+		IF (state.CS = 0) THEN RETURN 6605 (* Not halted *) END;
+		STP.Close
+	END;
+	gActive := FALSE;
+	RETURN res
+END Terminate;
+
+(* ---------------------------------------------------- *)
+PROCEDURE Install*;
+BEGIN
+	Scope.InitRDI(GetMachines, GetState, SetState, Read, Write, Init,
+						SetBreakPoint, ClearBreakPoint, Step, Execute, Terminate);
+	Out.String("Installed RDIserial as RDI"); Out.Ln
+END Install;
+
+(* ---------------------------------------------------- *)
+PROCEDURE Close*;
+BEGIN
+	STP.Close
+END Close;
+
+(* ==================================================== *)
+BEGIN
+	Out.String("Remote Debugging Interface (Serial link)");
+	Out.Ln;
+	gINT3 := -52; (* 0CCH -> INT 3 = breakpoint *)
+	gMainCode := 0;
+	gActive := FALSE
+END RDIserial.
+
+(* ==================================================== *)

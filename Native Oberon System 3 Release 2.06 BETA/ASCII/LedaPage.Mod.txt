@@ -1,0 +1,1409 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaPage;	(* uh, Fri, 12-Nov-1993 *)
+	
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaBox, LedaIO, LedaOverlay;
+	
+CONST
+	ModName = "LedaPage";
+	TextName = "LedaText";
+	PlaneName = "LedaPlane";
+	Page = "page";
+	NotImpl = "not implemented";	ProgErr = "program error";
+	
+	(*--- private flags ---*)
+	DrawPlane = 16;	(* 12 <= private flags <= 30 *)
+	
+	Dist = 3 * LedaBase.MM;
+	
+	BoxTag = 0DDX;	DscTag = 0DEX;	EndTag = 0DFX;	(* tags for storing/loading *)
+	
+	HdgT = LedaBox.PgHeading;	FtrT = LedaBox.PgFooter;
+	
+	MargWFact = 50;	MargHFact = 120;	(* margin for page *)
+	
+	Black = -1;
+	
+	(*--- dialog ---*)
+	Stat = TRUE;	Dyn = FALSE;
+	Display = "display";	Hide = "hide";	Suppress = "suppress";
+	UnAvail = "unavailable";	Missing = "missing";
+	
+	
+TYPE
+	Location* = POINTER TO LocationDsc;
+	LocationDsc = RECORD
+		X*, Y*: LONGINT
+	END;
+	Size* = RECORD
+		X*, Y*, W*, H*: LONGINT;
+	END;
+	Lettering* = RECORD
+		state*: CHAR;	(* display/hide/suppress/missing *)
+		box*: LedaBase.Box	(* included in document tree if state = "d" *)
+	END;
+		(*---
+			- state: capital character --> no room for lettering
+			- difference capital - small letter: 20H
+			- integration of lettering in document tree:
+				- heading: first descender
+				- footer: last descender
+			- lettering only in document tree if visible [small character: state >= 60X]
+				and displayed [state = "d" ] 
+		---*)
+		
+	Box* = POINTER TO BoxDsc;
+	BoxDsc* = RECORD
+		(LedaBase.BoxDsc)
+		hdg*, ftr*: Lettering;	(* heading and footer *)
+		unplaced*: LedaBase.Box;	(* unplaced plane boxes *) 
+		pgNbr*: INTEGER;	(* page number *)
+		size*: Size;	(* size of new descenders; temporary used *)
+		selLoc*: Location;	(* selection point *)
+		addPg*: BOOLEAN
+	END;
+	
+	(*---
+		- structure of a page: 
+			[heading]  standard box  {overlapping image areas}  [footer]
+		- the descenders of a page are sorted according the above structure;
+		- the functionality of a descender is determined by its postion within this sequence
+		- the standard box may be overlapped by other image areas
+		- image areas overlapping the standard box are called planes
+		- every plane area is completly contained in the standard box area
+		- the standard box may not be completly covered by images
+		- LedaOverlay provides the basic functionality to handle overlapping boxes [planes];
+		- the overlay area [area of standard box] is divided into fields;
+			the size of a single field is: 
+			- horizontal: width of column [without column margin]
+			- vertical: line space decremented by a screen pixel
+		- the overlay depends on the following document attributes:
+			- number of columns
+			- margin between columns
+			- basic line spacing
+	---*)
+	
+
+VAR
+	recPlane: LedaBase.Box;	(* recall buffer for planes *)
+	addPg: RECORD
+		text: LedaCtrl.Text;
+		nbr: INTEGER
+	END;	(* temporary used in AddBoxes *)
+	(*--- box type control ---*)
+	typeDoOp: LedaBase.CtrlProc;
+	
+
+	PROCEDURE Msg(nr: INTEGER);
+	BEGIN
+		CASE nr OF
+		 0: LedaSys.OutT(" - ", 0); LedaSys.OutT(ModName, 0); LedaSys.OutT(".Load: content skipped", 1)
+		| 1: LedaSys.OutT(" - ", 0); LedaSys.OutT(ModName, 0); LedaSys.OutT(".Load: tag missing [descender]", 1)
+		| 2: LedaSys.OutT(" - no room for plane", 1)
+		| 3: LedaSys.OutT(" - no plane available; ", 1)
+		| 4: LedaSys.OutT(" - ", 0); LedaSys.OutT(ModName, 0); LedaSys.OutT(" missing or bad", 1)
+		| 5: LedaSys.OutT(" - ", 0); LedaSys.OutT(ModName, 0); LedaSys.OutT(".Load: unplaced plane skipped", 1)
+		| 6: LedaSys.OutT(" - ", 0); LedaSys.OutT(ModName, 0); LedaSys.OutT(".Load: tag missing [planes]", 1)
+		ELSE
+		END
+	END Msg;
+	
+(*--- utilities ---*)
+
+	PROCEDURE NewLn(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR);
+	BEGIN
+		a.typ := LedaBox.NewLn; a.stat := TRUE; a.i := 0;
+		IF s # "" THEN COPY(s, a.s) ELSE a.s := "" END
+	END NewLn;
+	
+	PROCEDURE StrAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Str; COPY(s, a.s); a.stat := stat; a.i := 0;
+	END StrAt;
+	
+	PROCEDURE IntAt(VAR a: LedaBox.ParaDsc; i: LONGINT; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Int; a.i := i; a.stat := stat; a.s := ""
+	END IntAt;
+	
+	PROCEDURE EnumAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; i: LONGINT);
+	BEGIN
+		a.typ := LedaBox.Enum; COPY(s, a.s); a.i := i
+	END EnumAt;
+	
+	PROCEDURE DisposeBox(box: LedaBase.Box);
+		VAR m: LedaBox.Msg;
+	BEGIN
+		LedaBox.Remove(box);	(* removes box from the document tree *)
+		m.id := LedaBox.BoxId; m.op := 7; m.caller := NIL; m.box1 := NIL; m.box2 := NIL;
+		box.do.handle(box, m)	(* dispose notification *)
+	END DisposeBox;
+	
+(*--- plane stuff ---*)
+
+	PROCEDURE GetNr(pB: Box; dsc: LedaBase.Box): INTEGER;
+		VAR box: LedaBase.Box;	nr: INTEGER;
+	BEGIN
+		box := pB.dsc; nr := 0;
+		WHILE (box # NIL) & (box # dsc) DO INC(nr); box := box.next END;
+		IF box = NIL THEN nr := 9999 END;
+		RETURN nr
+	END GetNr;
+	
+	PROCEDURE GetDsc(pB: Box; nr: INTEGER): LedaBase.Box;
+		VAR box: LedaBase.Box;
+	BEGIN
+		box := pB.dsc;
+		WHILE (box # NIL) & (nr > 0) DO DEC(nr); box := box.next END;
+		RETURN box
+	END GetDsc;
+	
+	PROCEDURE DscRemove(pB: Box; box: LedaBase.Box);
+	(* removes the box box from the descender list of page pB *)
+		VAR b: LedaBase.Box;
+	BEGIN
+		b := pB.dsc;
+		IF b = box THEN pB.dsc := box.next
+		ELSE
+			WHILE b.next # box DO b := b.next END; b.next := box.next
+		END;
+		box.next := NIL
+	END DscRemove;
+	
+	PROCEDURE DscInsertFirst(pB: Box; box: LedaBase.Box);
+	(* inserts the box box as first plane in the descender list of page pB *)
+		VAR b: LedaBase.Box;
+	BEGIN
+		b := pB.dsc; IF b = pB.hdg.box THEN b := b.next END;	(* b -> standard box *)
+		box.next := b.next; b.next := box; box.anc := pB
+	END DscInsertFirst;
+	
+	PROCEDURE DscInsertLast(pB: Box; box: LedaBase.Box);
+	(* inserts the box box as last plane in the descender list of page pB *)
+		VAR b: LedaBase.Box;
+	BEGIN
+		b := pB.dsc; WHILE (b.next # NIL) & (b.next # pB.ftr.box) DO b := b.next END;
+		box.next := b.next; b.next := box; box.anc := pB
+	END DscInsertLast;
+		
+	PROCEDURE SortPlanes(VAR o: LedaOverlay.Overlay; pB: Box);
+	(* sorts the ordering of the planes *)
+		VAR i: INTEGER;	s: ARRAY 48 OF INTEGER;	b: ARRAY 48 OF LedaBase.Box;
+	BEGIN
+		LedaOverlay.GetSequence(o, s);
+		i := 0; WHILE s[i] # -1 DO b[i] := GetDsc(pB, s[i]); INC(i) END;
+		WHILE i > 0 DO
+			DEC(i); IF b[i] # NIL THEN DscRemove(pB, b[i]); DscInsertFirst(pB, b[i]) END
+		END
+	END SortPlanes;
+
+	PROCEDURE InitOverlay(VAR o: LedaOverlay.Overlay; pB: Box; oW, oH: LONGINT; plane: LedaBase.Box);
+	(* initializes the overlay area for page pB; oW, oH: size of overlay area *)
+	(* adds the planes of page pB to the overlay except plane specified by plane *)
+		VAR box: LedaBase.Box;	stdX, stdY: LONGINT;	c0, c1, l0, l1, nr: INTEGER;
+	BEGIN	(* planes are contained in standard box *)
+		LedaOverlay.Init(o, pB, oW, oH);
+		box := pB.dsc; nr := 0;
+		IF box = pB.hdg.box THEN box := box.next; INC(nr) END;
+		stdX := box.X; stdY := box.Y; box := box.next; INC(nr);	(* skip standard box *)
+		WHILE (box # NIL) & (box # pB.ftr.box) DO
+			IF box # plane THEN
+				LedaOverlay.RecToField(o, box.X-stdX, box.Y-stdY, box.W, box.H, c0, c1, l0, l1);
+				LedaOverlay.Set(o, c0, c1, l0, l1, nr)	(* mark area as used *)
+			END;
+			box := box.next; INC(nr)
+		END
+	END InitOverlay;
+	
+	PROCEDURE DrawBox(box: LedaBase.Box; X, Y: LONGINT; P: LedaSys.Port);
+	(* draws the box box at coordinates X, Y *)
+	BEGIN
+		(* outside -> (X >= P.X + P.W) OR (X + box.W <= P.X) OR (Y >= P.Y + P.H) OR (Y + box.H <= P.Y) *)
+		IF (X - P.X < P.W) & (X + box.W > P.X) & (Y - P.Y < P.H) & (Y + box.H > P.Y) THEN	(* visible *)
+			box.do(LedaBase.BoxHandler).draw(box, X, Y, P)
+		END
+	END DrawBox;
+
+	PROCEDURE PlaneGet(pB: Box; VAR plane: LedaBox.Plane; std: LedaBase.Box; mask: BOOLEAN);
+	(* return plane for standard box std in plane; mask: set mask for plane *)
+		VAR box: LedaBase.Box;	P: LedaSys.Port;	eX, eY: LONGINT;
+	BEGIN
+		plane := NIL; P := NIL;
+		IF pB.dsc # NIL THEN
+			box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+			IF (box = std) & (box.next # NIL) & (box.next # pB.ftr.box) THEN	(* build plane for standard box *)
+				box := box.next; LedaBox.ExtRef(pB, eX, eY);
+				REPEAT
+					plane := LedaBox.PlaneNew(box.X-std.X, box.Y-std.Y, box.W, box.H, plane);
+					IF mask THEN
+						IF P = NIL THEN LedaBox.GetPort(pB, P) END;
+						LedaIO.out.mask(P, "-", eX + box.X, eY + box.Y, box.W, box.H)
+					END;
+					box := box.next
+				UNTIL (box = NIL) OR (box = pB.ftr.box)
+			END
+		END
+	END PlaneGet;
+	
+	PROCEDURE PlaneMask(pB: Box; std, ignore: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; VAR avail: BOOLEAN);
+	(* set mask for plane of standard box std and set avail if plane is available *)
+	(* exclude box ignore from the mask of the plane *)
+		VAR box: LedaBase.Box;
+	BEGIN
+		avail := FALSE;
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+		IF (box = std) & (box.next # NIL) & (box.next # pB.ftr.box) THEN	(* mask planes *)
+			box := box.next;
+			IF P = NIL THEN LedaBox.GetPort(pB, P); LedaBox.ExtRef(pB, eX, eY) END;
+			REPEAT
+				IF box # ignore THEN
+					LedaIO.out.mask(P, "-", eX + box.X, eY + box.Y, box.W, box.H); avail := TRUE
+				END;
+				box := box.next
+			UNTIL (box = NIL) OR (box = pB.ftr.box)
+		END
+	END PlaneMask;
+	
+	PROCEDURE PlaneDraw(pB: Box; std, plane: LedaBase.Box);
+	(* draw the standard box std and it's planes according parameter plane *)
+	(* plane = NIL: draw all plane boxes / plane # NIL: draw only plane box plane *)
+		VAR box: LedaBase.Box;	P: LedaSys.Port;	eX, eY: LONGINT;	mask: BOOLEAN;
+	BEGIN
+		INCL(pB.flags, DrawPlane);
+		LedaBox.GetPort(pB, P);
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+		IF (box # std) OR (LedaSys.DrawFlag IN P.state) THEN RETURN END;	(*###*)
+		LedaBox.ExtRef(pB, eX, eY);
+		LedaIO.FadeMarks(P);	(* previous drawing faded marks in port already *)
+		IF plane = NIL THEN
+			LedaIO.out.erase(P, eX+std.X, eY+std.Y, std.W, std.H);	(* clear plane area *)
+			PlaneMask(pB, std, NIL, eX, eY, P, mask);	(* no drawing in plane boxes [like column marks] *)
+			DrawBox(std, eX + std.X, eY + std.Y, P);
+			IF mask THEN LedaIO.out.mask(P, "R", 0, 0, 0, 0) END;	(* reset masks *)
+			box := box.next;	(* box -> first plane box *)
+			WHILE (box # NIL) & (box # pB.ftr.box) DO
+				DrawBox(box, eX + box.X, eY + box.Y, P); box := box.next
+			END
+		ELSE
+			PlaneMask(pB, std, plane, eX, eY, P, mask);	(* no clearing of plane boxes *)
+			LedaIO.out.erase(P, eX+std.X, eY+std.Y, std.W, std.H);	(* clear plane area *)
+			IF plane.anc = pB THEN mask := TRUE;
+				LedaIO.out.mask(P, "-", eX + plane.X, eY + plane.Y, plane.W, plane.H)
+			END;
+			INCL(P.state, LedaSys.NoClearFlag);	(* area already cleared *)
+			LedaIO.out.update(P, eX+std.X, eY+std.Y, std.W, std.H, std.do(LedaBase.BoxHandler).draw, std);
+			IF mask THEN LedaIO.out.mask(P, "R", 0, 0, 0, 0) END;	(* reset masks *)
+			IF plane.anc = pB THEN DrawBox(plane, eX + plane.X, eY + plane.Y, P) END
+		END
+	END PlaneDraw;
+	
+	PROCEDURE PlaneShowSel(box: LedaBase.Box; mode: SHORTINT; eX, eY: LONGINT; P: LedaSys.Port);
+	BEGIN
+		box.do(LedaBase.BoxHandler).mark(box, eX, eY, P, LedaBase.SelMark, mode)
+	END PlaneShowSel;
+	
+	PROCEDURE PlaneChange(pB: Box; VAR std: LedaBase.Box; plane: LedaBase.Box);
+	(* notification that the plane changed for standard box std *)
+	(* plane: plane box that cause change *)
+		VAR m: LedaBox.PlaneMsg;
+	BEGIN
+		IF std = NIL THEN
+			std := pB.dsc; IF std = pB.hdg.box THEN std := std.next END
+		END;
+		m.id := LedaBox.PlChange; m.plane := NIL; m.box := std; m.planeBox := plane;
+		std.do.handle(std, m)
+	END PlaneChange;
+	
+	PROCEDURE PlaneHeight(pB: Box; plane: LedaBase.Box);
+	(* handles the changed height attribute of plane box plane *)
+		VAR o: LedaOverlay.Overlay;	P: LedaSys.Port;	eX, eY: LONGINT;
+			box: LedaBase.Box;	c0, c1, l0, l1, v, r: INTEGER;	done: BOOLEAN;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;	(* box -> standard box *)
+		IF plane # box THEN
+			InitOverlay(o, pB, box.W, box.H, plane);
+			LedaOverlay.RecToField(o, plane.X-box.X, plane.Y-box.Y, plane.W, plane.H, c0, c1, l0, l1);
+			v := l1 - l0 + 1 + o.raster DIV 2; v := (v DIV o.raster) * o.raster; l1 := l0 + v - 1;
+			LedaOverlay.Place(o, c0, c1, l0, l1, done);
+			IF ~done THEN INCL(plane.flags, LedaBox.Height)	(* no change in height *)
+			ELSE
+				LedaOverlay.FieldToRec(o, c0, c1, l0, l1, pB.size.X, pB.size.Y, pB.size.W, pB.size.H);
+				INC(pB.size.X, box.X); INC(pB.size.Y, box.Y); plane.X := pB.size.X; plane.Y := pB.size.Y;
+				plane.do(LedaBase.BoxHandler).size(plane, pB.size.W, pB.size.H, pB, FALSE, r);	(* adjust size, no drawing *)
+				LedaOverlay.Set(o, c0, c1, l0, l1, GetNr(pB, plane));	(* mark area as used *)
+				SortPlanes(o, pB)
+			END;
+			EXCL(pB.flags, DrawPlane);	(* plane not drawn *)
+			PlaneChange(pB, box, plane)
+		ELSE
+			EXCL(pB.flags, DrawPlane)	(* to force redraw of page *)
+		END;
+		IF ~ (DrawPlane IN pB.flags) THEN PlaneDraw(pB, box, plane) END;
+		IF LedaBox.GetSel(plane, LedaBox.Self) = plane THEN	(* plane is still selected *)
+			LedaBox.GetPort(pB, P); LedaBox.ExtRef(pB, eX, eY);
+			PlaneShowSel(plane, LedaBase.On, plane.X + eX, plane.Y + eY, P)
+		END	
+	END PlaneHeight;
+	
+	PROCEDURE PlaneSetValues(plane: LedaBase.Box; cVal, lVal, wdtVal, hgtVal: BOOLEAN;
+										c, l, h, v: INTEGER; wdt, hgt: LONGINT);
+	(* send the specified plane values to the plane box plane *)
+		VAR m: LedaBox.PlaneMsg;
+	BEGIN
+		m.id := LedaBox.PlSetValue;
+		IF cVal THEN m.c := c ELSE m.c := -1 END;
+		IF lVal THEN m.l := l ELSE m.l := -1 END;
+		IF wdtVal THEN m.h := h; m.wdt := wdt ELSE m.h := -1; m.wdt := -1 END;
+		IF hgtVal THEN m.v := v; m.hgt := hgt ELSE m.v := -1; m.hgt := -1 END;
+		plane.do.handle(plane, m)
+	END PlaneSetValues;
+
+	PROCEDURE PlanePlaceUpdate(VAR o: LedaOverlay.Overlay; pB: Box; c0, c1, l0, l1: INTEGER;
+									plane, std: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port);
+	(* place the plane plane to the area [c0..c1], [l0..l1] on page pB *)
+	(* the overlay area and the text flow of the standard box will be updated *)
+		VAR m: LedaBox.PlaneMsg;	
+	BEGIN
+		LedaOverlay.Set(o, c0, c1, l0, l1, GetNr(pB, plane));	(* mark area as used *)
+		SortPlanes(o, pB);
+		(*- update overlay area -*)
+		EXCL(pB.flags, DrawPlane);	(* plane not drawn *)
+		PlaneChange(pB, std, plane);	(* notify standard box *)
+		IF ~ (DrawPlane IN pB.flags) THEN PlaneDraw(pB, std, plane) END;
+		IF (P # NIL) & (LedaBox.GetSel(plane, LedaBox.Self) = plane) THEN
+			PlaneShowSel(plane, LedaBase.On, plane.X + eX, plane.Y + eY, P)
+		END
+	END PlanePlaceUpdate;
+
+	PROCEDURE PlaneInsert(pB: Box; VAR o: LedaOverlay.Overlay; c0, c1, l0, l1: INTEGER; 
+									ref, std: LedaBase.Box; copy: BOOLEAN; P: LedaSys.Port);
+	(* inserts the box ref in the overlay at area [c0..c1], [l0..l1] in page pB *)
+	(* ref = NIL: create new plane box; ref # NIL & copy: insert a copy of the given box *)
+	(* ovX, ovY: offset of overlay area on page *)
+		VAR box: LedaBase.Box;	res: INTEGER;	done: BOOLEAN;
+	BEGIN
+		LedaOverlay.FieldToRec(o, c0, c1, l0, l1, pB.size.X, pB.size.Y, pB.size.W, pB.size.H);
+		INC(pB.size.X, std.X); INC(pB.size.Y, std.Y);	(* location on page *)
+		pB.addPg := FALSE; addPg.text := NIL; addPg.nbr := 1;
+		IF ref = NIL THEN
+			box := LedaBox.New(PlaneName, "", pB); IF box = NIL THEN Msg(4) END
+		ELSIF copy THEN
+			box := ref.do(LedaBase.BoxHandler).new(ref.do(LedaBase.BoxHandler), pB, ref)	(* duplicate *)
+		ELSE box := ref
+		END;
+		IF box = NIL THEN Msg(3)
+		ELSE
+			LedaBox.RemSel(pB, P); LedaBox.RemFoc(pB, P);
+			box.X := pB.size.X; box.Y := pB.size.Y;
+			DscInsertLast(pB, box);
+			IF (box.W # pB.size.W) OR (box.H # pB.size.H) THEN
+				box.do(LedaBase.BoxHandler).size(box, pB.size.W, pB.size.H, pB, FALSE, res)	(* adjust size, no drawing *)
+			END;
+			PlaneSetValues(box, TRUE, TRUE, TRUE, TRUE, c0, l0, c1-c0+1, l1-l0+1, pB.size.W, pB.size.H);
+			PlanePlaceUpdate(o, pB, c0, c1, l0, l1, box, std, -1, -1, NIL)
+		END
+	END PlaneInsert;
+
+	PROCEDURE PlaneNew(pB: Box; rX, rY: LONGINT; in: LedaBase.Box;
+													  eX, eY: LONGINT; P: LedaSys.Port);
+	(* insert new plane at location rX, rY; location is relative to page pB *)
+	(* in: box containing coordinates rX, rY [in # NIL] *)
+		VAR o: LedaOverlay.Overlay;	box: LedaBase.Box;	c0, c1, l0, l1: INTEGER;	done: BOOLEAN;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+		IF box = in THEN	(* in is standard box *)
+			InitOverlay(o, pB, box.W, box.H, NIL);
+			LedaOverlay.PointToField(o, rX-box.X, rY-box.Y, c0, l0); c1 := c0;	(* get field containing location *)
+			LedaOverlay.FitLine(o, l0); l1 := l0 + o.raster -1;	(* [c0..c1], [l0..l1]: area of new plane *)
+			LedaOverlay.Place(o, c0, c1, l0, l1, done);
+			IF ~done THEN Msg(2)
+			ELSE PlaneInsert(pB, o, c0, c1, l0, l1, NIL, in, FALSE, P)
+			END
+		END
+	END PlaneNew;
+
+	PROCEDURE PlaneMove(pB: Box; eX, eY: LONGINT; P: LedaSys.Port; plane, std: LedaBase.Box);
+	(* moves the plane box plane; std: standard box *)
+		VAR o: LedaOverlay.Overlay;	ml, mr, noMove, done: BOOLEAN;
+			W, H: LONGINT;	c0, c1, l0, l1, res: INTEGER;
+	BEGIN
+		InitOverlay(o, pB, std.W, std.H, plane);	(* adds planes without plane *)
+		LedaOverlay.RecToField(o, plane.X-std.X, plane.Y-std.Y, plane.W, plane.H, c0, c1, l0, l1);	(* fields occupied by plane *)
+		PlaneShowSel(plane, LedaBase.Off, plane.X+eX, plane.Y+eY, P);	(* unhighlight selection *)
+		LedaOverlay.TrackMoveArea(o, eX+std.X, eY+std.Y, P, c0, c1, l0, l1, ml, mr, noMove);
+		IF (ml & mr) OR noMove THEN
+			PlaneShowSel(plane, LedaBase.On, plane.X + eX, plane.Y + eY, P)
+		ELSIF ml OR mr THEN	(* copy plane *)
+			LedaOverlay.Place(o, c0, c1, l0, l1, done);
+			IF ~done THEN Msg(2); PlaneShowSel(plane, LedaBase.On, plane.X + eX, plane.Y + eY, P)
+			ELSE
+				PlaneInsert(pB, o, c0, c1, l0, l1, plane, std, TRUE, P);
+				IF LedaBox.GetSel(plane, LedaBox.Self) = plane THEN	(* plane is still selected *)
+					PlaneShowSel(plane, LedaBase.On, plane.X + eX, plane.Y + eY, P)
+				END
+			END
+		ELSE	(* plane moved *)
+			LedaBox.RemFoc(pB, P);
+			LedaOverlay.FieldToRec(o, c0, c1, l0, l1, plane.X, plane.Y, W, H);
+			INC(plane.X, std.X); INC(plane.Y, std.Y);
+			PlaneSetValues(plane, TRUE, TRUE, W # plane.W, H # plane.H, c0, l0, c1-c0+1, l1-l0+1, W, H);
+			IF (W # plane.W) OR (H # plane.H) THEN
+				plane.do(LedaBase.BoxHandler).size(plane, W, H, pB, FALSE, res)	(* adjust size, no drawing *)
+			END;
+			PlanePlaceUpdate(o, pB, c0, c1, l0, l1, plane, std, eX, eY, P)
+		END
+	END PlaneMove;
+
+	PROCEDURE PlaneSize(pB: Box; eX, eY: LONGINT; P: LedaSys.Port; plane, std: LedaBase.Box);
+	(* sizes the plane box  plane; std: standard box *)
+		VAR o: LedaOverlay.Overlay;	c0, c1, l0, l1, c, l, r: INTEGER;	mm, mr, noDH, noDV: BOOLEAN;
+	BEGIN
+		InitOverlay(o, pB, std.W, std.H, plane);	(* adds planes without plane *)
+		LedaOverlay.RecToField(o, plane.X-std.X, plane.Y-std.Y, plane.W, plane.H, c0, c1, l0, l1);	(* fields occupied by plane *)
+		c := c0; l := l0;
+		PlaneShowSel(plane, LedaBase.Off, plane.X+eX, plane.Y+eY, P);	(* unhgihglight selection *)
+		LedaOverlay.TrackSizeArea(o, eX+std.X, eY+std.Y, P, ~(LedaBox.Height IN plane.flags), c0, c1, l0, l1, mm, mr, noDH, noDV);
+		IF (mm & mr) OR (noDH & noDV) THEN
+			PlaneShowSel(plane, LedaBase.On, plane.X + eX, plane.Y + eY, P);
+		ELSE
+			LedaBox.RemFoc(pB, P);
+			LedaOverlay.FieldToRec(o, c0, c1, l0, l1, pB.size.X, pB.size.Y, pB.size.W, pB.size.H);
+			INC(pB.size.X, std.X); INC(pB.size.Y, std.Y); plane.X := pB.size.X; plane.Y := pB.size.Y;
+			plane.do(LedaBase.BoxHandler).size(plane, pB.size.W, pB.size.H, pB, FALSE, r);	(* adjust size, no drawing *)
+			PlaneSetValues(plane, c # c0, l # l0, ~noDH, ~noDV, c0, l0, c1-c0+1, l1-l0+1, pB.size.W, pB.size.H);
+			PlanePlaceUpdate(o, pB, c0, c1, l0, l1, plane, std, eX, eY, P)
+		END
+	END PlaneSize;
+	
+	PROCEDURE GetFocusInfo(foc: LedaBase.Box; VAR pB: Box; VAR X, Y: LONGINT);
+	(* returns the page containing the focus and the page relative coordinates of the focus *)
+		VAR box: LedaBase.Box;	m: LedaBox.Msg;	eX, eY: LONGINT;
+	BEGIN
+		box := foc; WHILE (box # NIL) & ~(box IS Box) DO box := box.anc END;
+		IF box = NIL THEN pB := NIL; X := 0; Y := 0
+		ELSE
+			pB := box(Box);
+			m.id := LedaBox.FocusId; m.op := 2; m.l1 := 0; m.l2 := 0;	(* get focus location *)
+			foc.do.handle(foc, m);
+			IF m.id = LedaBox.DoneId THEN
+				X := m.l1; Y := m.l2;	(* global coordinate of focus *)
+				LedaBox.ExtRef(pB, eX, eY); DEC(X, eX); DEC(Y, eY)
+			ELSE
+				box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;	(* standard box *)
+				X := box.X; Y := box.Y
+			END
+		END
+	END GetFocusInfo;
+	
+	PROCEDURE PlaneToFocus(foc, ref: LedaBase.Box; copy: BOOLEAN; P: LedaSys.Port; VAR done: BOOLEAN);
+	(* copies the plane given by ref according copy and inserts it at the given focus foc *)
+		VAR pB: Box;	box: LedaBase.Box;	o: LedaOverlay.Overlay;
+			rX, rY: LONGINT;	c0, c1, l0, l1, h, v: INTEGER;
+	BEGIN
+		GetFocusInfo(foc, pB, rX, rY);
+		IF pB # NIL THEN
+			box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;	(* standard box *)
+			InitOverlay(o, pB, box.W, box.H, NIL);
+			LedaOverlay.PointToField(o, rX-box.X, rY-box.Y, c0, l0);	(* get field containing location *)
+			LedaOverlay.AreaToField(o, c0, l0, ref.W, ref.H, ~(LedaBox.Height IN ref.flags), c1, l1);
+			LedaOverlay.Place(o, c0, c1, l0, l1, done);
+			IF ~done THEN Msg(2)
+			ELSE PlaneInsert(pB, o, c0, c1, l0, l1, ref, box, copy, P)
+			END
+		ELSE done := FALSE
+		END
+	END PlaneToFocus;
+	
+	PROCEDURE PlaneCopy(pB: Box; ref: LedaBase.Box);
+	(* copies the box ref to the focus *)
+		VAR box, foc: LedaBase.Box;	focP: LedaSys.Port;	done: BOOLEAN;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;	(* standard box *)
+		IF ref # box THEN
+			LedaBox.Focus(foc, focP);
+			IF foc # NIL THEN PlaneToFocus(foc, ref, TRUE, focP, done) END
+		END
+	END PlaneCopy;
+	
+	PROCEDURE PlaneRecall*(foc: LedaBase.Box; P: LedaSys.Port);
+	(* tries to insert the plane of the global recall buffer recPlane *)
+		VAR done: BOOLEAN;
+	BEGIN
+		IF recPlane # NIL THEN
+			PlaneToFocus(foc, recPlane, FALSE, P, done);
+			IF done THEN recPlane := NIL END
+		END
+	END PlaneRecall;
+	
+	PROCEDURE PutRecallBuf(box: LedaBase.Box);
+		VAR m: LedaBox.Msg;
+	BEGIN
+		IF recPlane # NIL THEN
+			m.id := LedaBox.BoxId; m.op := 7; m.caller := NIL; m.box1 := NIL; m.box2 := NIL;
+			recPlane.do.handle(recPlane, m)	(* dispose notification *)
+		END;
+		recPlane := box; LedaBase.Recall := PlaneRecall	(* to recall plane *)
+	END PutRecallBuf;
+	
+	PROCEDURE RemoveEmptyPages(pB: Box; VAR n: INTEGER);
+	(* removes empty pages [except first page] beginnig with page pB *)
+	(* returns in number of removed pages *)
+		VAR prev: Box;	box: LedaBase.Box;	m: LedaBox.Msg;
+	BEGIN
+		n := 0;
+		IF pB.next # NIL THEN RETURN END;
+		WHILE (pB # NIL) & (pB.anc.dsc # pB) DO
+			box := pB.anc.dsc; WHILE box.next # pB DO box := box.next END;
+			prev := box(Box);	(* previous page *)
+			box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+			IF (box.next = NIL) OR (box.next = pB.ftr.box) THEN	(* contains no planes *)
+				m.id := LedaBox.BoxId; m.op := 3; m.box1 := box;	(* 3 = check if m.box1 is empty *)
+				box.do.handle(box, m);
+				IF m.id = LedaBox.DoneId THEN	(* standard box is empty -> remove page *)
+					DisposeBox(box);
+					m.id := LedaBox.BoxId; m.op := 2; m.box1 := pB; m.box2 := pB.anc;	(* 2 = delete m.box1 *)
+					pB.anc.do.handle(pB.anc, m);	(* remove page *)
+					INC(n); pB := prev
+				ELSE pB := NIL	(* do stop *)
+				END
+			ELSE pB := NIL	(* do stop *)
+			END
+		END
+	END RemoveEmptyPages;
+	
+	PROCEDURE PlaneDelete(pB: Box; plane: LedaBase.Box; P: LedaSys.Port);
+	(* deletes the plane plane form the page pB *)
+		VAR box: LedaBase.Box;	n: INTEGER;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;	(* standard box *)
+		IF plane # box THEN
+			LedaBox.RemSel(pB, P); LedaBox.RemFoc(pB, P);
+			LedaBox.Remove(plane);
+			PutRecallBuf(plane);
+			RemoveEmptyPages(pB, n);
+			IF n = 0 THEN	(* no pages removed *)
+				EXCL(pB.flags, DrawPlane);	(* plane not drawn *)
+				PlaneChange(pB, box, plane);
+				IF ~ (DrawPlane IN pB.flags) THEN PlaneDraw(pB, box, plane) END
+			END
+		END
+	END PlaneDelete;
+	
+	PROCEDURE PlaneFit(VAR o: LedaOverlay.Overlay; plane: LedaBase.Box; rpX, rpY: LONGINT;
+											hAdj, vAdj: BOOLEAN; VAR c0, c1, l0, l1: INTEGER);
+	(* fits the given plane box plane to the overlay and returns the area needed in [c0..c1], [l0..l1] *)
+	(* rpX, rpY:  coordinates of plane box plane relative to overlay *)
+		VAR m: LedaBox.PlaneMsg;	W, H: LONGINT;	h, v, x: INTEGER;
+	BEGIN
+		IF hAdj OR vAdj THEN
+			m.id := LedaBox.PlGetValue; m.c := -1; m.l := -1;
+			m.h := -1; m.wdt := -1; m.v := -1; m.hgt := -1;
+			plane.do.handle(plane, m)	(* get original plane values *)
+		END;
+		IF hAdj & (m.c >= 0) THEN
+			c0 := m.c; IF c0 >= o.cols THEN c0 := o.cols - 1 END
+		ELSE LedaOverlay.PointToField(o, rpX + o.colW DIV 2, 0, c0, x)
+		END;
+		IF hAdj & (m.wdt > 0) THEN W := m.wdt ELSE W := plane.W END;
+		IF vAdj & (m.l >= 0) THEN
+			l0 := m.l; IF l0 >= o.lines THEN l0 := o.lines - 1 END
+		ELSE LedaOverlay.PointToField(o, 0, rpY, x, l0)
+		END;
+		IF vAdj & (m.v > 0) THEN H := m.v * o.lsp ELSE H := plane.H END;
+		LedaOverlay.AreaToField(o, c0, l0, W, H, ~(LedaBox.Height IN plane.flags), c1, l1)
+	END PlaneFit;
+
+	PROCEDURE CheckUnplaced(pB: Box; answer: BOOLEAN);
+		VAR uB: LedaBase.Box;	r: INTEGER;
+	BEGIN
+		uB := pB.unplaced; r := 0; WHILE uB # NIL DO INC(r); uB := uB.next END;
+		IF r > 0 THEN
+			LedaSys.OutT(" - page ", 0); LedaSys.OutI(pB.pgNbr, 0); LedaSys.OutT(": ", 0);
+			LedaSys.OutI(r, 0); LedaSys.OutT(" unplaced ", 0);
+			IF r > 1 THEN LedaSys.OutT("boxes", 1) ELSE LedaSys.OutT("box", 1) END
+		ELSIF answer THEN
+			LedaSys.OutT(" - page ", 0); LedaSys.OutI(pB.pgNbr, 0); LedaSys.OutT(": no unplaced boxes", 1)
+		END
+	END CheckUnplaced;
+
+	PROCEDURE InsertList(box: LedaBase.Box; VAR root: LedaBase.Box);
+	(* insert the box box to the list starting with root *)
+		VAR b: LedaBase.Box;
+	BEGIN
+		box.next := NIL; box.anc := NIL;
+		IF root = NIL THEN root := box
+		ELSE b := root; 
+			WHILE b.next # NIL DO b := b.next END;
+			b.next := box
+		END 
+	END InsertList;
+	
+	PROCEDURE RemoveList(box: LedaBase.Box; VAR root: LedaBase.Box);
+	(* remove box box from the list starting with root *)
+		VAR b: LedaBase.Box;
+	BEGIN
+		IF box = root THEN root := box.next
+		ELSE b := root;
+			WHILE (b # NIL) & (b.next # box) DO b := b.next END;
+			IF b # NIL THEN b.next := box.next END
+		END
+	END RemoveList;
+			
+	PROCEDURE PlanePut(VAR o: LedaOverlay.Overlay; plane: LedaBase.Box; pB: Box; c0, c1, l0, l1: INTEGER; stdX, stdY: LONGINT);
+	(* puts the plane box plane to the overlay at the given area [c0..c1], [l0..l1] *)
+		VAR r: INTEGER;
+	BEGIN
+		LedaOverlay.FieldToRec(o, c0, c1, l0, l1, pB.size.X, pB.size.Y, pB.size.W, pB.size.H);
+		INC(pB.size.X, stdX); INC(pB.size.Y, stdY);
+		IF (plane.W # pB.size.W) OR (plane.H # pB.size.H) THEN
+			plane.do(LedaBase.BoxHandler).size(plane, pB.size.W, pB.size.H, pB, FALSE, r)	(* adjust size, no drawing *)
+		END;
+		plane.X := pB.size.X; plane.Y := pB.size.Y;
+		LedaOverlay.Set(o, c0, c1, l0, l1, GetNr(pB, plane))	(* mark area as used *)
+	END PlanePut;
+	
+	PROCEDURE PlaneAdjustAreas(pB: Box; dX, dY: LONGINT; hAdj, vAdj: BOOLEAN);
+	(* adjust the plane areas according the given values *)
+		VAR box, uB, b, std: LedaBase.Box;	o: LedaOverlay.Overlay;
+			c0, c1, l0, l1, r: INTEGER;	done: BOOLEAN;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+		LedaOverlay.Init(o, pB, box.W, box.H); uB := NIL;	(* uB -> unplaced boxes *)
+		std := box; box := box.next;	(* skip standard box *)
+		WHILE (box # NIL) & (box # pB.ftr.box) DO
+			INC(box.X, dX); INC(box.Y, dY);
+			PlaneFit(o, box, box.X-std.X, box.Y-std.Y, hAdj, vAdj, c0, c1, l0, l1);
+			LedaOverlay.Place(o, c0, c1, l0, l1, done);
+			IF done THEN PlanePut(o, box, pB, c0, c1, l0, l1, std.X, std.Y); box := box.next
+			ELSE b := box; box := box.next;
+				LedaBox.Remove(b);	(* remove plane as descender *)
+				DEC(b.X, std.X); DEC(b.Y, std.Y); InsertList(b, uB)	(* put plane to list of unplaced boxes *)
+			END
+		END;
+		box := pB.unplaced;
+		WHILE box # NIL DO
+			PlaneFit(o, box, box.X, box.Y, hAdj, vAdj, c0, c1, l0, l1);
+			LedaOverlay.Place(o, c0, c1, l0, l1, done);
+			b := box; box := box.next;
+			IF ~ done THEN InsertList(b, uB)	(* put plane to list of unplaced boxes *)
+			ELSE
+				RemoveList(b, pB.unplaced);	(* remove plane from list of unplaced boxes *)
+				DscInsertLast(pB, b);	(* insert plane as last descender *)
+				PlanePut(o, b, pB, c0, c1, l0, l1, std.X, std.Y)
+			END
+		END;
+		pB.unplaced := uB; CheckUnplaced(pB, FALSE);
+		InitOverlay(o, pB, std.W, std.H, NIL);
+		SortPlanes(o, pB)
+	END PlaneAdjustAreas;
+	
+	PROCEDURE PlaneInsertHidden(pB: Box);
+	(* tries to insert unplaced boxes *)
+		VAR box, uB, b, std: LedaBase.Box;	o: LedaOverlay.Overlay;
+			c0, c1, l0, l1, r: INTEGER;	done, placed: BOOLEAN;
+	BEGIN
+		std := pB.dsc; IF std = pB.hdg.box THEN std := std.next END;
+		InitOverlay(o, pB, std.W, std.H, NIL);
+		box := pB.unplaced; uB := NIL; placed := FALSE;	(* uB -> unplaced boxes *)
+		WHILE box # NIL DO
+			PlaneFit(o, box, box.X, box.Y, TRUE, TRUE, c0, c1, l0, l1);
+			LedaOverlay.Place(o, c0, c1, l0, l1, done);
+			b := box; box := box.next;
+			IF ~ done THEN InsertList(b, uB)	(* put plane to list of unplaced boxes *)
+			ELSE placed := TRUE;
+				RemoveList(b, pB.unplaced);	(* remove plane from list of unplaced boxes *)
+				DscInsertLast(pB, b);	(* insert plane as last descender *)
+				PlanePut(o, b, pB, c0, c1, l0, l1, std.X, std.Y)
+			END
+		END;
+		pB.unplaced := uB; CheckUnplaced(pB, FALSE);
+		IF placed THEN
+			InitOverlay(o, pB, std.W, std.H, NIL);
+			SortPlanes(o, pB);
+			EXCL(pB.flags, DrawPlane);	(* plane not drawn *)
+			PlaneChange(pB, std, NIL);
+			IF ~ (DrawPlane IN pB.flags) THEN PlaneDraw(pB, std, NIL) END
+		END
+	END PlaneInsertHidden;
+	
+	PROCEDURE PlaneSort(pB: Box);
+		VAR o: LedaOverlay.Overlay;	box: LedaBase.Box;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;	(* box -> standard box *)
+		InitOverlay(o, pB, box.W, box.H, NIL);
+		SortPlanes(o, pB)
+	END PlaneSort;
+
+(*--- page stuff ---*)
+	
+	PROCEDURE LocateBox(pB: Box; rX, rY: LONGINT; VAR in, near: LedaBase.Box; VAR nx, ny: LONGINT);
+	(* locates the box containing or nearest to the relative coordinate rX, rY *)
+		VAR box: LedaBase.Box;	dx, dy, min: LONGINT;
+	BEGIN
+		box := pB.dsc; in := NIL; near := NIL; min := MAX(LONGINT);
+		WHILE box # NIL DO
+			dx := box.X - rX; dy := box.Y - rY;
+			IF dx <= 0 THEN IF ABS(dx) <  box.W THEN dx := 0 ELSE INC(dx, box.W) END END;
+			IF dy <= 0 THEN IF ABS(dy) <  box.H THEN dy := 0 ELSE INC(dy, box.H) END END;
+			IF (dx = 0) & (dy = 0) THEN in := box
+			ELSIF ABS(dx) + ABS(dy) < min THEN near := box;
+				nx := dx; ny := dy; min := ABS(dx) + ABS(dy)
+			END;
+			box := box.next
+		END
+	END LocateBox;
+	
+	PROCEDURE GetTypeArea(from, pB: LedaBase.Box;VAR X, Y, W, H: LONGINT);
+		VAR m: LedaBox.Msg;
+	BEGIN
+		m.id := LedaBox.SizeId; m.op := 2;	(* 2 = type area *)
+		m.l1 := pB.W DIV 6; m.l2 := pB.H DIV 8; m.l3 := m.l1 * 4; m.l4 := m.l2 * 6;	(* default values *)
+		IF from # NIL THEN from.do.handle(from, m) END;
+		X := m.l1; Y := m.l2; W := m.l3; H := m.l4
+	END GetTypeArea;
+	
+	PROCEDURE GetPageNbr(from, page: LedaBase.Box; VAR nbr: INTEGER);
+	(* asks the page number for page page *)
+		VAR m: LedaBox.Msg;
+	BEGIN
+		m.id := LedaBox.PageNbrId; m.op := 1; m.caller := page; m.l1 := -1;
+		LedaBox.GetInfo(from, m);
+		IF m.l1 >=0 THEN nbr := SHORT(m.l1) ELSE nbr := -1 END
+	END GetPageNbr;
+	
+	PROCEDURE EnlargeTop(doc: LedaBase.Box; VAR Y, H: LONGINT);
+		VAR m: LedaBox.PageMsg;
+	BEGIN
+		m.id := LedaBox.PgLettering; m.op := 4; m.typ := LedaBox.PgHeading;
+		m.Y := Y; m.H := 0; doc.do.handle(doc, m);
+		IF (m.Y < Y) & (m.H > 0) THEN INC(H, Y - m.Y); Y := m.Y END
+	END EnlargeTop;
+	
+	PROCEDURE EnlargeBot(doc: LedaBase.Box; Y: LONGINT; VAR H: LONGINT);
+		VAR m: LedaBox.PageMsg;
+	BEGIN
+		m.id := LedaBox.PgLettering; m.op := 4; m.typ := LedaBox.PgFooter;
+		m.Y := Y; m.H := 0; doc.do.handle(doc, m);
+		IF (m.Y >= Y + H) & (m.H > 0) THEN H := m.Y + m.H - Y END
+	END EnlargeBot;
+	
+	PROCEDURE AdjustToLine(pB: Box; VAR m: LedaBase.BoxMsg);
+		VAR box: LedaBase.Box;	eX, eY: LONGINT;
+	BEGIN	(* coordinates in message m relative to box pB *)
+		box := pB.dsc;
+		LOOP
+			IF (box.Y <= m.l1) & (m.l1 < box.Y + box.H) THEN
+				DEC(m.l1, box.Y); DEC(m.l2, box.Y);
+				box.do.handle(box, m);
+				INC(m.l1, box.Y); INC(m.l2, box.Y); EXIT	(*###*)
+			END;
+			box := box.next;
+			IF box = NIL THEN EXIT END	(*###*)
+		END;
+	END AdjustToLine;
+	
+	PROCEDURE AllocatePage(VAR pB: Box; bT: LedaBase.BoxType; flags: SET);
+	BEGIN
+		NEW(pB); LedaBox.Init(pB); 
+		pB.do := bT; pB.flags := flags;
+		pB.hdg.state := "m"; pB.hdg.box := NIL;
+		pB.ftr.state := "m"; pB.ftr.box := NIL;
+		pB.unplaced := NIL;
+		pB.pgNbr := -1;
+		pB.selLoc := NIL;
+		pB.addPg := FALSE
+	END AllocatePage;
+	
+	PROCEDURE EnlargeStdFlow(pB: Box; std: LedaBase.Box;
+								 text: LedaCtrl.Text; beg, len: LONGINT; VAR res: INTEGER);
+	(* enlarges the text flow of the standard box std; pour all text of stream text *)
+	(* adds pages as long unpoured text is available *)
+		VAR box, page: LedaBase.Box;	m: LedaBox.Msg;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+		IF (std = NIL) OR (box # std) THEN RETURN END;	(*###*)
+		pB.addPg := TRUE; addPg.text := text; addPg.nbr := pB.pgNbr + 1;
+		pB.size.W := pB.W; pB.size.H := pB.H;	(* same size for new pages *)
+		m.box1 := NIL; m.box2 := pB; m.l1 := LedaBox.After;
+		WHILE len > 0 DO
+			 page := pB.do(LedaBase.BoxHandler).new(pB.do(LedaBase.BoxHandler), pB, NIL);	(* create new page *)
+			 IF page # NIL THEN	 	(* add box to list of new pages *)
+			 	IF m.box1 = NIL THEN m.box1 := page ELSE box.next := page END;
+			 	box := page; page.next := NIL
+			 END;
+			 LedaCtrl.TextLen(LedaCtrl.UnpouredLen, addPg.text, len);
+			 INC(addPg.nbr)
+		END;
+		pB.addPg := FALSE; addPg.text := NIL; addPg.nbr := 1;
+		IF m.box1 # NIL THEN
+			m.id := LedaBox.BoxId; m.op := 1; pB.anc.do.handle(pB.anc, m)	(* 1 = insert pag(es) *)
+		END;
+		res := LedaBox.DoneId
+	END EnlargeStdFlow;
+	
+	PROCEDURE ReduceStdFlow(pB: Box; std: LedaBase.Box; VAR res: INTEGER);
+	(* reduces the text flow of the standard box std if possible *)
+	(* removes page if page contains no planes *)
+		VAR box, next: LedaBase.Box;	m: LedaBox.Msg;	Y, H: LONGINT;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+		IF (std = NIL) OR (box # std) THEN RETURN END;	(*###*)
+		IF (box.next = NIL) OR (box.next = pB.ftr.box) THEN	(* contains no planes *)
+			DisposeBox(std);	(* remove standard box *)
+			m.id := LedaBox.BoxId; m.op := 2; m.box1 := pB; m.box2 := pB.anc;	(* 2 = delete m.box1 *)
+			IF pB.anc # NIL THEN pB.anc.do.handle(pB.anc, m) END;	(* remove page *)
+			res := LedaBox.DoneId
+		END
+	END ReduceStdFlow;
+	
+	PROCEDURE RemovePage(pB: Box);
+		VAR box, next: LedaBase.Box;	m: LedaBox.Msg;
+	BEGIN
+		box := pB.dsc;
+		WHILE box # NIL DO
+			next := box.next; DisposeBox(box); box := next
+		END;
+		m.id := LedaBox.BoxId; m.op := 2; m.box1 := pB; m.box2 := pB.anc;	(* 2 = delete m.box1 *)
+		IF pB.anc # NIL THEN pB.anc.do.handle(pB.anc, m) END	(* remove page *)
+	END RemovePage;
+			
+	PROCEDURE StoreBox(VAR r: LedaBase.Rider; box: LedaBase.Box);
+	BEGIN
+		LedaBase.StoreVal(r, box.X); LedaBase.StoreVal(r, box.Y);
+		LedaBase.StoreVal(r, box.W); LedaBase.StoreVal(r, box.H);
+		LedaBase.StoreBox(r, box)
+	END StoreBox;
+	
+	PROCEDURE LoadBox(VAR r: LedaBase.Rider; pB: Box; VAR box: LedaBase.Box);
+	BEGIN
+		LedaBase.LoadVal(r, pB.size.X); LedaBase.LoadVal(r, pB.size.Y);
+		LedaBase.LoadVal(r, pB.size.W); LedaBase.LoadVal(r, pB.size.H);
+		LedaBase.LoadBox(r, pB, box);
+		IF box # NIL THEN
+			box.X := pB.size.X; box.Y := pB.size.Y; box.W := pB.size.W; box.H := pB.size.H
+		END
+	END LoadBox;
+	
+	PROCEDURE StoreLettering(VAR r: LedaBase.Rider; pB: Box; VAR ltr: Lettering);
+		VAR box: LedaBase.Box;	i: INTEGER;
+	BEGIN
+		LedaBase.Store(r, ltr.state);
+		IF ltr.state = "m" THEN	(* no lettering available *)
+		ELSIF ltr.state # "d" THEN StoreBox(r, ltr.box)
+		ELSE
+			i := 1; box := pB.dsc;
+			WHILE (box # NIL) & (box # ltr.box) DO box := box.next; INC(i) END;	(* search ltr.box *)
+			IF box = NIL THEN i := MAX(INTEGER) END;
+			LedaBase.StoreI(r, i)
+		END
+	END StoreLettering;
+	
+	PROCEDURE LoadLettering(VAR r: LedaBase.Rider; pB: Box; VAR ltr: Lettering);
+		VAR box: LedaBase.Box;	i: INTEGER;
+	BEGIN
+		LedaBase.Load(r, ltr.state);
+		IF ltr.state = "m" THEN	(* no lettering available *)
+		ELSIF ltr.state # "d" THEN LoadBox(r, pB, ltr.box)
+		ELSE
+			LedaBase.LoadI(r, i); box := pB.dsc;
+			WHILE (i > 1) & (box # NIL) DO box := box.next; DEC(i) END;	(* search ltr.box *)
+			IF box = NIL THEN ltr.state := "m" END;
+			ltr.box := box
+		END
+	END LoadLettering;
+	
+	PROCEDURE InvalLettering(pB: Box; VAR ltr: Lettering);
+	(* invalidate lettering: lettering becomes invisible [state described by capital character] *)
+	BEGIN
+		IF ltr.state = "d" THEN LedaBox.Remove(ltr.box) END;	(* remove from document tree *)
+		IF ltr.state >= 60X THEN ltr.state := CHR(ORD(ltr.state) - 20H) END	(* convert to capital letter *)
+	END InvalLettering;
+	
+	PROCEDURE SetLettering(pB: Box; VAR ltr: Lettering; ltrBox: LedaBase.Box; noroom: BOOLEAN; insKind: SHORTINT);
+	(* sets the lettering ltr to box box in data structure [no drawing] *)
+	BEGIN	(* location and size of ltrBox set *)
+		IF ltr.state = "d" THEN LedaBox.Remove(ltr.box) END;	(* remove from document tree *)
+		IF ltr.state < 60X THEN ltr.state := CHR(ORD(ltr.state) + 20H) END;	(* convert to small letter *)
+		IF ltr.state = "m" THEN ltr.state := "d" END;	(* no lettering available up to now *)
+		IF noroom THEN ltr.state := CHR(ORD(ltr.state) - 20H) END;	(* convert to capital letter *)
+		ltrBox.anc := pB; 
+		ltr.box := ltrBox;
+		IF ltr.state = "d" THEN LedaBox.Insert(ltrBox, pB, insKind) END
+	END SetLettering;
+	
+	PROCEDURE ChangeLettering(pB: Box; VAR ltr: Lettering; insKind: SHORTINT; state: CHAR; VAR doDraw, doMarg: CHAR);
+	(* changes the state of lettering ltr to state; returns in needed actions in doMarg and doDraw *)
+	BEGIN
+		doDraw := 0X; doMarg := 0X;	(* no actions *)
+		IF (ltr.state >= 60X) & (ltr.state # "m") & (state # 0X) THEN
+			IF state = ltr.state THEN
+				IF state = "s" THEN doMarg := "e" END
+			ELSIF state = "s" THEN	(* ltr.state: "d" or "h" *)
+				doMarg := "E";
+				IF ltr.state = "d" THEN LedaBox.Remove(ltr.box) END	(* remove from document tree *)
+			ELSIF ltr.state = "s" THEN	(* state: "d" or "h" *)
+				doMarg := "R";
+				IF state = "d" THEN doDraw := "D"; LedaBox.Insert(ltr.box, pB, insKind) END	(* insert in document tree *)
+			ELSIF state = "d" THEN	(* ltr.state = "h" *)
+				doDraw := "D"; LedaBox.Insert(ltr.box, pB, insKind)	(* insert in document tree *)
+			ELSIF state = "h" THEN	(* ltr.state = "d" *)
+				doDraw := "X"; LedaBox.Remove(ltr.box)	(* remove from document tree *)
+			ELSE LedaSys.Halt(ProgErr)
+			END;
+			ltr.state := state
+		END
+	END ChangeLettering;
+	
+	PROCEDURE SetStdArea(pB: Box; X, Y, W, H : LONGINT; VAR dX, dY: LONGINT);
+	(* sets the size and location of the standard area *)
+		VAR box: LedaBase.Box;	res: INTEGER;
+	BEGIN
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;	(* box -> standard box *)
+		dX := X - box.X; dY := Y - box.Y;
+		IF (box.H # H) OR (box.W # W) THEN		(* set size, no drawing *)
+			box.do(LedaBase.BoxHandler).size(box, W, H, pB, FALSE, res)
+		END;
+		box.X := X; box.Y := Y
+	END SetStdArea;
+	
+	PROCEDURE SizeStdArea(pB: Box; topExt, botExt: BOOLEAN);
+	(* sizes the standard area according topExt and botExt vertically *)
+		VAR X, Y, W, H, dX, dY: LONGINT;
+	BEGIN
+		GetTypeArea(LedaBox.Root(pB), pB, X, Y, W, H);
+		IF topExt THEN EnlargeTop(pB.anc, Y, H) END;
+		IF botExt THEN EnlargeBot(pB.anc, Y, H) END;
+		SetStdArea(pB, X, Y, W, H, dX, dY);
+		PlaneAdjustAreas(pB, dX, dY, FALSE, FALSE)
+	END SizeStdArea;
+
+	PROCEDURE ValidateAttr(VAR hdrState, ftrState: CHAR; VAR a: LedaBox.Attributes): BOOLEAN;
+	(* scans the attributes a and sets hdrState and ftrState accordingly *)
+	BEGIN
+		IF a[0].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)	(* heading state *)
+		IF a[0].s = Display THEN hdrState := "d"
+		ELSIF a[0].s = Hide THEN hdrState := "h"
+		ELSIF a[0].s = Suppress THEN hdrState := "s"
+		ELSE hdrState := 0X
+		END;
+		IF a[1].s = Display THEN ftrState := "d"
+		ELSIF a[1].s = Hide THEN ftrState := "h"
+		ELSIF a[1].s = Suppress THEN ftrState := "s"
+		ELSE ftrState := 0X
+		END;
+		RETURN (hdrState # 0X) OR (ftrState # 0X)
+	END ValidateAttr;
+	
+	PROCEDURE GetAttributes(pB: Box; VAR M: LedaBox.AttributeMsg);
+	(* specifies the attributes of page pB in the attribute message M *)
+		VAR n, i: INTEGER;	ch: CHAR;
+	BEGIN
+		IF pB.selLoc # NIL THEN
+			M.name := Page;
+			NewLn(M.a[0], "heading"); n := 1; ch := pB.hdg.state;
+			IF ch < 60X THEN StrAt(M.a[n], UnAvail, Stat); INC(n)	(* top margin too small *)
+			ELSIF ch = "m" THEN StrAt(M.a[n], Missing, Stat); INC(n)
+			ELSE
+				IF ch = "h" THEN i := 1 ELSIF ch = "s" THEN i := 2 ELSE i := 0 END;
+				EnumAt(M.a[n], "-|-|-", i); INC(n); StrAt(M.a[n], Display, Stat); INC(n);
+				StrAt(M.a[n], Hide, Stat); INC(n); StrAt(M.a[n], Suppress, Stat); INC(n)
+			END;
+			NewLn(M.a[n], "footer"); INC(n); ch := pB.ftr.state;
+			IF ch < 60X THEN StrAt(M.a[n], UnAvail, Stat); INC(n)	(* bottom margin too small *)
+			ELSIF ch = "m" THEN StrAt(M.a[n], Missing, Stat); INC(n)
+			ELSE
+				IF ch = "h" THEN i := 1 ELSIF ch = "s" THEN i := 2 ELSE i := 0 END;
+				EnumAt(M.a[n], "-|-|-", i); INC(n); StrAt(M.a[n], Display, Stat); INC(n);
+				StrAt(M.a[n], Hide, Stat); INC(n); StrAt(M.a[n], Suppress, Stat); INC(n)
+			END;
+			M.nbr := n
+		END
+	END GetAttributes;
+
+	PROCEDURE SetAttributes(pB: Box; VAR M: LedaBox.AttributeMsg);
+	(* scans the attribute message M and set the attributes of page pB accordingly *)
+		VAR hdgState, ftrState, hdgDraw, ftrDraw, topMarg, botMarg: CHAR;
+			X, Y, eX, eY: LONGINT;	box: LedaBase.Box;
+	BEGIN
+		IF (pB.selLoc # NIL) & (M.name = Page) THEN
+			IF (M.nbr = 2) & ValidateAttr(hdgState, ftrState, M.a) THEN	(* adjust attributes of pB *)
+				ChangeLettering(pB, pB.hdg, LedaBox.FirstDsc, hdgState, hdgDraw, topMarg);	(* heading *)
+				ChangeLettering(pB, pB.ftr, LedaBox.LastDsc, ftrState, ftrDraw, botMarg);	(* footer *)
+				IF LedaSys.EqualCh("ER", topMarg) OR  LedaSys.EqualCh("ER", botMarg) THEN
+					INCL(M.P.state, LedaSys.DrawFlag);	(* redraw all *)
+					SizeStdArea(pB, CAP(topMarg) = "E", CAP(botMarg) = "E");
+					box := NIL; PlaneChange(pB, box, NIL)
+				ELSE
+					LedaBox.ExtRef(pB, eX, eY);
+					LedaBox.RemFoc(pB, M.P);
+					pB.do(LedaBase.BoxHandler).mark(pB, eX, eY, M.P, LedaBase.SelMark, LedaBase.Off);	(* unhighlighte selection *)
+					IF hdgDraw # 0X THEN
+						box := pB.hdg.box; X := eX + box.X; Y := eY + box.Y;
+						IF hdgDraw = "X" THEN LedaIO.out.erase(M.P, X, Y, box.W, box.H)
+						ELSIF hdgDraw = "D" THEN box.do(LedaBase.BoxHandler).draw(box, X, Y, M.P)
+						END
+					END;
+					IF ftrDraw # 0X THEN
+						box := pB.ftr.box; X := eX + box.X; Y := eY + box.Y;
+						IF ftrDraw = "X" THEN LedaIO.out.erase(M.P, X, Y, box.W, box.H)
+						ELSIF ftrDraw = "D" THEN box.do(LedaBase.BoxHandler).draw(box, X, Y, M.P)
+						END
+					END;
+					pB.do(LedaBase.BoxHandler).mark(pB, eX, eY, M.P, LedaBase.SelMark, LedaBase.On);	(* highlighte selection *)
+				END
+			END
+		END
+	END SetAttributes;
+	
+	PROCEDURE SelectPage(pB: Box; locX, locY: LONGINT; P: LedaSys.Port);
+	BEGIN
+		LedaBox.RemSel(pB, P);
+		NEW(pB.selLoc); pB.selLoc.X := locX; pB.selLoc.Y := locY;
+		LedaBox.SetSel(pB, P, LedaBox.NewSel);
+		LedaIO.in.waitNoKeys(P)
+	END SelectPage;
+	
+	PROCEDURE TrackMouse(pB: Box; eX, eY: LONGINT; P: LedaSys.Port; in: LedaBase.Box;
+											mX, mY: LONGINT; keys: SET; VAR res: INTEGER);
+	(* track the mouse; mX, mY: absolute mouse coordinates, contained in box in *)
+		VAR box: LedaBase.Box;	level: INTEGER;	handled, ml, mm: BOOLEAN;
+	BEGIN
+		handled := FALSE;
+		box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;	(* box: standard box *)
+		IF (in # pB.hdg.box) & (in # pB.ftr.box) & (in # box) THEN
+			LedaBox.SelLevel(in, level);
+			IF level = 0 THEN	(* plane box in selected itself -> move or size plane *)
+				IF keys = {LedaSys.MM} THEN
+					handled := TRUE; PlaneMove(pB, eX, eY, P, in, box)
+				ELSIF keys = {LedaSys.ML} THEN
+					handled := TRUE; PlaneSize(pB, eX, eY, P, in, box)
+				END
+			END
+		END;
+		IF ~ handled THEN	(* call box to handle mouse *)
+			in.do(LedaBase.BoxHandler).mouse(in, eX+in.X, eY+in.Y, P, mX, mY, keys, res);
+			IF res = LedaBase.DoTrack THEN
+				IF LedaSys.MR IN keys THEN
+					LedaIO.TrackKeys(P, LedaSys.ML, LedaSys.MM, ml, mm);
+					IF ml & mm THEN	(* CANCEL *)
+					ELSIF ml THEN PlaneDelete(pB, in, P)
+					ELSIF mm THEN PlaneCopy(pB, in)
+					END
+				ELSE LedaIO.in.waitNoKeys(P)
+				END;
+				res :=  LedaBase.Done
+			END
+		ELSE res := LedaBase.Done
+		END
+	END TrackMouse;
+
+	PROCEDURE Execute(P: LedaSys.Port; eX, eY: LONGINT; pB: Box;
+										mX, mY: LONGINT; box: LedaBase.Box; VAR res: INTEGER);
+	(* mX, mY: absolute marker coordinates; box: box containing mX, mY *)
+		VAR s: LedaSys.String;
+	BEGIN
+		LedaBox.ParPopStr(s);
+		IF LedaSys.EqualStr("plane", s) THEN	(* illustration *)
+			LedaBox.ParPopStr(s); res := LedaBase.Done;
+			IF LedaSys.EqualStr("ins", s) THEN	(* insert new plane *)
+				IF box # NIL THEN PlaneNew(pB, mX-eX, mY-eY, box, eX, eY, P) END
+			ELSIF LedaSys.EqualStr("place", s) THEN PlaneInsertHidden(pB)
+			ELSIF LedaSys.EqualStr("sort", s) THEN PlaneSort(pB)
+			ELSIF LedaSys.EqualStr("hid", s) THEN CheckUnplaced(pB, TRUE)
+			ELSE LedaBox.ParReset(LedaBox.Str)
+			END
+		ELSIF LedaSys.EqualStr("page", s) THEN	(* page command *)
+			LedaBox.ParPopStr(s); res := LedaBase.Done;
+			IF LedaSys.EqualStr("rem", s) THEN RemovePage(pB) END
+		ELSE LedaBox.ParReset(LedaBox.Str)
+		END
+	END Execute;
+	
+(*--- procedures attached to boxType ---*)
+	
+	PROCEDURE New*(bT: LedaBase.BoxType; caller, ref: LedaBase.Box): LedaBase.Box;
+	(** ref = NIL: create default box;  ref # NIL: copy box ref *)
+		VAR pB: Box;	box: LedaBase.Box;
+	BEGIN
+		IF ref # NIL THEN LedaSys.Halt(NotImpl)
+		ELSE
+			AllocatePage(pB, bT, {});
+			pB.anc := caller;	(* to allow access to caller *)
+			LedaBox.GetSize(caller, LedaBase.WA4, LedaBase.HA4, pB.W, pB.H);
+			GetTypeArea(LedaBox.Root(caller), pB, pB.size.X, pB.size.Y, pB.size.W, pB.size.H);
+			GetPageNbr(caller, pB, pB.pgNbr);
+			box := LedaBox.New(TextName, "", pB);
+			IF box # NIL THEN
+				box.X := pB.size.X; box.Y := pB.size.Y;
+				LedaBox.Insert(box, pB, LedaBox.LastDsc)
+			END;
+		END;
+		RETURN pB
+	END New;
+	
+	PROCEDURE Load*(VAR r: LedaBase.Rider; bT: LedaBase.BoxType; flags: SET; caller: LedaBase.Box): LedaBase.Box;
+		VAR pB: Box;	box: LedaBase.Box;	ch: CHAR;
+	BEGIN
+		AllocatePage(pB, bT, flags);
+		pB.anc := caller;	(* to allow access to caller *)
+		LedaBase.LoadI(r, pB.pgNbr);
+		LedaBase.Load(r, ch);	(* earlier layout field *)
+		LedaBase.Load(r, ch);	(* tag for box list *)
+		WHILE ch = DscTag DO
+			LoadBox(r, pB, box);
+			IF box # NIL THEN LedaBox.Insert(box, pB, LedaBox.LastDsc) ELSE Msg(0) END;
+			LedaBase.Load(r, ch)
+		END;
+		IF (ch # EndTag) & (ch # BoxTag) THEN Msg(1) END;
+		WHILE ch = BoxTag DO
+			LoadBox(r, pB, box);
+			IF box # NIL THEN InsertList(box, pB.unplaced) ELSE Msg(5) END;
+			LedaBase.Load(r, ch)
+		END;
+		IF ch # EndTag THEN Msg(6) END;
+		LoadLettering(r, pB, pB.hdg);
+		LoadLettering(r, pB, pB.ftr);
+		RETURN pB
+	END Load;
+	
+	PROCEDURE Store*(self: LedaBase.Box; VAR r: LedaBase.Rider);
+		VAR pB: Box;	box: LedaBase.Box;
+	BEGIN
+		pB := self(Box);
+		LedaBase.StoreI(r, pB.pgNbr);
+		LedaBase.Store(r, "d");	(* earlier layout field *)
+		box := pB.dsc;
+		WHILE box # NIL DO
+			LedaBase.Store(r, DscTag); StoreBox(r, box); box := box.next
+		END;
+		box := pB.unplaced;
+		WHILE box # NIL DO
+			LedaBase.Store(r, BoxTag); StoreBox(r, box); box := box.next
+		END;
+		LedaBase.Store(r, EndTag);
+		StoreLettering(r, pB, pB.hdg);
+		StoreLettering(r, pB, pB.ftr);
+	END Store;
+	
+	PROCEDURE Draw*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port);
+		VAR pB: Box;	box: LedaBase.Box;	X, Y: LONGINT;	mask: BOOLEAN;
+	BEGIN	(* box is visible *)
+		pB := self(Box);
+		IF ~ (LedaSys.PrintFlag IN P.state) THEN
+			LedaIO.out.rectangle(P, eX, eY, pB.W, pB.H, P.unit, Black, LedaSys.fg, LedaIO.Replace)
+		END;
+		box := pB.dsc;
+		IF box = pB.hdg.box THEN	(* draw heading *)
+			DrawBox(box, eX + box.X, eY + box.Y, P); box := box.next
+		END;
+		PlaneMask(pB, box, NIL, eX, eY, P, mask);	(* no drawing in plane boxes [like column marks] *)
+		DrawBox(box, eX + box.X, eY + box.Y, P); box := box.next;	(* draw standard box *)
+		IF mask THEN LedaIO.out.mask(P, "R", 0, 0, 0, 0) END;	(* reset masks *)
+		WHILE box # NIL DO DrawBox(box, eX + box.X, eY + box.Y, P); box := box.next END
+	END Draw;
+	
+	PROCEDURE Mark*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; kind, mode: SHORTINT);
+	(** kind = LedaBase.FocMark or LedaBase.SelMark ; mode = LedaBase.On or LedaBase.Off  *)
+	(** P # NIL: show mark / P = NIL: change of mark state [get/loose] *)
+		VAR pB: Box;
+	BEGIN
+		pB := self(Box);
+		IF kind = LedaBase.FocMark THEN	(* focus *)
+		ELSIF kind = LedaBase.SelMark THEN 	(* selection *)
+			IF P = NIL THEN		(* change of state *)
+				IF mode = LedaBase.On THEN
+					IF pB.selLoc = NIL THEN LedaSys.Halt(ProgErr) END
+				ELSIF mode = LedaBase.Off THEN pB.selLoc := NIL
+				END
+			ELSE		(* show selection *)
+				IF pB.selLoc # NIL THEN
+					LedaIO.out.area(P, eX, eY, pB.W, pB.H, LedaSys.Grey2, LedaSys.inv, LedaIO.Invert)
+				END
+			END
+		END
+	END Mark;
+	
+	PROCEDURE Mouse*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port;
+											mX, mY: LONGINT; keys: SET; VAR res: INTEGER);
+		VAR pB: Box;	in, near: LedaBase.Box;	dx, dy, nx, ny: LONGINT;
+	BEGIN	(* res <= LedaBase.NotHandled *)
+		pB := self(Box);
+		IF (keys = {LedaSys.MR}) & (pB.selLoc # NIL) & (ABS(mX-eX-pB.selLoc.X) < Dist) & (ABS(mY-eY-pB.selLoc.Y) < Dist) THEN
+			LedaBox.RemSel(pB, P); res := LedaBase.DoHandle	(* pass selection to pB.anc *)
+		ELSE
+			LocateBox(pB, mX-eX, mY-eY, in, near, nx, ny);
+			IF in # NIL THEN	(* mX, mY contained in box in *)
+				TrackMouse(pB, eX, eY, P, in, mX, mY, keys, res)
+			ELSIF (near # NIL) & (keys # {LedaSys.MX})  THEN
+				dx := pB.W DIV MargWFact; dy := pB.H DIV MargHFact;
+				IF (keys = {LedaSys.ML}) OR ((ABS(nx) < dx) & (ABS(ny) < dy))
+					OR LedaSys.InRange(mX, eX+dx, pB.W-2*dx) & LedaSys.InRange(mY, eY+dy, pB.H-2*dy) THEN
+						INC(mX, nx); INC(mY, ny);	(* adjust mouse coordinates to box near *)
+						TrackMouse(pB, eX, eY, P, near, mX, mY, keys, res)
+				ELSIF keys = {LedaSys.MR} THEN SelectPage(pB, mX - eX, mY - eY, P); res := LedaBase.Done
+				END
+			ELSIF keys = {LedaSys.MR} THEN SelectPage(pB, mX - eX, mY - eY, P); res := LedaBase.Done
+			END;
+			IF (keys = {LedaSys.MX}) & (res = LedaBase.NotHandled) THEN Execute(P, eX, eY, pB, mX, mY, in, res)
+			ELSIF (keys = {LedaSys.MR}) & (res = LedaBase.DoHandle) THEN
+				SelectPage(pB, mX - eX, mY - eY, P); res := LedaBase.Done
+			END
+		END
+	END Mouse;
+	
+	PROCEDURE Handle*(self: LedaBase.Box; VAR m: LedaBase.Msg);
+		VAR pB: Box;	box: LedaBase.Box;
+	BEGIN
+		pB := self(Box);
+		IF m IS LedaBox.Msg THEN
+			WITH m: LedaBox.Msg DO
+				IF (m.id > 0) & (m.id <= LedaBox.LocateId) THEN
+					CASE m.id OF LedaBox.SizeId:
+							IF m.op = 1 THEN m.id := LedaBox.DoneId; m.l1 := pB.size.W; m.l2 := pB.size.H END;
+					| LedaBox.TextId:
+							IF m.op = 1 THEN	(* ask for reference data of text *)
+								IF pB.addPg THEN m.id := LedaBox.DoneId; m.text := addPg.text; m.ctrl := NIL END
+							ELSIF m.op = 3 THEN	(* unpoured text available *)
+								 EnlargeStdFlow(pB, m.box1, m.text, m.l1, m.l2, m.id)
+							ELSIF m.op = 4 THEN	(* text becomes empty *)
+								ReduceStdFlow(pB, m.box1, m.id)
+							END
+					| LedaBox.PageNbrId:
+							IF m.op = 1 THEN	(* ask for page number *)
+								IF pB.addPg THEN m.id := LedaBox.DoneId; m.l1 := addPg.nbr
+								ELSIF pB.pgNbr >= 0 THEN m.id := LedaBox.DoneId; m.l1 := pB.pgNbr
+								END
+							ELSIF m.op = 2 THEN	(* set page number to given value *)
+								IF m.l1 >= 0 THEN pB.pgNbr := SHORT(m.l1) END
+							END
+					| LedaBox.LocateId:
+							IF m.op = 1 THEN	(* get text location *)
+								box := pB.dsc; IF box = pB.hdg.box THEN box := box.next END;
+								box.do.handle(box, m)
+							END
+					ELSE
+					END
+				END	(* IF *)
+			END	(* WITH *)
+		ELSIF m IS LedaBox.PlaneMsg THEN
+			WITH m: LedaBox.PlaneMsg DO
+				IF m.id = LedaBox.PlGet THEN PlaneGet(pB, m.plane, m.box, m.mask)
+				ELSIF m.id = LedaBox.PlMask THEN PlaneMask(pB, m.box, NIL, 0, 0, NIL, m.avail)
+				ELSIF m.id = LedaBox.PlDraw THEN PlaneDraw(pB, m.box, m.planeBox)
+				ELSIF m.id = LedaBox.PlAttr THEN PlaneHeight(pB, m.box)
+				END
+			END
+		ELSIF m IS LedaBox.PageMsg THEN
+			WITH m: LedaBox.PageMsg DO
+				IF m.id = LedaBox.PgArea THEN
+					SetStdArea(pB, m.X, m.Y, m.W, m.H, m.dX, m.dY);
+					PlaneAdjustAreas(pB, m.dX, m.dY, m.colsChng, m.lspChng OR m.rstrChng)
+				ELSIF m.id = LedaBox.PgTexts THEN
+					box := pB.hdg.box; IF (pB.hdg.state # "d") & (box # NIL) THEN box.do.handle(box, m) END;
+					box := pB.ftr.box; IF (pB.ftr.state # "d") & (box # NIL) THEN box.do.handle(box, m) END
+				ELSIF m.id = LedaBox.PgLettering THEN
+					CASE m.op OF
+					  0:  IF m.box = pB.hdg.box THEN m.typ := HdgT ELSIF m.box = pB.ftr.box THEN m.typ := FtrT END
+					| 1:  IF m.typ = HdgT THEN m.box := pB.hdg.box ELSIF m.typ = FtrT THEN m.box := pB.ftr.box END
+					| 2:  IF m.typ = HdgT THEN SetLettering(pB, pB.hdg, m.box, ~m.avail, LedaBox.FirstDsc)
+							ELSIF m.typ = FtrT THEN SetLettering(pB, pB.ftr, m.box, ~m.avail, LedaBox.LastDsc)
+							END
+					| 3:  IF m.typ = HdgT THEN box := pB.hdg.box ELSIF m.typ = FtrT THEN box := pB.ftr.box ELSE box := NIL END;
+							IF box # NIL THEN box.do.handle(box, m) END
+					| 5:  IF m.typ = HdgT THEN InvalLettering(pB, pB.hdg)
+							ELSIF m.typ = FtrT THEN InvalLettering(pB, pB.ftr)
+							END
+					ELSE
+					END
+				END
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.AdjustYId THEN AdjustToLine(pB, m)
+				ELSIF m.id = LedaBase.TypeInstId THEN
+					IF (m.name = ModName) & (m.s = "DC") THEN	(* return box type instance *) 
+						m.ctrl := pB.do; INCL(LedaBox.bcFlags, LedaBox.BcMsg)	(* stop broadcast *)
+					END
+				END
+			END
+		ELSIF m IS LedaBox.AttributeMsg THEN	(* pB has selection *)
+			WITH m: LedaBox.AttributeMsg DO
+				IF m.id = LedaBox.GetValue THEN GetAttributes(pB, m)
+				ELSIF m.id = LedaBox.SetValue THEN SetAttributes(pB, m)
+				END
+			END
+		END
+	END Handle;
+	
+(*--- box type control ---*)
+
+	PROCEDURE NewType(ctrl: LedaBase.Control): LedaBase.BoxHandler;
+	(* return new instance of box type *)
+		VAR nT: LedaBase.BoxHandler;
+	BEGIN
+		NEW(nT);
+		LedaBase.InitControl(nT, typeDoOp);
+		LedaBox.InitType(nT);
+		nT.handle := Handle;
+		nT.new := New; 
+		nT.load := Load;
+		nT.store := Store;
+		nT.draw := Draw;
+		nT.mark := Mark;
+		nT.mouse := Mouse;
+		(* nT.key := ; *)
+		(* nT.insert := ; *)
+		(* nT.size := ; *)
+		nT.data := ctrl;	(* data of box type control *)
+		RETURN nT
+	END NewType;
+	
+	PROCEDURE PutType(bT: LedaBase.BoxType; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		IF bT.data # NIL THEN cM.id := LedaBase.RegisterId; bT.data.doOp(bT.data, cM) END;
+		LedaBase.PutToList(bT, refId)
+	END PutType;
+	
+	PROCEDURE *TypeDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* implements the basic behaviour of the box type control *)
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.RegisterId:  PutType(ctrl(LedaBase.BoxType), m.ctrlId)
+				| LedaBase.StoreId:  LedaBase.StoreCtrl(m.r, ctrl(LedaBase.BoxType).data)
+				| LedaBase.LoadId:  
+						IF LedaBase.version > 0X THEN LedaBase.LoadCtrl(m.r, ctrl) ELSE ctrl := NIL END;
+						m.ctrl := NewType(ctrl)
+				| LedaBase.StoreModCmd:  LedaBase.StoreStr(m.r, ModName); LedaBase.StoreStr(m.r, "DC")
+				ELSE
+				END
+			END
+		END
+	END TypeDoOp;
+	
+	PROCEDURE DC*;
+	(** deposits own box type in the module LedaCtrl *)
+	BEGIN
+		LedaBase.depositedCtrl := NewType(NIL)
+	END DC;
+	
+BEGIN
+	recPlane := NIL;
+	addPg.text := NIL; addPg.nbr := 1;
+	
+	(*--- box type control ---*)
+	typeDoOp := TypeDoOp
+		
+END LedaPage.

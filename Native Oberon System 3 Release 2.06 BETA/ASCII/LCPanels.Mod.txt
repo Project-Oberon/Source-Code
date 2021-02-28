@@ -1,0 +1,627 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LCPanels;	(* pjm 24.06.96 *)
+
+IMPORT Texts, Oberon, Gadgets, Objects, Files, Display, Panels, Documents, PanelDocs, Desktops;
+
+(**
+	LCPanels.Generate panel
+	
+	panel = [ docname ] [ "FIXED" ] [ size ] layout .
+	size = width [ height ] .
+	layout = "(" { declaration } gridX "@" gridY { area } ")" .
+	declaration = name "=" component .
+	area = X0 [":" X1] "@" Y0 [":" Y1] ["%" margin] component .
+	component = typ [ "(" { "A" name value | "L" name value } ")" | layout .
+	
+	1. A layout divides an area into a numbered grid of fields with (0, 0) in the bottom left corner.
+	2. gridX and gridY give the number of fields in the X and Y direction respectively.
+	3. X0@Y0 is the area with coordinates (X0, Y0).  X0:X1@Y0:Y1 is the area spanning
+		the fields X0 to X1 in the X direction and the fields Y0 to Y1 in the Y direction.
+	4. margin specifies an optional margin as a percentage of the shortest area side.
+	5. A component type is specified in the form of a generator or generator alias.
+	6. As parameter to component type attributes ("A") and links ("L") can be specified.
+		name gives the name and value the value.  Link values are specified using declarations.
+	7. If a docname string is specified, a new PanelDoc is generated and opened, otherwise a 
+		new Panel is generated and inserted at the caret.
+	8. If the FIXED option is specified, a normal Panel is generated, otherwise a LCPanels.NewPanel 
+		is generated.  The latter retains the layout constraints and adjusts its components when resized.
+	9. The size option specifies the initial size of the Panel.
+*)
+
+VAR
+	w: Texts.Writer;
+
+TYPE
+	Area = POINTER TO AreaDesc;
+	AreaDesc = RECORD (Gadgets.ObjDesc)
+		x0, x1, y0, y1, margin: LONGINT;	(* description of area relative to layout *)
+		comp: Objects.Object;	(* component in area: visual object or Layout *)
+		next: Objects.Object	(* next Area in list *)
+	END;
+	Layout = POINTER TO LayoutDesc;
+	LayoutDesc = RECORD (Gadgets.ObjDesc)
+		gridX, gridY: LONGINT;	(* grid size in layout *)
+		list: Objects.Object	(* list of Areas linked with next *)
+	END;
+
+(* AreaHandler - an Area is an abstract object used to store an area definition. *)
+
+PROCEDURE AreaHandler(obj: Objects.Object; VAR M: Objects.ObjMsg);
+BEGIN
+	WITH obj: Area DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF M.id = Objects.get THEN
+					IF M.name = "Gen" THEN M.class := Objects.String; COPY("LCPanels.NewArea", M.s); M.res := 0
+					ELSIF M.name = "X0" THEN M.class := Objects.Int;  M.i := obj.x0;  M.res := 0
+					ELSIF M.name = "X1" THEN M.class := Objects.Int;  M.i := obj.x1;  M.res := 0
+					ELSIF M.name = "Y0" THEN M.class := Objects.Int;  M.i := obj.y0;  M.res := 0
+					ELSIF M.name = "Y1" THEN M.class := Objects.Int;  M.i := obj.y1;  M.res := 0
+					ELSIF M.name = "Margin" THEN M.class := Objects.Int;  M.i := obj.margin;  M.res := 0
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.set THEN
+					IF (M.name = "X0") OR (M.name = "X1") OR (M.name = "Y0") OR (M.name = "Y1") OR 
+						(M.name = "Margin") THEN M.res := -1
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.enum THEN
+					M.Enum("X0");  M.Enum("X1");  M.Enum("Y0");  M.Enum("Y1");  M.Enum("Margin");
+					Gadgets.objecthandle(obj, M)
+				ELSE Gadgets.objecthandle(obj, M)
+				END
+			END
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				M.obj := obj
+			END
+		ELSIF M IS Objects.BindMsg THEN
+			IF obj.comp # NIL THEN obj.comp.handle(obj.comp, M) END;
+			IF obj.next # NIL THEN obj.next.handle(obj.next, M) END;
+			Gadgets.objecthandle(obj, M)
+		ELSIF M IS Objects.LinkMsg THEN
+			WITH M: Objects.LinkMsg DO
+				IF M.id = Objects.get THEN
+					IF M.name = "Next" THEN M.res := 0;  M.obj := obj.next
+					ELSIF M.name = "Comp" THEN M.res := 0;  M.obj := obj.comp
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.set THEN
+					IF M.name = "Next" THEN M.res := -1
+					ELSIF M.name = "Comp" THEN M.res := -1
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.enum THEN
+					M.Enum("Comp");  M.Enum("Next");  Gadgets.objecthandle(obj, M)
+				ELSE Gadgets.objecthandle(obj, M)
+				END
+			END
+		ELSIF M IS Objects.FileMsg THEN
+			WITH M: Objects.FileMsg DO
+				IF M.id = Objects.store THEN
+					Files.WriteNum(M.R, obj.x0);  Files.WriteNum(M.R, obj.x1);
+					Files.WriteNum(M.R, obj.y0);  Files.WriteNum(M.R, obj.y1);
+					Files.WriteNum(M.R, obj.margin);
+					Gadgets.WriteRef(M.R, obj.lib, obj.comp);
+					Gadgets.WriteRef(M.R, obj.lib, obj.next);
+					Gadgets.objecthandle(obj, M)
+				ELSIF M.id = Objects.load THEN
+					Files.ReadNum(M.R, obj.x0);  Files.ReadNum(M.R, obj.x1);
+					Files.ReadNum(M.R, obj.y0);  Files.ReadNum(M.R, obj.y1);
+					Files.ReadNum(M.R, obj.margin);
+					Gadgets.ReadRef(M.R, obj.lib, obj.comp);
+					Gadgets.ReadRef(M.R, obj.lib, obj.next);
+					Gadgets.objecthandle(obj, M)
+				ELSE Gadgets.objecthandle(obj, M)
+				END
+			END
+		ELSE Gadgets.objecthandle(obj, M)
+		END
+	END
+END AreaHandler;
+
+(** NewArea - Generator for internal Area object *)
+
+PROCEDURE NewArea*;
+VAR a: Area;
+BEGIN
+	NEW(a);  a.handle := AreaHandler;  Objects.NewObj := a
+END NewArea;
+
+(* LayoutHandler - a Layout is an abstract object used to store a layout definition. *)
+
+PROCEDURE LayoutHandler(obj: Objects.Object; VAR M: Objects.ObjMsg);
+BEGIN
+	WITH obj: Layout DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF M.id = Objects.get THEN
+					IF M.name = "Gen" THEN M.class := Objects.String; COPY("LCPanels.NewLayout", M.s); M.res := 0
+					ELSIF M.name = "GridX" THEN M.class := Objects.Int;  M.i := obj.gridX;  M.res := 0
+					ELSIF M.name = "GridY" THEN M.class := Objects.Int;  M.i := obj.gridY;  M.res := 0
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.set THEN
+					IF (M.name = "GridX") OR (M.name = "GridY") THEN M.res := -1
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.enum THEN
+					M.Enum("GridX");  M.Enum("GridY");  Gadgets.objecthandle(obj, M)
+				ELSE Gadgets.objecthandle(obj, M)
+				END
+			END
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				M.obj := obj
+			END
+		ELSIF M IS Objects.BindMsg THEN
+			IF obj.list # NIL THEN obj.list.handle(obj.list, M) END;
+			Gadgets.objecthandle(obj, M)
+		ELSIF M IS Objects.LinkMsg THEN
+			WITH M: Objects.LinkMsg DO
+				IF M.id = Objects.get THEN
+					IF M.name = "Area" THEN M.res := 0;  M.obj := obj.list
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.set THEN
+					IF M.name = "Area" THEN M.res := -1
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.enum THEN
+					M.Enum("Area");  Gadgets.objecthandle(obj, M)
+				ELSE Gadgets.objecthandle(obj, M)
+				END
+			END
+		ELSIF M IS Objects.FileMsg THEN
+			WITH M: Objects.FileMsg DO
+				IF M.id = Objects.store THEN
+					Files.WriteNum(M.R, obj.gridX);  Files.WriteNum(M.R, obj.gridY);
+					Gadgets.WriteRef(M.R, obj.lib, obj.list);
+					Gadgets.objecthandle(obj, M)
+				ELSIF M.id = Objects.load THEN
+					Files.ReadNum(M.R, obj.gridX);  Files.ReadNum(M.R, obj.gridY);
+					Gadgets.ReadRef(M.R, obj.lib, obj.list);
+					Gadgets.objecthandle(obj, M)
+				ELSE Gadgets.objecthandle(obj, M)
+				END
+			END
+		ELSE Gadgets.objecthandle(obj, M)
+		END
+	END
+END LayoutHandler;
+
+(** NewLayout - Generator for internal Layout object *)
+
+PROCEDURE NewLayout*;
+VAR a: Layout;
+BEGIN
+	NEW(a);  a.handle := LayoutHandler;  Objects.NewObj := a
+END NewLayout;
+
+(* SizeComp - Resize and reposition all components in a layout in the specified area. *)
+
+PROCEDURE SizeComp(obj: Objects.Object;  x, y, w, h: INTEGER);
+VAR a: Area;  l: Layout;  x0, y0, w0, h0, m, t: INTEGER;  mm: Display.ModifyMsg;  f: Display.Frame;
+BEGIN
+	l := obj(Layout);  obj := l.list;	(* skip to area *)
+	WHILE obj # NIL DO
+		a := obj(Area);
+		x0 := SHORT(x + a.x0 * w DIV l.gridX);
+		y0 := SHORT(y + a.y0 * h DIV l.gridY);
+		w0 := SHORT((a.x1-a.x0+1) * w DIV l.gridX);
+		h0 := SHORT((a.y1-a.y0+1) * h DIV l.gridY);
+		m := SHORT(w*a.margin DIV 100);  t := SHORT(h*a.margin DIV 100);
+		IF t < m THEN m := t END;
+		INC(x0, t);  INC(y0, t);  DEC(w0, 2*t);  DEC(h0, 2*t);
+		IF a.comp # NIL THEN
+			IF a.comp IS Layout THEN
+				SizeComp(a.comp, x0, y0, w0, h0)
+			ELSE
+				f := a.comp(Display.Frame);
+				Objects.Stamp(mm);  mm.F := f;  mm.res := -1;
+				mm.id := Display.extend;  mm.mode := Display.state;
+				mm.x := 0;  mm.y := 0;
+				mm.X := x0;  mm.Y := y0;  mm.W := w0;  mm.H := h0;
+				mm.dX := mm.X-f.X;  mm.dY := mm.Y-f.Y;  mm.dW := mm.W-f.W;  mm.dH := mm.H-f.H;
+				f.handle(f, mm)
+			END
+		END;
+		obj := a.next
+	END
+END SizeComp;
+
+(* PanelHandler - Handler for LC Panel. *)
+
+PROCEDURE PanelHandler(obj: Objects.Object; VAR M: Objects.ObjMsg);
+VAR obj0: Objects.Object;  l: Objects.LinkMsg;
+BEGIN
+	WITH obj: Panels.Panel DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF M.id = Objects.get THEN
+					IF M.name = "Gen" THEN M.class := Objects.String; COPY("LCPanels.NewPanel", M.s); M.res := 0
+					ELSE Panels.PanelHandler(obj, M)
+					END
+				ELSE Panels.PanelHandler(obj, M)
+				END
+			END
+		ELSIF M IS Display.ModifyMsg THEN
+			Panels.PanelHandler(obj, M);
+			Objects.Stamp(l);  l.id := Objects.get;  l.name := "Layout";  l.res := -1;  obj.handle(obj, l);
+			ASSERT(l.res >= 0);  SizeComp(l.obj, 0, -obj.H, obj.W, obj.H)
+		ELSE Panels.PanelHandler(obj, M)
+		END
+	END
+END PanelHandler;
+
+(** NewPanel - Generator for LCPanel. *)
+
+PROCEDURE NewPanel*;
+BEGIN
+	Panels.NewPanel;  Objects.NewObj.handle := PanelHandler
+END NewPanel;
+
+(* CreateDoc - Create a panel document *)
+
+PROCEDURE CreateDoc(p: Panels.Panel;  name: ARRAY OF CHAR);
+VAR d: Documents.Document;
+BEGIN
+	NEW(d);  PanelDocs.InitDoc(d, p.W, p.H);
+	d.dsc := p;  COPY(name, d.name);
+	Desktops.ShowDoc(d)
+END CreateDoc;
+
+(** MakePanelDoc - Place the selected panel in a document. *)
+
+PROCEDURE MakePanelDoc*;	(* ^ *)
+VAR s: Display.SelectMsg;
+BEGIN
+	s.id := Display.get;  s.time := 0;  s.F := NIL;  s.obj := NIL;  Display.Broadcast(s);
+	IF (s.obj # NIL) & (s.obj IS Panels.Panel) THEN
+		CreateDoc(s.obj(Panels.Panel), "")
+	END
+END MakePanelDoc;
+
+(* Parse - Parse a panel description and generate a panel. *)
+
+PROCEDURE Parse(VAR s: Texts.Scanner);
+TYPE
+	Decl = POINTER TO DeclDesc;
+	DeclDesc = RECORD
+		name: ARRAY 64 OF CHAR;
+		obj: Objects.Object;
+		next: Decl
+	END;
+VAR
+	error: BOOLEAN;  decl: Decl;
+	
+	PROCEDURE Error(msg: ARRAY OF CHAR);
+	BEGIN
+		IF ~error THEN
+			error := TRUE;  Texts.WriteString(w, "Error: ");  Texts.WriteString(w, msg);  
+			Texts.WriteString(w, " on line ");  Texts.WriteInt(w, s.line, 1);
+			Texts.WriteString(w, ", symbol: ");
+			CASE s.class OF
+				Texts.Char:  Texts.Write(w, 22X);  Texts.Write(w, s.c);  Texts.Write(w, 22X)
+				|Texts.Name: Texts.WriteString(w, s.s)
+				|Texts.String: Texts.Write(w, 22X);  Texts.WriteString(w, s.s);  Texts.Write(w, 22X)
+				|Texts.Int: Texts.WriteInt(w, s.i, 1);
+				|Texts.Real: Texts.WriteReal(w, s.x, 1)
+				|Texts.LongReal: Texts.WriteLongReal(w, s.y, 1)
+			END;
+			Texts.WriteString(w, ", next: ");
+			IF s.nextCh < " " THEN
+				Texts.WriteString(w, "CHR(");  Texts.WriteInt(w, ORD(s.nextCh), 1);  Texts.Write(w, ")")
+			ELSE
+				Texts.Write(w, 22X);  Texts.Write(w, s.nextCh);  Texts.Write(w, 22X)
+			END;
+			Texts.WriteLn(w);  Texts.Append(Oberon.Log, w.buf)
+		END;
+		s.class := Texts.Inval
+	END Error;
+	
+	PROCEDURE ^layout(VAR obj: Objects.Object);
+	
+	PROCEDURE component(VAR obj: Objects.Object);
+	VAR name: ARRAY 64 OF CHAR;  attrib: BOOLEAN;  d: Decl;  a: Objects.AttrMsg;  l: Objects.LinkMsg;
+	BEGIN
+		obj := NIL;
+		IF s.class = Texts.Name THEN
+			Gadgets.GetAlias(s.s, name);  IF name = "" THEN COPY(s.s, name) END;
+			obj := Gadgets.CreateObject(name);
+			IF obj = NIL THEN Error("Unknown generator") END;
+			Texts.Scan(s);
+			IF (s.class = Texts.Char) & (s.c = "(") THEN
+				Texts.Scan(s);
+				WHILE (s.class = Texts.Name) & ((s.s = "A") OR (s.s = "L")) DO
+					attrib := s.s = "A";  Texts.Scan(s);
+					IF s.class = Texts.Name THEN
+						COPY(s.s, name);  Texts.Scan(s);
+						IF attrib THEN
+							CASE s.class OF
+								Texts.Name, Texts.String: a.class := Objects.String;  COPY(s.s, a.s)
+								|Texts.Int: a.class := Objects.Int;  a.i := s.i
+								|Texts.Real: a.class := Objects.Real;  a.x := s.x
+								|Texts.LongReal: a.class := Objects.LongReal;  a.y := s.y
+								|Texts.Char: a.class := Objects.Char;  a.c := s.c
+								ELSE a.class := Texts.Inval
+							END;
+							IF a.class # Texts.Inval THEN
+								Objects.Stamp(a);  a.id := Objects.set;  COPY(name, a.name);  a.res := -1;
+								IF obj # NIL THEN
+									obj.handle(obj, a);
+									IF a.res < 0 THEN Error("attribute could not be set") END
+								END;
+								Texts.Scan(s)
+							ELSE Error("value expected in A")
+							END
+						ELSE
+							IF s.class = Texts.Name THEN
+								d := decl;  WHILE (d # NIL) & (d.name # s.s) DO d := d.next END;
+								IF d # NIL THEN
+									Objects.Stamp(l);  l.id := Objects.set;  COPY(name, l.name);  l.res := -1;
+									l.obj := d.obj;
+									IF obj # NIL THEN
+										obj.handle(obj, l);
+										IF l.res < 0 THEN Error("Link could not be set") END
+									END
+								END;
+								Texts.Scan(s)
+							ELSE Error("value expected in L")
+							END
+						END
+					ELSE Error("name expected after A|L")
+					END
+				END;
+				IF (s.class = Texts.Char) & (s.c = ")") THEN Texts.Scan(s)
+				ELSE Error(") expected")
+				END
+			END
+		ELSIF (s.class = Texts.Char) & (s.c = "(") THEN
+			layout(obj)
+		ELSE Error("type or layout expected")
+		END
+	END component;
+	
+	PROCEDURE area(VAR obj: Objects.Object);
+	VAR a: Area;
+	BEGIN
+		obj := NIL;
+		IF s.class = Texts.Int THEN
+			NewArea;  a := Objects.NewObj(Area);
+			a.x0 := s.i;  Texts.Scan(s);
+			IF (s.class = Texts.Char) & (s.c = ":") THEN
+				Texts.Scan(s);
+				IF s.class = Texts.Int THEN
+					a.x1 := s.i;  Texts.Scan(s)
+				ELSE Error("int expected")
+				END
+			ELSE a.x1 := a.x0
+			END;
+			IF (s.class = Texts.Char) & (s.c = "@") THEN
+				Texts.Scan(s);
+				IF s.class = Texts.Int THEN
+					a.y0 := s.i;  Texts.Scan(s);
+					IF (s.class = Texts.Char) & (s.c = ":") THEN
+						Texts.Scan(s);
+						IF s.class = Texts.Int THEN
+							a.y1 := s.i;  Texts.Scan(s)
+						ELSE Error("int expected")
+						END
+					ELSE a.y1 := a.y0
+					END;
+					IF (s.class = Texts.Char) & (s.c = "%") THEN
+						Texts.Scan(s);
+						IF s.class = Texts.Int THEN
+							a.margin := s.i;  Texts.Scan(s)
+						ELSE Error("int expected")
+						END
+					ELSE a.margin := 0
+					END;
+					component(a.comp);
+					obj := a
+				ELSE Error("int expected")
+				END
+			ELSE Error("@ expected")
+			END
+		ELSE Error("int expected")
+		END
+	END area;
+	
+	PROCEDURE declaration(VAR name: ARRAY OF CHAR;  VAR obj: Objects.Object);
+	BEGIN
+		obj := NIL;
+		IF s.class = Texts.Name THEN
+			COPY(s.s, name);  Texts.Scan(s);
+			IF (s.class = Texts.Char) & (s.c = "=") THEN
+				Texts.Scan(s);  component(obj)
+			ELSE Error("= expected")
+			END
+		ELSE Error("name expected")
+		END
+	END declaration;
+	
+	PROCEDURE layout(VAR obj: Objects.Object);
+	VAR p: Layout;  t: Objects.Object;  a0: Area;  d: Decl;
+	BEGIN
+		p := NIL;
+		IF (s.class = Texts.Char) & (s.c = "(") THEN
+			NewLayout;  p := Objects.NewObj(Layout);
+			Texts.Scan(s);
+			IF s.class = Texts.Name THEN
+				WHILE s.class = Texts.Name DO
+					NEW(d);  declaration(d.name, d.obj);  d.next := decl;  decl := d
+				END
+			END;
+			IF s.class = Texts.Int THEN
+				p.gridX := s.i;  Texts.Scan(s);
+				IF (s.class = Texts.Char) & (s.c = "@") THEN
+					Texts.Scan(s);
+					IF s.class = Texts.Int THEN
+						p.gridY := s.i;  Texts.Scan(s);  a0 := NIL;
+						WHILE s.class = Texts.Int DO
+							area(t);
+							IF t # NIL THEN
+								IF a0 = NIL THEN p.list := t ELSE a0.next := t END;
+								a0 := t(Area)
+							END
+						END;
+						IF (s.class = Texts.Char) & (s.c = ")") THEN Texts.Scan(s)
+						ELSE Error(") expected")
+						END
+					ELSE Error("int expected")
+					END
+				ELSE Error("@ expected")
+				END
+			ELSE Error("error in layout")
+			END
+		ELSE Error("( expected")
+		END;
+		obj := p
+	END layout;
+	
+	PROCEDURE LinkComp(obj: Objects.Object;  VAR list: Objects.Object);
+	VAR a: Area;
+	BEGIN
+		obj := obj(Layout).list;	(* skip to area *)
+		WHILE obj # NIL DO
+			a := obj(Area);
+			IF a.comp # NIL THEN
+				IF a.comp IS Layout THEN LinkComp(a.comp, list)
+				ELSE a.comp.slink := list;  list := a.comp
+				END
+			END;
+			obj := a.next
+		END
+	END LinkComp;
+	
+	PROCEDURE CreatePanel;
+	VAR
+		l, list: Objects.Object;  p: Panels.Panel;  c: Display.ConsumeMsg;  a: Objects.AttrMsg;
+		w, h: LONGINT;  lc: BOOLEAN;  lm: Objects.LinkMsg;  doc: ARRAY 32 OF CHAR;
+	BEGIN
+		w := 400;  h := 200;  l := NIL;
+			(* parse options *)
+		IF s.class = Texts.String THEN COPY(s.s, doc);  Texts.Scan(s)
+		ELSE doc := ""
+		END;
+		IF (s.class = Texts.Name) & (s.s = "FIXED") THEN lc := FALSE;  Texts.Scan(s)
+		ELSE lc := TRUE
+		END;
+		IF s.class = Texts.Int THEN
+			w := s.i;  Texts.Scan(s);
+			IF s.class = Texts.Int THEN h := s.i;  Texts.Scan(s) END
+		END;
+			(* parse layout *)
+		IF ~error THEN layout(l) END;
+			(* generate panel *)
+		IF ~error & (l # NIL) THEN
+			Panels.NewPanel;  p := Objects.NewObj(Panels.Panel);
+			p.W := SHORT(w);  p.H := SHORT(h);
+			IF lc THEN
+				p.handle := PanelHandler;	(* attach new functionality *)
+				Objects.Stamp(lm);  lm.id := Objects.set;  lm.name := "Layout";  lm.res := -1;  lm.obj := l;
+				p.handle(p, lm);  ASSERT(lm.res >= 0)	(* attach layout to panel *)
+			END;
+				(* drop components in panel *)
+			list := NIL;  LinkComp(l, list);
+			IF list # NIL THEN
+				Objects.Stamp(c);  c.F := p;  c.x := 0;  c.y := 0;  c.res := -1;
+				c.id := Display.drop;  c.u := 0;  c.v := -p.H;  c.obj := list;
+				p.handle(p, c)
+			END;
+			SizeComp(l, 0, -p.H, p.W, p.H);	(* adjust component sizes/positions according to layout *)
+				(* lock the panel *)
+			Objects.Stamp(a);  a.id := Objects.set;  a.name := "Locked";  a.res := -1;
+			a.class := Objects.Bool;  a.b := TRUE;  p.handle(p, a);
+			IF lc THEN p.state := p.state - {Gadgets.lockedsize} END;
+				(* produce the output *)
+			IF doc # "" THEN CreateDoc(p, doc)
+			ELSE Gadgets.Integrate(p)
+			END
+		END
+	END CreatePanel;
+	
+BEGIN
+	decl := NIL;  error := FALSE;  Texts.Scan(s);	(* init parser *)
+	CreatePanel
+END Parse;
+
+(** Generate - Command to generate a panel from a description. *)
+
+PROCEDURE Generate*;
+VAR s: Texts.Scanner;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);
+	Parse(s)
+END Generate;
+
+BEGIN
+	Texts.OpenWriter(w)
+END LCPanels.
+
+Examples (set the caret and execute LCPanels.Generate):
+
+A textfield and slider with the same integer model:
+LCPanels.Generate 100 50 (
+	model = Integer (A Value 250)
+	1@2 
+		0@0%5 TextField (L Model model)
+		0@1%5 Slider (L Model model A Min 0 A Max 500)
+	)
+
+A radio button with five selections:
+LCPanels.Generate 100 100 (
+	model = Integer (A Value 1)
+	5@5
+		0@4%2 CheckBox (A SetVal 1 L Model model)
+		0@3%2 CheckBox (A SetVal 2 L Model model)
+		0@2%2 CheckBox (A SetVal 3 L Model model)
+		0@1%2 CheckBox (A SetVal 4 L Model model)
+		0@0%2 CheckBox (A SetVal 5 L Model model)
+		1:4@4%2 Caption (A Value "Option 1")
+		1:4@3%2 Caption (A Value "Option 2")
+		1:4@2%2 Caption (A Value "Option 3")
+		1:4@1%2 Caption (A Value "Option 4")
+		1:4@0%2 Caption (A Value "Option 5")
+	)
+
+A documents panel:
+LCPanels.Generate "Test.Panel" 360 230 (
+	model = Integer
+	2@1 
+		0@0%3 List (A Name "L" A Cmd "Desktops.OpenDoc #Point")
+		1@0%3 (
+			1@2
+				0@1 List (A Cmd "Lists.Directory '#Point ' L")
+				0@0 (
+					3@5
+						0@0 Button (A Caption "Print *" A Cmd "Desktops.PrintDoc &P.Value  *")
+						0@1 Button (A Caption "Recall" A Cmd "Desktops.Recall")
+						0@2 Button (A Caption "Open ^" A Cmd "Desktops.OpenDoc ^")
+						0@3 Button (A Caption "Open" A Cmd "Desktops.OpenDoc &F.Value")
+						0@4 Button (A Caption "Show" A Cmd "Lists.Directory '&P.Value ' L")
+						1:2@0 TextField (A Name "P" A Value "LPT1")
+						1@1 Button (A Caption "Inspector" A Cmd "Desktops.OpenDoc (Inspector)")
+						1@2 Button (A Caption "Panel" A Cmd "Desktops.OpenDoc (PanelDoc)")
+						1:2@3 TextField (A Name "F" A Cmd "Desktops.OpenDoc #Value")
+						1:2@4 TextField (A Name "P" A Value "*.Text")
+						2@1 Button (A Caption "Icon *" A Cmd "Icons.InsertIcon *")
+						2@2 Button (A Caption "Text" A Cmd "Desktops.OpenDoc (TextDoc)")
+				)
+		)
+	)
+Drop the following patterns in the small list before storing the panel.
+"*.Arc" "*.Book" "*.Mod" "*.Panel" "*.Pict" "*.Text" "*.Tool" "*.Obj" "*.Sym"

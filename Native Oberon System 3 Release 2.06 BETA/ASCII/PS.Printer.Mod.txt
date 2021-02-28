@@ -1,0 +1,772 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Printer; (*bh, ard 27.11.92 / kr 23.12. 92 / 03.08.93*)
+
+	IMPORT SYSTEM, Files, Oberon, V24, Centronics, Fonts, Texts;
+	(* 
+	kr 29. 12. 93 created
+	*)
+		
+(* pjm 21.06.96 - PS.Printer *)
+(* pjm/ard/js 26.07.96 changes for 600dpi *)
+
+	CONST 
+		N = 20;
+		maxFonts = 64;
+		headerFileName = "Oberon.Header.ps";
+		
+	TYPE
+		Name = ARRAY 32 OF CHAR;
+		RealVector = ARRAY N OF REAL;
+		Poly = RECORD a, b, c, d, t: REAL END ;
+		PolyVector = ARRAY N OF Poly;
+
+		FontDesc = RECORD
+			name: Name;
+			used: ARRAY 8 OF SET;
+		END;
+
+	VAR 
+		res*: INTEGER;
+		Width*, Height*, Depth*: INTEGER;
+		FrameX*, FrameY*, FrameW*, FrameH*: INTEGER;
+		Unit*: LONGINT; 
+		
+		fontTable: ARRAY maxFonts OF FontDesc;
+		fontIndex, curFont: INTEGER;
+		listFont: Name;
+		headerF, bodyF: Files.File;
+		bodyR: Files.Rider;
+		pno, ppos: LONGINT;
+		curR, curG, curB: INTEGER;
+		hexArray: ARRAY 17 OF CHAR;
+		dense, landscape: BOOLEAN;
+		location: SHORTINT; 
+		plen: LONGINT;
+		printFname: ARRAY 32 OF CHAR;
+		Resolution: LONGINT; 
+
+	PROCEDURE Str (VAR R: Files.Rider; s: ARRAY OF CHAR);
+	VAR i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE s[i] # 0X DO Files.Write(R, s[i]); INC(i) END;
+	END Str;
+
+	PROCEDURE Int (VAR R: Files.Rider; i: LONGINT);
+	VAR j: LONGINT;
+	BEGIN
+		IF i = 0 THEN Files.Write(R, "0") ELSIF i < 0 THEN i := -i; Files.Write(R, "-") END;
+		j := 1;
+		WHILE (i DIV j) # 0 DO j := j * 10 END;
+		WHILE j >= 10 DO j := j DIV 10; Files.Write(R, CHR(ORD("0") + (i DIV j) MOD 10)) END;
+	END Int;
+
+	PROCEDURE Hex(VAR R: Files.Rider; i: INTEGER);
+	BEGIN
+		IF i < 10 THEN Files.Write(R, CHR(i+ORD("0")))
+		ELSE Files.Write(R, CHR(i+(ORD("a")-10))) END
+	END Hex;
+
+	PROCEDURE Hex2(VAR R: Files.Rider; ch: CHAR);
+	BEGIN
+		Files.Write(R, hexArray[ORD(ch) DIV 16]);
+		Files.Write(R, hexArray[ORD(ch) MOD 16]);
+	END Hex2;
+
+	PROCEDURE SetBitmapFont(VAR fontR, R: Files.Rider; fd: FontDesc; pRes: INTEGER);
+		CONST fontFileId = 0DBX;
+		TYPE
+			RunRec = RECORD beg, end: INTEGER END;
+			Metrics = RECORD dx, x, y, w, h: INTEGER END;
+
+		VAR
+			ch: CHAR;
+			pixmapDX, n, b: LONGINT;
+			k, m: INTEGER;
+			height, minX, maxX, minY, maxY: INTEGER;
+			nOfBoxes, nOfRuns: INTEGER;
+			run: ARRAY 16 OF RunRec;
+			metrics: ARRAY 256 OF Metrics;
+
+		PROCEDURE Flip(ch: CHAR): CHAR;
+		VAR i, s, d: INTEGER;
+		BEGIN
+			i := 0; s := ORD(ch); d := 0;
+			WHILE i < 8 DO
+				IF s MOD 2 = 1 THEN d := d * 2 + 1 ELSE d := d * 2 END;
+				s := s DIV 2;
+				INC(i)
+			END;
+			RETURN CHR(d);
+		END Flip;
+
+		PROCEDURE Name(m: INTEGER);
+		BEGIN
+			CASE m OF
+			| 9: Str(fontR, "tab")
+			| 32: Str(fontR, "space")
+			| 33: Str(fontR, "exclam")
+			| 34: Str(fontR, "quotedbl")
+			| 35: Str(fontR, "numbersign")
+			| 36: Str(fontR, "dollar")
+			| 37: Str(fontR, "percent")
+			| 38: Str(fontR, "ampersand")
+			| 39: Str(fontR, "quotesingle")
+			| 40: Str(fontR, "parenleft")
+			| 41: Str(fontR, "parenright")
+			| 42: Str(fontR, "asterisk")
+			| 43: Str(fontR, "plus")
+			| 44: Str(fontR, "comma")
+			| 45: Str(fontR, "minus")
+			| 46: Str(fontR, "period")
+			| 47: Str(fontR, "slash")
+			| 48: Str(fontR, "zero")
+			| 49: Str(fontR, "one")
+			| 50: Str(fontR, "two")
+			| 51: Str(fontR, "three")
+			| 52: Str(fontR, "four")
+			| 53: Str(fontR, "five")
+			| 54: Str(fontR, "six")
+			| 55: Str(fontR, "seven")
+			| 56: Str(fontR, "eight")
+			| 57: Str(fontR, "nine")
+			| 58: Str(fontR, "colon")
+			| 59: Str(fontR, "semicolon")
+			| 60: Str(fontR, "less")
+			| 61: Str(fontR, "equal")
+			| 62: Str(fontR, "greater")
+			| 63: Str(fontR, "question")
+			| 64: Str(fontR, "at")
+			| 65..90: Files.Write(fontR, CHR(m))
+			| 91: Str(fontR, "bracketleft")
+			| 92:  Str(fontR, "backslash")
+			| 93: Str(fontR, "bracketright")
+			| 94: Str(fontR, "asciicircum")
+			| 95: Str(fontR, "underscore") 
+			| 96: Str(fontR, "grave")
+			| 97..122: Files.Write(fontR, CHR(m))
+			| 123: Str(fontR, "braceleft")
+			| 124: Str(fontR, "bar")
+			| 125: Str(fontR, "braceright")
+			| 126: Str(fontR, "asciitilde")
+			| 128: Str(fontR, "Adieresis")
+			| 129: Str(fontR, "Odieresis")
+			| 130: Str(fontR, "Udieresis")
+			| 131: Str(fontR, "adieresis")
+			| 132: Str(fontR, "odieresis")
+			| 133: Str(fontR, "udieresis")
+			| 134: Str(fontR, "acircumflex")
+			| 135: Str(fontR, "ecircumflex")
+			| 136: Str(fontR, "icircumflex")
+			| 137: Str(fontR, "ocircumflex")
+			| 138: Str(fontR, "ucircumflex")
+			| 139: Str(fontR, "agrave")
+			| 140: Str(fontR, "egrave")
+			| 141: Str(fontR, "igrave")
+			| 142: Str(fontR, "ograve")
+			| 143: Str(fontR, "ugrave")
+			| 144: Str(fontR, "eacute")
+			| 145: Str(fontR, "edieresis")
+			| 146: Str(fontR, "idieresis")
+			| 147: Str(fontR, "ccedilla")
+			| 148: Str(fontR, "aacute")
+			| 149: Str(fontR, "ntilde")
+			| 150: Str(fontR, "germandbls")
+			| 155: Str(fontR, "endash")
+			| 159: Str(fontR, "hyphen")
+			ELSE
+				Str(fontR, "ascii");
+				Files.Write(fontR, CHR(ORD("0") + (m DIV 100) MOD 10));
+				Files.Write(fontR, CHR(ORD("0") + (m DIV 10) MOD 10));
+				Files.Write(fontR, CHR(ORD("0") + m MOD 10))
+			END
+		END Name;
+
+	BEGIN
+		Str(fontR, "% Conversion of the Oberon font "); Str(fontR, fd.name); Files.Write(fontR, 0AX);
+		Files.Read(R, ch);
+		IF ch = fontFileId THEN
+			Files.Read(R, ch); Str(fontR, "% abstraction: "); Int(fontR, ORD(ch)); 
+			Files.Read(R, ch); Str(fontR, ", family: "); Files.Write(fontR, ch); 
+			Files.Read(R, ch); Str(fontR, ", variant: "); Int(fontR, ORD(ch)); Files.Write(fontR, 0AX);
+			Files.ReadInt(R, height); Str(fontR, "% height: "); Int(fontR, height); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+			Files.ReadInt(R, minX); Files.ReadInt(R, maxX);
+			Files.ReadInt(R, minY); Files.ReadInt(R, maxY);
+			Files.ReadInt(R, nOfRuns);
+			nOfBoxes := 0; k := 0;
+			WHILE k # nOfRuns DO
+				Files.ReadInt(R, run[k].beg); Files.ReadInt(R, run[k].end);
+				INC(nOfBoxes, run[k].end - run[k].beg);
+				INC(k)
+			END;
+			Str(fontR, "9 dict begin"); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+			Str(fontR, "/FontType 3 def"); Files.Write(fontR, 0AX);
+			Str(fontR, "/FontMatrix [ 72 "); Int(fontR, pRes); Str(fontR, " div "); Str(fontR, " factor div 0 0 ");	(* was .24 *)
+			Str(fontR, "72 "); Int(fontR, pRes); Str(fontR, " div "); Str(fontR, " factor div 0 0");	(* was .24 *)
+			Str(fontR, "] def"); Files.Write(fontR, 0AX);
+			Str(fontR, "/FontBBox [");  
+			Int(fontR, minX); Files.Write(fontR, " ");
+			Int(fontR, minY); Files.Write(fontR, " ");
+			Int(fontR, maxX); Files.Write(fontR, " ");
+			Int(fontR, maxY);
+			Str(fontR, "] def"); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+			Str(fontR, "/Encoding 256 array def"); Files.Write(fontR, 0AX);
+			Str(fontR, "0 1 255 {Encoding exch /.notdef put} for"); Files.Write(fontR, 0AX);
+			Str(fontR, "Encoding OberonEncoding OberonXEncoding OberonYEncoding /Encoding exch def"); Files.Write(fontR, 0AX);
+			Files.Write(fontR, 0AX);
+			Str(fontR, "/CharData "); Int(fontR, nOfBoxes+1);
+			Str(fontR, " dict def"); Files.Write(fontR, 0AX);
+			Str(fontR, "CharData begin"); Files.Write(fontR, 0AX);
+			k := 0; m := 0;
+			WHILE k < nOfRuns DO
+				m := run[k].beg;
+				WHILE m < run[k].end DO
+					Files.ReadInt(R, metrics[m].dx);
+					Files.ReadInt(R, metrics[m].x); Files.ReadInt(R, metrics[m].y);
+					Files.ReadInt(R, metrics[m].w); Files.ReadInt(R, metrics[m].h);
+					INC(m);
+				END;
+				INC(k)
+			END;
+			Str(fontR, "/.notdef"); Str(fontR, " [");
+			Int(fontR, metrics[32].w); Str(fontR, " 0 0 0 0 1 1 0 0"); Files.Write(fontR, 0AX);
+			Str(fontR, "<>] bdef"); Files.Write(fontR, 0AX);
+			k := 0; m := 0;
+			WHILE k < nOfRuns DO
+				m := run[k].beg;
+				WHILE m < run[k].end DO
+					IF m MOD 32 IN fd.used[m DIV 32] THEN
+						Str(fontR, "/"); Name(m); Str(fontR, " [");
+						Int(fontR, metrics[m].dx); Str(fontR, " ");
+						Int(fontR, metrics[m].x); Str(fontR, " "); Int(fontR, metrics[m].y); Str(fontR, " ");
+						Int(fontR, metrics[m].x + metrics[m].w); Str(fontR, " ");
+						Int(fontR, metrics[m].y + metrics[m].h); Str(fontR, " ");
+						IF metrics[m].w > 0 THEN Int(fontR, metrics[m].w); ELSE Int(fontR, 1) END; Str(fontR, " ");
+						IF metrics[m].h > 0 THEN Int(fontR, metrics[m].h); ELSE Int(fontR, 1) END; Str(fontR, " ");
+						Int(fontR, -metrics[m].x); Str(fontR, " "); Int(fontR, -metrics[m].y); Files.Write(fontR, 0AX);
+						Str(fontR, "<");
+						pixmapDX := (metrics[m].w + 7) DIV 8;
+						n := pixmapDX * metrics[m].h;
+						b := 0;
+						WHILE b < n DO
+							Files.Read(R, ch); Hex2(fontR, Flip(ch));
+							INC(b);
+							IF b MOD 32 = 0 THEN Files.Write(fontR, 0AX); Str(fontR, " ") END
+						END;
+						Str(fontR, ">] bdef"); Files.Write(fontR, 0AX);
+					ELSE
+						n := (metrics[m].w + 7) DIV 8 * metrics[m].h;
+						b := 0; WHILE b < n DO Files.Read(R, ch); INC(b) END;
+					END;
+					INC(m);
+				END;
+				INC(k)
+			END;
+			Str(fontR, "  end"); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+			Str(fontR, "/BuildGlyph {GlobalBuildGlyph} bdef"); Files.Write(fontR, 0AX);
+			Str(fontR, "/BuildChar {GlobalBuildChar} bdef"); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+			Str(fontR, "/imageMaskMatrix [1 0 0 1 0 0] bdef"); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+			Str(fontR, "currentdict"); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+			Str(fontR, "end"); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+			Files.Write(fontR, "/"); Str(fontR, fd.name);
+			Str(fontR, " exch definefont pop"); Files.Write(fontR, 0AX); Files.Write(fontR, 0AX);
+		END;
+	END SetBitmapFont;
+
+	PROCEDURE SetType1Font (VAR fontR: Files.Rider; VAR name, variant, t1name: ARRAY OF CHAR; size: INTEGER);
+	VAR str: ARRAY 8 OF CHAR;
+	BEGIN
+		Str(fontR, "% Conversion of the Oberon font "); Str(fontR, name); Files.Write(fontR, 0AX);
+		Str(fontR, "/"); Str(fontR, name); Str(fontR, " /"); Str(fontR, t1name); Str(fontR, " "); Int(fontR, size);
+		Str(fontR, " ReEncode"); Files.Write(fontR, 0AX);
+	END SetType1Font;
+	
+	PROCEDURE GetType1Name(VAR R: Files.Rider; VAR name: ARRAY OF CHAR); 
+	VAR nOfRuns, beg, end, nOfBoxes: INTEGER;
+	BEGIN
+		Files.Set(R, Files.Base(R), Files.Pos(R) + 12);
+		Files.ReadInt(R, nOfRuns);
+		nOfBoxes := 0;
+		WHILE nOfRuns > 0 DO
+			Files.ReadInt(R, beg); Files.ReadInt(R, end);
+			INC(nOfBoxes, end - beg); DEC(nOfRuns)
+		END;
+		Files.Set(R, Files.Base(R), Files.Pos(R) + 10*nOfBoxes);
+		Files.ReadString(R, name);
+	END GetType1Name;
+	
+	PROCEDURE DefineFont(VAR fontR: Files.Rider; fd: FontDesc);
+	VAR name, tmp, family, variant: ARRAY 32 OF CHAR; i, j, size: INTEGER; VAR f: Files.File; R: Files.Rider; ch: CHAR;
+	BEGIN
+		COPY(fd.name, name); COPY(fd.name, tmp); i := 0; size := 0;
+		WHILE (name[i] # 0X) & (name[i] # ".") & ((name[i] < "0") OR (name[i] > "9")) DO family[i] := name[i]; INC(i) END;
+		family[i] := 0X;
+		WHILE (name[i] >= "0") & (name[i] <= "9") DO size := size * 10 + ORD(name[i]) - ORD("0"); INC(i) END;
+		j := 0; 
+		WHILE (name[i] # 0X) & (name[i] # ".") DO variant[j] := name[i]; INC(j); INC(i) END;
+		variant[j] := 0X;
+		tmp[i+1] := "P"; tmp[i+2] := "r";
+		IF Resolution = 300 THEN tmp[i+3] := "3" ELSE tmp[i+3] := "6" END;
+		f := Files.Old(tmp); ch := 0FFX;
+		IF f # NIL THEN Files.Set(R, f, 1); Files.Read(R, ch) END;
+		IF ch = 01X THEN GetType1Name(R, tmp); SetType1Font(fontR, name, variant, tmp, size)	(* metric data *)
+		ELSIF ch = 0X THEN Files.Set(R, f, 0);  SetBitmapFont(fontR, R, fd, SHORT(Resolution))			(* raster data *)
+		ELSIF f = NIL THEN
+			name[i+1] := "S"; name[i+2] := "c";  name[i+3] := "n"; f := Files.Old(name);
+			IF f = NIL THEN f := Files.Old("Oberon10.Pr3.Fnt"); Files.Set(R, f, 0); SetBitmapFont(fontR, R, fd, 300) (* default *)
+			ELSE Files.Set(R, f, 0); SetBitmapFont(fontR, R, fd, 84) END 
+		ELSE HALT(66) END; (* wrong font type *)
+	END DefineFont;
+
+	PROCEDURE PrintPoly(VAR p, q: Poly; lim: REAL);
+	VAR x0, y0, x1, y1, x2, y2, x3, y3: REAL;
+	BEGIN
+		x0 := p.d;
+		y0 := q.d;
+		x1 := x0 + p.c*lim/3.0;
+		y1 := y0 + q.c*lim/3.0;
+		x2 := x1 + (p.c + p.b*lim)*lim/3.0;
+		y2 := y1 + (q.c + q.b*lim)*lim/3.0;
+		x3 := x0 + (p.c + (p.b + p.a*lim)*lim)*lim;
+		y3 := y0 + (q.c + (q.b + q.a*lim)*lim)*lim;
+		Int(bodyR, ENTIER(x1)); Files.Write(bodyR, " ");
+		Int(bodyR, ENTIER(y1)); Files.Write(bodyR, " ");
+		Int(bodyR, ENTIER(x2)); Files.Write(bodyR, " ");
+		Int(bodyR, ENTIER(y2)); Files.Write(bodyR, " ");
+		Int(bodyR, ENTIER(x3)); Files.Write(bodyR, " ");
+		Int(bodyR, ENTIER(y3)); Files.Write(bodyR, " ");
+		Int(bodyR, ENTIER(x0)); Files.Write(bodyR, " ");
+		Int(bodyR, ENTIER(y0)); Str(bodyR, " z");
+		Files.Write(bodyR, 0AX);
+	END PrintPoly;
+
+	PROCEDURE SolveTriDiag(VAR a, b, c, y: RealVector; n: INTEGER);
+	VAR i: INTEGER; help: REAL;
+	BEGIN (*a, b, c of tri-diag matrix T; solve Ty' = y for y', assign y' to y*)
+		i := 1;
+		WHILE i < n DO help := c[i-1]*y[i-1]; y[i] := y[i] - help; INC(i) END ;
+		i := n-1; y[i] := y[i]/a[i];
+		WHILE i > 0 DO DEC(i); help := b[i]*y[i+1]; y[i] := (y[i] - help)/a[i] END
+	END SolveTriDiag;	
+
+	PROCEDURE OpenSpline(VAR x, y, d: RealVector; n: INTEGER);
+	VAR i: INTEGER; d1, d2: REAL;
+			a, b, c: RealVector;
+	BEGIN (*from x, y compute d = y'*)
+		b[0] := 1.0/(x[1] - x[0]); a[0] := 2.0*b[0]; c[0] := b[0];
+		d1 := (y[1] - y[0])*3.0*b[0]*b[0]; d[0] := d1; i := 1;
+		WHILE i < n-1 DO
+			b[i] := 1.0/(x[i+1] - x[i]);
+			a[i] := 2.0*(c[i-1] + b[i]);
+			c[i] := b[i];
+			d2 := (y[i+1] - y[i])*3.0*b[i]*b[i];
+			d[i] := d1 + d2; d1 := d2; INC(i)
+		END ;
+		a[i] := 2.0*b[i-1]; d[i] := d1; i := 0;
+		WHILE i < n-1 DO c[i] := c[i]/a[i]; a[i+1] := a[i+1] - c[i]*b[i]; INC(i) END ;
+		SolveTriDiag(a, b, c, d, n)
+	END OpenSpline;
+
+	PROCEDURE ClosedSpline(VAR x, y, d: RealVector; n: INTEGER);
+	VAR i: INTEGER; d1, d2, hn, dn: REAL;
+			a, b, c, w: RealVector;
+	BEGIN (*from x, y compute d = y'*)
+		hn := 1.0/(x[n-1] - x[n-2]);
+		dn := (y[n-1] - y[n-2])*3.0*hn*hn;
+		b[0] := 1.0/(x[1] - x[0]);
+		a[0] := 2.0*b[0] + hn;
+		c[0] := b[0];
+		d1 := (y[1] - y[0])*3.0*b[0]*b[0]; d[0] := dn + d1;
+		w[0] := 1.0; i := 1;
+		WHILE i < n-2 DO
+			b[i] := 1.0/(x[i+1] - x[i]);
+			a[i] := 2.0*(c[i-1] + b[i]);
+			c[i] := b[i];
+			d2 := (y[i+1] - y[i])*3.0*b[i]*b[i]; d[i] := d1 + d2; d1 := d2;
+			w[i] := 0; INC(i)
+		END ;
+		a[i] := 2.0*b[i-1] + hn; d[i] := d1 + dn;
+		w[i] := 1.0; i := 0;
+		WHILE i < n-2 DO c[i] := c[i]/a[i]; a[i+1] := a[i+1] - c[i]*b[i]; INC(i) END ;
+		SolveTriDiag(a, b, c, d, n-1); SolveTriDiag(a, b, c, w, n-1); 
+		d1 := (d[0] + d[i])/(w[0] + w[i] + x[i+1] - x[i]); i := 0;
+		WHILE i < n-1 DO d[i] := d[i] - d1*w[i]; INC(i) END ;
+		d[i] := d[0]
+	END ClosedSpline;
+
+	PROCEDURE Spline*(x0, y0, n, open: INTEGER; VAR X, Y: ARRAY OF INTEGER);
+	VAR i: INTEGER; dx, dy, ds: REAL;
+			x, xd, y, yd, s: RealVector;
+			p, q: PolyVector;
+	BEGIN (*from X, Y compute x, y, s*)
+		x[0] := X[0]; y[0] := Y[0]; s[0] := 0; i := 1;
+		WHILE i < n DO
+			x[i] := X[i]; dx := x[i] - x[i-1];
+			y[i] := Y[i]; dy := y[i] - y[i-1];
+			s[i] := ABS(dx) + ABS(dy) + s[i-1]; INC(i)
+		END ;
+		IF open = 1 THEN OpenSpline(s, x, xd, n); OpenSpline(s, y, yd, n) 
+		ELSE ClosedSpline(s, x, xd, n); ClosedSpline(s, y, yd, n) END ;
+		(*compute coefficients from x, y, xd, yd, s*) i := 0;
+		WHILE i < n-1 DO
+			ds := 1.0/(s[i+1] - s[i]);
+			dx := (x[i+1] - x[i])*ds;
+			p[i].a := ds*ds*(xd[i] + xd[i+1] - 2.0*dx);
+			p[i].b := ds*(3.0*dx - 2.0*xd[i] -xd[i+1]);
+			p[i].c := xd[i];
+			p[i].d := x[i];
+			p[i].t := s[i];
+			dy := ds*(y[i+1] - y[i]);
+			q[i].a := ds*ds*(yd[i] + yd[i+1] - 2.0*dy);
+			q[i].b := ds*(3.0*dy - 2.0*yd[i] - yd[i+1]);
+			q[i].c := yd[i];
+			q[i].d := y[i];
+			q[i].t := s[i]; INC(i)
+		END ;
+		p[i].t := s[i]; q[i].t := s[i];
+		(*display polynomials*)
+		i := 0;
+		WHILE i < n-1 DO PrintPoly(p[i], q[i], p[i+1].t - p[i].t); INC(i) END
+	END Spline;
+
+	PROCEDURE ReplConst*(x, y, w, h: INTEGER);
+	BEGIN 
+		IF (w > 0) & (h > 0) THEN
+			Int(bodyR, x+1); Files.Write(bodyR, " ");
+			Int(bodyR, y);  Files.Write(bodyR, " ");
+			Int(bodyR, w-1); Files.Write(bodyR, " ");
+			Int(bodyR, h-1); Str(bodyR, " l"); Files.Write(bodyR, 0AX);
+		END
+	END ReplConst;
+
+	PROCEDURE ContString*(s: ARRAY OF CHAR; VAR fname: ARRAY OF CHAR);
+	VAR fNo, i, n: INTEGER; ch: CHAR; family: ARRAY 7 OF CHAR; fontName: ARRAY 32 OF CHAR;
+	
+			PROCEDURE Use(ch: CHAR);
+			BEGIN
+				INCL(fontTable[curFont].used[ORD(ch) DIV 32], ORD(ch) MOD 32);
+			END Use;
+	
+	BEGIN 
+		IF fname = listFont THEN fontName := "Courier8.Scn.Fnt" ELSE COPY (fname, fontName) END;
+		IF (curFont < 0) OR (fontTable[curFont].name # fontName) THEN
+			COPY(fontName, fontTable[fontIndex+1].name);
+			i := 0; WHILE i < 8 DO fontTable[fontIndex+1].used[i] := {}; INC(i) END;		
+			fNo := 0;
+			WHILE fontTable[fNo].name # fontName DO INC(fNo) END;
+			IF fNo > fontIndex THEN (* DefineFont(fontName); *) fontIndex := fNo END;
+			curFont := fNo; Files.Write(bodyR, "("); Str(bodyR, fontTable[curFont].name); Str(bodyR, ") f ")
+		END;
+		Files.Write(bodyR, "(");
+		i := 0; ch := s[0];
+		WHILE ch # 0X DO
+			CASE ch OF
+			| "(", ")", "\": Files.Write(bodyR, "\"); Files.Write(bodyR, ch); Use(ch);
+			| 9X: Str(bodyR, "  "); Use(" ")	(* or Str("\tab") *)
+			| 80X..95X, 0ABX:
+				Str(bodyR, "\2"); n := ORD(ch)-128;
+				Files.Write(bodyR, CHR(n DIV 8 + 48)); Files.Write(bodyR, CHR(n MOD 8 + 48)); Use(ch)
+			| 9FX: COPY(fontTable[curFont].name, family);
+				IF family = "Courie" THEN Files.Write(bodyR, " ") ELSE Str(bodyR, "  ") END; Use(" ");
+			ELSE
+				IF (ORD(ch) >= 32) & (ORD(ch)  < 127) THEN Files.Write(bodyR, ch)
+				ELSE
+					Files.Write(bodyR, "\");
+					Files.Write(bodyR, CHR((ORD(ch) DIV 64) MOD 8 + ORD("0")));
+					Files.Write(bodyR, CHR((ORD(ch) DIV 8) MOD 8 + ORD("0")));
+					Files.Write(bodyR, CHR(ORD(ch) MOD 8 + ORD("0")))
+				END;
+				Use(ch);
+			END ;
+			INC(i); ch := s[i];
+		END;
+		Str(bodyR, ") s"); Files.Write(bodyR, 0AX)
+	END ContString;
+
+	PROCEDURE String*(x, y: INTEGER; s: ARRAY OF CHAR; VAR fname: ARRAY OF CHAR);
+	BEGIN 
+		Int(bodyR, x); Files.Write(bodyR, " ");
+		Int(bodyR, y); Str(bodyR, " m "); ContString(s, fname)
+	END String;
+
+	PROCEDURE ReplPattern*(x, y, w, h, col: INTEGER);
+	BEGIN 
+		Int(bodyR, x+1); Files.Write(bodyR, " ");
+		Int(bodyR, y); Files.Write(bodyR, " ");
+		Int(bodyR, w-1); Files.Write(bodyR, " ");
+		Int(bodyR, h-1); Files.Write(bodyR, " ");
+		Int(bodyR, col); Str(bodyR, " b"); Files.Write(bodyR, 0AX);
+	END ReplPattern;
+
+	PROCEDURE Line*(x0, y0, x1, y1: INTEGER);
+	BEGIN 
+		Int(bodyR, x0); Files.Write(bodyR, " ");
+		Int(bodyR, y0); Files.Write(bodyR, " ");
+		Int(bodyR, x1-x0); Files.Write(bodyR, " ");
+		Int(bodyR, y1-y0); Str(bodyR, " x");
+		Files.Write(bodyR, 0AX);
+	END Line;
+
+	PROCEDURE Circle*(x0, y0, r: INTEGER);
+	BEGIN 
+		Int(bodyR, x0); Files.Write(bodyR, " ");
+		Int(bodyR, y0); Files.Write(bodyR, " ");
+		Int(bodyR, r); Files.Write(bodyR, " ");
+		Int(bodyR, r); Str(bodyR, " c");
+		Files.Write(bodyR, 0AX);
+	END Circle;
+
+	PROCEDURE Ellipse*(x0, y0, a, b: INTEGER);
+	BEGIN 
+		Int(bodyR, x0); Files.Write(bodyR, " ");
+		Int(bodyR, y0); Files.Write(bodyR, " ");
+		Int(bodyR, a); Files.Write(bodyR, " ");
+		Int(bodyR, b); Str(bodyR, " c");
+		Files.Write(bodyR, 0AX);
+	END Ellipse;
+
+	PROCEDURE Picture*(x, y, w, h, mode: INTEGER; adr: LONGINT);
+	VAR n, i, v: INTEGER; ch: CHAR;
+	BEGIN 
+		Int(bodyR, x); Files.Write(bodyR, " ");
+		Int(bodyR, y); Files.Write(bodyR, " ");
+		Int(bodyR, w); Files.Write(bodyR, " ");
+		Int(bodyR, h); Files.Write(bodyR, " ");
+		Int(bodyR,mode); Str(bodyR, " i");
+		n := (w + 7) DIV 8 * h; i := 0;
+		WHILE i < n DO
+			SYSTEM.GET(adr+i, ch);
+			IF i MOD 40 = 0 THEN Files.Write(bodyR, 0AX); END ;
+			v := (-ORD(ch)-1) MOD 256;
+			Hex(bodyR, v DIV 16); Hex(bodyR, v MOD 16);
+			INC(i)
+		END ;
+		Files.Write(bodyR, 0AX);
+	END Picture;
+
+	PROCEDURE Page*(nofcopies: INTEGER);
+	BEGIN 
+		curR := 0; curG := 0; curB := 0;
+		IF dense THEN
+			IF Resolution = 300 THEN
+				CASE location OF
+				| 0: Str(bodyR, "2336 0 translate"); Files.Write(bodyR, 0AX); location := 1;
+				| 1: Str(bodyR, "-2336 -3519.7 translate"); Files.Write(bodyR, 0AX); location := 2;
+				| 2: Str(bodyR, "2336 0 translate"); Files.Write(bodyR, 0AX); location := 3;
+				| 3: Str(bodyR, "-2336 3519.7 translate"); Files.Write(bodyR, 0AX); location := 0;
+					Int(bodyR, 1); Str(bodyR, " p"); Files.Write(bodyR, 0AX);
+					curFont := -1; INC(pno); ppos := Files.Pos(bodyR);
+					Str(bodyR, "%%Page: 0 "); Int(bodyR, pno); plen := Files.Pos(bodyR) - ppos; Files.Write(bodyR, 0AX);
+				END
+			ELSE
+				CASE location OF
+				| 0: Str(bodyR, "4672 0 translate"); Files.Write(bodyR, 0AX); location := 1;
+				| 1: Str(bodyR, "-4672 -7039.4 translate"); Files.Write(bodyR, 0AX); location := 2;
+				| 2: Str(bodyR, "4672 0 translate"); Files.Write(bodyR, 0AX); location := 3;
+				| 3: Str(bodyR, "-4672 7039.4 translate"); Files.Write(bodyR, 0AX); location := 0;
+					Int(bodyR, 1); Str(bodyR, " p"); Files.Write(bodyR, 0AX);
+					curFont := -1; INC(pno); ppos := Files.Pos(bodyR);
+					Str(bodyR, "%%Page: 0 "); Int(bodyR, pno); plen := Files.Pos(bodyR) - ppos; Files.Write(bodyR, 0AX);
+				END
+			END
+		ELSIF landscape THEN
+			IF Resolution = 300 THEN
+				CASE location OF
+				| 0: Str(bodyR, "2336 0 translate"); Files.Write(bodyR, 0AX); location := 1;
+				| 1: Str(bodyR, "-2336 0 translate"); Files.Write(bodyR, 0AX); location := 0;
+					Int(bodyR, 1); Str(bodyR, " p"); Files.Write(bodyR, 0AX);
+					curFont := -1; INC(pno); ppos := Files.Pos(bodyR);
+					Str(bodyR, "%%Page: 0 "); Int(bodyR, pno); plen := Files.Pos(bodyR) - ppos; Files.Write(bodyR, 0AX);
+				END
+			ELSE
+				CASE location OF
+				| 0: Str(bodyR, "4672 0 translate"); Files.Write(bodyR, 0AX); location := 1;
+				| 1: Str(bodyR, "-4672 0 translate"); Files.Write(bodyR, 0AX); location := 0;
+					Int(bodyR, 1); Str(bodyR, " p"); Files.Write(bodyR, 0AX);
+					curFont := -1; INC(pno); ppos := Files.Pos(bodyR);
+					Str(bodyR, "%%Page: 0 "); Int(bodyR, pno); plen := Files.Pos(bodyR) - ppos; Files.Write(bodyR, 0AX);
+				END
+			END
+		ELSE
+			Int(bodyR, nofcopies); Str(bodyR, " p"); Files.Write(bodyR, 0AX);
+			curFont := -1; INC(pno); ppos := Files.Pos(bodyR);
+			Str(bodyR, "%%Page: 0 "); Int(bodyR, pno); plen := Files.Pos(bodyR) - ppos; Files.Write(bodyR, 0AX);
+		END;
+	END Page;
+	
+	PROCEDURE Open*(name, options: ARRAY OF CHAR);
+	VAR i, j: INTEGER;
+	BEGIN 
+		COPY(name, printFname);
+		dense := CAP(options[0]) = "D";
+		landscape := CAP(options[0]) = "L";
+		curR := 0; curG := 0; curB := 0;
+		headerF := Files.Old(headerFileName);
+		IF headerF # NIL THEN res := 0;
+			bodyF := Files.New(""); Files.Set(bodyR, bodyF, 0);
+			fontIndex := -1; curFont := -1; listFont := ""; ppos := 0; pno := 1;
+		ELSE res := 1 END;
+		location := 0;
+	END Open;
+
+	PROCEDURE Send(printF: Files.File);
+	VAR srcR: Files.Rider;  ch: CHAR;  port: INTEGER;  t: LONGINT;
+
+		PROCEDURE V24Write(ch: CHAR);
+		VAR dr: CHAR;  t: LONGINT;
+		BEGIN
+			IF V24.Available(port) > 0 THEN 
+				V24.Receive(port, dr, t);
+				IF dr = 13X THEN
+					REPEAT IF V24.Available(port) > 0 THEN V24.Receive(port, dr, t) END UNTIL dr = 11X
+				END
+			END;
+			V24.Send(port, ch, t)
+		END V24Write;
+	  
+	BEGIN
+		IF (printFname = "COM1") OR (printFname = "COM2") THEN
+			IF printFname = "COM1" THEN port := 0 ELSE port := 1 END;
+			V24.Start(port, 9600, 8, V24.ParNo, V24.Stop1, t);
+			IF t # 0 THEN HALT(99) END;
+			Files.Set(srcR, printF, 0); Files.Read(srcR, ch);
+			WHILE (ch # "%") & ~srcR.eof DO Files.Read(srcR, ch) END;
+			WHILE ~srcR.eof DO
+				V24Write(ch); Files.Read(srcR, ch)
+			END; 
+			V24Write(4X);  ch := 0X;
+			REPEAT IF V24.Available(port) > 0 THEN V24.Receive(port, ch, t) END UNTIL ch = 4X;
+			V24.Stop(port)
+		ELSIF (printFname = "LPT1") OR (printFname = "LPT2") OR (printFname = "LPT3") THEN
+			IF printFname = "LPT1" THEN port := Centronics.LPT1 
+			ELSIF printFname = "LPT2" THEN port := Centronics.LPT2
+			ELSE port := Centronics.LPT3 END;
+			Centronics.Start(port);
+			Files.Set(srcR, printF, 0); Files.Read(srcR, ch);
+			WHILE (ch # "%") & ~srcR.eof DO Files.Read(srcR, ch) END;
+			WHILE ~srcR.eof DO	
+				Centronics.Send(port, ch); Files.Read(srcR, ch)
+			END; 
+			Centronics.Send(port, 4X)
+		ELSE
+			Files.Register(printF)
+		END
+	END Send;
+	
+	PROCEDURE Close*;
+	CONST bufSize = 4096;
+	VAR printF: Files.File; printR, srcR: Files.Rider;
+			buffer: ARRAY bufSize OF CHAR;
+			i: INTEGER;
+	BEGIN 
+		Str(bodyR, "OberonClose"); Files.Write(bodyR, 0AX);
+		IF (dense OR landscape) & (location # 0) THEN
+			Int(bodyR, 1); Str(bodyR, " p"); Files.Write(bodyR, 0AX);
+			curFont := -1; INC(pno); ppos := Files.Pos(bodyR);
+			Str(bodyR, "%%Page: 0 "); Int(bodyR, pno); plen := Files.Pos(bodyR) - ppos; Files.Write(bodyR, 0AX);
+		END;
+		Files.Set(bodyR, bodyF, ppos);	(*overwrite last %%Page line*)
+		Str(bodyR, "%%Trailer"); DEC(plen, 9); WHILE plen > 0 DO Files.Write(bodyR, " "); DEC(plen) END;
+		printF := Files.New(printFname); Files.Set(printR, printF, 0);
+		Str(printR, "%!PS-Adobe- minimal conforming"); Files.Write(printR, 0AX); 
+		Str(printR, "%%Creator: Native Oberon"); Files.Write(printR, 0AX); 
+		Str(printR, "%"); Files.Write(printR, 0AX); 
+		Str(printR, "% J. Templ, 1990, 1991, 1992"); Files.Write(printR, 0AX); 
+		Str(printR, "% J. Supcik, 1994"); Files.Write(printR, 0AX); 
+		Str(printR, "%"); Files.Write(printR, 0AX); 
+		Str(printR, "/factor ");
+		IF Resolution = 300 THEN Str(printR, ".24") ELSE Str(printR, ".12") END;
+		Str(printR, " def");  Files.Write(printR, 0AX);
+		Files.Set(srcR, headerF, 0(*34*)); Files.ReadBytes(srcR, buffer, bufSize);
+		WHILE ~srcR.eof DO Files.WriteBytes(printR, buffer, bufSize); Files.ReadBytes(srcR, buffer, bufSize) END;
+		IF srcR.res # bufSize THEN Files.WriteBytes(printR, buffer, bufSize-srcR.res) END;
+		i := 0;
+		WHILE i <= fontIndex DO DefineFont(printR, fontTable[i]); INC(i) END;
+		Files.Write(printR, 0AX);
+		Str(printR, "OberonInit"); Files.Write(printR, 0AX); 
+		IF dense THEN 
+			Str(printR, "0.5 0.5 scale"); Files.Write(printR, 0AX); 
+			Str(printR, "0 ");  Int(printR, 3520 * Resolution DIV 300); Str(printR, " translate"); Files.Write(printR, 0AX)
+		ELSIF landscape THEN
+			Str(printR, "90 rotate"); Files.Write(printR, 0AX);
+			Str(printR, "0.7071 0.7071 scale"); Files.Write(printR, 0AX);
+			Str(printR, "0 ");  Int(printR, ENTIER(-3519.7 * Resolution/300)); Str(printR, " translate"); Files.Write(printR, 0AX)
+		END;
+		Str(printR, "save"); Files.Write(printR, 0AX); Files.Write(printR, 0AX); 
+		Str(printR, "%%EndProlog"); Files.Write(printR, 0AX); Files.Write(printR, 0AX);
+		Str(printR, "%%Page: 0 1"); Files.Write(printR, 0AX);
+		Files.Set(srcR, bodyF, 0); Files.ReadBytes(srcR, buffer, bufSize);
+		WHILE ~srcR.eof DO Files.WriteBytes(printR, buffer, bufSize); Files.ReadBytes(srcR, buffer, bufSize) END;
+		IF srcR.res # bufSize THEN Files.WriteBytes(printR, buffer, bufSize-srcR.res) END;
+		Send(printF);
+		(*IF service # "" THEN
+			Services.Demand(server, service, me, done);
+			IF done THEN Files.Set(printR, Files.Base(printR), 0); Services.SendData(me, printR, Files.Length(Files.Base(printR)), done) 
+			ELSE Files.Register(printF) END
+		ELSE Files.Register(printF) END*);
+		Files.Set(bodyR, NIL, 0); 
+		headerF := NIL; bodyF := NIL; printF := NIL
+	END Close;
+	
+	PROCEDURE UseColor*(red, green, blue: INTEGER);
+	BEGIN
+		IF (red # curR) OR (green # curG) OR (blue # curB) THEN
+			curR := red; curG := green; curB := blue;
+			Int(bodyR, curR); Str(bodyR, " 255 div ");
+			Int(bodyR, curG); Str(bodyR, " 255 div ");
+			Int(bodyR, curB); Str(bodyR, " 255 div u");
+			Files.Write(bodyR, 0AX);
+		END;
+	END UseColor;
+	
+	PROCEDURE UseListFont*(VAR name: ARRAY OF CHAR);
+	END UseListFont;
+
+	PROCEDURE GetMetric* (font: ARRAY OF CHAR): Fonts.Font;
+	VAR name: ARRAY 32 OF CHAR; i: INTEGER; metric: Fonts.Font;
+	BEGIN
+		COPY(font, name);
+		i := 0; WHILE (name[i] # ".") & (name[i] # 0X) DO INC(i) END;
+		(* look for Mdx *)
+		name[i] := "."; name[i+1] := "M"; name[i+2] := "d";
+		IF Resolution = 300 THEN name[i+3] := "3"
+		ELSIF Resolution = 600 THEN name[i+3] := "6"
+		END;
+		name[i+4] := "."; name[i+5] := "F"; name[i+6] := "n"; name[i+7] := "t";
+		name[i+8] := 0X;
+		metric := Fonts.This(name);
+		IF (metric.type = Fonts.substitute) THEN RETURN NIL ELSE RETURN metric END
+	END GetMetric;
+
+	PROCEDURE Init;
+	VAR S: Texts.Scanner;
+	BEGIN 
+		Oberon.OpenScanner(S, "PrinterResolution");
+		IF S.class = Texts.Int THEN Resolution := S.i ELSE Resolution := 600 END;
+		IF Resolution = 300 THEN 
+			Width := 2480; Height := 3519; Depth := 1;
+			FrameX := 94; FrameY := 177; FrameW := 2336; FrameH := 3280;
+			Unit := 3048
+		ELSIF Resolution = 600 THEN
+			Width := 2480*2; Height := 3519*2; Depth := 1;
+			FrameX := 94*2; FrameY := 177*2; FrameW := 2336*2; FrameH := 3280*2;
+			Unit := 3048 DIV 2
+		ELSE HALT(99) END;
+		hexArray := "0123456789ABCDEF"
+	END Init;
+	
+BEGIN 
+	Init
+END Printer.

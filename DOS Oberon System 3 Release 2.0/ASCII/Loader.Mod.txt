@@ -1,0 +1,750 @@
+MODULE Loader;	(* ARD 2. 4. 93 *)
+(* ARD 20.07.93, EntryLength = 128, MaxComs = 128 *)
+(* ARD 31.08.93, New segments and parameters *)
+
+IMPORT SYSTEM;
+
+CONST done = 0;
+			fileNotFound = 1;
+			invalidObjFile = 2;
+			keyMismatch = 3;
+			notEnoughSpace = 4;
+			cmdNotFound = 5;
+			refCntNotZero = 6;
+			moduleNotFound = 7;
+			cyclicImport = 8;
+			
+			MaxExt = 16;  (* Values taken from DOSOPx-Modules *)
+			MaxEntry = 128;
+			MaxCmds = 128;
+			MaxPtrs = 128;
+			MaxTD = 32; 
+			MaxTBP = 16;
+			MaxCodeLen = 64000;
+			MaxLinks = 250;
+			MaxConstLen = 5000;
+			MaxImports = 32;
+			
+			BufSize = 4096;
+						
+TYPE Name32 = ARRAY 32 OF CHAR;
+		Module = POINTER TO ModuleDesc;
+		Type = POINTER TO TypeDesc;
+		
+		Cmd = RECORD name: Name32; absentry: LONGINT END;
+		Entries = POINTER TO ARRAY MaxEntry OF LONGINT;
+		Commands = POINTER TO ARRAY MaxCmds OF Cmd;
+		PtrTab = POINTER TO ARRAY MaxPtrs OF LONGINT;
+		TDesc = POINTER TO ARRAY MaxTD OF LONGINT;
+		Imports = POINTER TO ARRAY MaxImports OF LONGINT; (* HACK!!! Should be Module, but compiler-error 235 *)
+		Data = POINTER TO ARRAY MaxConstLen OF SYSTEM.BYTE;
+		Code = POINTER TO ARRAY MaxCodeLen OF SYSTEM.BYTE;
+		
+		TypeDesc = RECORD 
+			tdsize: LONGINT;
+			sentinel: LONGINT;
+			self: LONGINT;
+			noftbp: LONGINT;
+			name: Name32;
+			mdesc: Module;
+			tbp: ARRAY MaxTBP OF LONGINT;	(* MethTab, not yet implemented *)
+			tags: ARRAY 16 OF LONGINT;
+			tag: LONGINT;
+			recsize: LONGINT;
+			ptroffset: ARRAY MaxPtrs+1 OF LONGINT 
+		END;
+
+		ModuleDesc = RECORD
+			next: Module;
+			name: Name32;
+			init, trapped: BOOLEAN;
+			key, refcnt, nofentries, nofcoms, nofptrs, nofimps, size, nofrecs: LONGINT;
+			entries: Entries;
+			cmds: Commands;
+			ptrTab: PtrTab;
+			tdescs: TDesc;
+			imports: Imports;
+			SB: LONGINT;
+			data: Data;
+			code: Code;
+			refs: LONGINT
+		END;
+		
+		ModTab = ARRAY MaxImports OF RECORD name: Name32; key: LONGINT END;
+		LinkTab = ARRAY MaxLinks OF RECORD m, n: SHORTINT; link: LONGINT END;
+		TypeTab = ARRAY MaxTD OF RECORD tdesc: LONGINT END;
+		
+		RegPtr = POINTER TO REGISTER;
+		REGISTER* = RECORD
+								AX*, CX*, DX*, BX*: INTEGER;
+								SP*, BP*, SI*, DI*: INTEGER;		(* SP, BP: read only *)
+								Flags*: INTEGER;							(* read only *)
+								CS*, SS*: LONGINT;						(* read only *)
+								DS*, ES*: LONGINT
+							END;
+									
+									(* Bit 0: Carry CF
+										Bit 1: unused
+										Bit 2: Parity PF  (* not yet implemented *)
+										Bit 3: unused
+										Bit 4: Auxiliary AF  (* not yet implemented *)
+										Bit 5: Overflow OF  (* not yet implemented *)
+										Bit 6: Zero ZF
+										Bit 7: SignSF *)  (* not yet implemented *)
+									
+		Proc = PROCEDURE;
+		Proc1 = PROCEDURE (mod: ARRAY OF CHAR; VAR m: Module; VAR res: INTEGER);	(* Load *)
+		Proc2 = PROCEDURE (R: RegPtr; Int: INTEGER);	(* Int *)
+		Proc3 = PROCEDURE (cmd: ARRAY OF CHAR; m: Module; VAR command: Proc; VAR res: INTEGER); (* GetProc *)
+		Proc4 = PROCEDURE (mod: ARRAY OF CHAR; all: BOOLEAN; VAR res: INTEGER);	(* Free *)
+		
+		new = PROCEDURE (VAR adr: ARRAY OF SYSTEM.BYTE):LONGINT;
+		sysnew = PROCEDURE (size: LONGINT):LONGINT;
+		
+VAR First: LONGINT;
+		modules: Module;
+		Handle, res: INTEGER;
+		File1, File2, FileName: Name32;
+		P: RegPtr;
+		Routine: ARRAY 2 OF LONGINT;
+		KernelLoaded, SystemLoaded, FilesLoaded, LoadHigh: BOOLEAN;
+		PageDir: LONGINT;
+		OldSegment: LONGINT;
+		DS, ES: INTEGER;
+		main: ARRAY 64 OF CHAR;
+		New: new; 
+		SysNew: sysnew;
+		TableRoot: LONGINT;								(* Addr of Ptr to Filetranslationtable *)
+		IntTransfer: LONGINT;								(* Address of Interrupt transfer buffer *)
+		heapSize: LONGINT;
+		Display: LONGINT;										(* Beginning of the Displaymemory *)
+		BufBeg: LONGINT;										(* Distance between Interruptbase and loaderbegin *)
+		StackOrg: LONGINT;									(* Start of Stack *)
+		heapAdr: LONGINT;									(* Start of heap *)
+		Reg: REGISTER;										(* Parameter for interruptoperations *)
+		Transfer: ARRAY BufSize OF CHAR;				(* Transferbuffer for fileoperations *)
+
+		
+PROCEDURE INT(R: RegPtr; Int: INTEGER);
+(* 0C8H, 0, 0, 0, 9AH, 0, 0, 0, 0, 0, 0, 0C9H, 0C2H, 8, 0;*)
+BEGIN
+	(*$ DInline.Assemble
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+		NOP
+	END *)
+(* CALL Code16Sel:offset StartInt *)
+(* Must be in first place *)
+END INT;
+		
+PROCEDURE^ InitKernel (m: Module);
+
+PROCEDURE WriteInt (i: LONGINT);
+BEGIN
+	IF i < 0 THEN Transfer[0] := CHR(45) ELSE Transfer[0] := CHR(32) END;
+	i := ABS(i);
+	Transfer[1] := CHR((i DIV 1000000000) + 48); i := i MOD 1000000000;
+	Transfer[2] := CHR((i DIV 100000000) + 48); i := i MOD 100000000;
+	Transfer[3] := CHR((i DIV 10000000) + 48); i := i MOD 10000000;
+	Transfer[4] := CHR((i DIV 1000000) + 48); i := i MOD 1000000;
+	Transfer[5] := CHR((i DIV 100000) + 48); i := i MOD 100000;
+	Transfer[6] := CHR((i DIV 10000) + 48); i := i MOD 10000;
+	Transfer[7] := CHR((i DIV 1000) + 48); i := i MOD 1000;
+	Transfer[8] := CHR((i DIV 100) + 48); i := i MOD 100;
+	Transfer[9] := CHR((i DIV 10) + 48); i := i MOD 10;
+	Transfer[10] := CHR(i + 48);
+	Transfer[11] := CHR(36); (* $ *)
+	P.AX := 900H; 
+	P.DX := SHORT(BufBeg);
+	P.DS := DS;
+	INT(P, 21H);
+END WriteInt;
+
+PROCEDURE WriteString (s: ARRAY OF CHAR);
+VAR i: LONGINT;
+BEGIN 
+	i := 0; WHILE s[i] # 0X DO Transfer[i] := s[i]; INC(i) END; Transfer[i] := "$";
+	P.AX := 900H; 
+	P.DX := SHORT(BufBeg);
+	P.DS := DS;
+	INT(P, 21H);
+END WriteString;
+
+PROCEDURE WriteLn;
+BEGIN
+	Transfer[0] := 0DX; 
+	Transfer[1] := 0AX;
+	Transfer[2] := "$"; 
+	P.AX := 900H; 
+	P.DX := SHORT(BufBeg);
+	P.DS := DS;
+	INT(P, 21H);
+END WriteLn;	
+
+PROCEDURE Write(ch: CHAR);
+BEGIN
+	P.AX := 200H; 
+	P.DX := ORD(ch);
+	INT(P, 21H);
+END Write;
+
+PROCEDURE DOSNew (VAR adr: LONGINT; size: LONGINT);
+VAR k, dest, help: LONGINT;
+BEGIN 
+	size := (size + 28 + 32 + 15) DIV 16; (* +15: auf 16 byte alinieren *) (* Start address MOD 32 = 0 *)
+	P.BX := SHORT(size); size := size * 16;
+	INT(P, 99); 
+	IF P.AX < 0 THEN adr := (LONG(P.AX) + 10000H)*16 ELSE adr := LONG(P.AX)*16 END;
+	dest := adr; help := 0; k := 0; 
+	WHILE k < (size DIV 4) DO SYSTEM.PUT(dest, help); INC(dest, 4); INC(k) END;
+	IF (adr MOD 32) = 0 THEN INC(adr, 28) ELSE INC(adr, 12) END;
+	SYSTEM.PUT(adr, adr+4);
+	SYSTEM.PUT(adr+4, size-4); help := -4;
+	SYSTEM.PUT(adr+8, help); help := 0;
+	SYSTEM.PUT(adr+12, help);
+	SYSTEM.PUT(adr+16, help);
+	SYSTEM.PUT(adr+20, help);
+	SYSTEM.PUT(adr+24, adr+4);
+	adr := adr + 28;
+END DOSNew;
+
+PROCEDURE Close (handle: INTEGER);
+BEGIN
+	P.AX := 3E00H; 
+	P.BX := handle;			(* Close file *)
+	INT(P, 21H);
+END Close;
+		
+PROCEDURE Open (VAR name: ARRAY OF CHAR; VAR res: INTEGER; VAR length: LONGINT);
+VAR m: LONGINT;
+BEGIN  
+	COPY(name, Transfer);
+	P.AX := 3D02H;  			(* Open file *)
+	P.DX := SHORT(BufBeg);
+	P.DS := DS;
+	INT(P, 21H);
+	Handle := P.AX;
+	IF SYSTEM.BIT(SYSTEM.ADR(P.Flags), 0) THEN res := fileNotFound; length := 0; Handle := -1; RETURN ELSE res := done END;
+	P.AX := 4202H;
+	P.BX := Handle;
+	P.CX := 0;
+	P.DX := 0;
+	INT(P, 21H);
+	IF P.AX < 0 THEN m := P.AX + 10000H ELSE m := P.AX END;
+	length := P.DX * 65536 + m;
+	P.AX := 4200H;
+	P.BX := Handle;
+	P.CX := 0;
+	P.DX := 0;
+	INT(P, 21H);
+	IF SYSTEM.BIT(SYSTEM.ADR(P.Flags), 0) THEN res := fileNotFound; length := 0; Handle := -1 ELSE res := done END;
+END Open;
+
+PROCEDURE Find(mod: ARRAY OF CHAR; VAR m: Module);
+VAR i: INTEGER;
+BEGIN
+	i := 0; WHILE (mod[i] # ".") & (i < 31) DO INC(i) END; mod[i] := 0X;
+	m := modules; 
+	LOOP 
+		IF m = NIL THEN EXIT END;
+		IF m.name = mod THEN EXIT ELSE m := m.next END;
+	END;
+END Find;
+
+PROCEDURE Delete(m: Module);
+VAR m1: Module;
+BEGIN
+	IF m = modules THEN modules := modules.next
+	ELSE m1 := modules;
+		WHILE m1.next # m DO m1 := m1.next END;
+		m1.next := m1.next.next
+	END
+END Delete;
+
+PROCEDURE ErrMsg*(msg: INTEGER);
+BEGIN
+	IF (~SystemLoaded) & (msg # done) THEN
+		IF msg = fileNotFound THEN WriteString ("Objectfile not found: "); WriteString (main); WriteString (File1); WriteLn;
+		ELSIF msg = moduleNotFound THEN WriteString ("Module not found: "); WriteString (main); WriteString (File1); WriteLn;
+		ELSIF msg = keyMismatch THEN WriteString ("Version error: "); WriteString (File1); 
+				WriteString (" importing "); WriteString (File2); WriteLn;
+		ELSIF msg = cmdNotFound THEN WriteString ("Command not found: "); WriteString (File1); WriteLn;
+		ELSIF msg = invalidObjFile THEN WriteString ("Invalid object file: "); WriteString (File1); WriteLn;
+		ELSIF msg = refCntNotZero THEN WriteString ("Reference count not zero: "); WriteString (File1); WriteLn;
+		ELSIF msg = cyclicImport THEN WriteString ("Cyclic import: "); WriteString (File1); WriteLn;
+		ELSIF msg = notEnoughSpace THEN WriteString ("Not enough Space: "); WriteString (File1); WriteLn;
+		ELSE WriteString ("Errornumber: "); WriteInt(msg); WriteLn END;
+		WriteString("For continuation reboot"); WriteLn; LOOP END;
+	END
+END ErrMsg;
+
+PROCEDURE Check (ch: CHAR);
+BEGIN
+	P.AX := 3F00H; 
+	P.BX := Handle;
+	P.CX := 1; 													(* Read one byte *)
+	P.DX := SHORT(BufBeg); 					(* Buffer = Begin of code32-segment *)
+	P.DS := DS;
+	INT(P, 21H);
+	IF ch # Transfer[0] THEN File1 := FileName; ErrMsg(invalidObjFile) END;
+END Check;
+
+PROCEDURE Read (VAR i: SHORTINT);
+BEGIN
+	P.AX := 3F00H; 
+	P.BX := Handle;
+	P.CX := 1; 													(* Read one bytes *)
+	P.DX := SHORT(BufBeg);	(* Buffer = Begin of code32-segment *)
+	P.DS := DS;
+	INT(P, 21H);
+	i := SHORT(ORD(Transfer[0]));
+	IF P.AX MOD 100H # 1 THEN ErrMsg(100) END;
+END Read;
+
+PROCEDURE Read2 (VAR i: LONGINT);
+BEGIN
+	P.AX := 3F00H; 
+	P.BX := Handle;
+	P.CX := 2; 													(* Read two bytes *)
+	P.DX := SHORT(BufBeg);	(* Buffer = Begin of code32-segment *)
+	P.DS := DS;
+	INT(P, 21H);
+	i := ASH(LONG(ORD(Transfer[1])), 8) + ORD(Transfer[0]);
+	IF P.AX MOD 100H # 2 THEN ErrMsg(101) END;
+END Read2;
+
+PROCEDURE Read4 (VAR i: LONGINT);
+BEGIN
+	P.AX := 3F00H; 
+	P.BX := Handle;
+	P.CX := 4; 													(* Read four bytes *)
+	P.DX := SHORT(BufBeg);	(* Buffer = Begin of code32-segment *)
+	P.DS := DS;
+	INT(P, 21H);
+	SYSTEM.GET(SYSTEM.ADR(Transfer[0]), i);
+	IF P.AX MOD 100H # 4 THEN ErrMsg(102) END;
+END Read4;
+
+PROCEDURE Readx (dest, size: LONGINT);
+VAR count, transferred: LONGINT; i: INTEGER;
+BEGIN 
+	REPEAT
+		i := 0;
+		IF size < BufSize THEN count := size ELSE count := BufSize END;
+		P.AX := 3F00H; 
+		P.BX := Handle;
+		P.CX := SHORT(count); 		(* Read size bytes *)
+		P.DX := SHORT(BufBeg);	(* Buffer = Begin of code32-segment *)
+		P.DS := DS;
+		INT(P, 21H);
+		IF P.AX < 0 THEN transferred := P.AX + 10000H ELSE transferred := P.AX END;
+		WHILE i < transferred DO SYSTEM.PUT (dest, Transfer[i]); INC (dest); INC (i) END;
+		size := size - transferred;
+	UNTIL size = 0;
+END Readx;
+
+PROCEDURE ReadName (VAR name: ARRAY OF CHAR; size: INTEGER);
+VAR i: INTEGER;
+BEGIN
+	i := 0;
+	REPEAT
+		P.AX := 3F00H; 
+		P.BX := Handle;
+		P.CX := 1; 													(* Read one byte *)
+		P.DX := SHORT(BufBeg);	(* Buffer = Begin of code32-segment *)
+		P.DS := DS;
+		INT(P, 21H);
+		name[i] := Transfer[0]; INC(i);
+	UNTIL (Transfer[0] = 0X) OR (i = size); 
+END ReadName;
+
+PROCEDURE ReadChar (VAR ch: CHAR);
+BEGIN
+	P.AX := 3F00H; 
+	P.BX := Handle;
+	P.CX := 1; 													(* Read one byte *)
+	P.DX := SHORT(BufBeg);	(* Buffer = Begin of code32-segment *)
+	P.DS := DS;
+	INT(P, 21H);
+	ch := Transfer[0]
+END ReadChar;
+
+PROCEDURE MakeFileName(dir, name: ARRAY OF CHAR; VAR dest: ARRAY OF CHAR);
+VAR i, j: INTEGER;
+BEGIN
+	i := 0; j := 0; 
+	WHILE dir[i] # 0X DO dest[i] := dir[i]; INC(i) END;
+	IF (dest[i-1] # "\") THEN dest[i] := "\"; INC(i) END;
+	WHILE name[j] # 0X DO dest[i] := name[j]; INC(i); INC(j) END;
+	dest[i] := 0X
+END MakeFileName;
+
+PROCEDURE ReadTypes (m: Module; nofrecs: LONGINT; VAR types: TypeTab; VAR res: INTEGER);
+VAR i, k, tdsize, recsize, tdadr, nofptr, noftbp, (*j, *)dmy: LONGINT;
+		td: Type;
+BEGIN  
+	i := 0; res := done;
+	WHILE i < nofrecs DO  
+		Read2 (tdsize); Read4 (tdadr); Read4 (recsize); Read2 (nofptr); Read2 (noftbp);
+		IF KernelLoaded & LoadHigh THEN dmy := SysNew(tdsize-24) ELSE DOSNew(dmy, tdsize-24) END;					(* ALLOCATE *)
+		IF dmy = 0 THEN res := notEnoughSpace; RETURN END;
+		td := SYSTEM.VAL(Type, dmy-24);
+		td.self := SYSTEM.ADR(td.recsize);
+		td.noftbp := noftbp;
+		td.name := m.name;
+		td.mdesc := m;
+		td.tag := SYSTEM.ADR(td.tdsize);
+		td.recsize := recsize;
+		types[i].tdesc := SYSTEM.ADR(td.recsize);
+		k := 0;
+		WHILE k < nofptr DO Read4 (td.ptroffset[k]); INC(k) END;
+		td.ptroffset[k] := -(nofptr + 1) * 4; 
+		dmy := SYSTEM.ADR(m.data[tdadr]);
+		SYSTEM.PUT(dmy, SYSTEM.ADR(td.recsize));
+		k := 0;
+		WHILE k < noftbp DO Read4 (td.tbp[k]); INC(k) END;
+		INC (i)
+	END; 
+END ReadTypes;
+
+PROCEDURE InitTypes (nofrec: LONGINT; VAR types: TypeTab);
+VAR i, k: INTEGER;
+		tdesc: LONGINT;
+BEGIN 
+	i := 0;
+	WHILE i < nofrec DO
+		k := 0;
+		tdesc := types[i].tdesc;
+		WHILE k < MaxExt DO SYSTEM.PUT(tdesc-k*4-8, tdesc); INC (k) END;
+		INC (i)
+	END;
+END InitTypes;
+
+PROCEDURE InitVars(m: Module; size: LONGINT);
+VAR i, zero: LONGINT;
+BEGIN i := 4; zero := 0;
+	WHILE i <= size DO SYSTEM.PUT(m.SB - i, zero); INC(i, 4) END
+END InitVars;
+
+PROCEDURE GetPcFno (m: Module; L: LONGINT; VAR next, adr: LONGINT);
+VAR mem: LONGINT;
+BEGIN
+	SYSTEM.GET (SYSTEM.VAL(LONGINT, m.code) + L, mem); 
+	next := mem MOD 10000H;
+	adr := ASH(mem, -16);
+END GetPcFno;
+
+PROCEDURE Fixup (m: Module; noflink: LONGINT; links: LinkTab);
+VAR i, modnr, entnr, count: INTEGER;
+		imp: Module;
+		L1, adr, L, procadr: LONGINT;
+BEGIN 
+	i := 0; 
+	WHILE i < m.nofcoms DO INC(m.cmds[i].absentry, SYSTEM.VAL(LONGINT, m.code)); INC(i) END;
+	i := 0;
+	WHILE i < noflink DO
+		modnr := links[i].m; IF modnr < 0 THEN INC(modnr, 256) END;
+		entnr := links[i].n; IF entnr < 0 THEN INC(entnr, 256) END;
+		L := links[i].link;
+		IF (modnr # 255) & (modnr # 254) THEN imp := SYSTEM.VAL(Module, m.imports[modnr]) END;
+		WHILE L # 0 DO
+			IF (entnr = 255) & (modnr # 254) THEN				(* Global Data *)
+				GetPcFno (m, L, L1, adr); 
+				SYSTEM.PUT (SYSTEM.VAL(LONGINT, m.code) + L, imp.SB + adr);
+				L := L1;
+			ELSE											(* entnr # 255 --> procedure *)
+				IF modnr = 255 THEN 			(* NEW and SYSTEM.NEW *)
+					GetPcFno (m, L, L1, adr); 
+					adr := Routine[entnr] - SYSTEM.VAL(LONGINT, m.code) - L - 4; 
+					IF Routine[entnr] = 0 THEN WriteString ("Kernel not loaded"); WriteLn; RETURN END;
+					SYSTEM.PUT (SYSTEM.VAL(LONGINT, m.code) + L, adr);
+					L := L1;
+				ELSIF modnr = 254 THEN			(* CASE Table *)
+					count := 0;
+					WHILE count < entnr DO 
+						SYSTEM.GET(m.SB + L, adr); 
+						SYSTEM.PUT(m.SB + L, adr + SYSTEM.VAL(LONGINT, m.code));
+						INC(L, 4); INC(count);
+					END; L := 0;
+				ELSE
+					GetPcFno (m, L, L1, adr);
+					IF adr < 0 THEN 
+						SYSTEM.PUT (SYSTEM.VAL(LONGINT, m.code) + L, imp.entries[entnr])	(* CALL indirect --> absolute *)
+					ELSE procadr := imp.entries[entnr] - SYSTEM.VAL(LONGINT, m.code) - L - 4;			(* disp := loc - pc - 4 *)
+						SYSTEM.PUT (SYSTEM.VAL(LONGINT, m.code) + L, procadr)					(* CALL direct --> via offset *)
+					END;
+					L := L1
+				END
+			END
+		END;
+		INC (i)
+	END;
+END Fixup;
+
+PROCEDURE Free*(mod: ARRAY OF CHAR; all: BOOLEAN; VAR res: INTEGER);
+VAR m, hack: Module; 
+		i, r: INTEGER; A: LONGINT;
+BEGIN res := done;
+	Find(mod, m);
+	IF m = NIL THEN res := moduleNotFound
+	ELSIF m.refcnt # 0 THEN res := refCntNotZero
+	ELSE i := 1; 
+		WHILE i <= m.nofimps DO hack := SYSTEM.VAL(Module,  m.imports[i]); DEC(hack.refcnt); INC(i) END;
+		Delete(m);
+		IF all THEN i := 1; 
+			WHILE i <= m.nofimps DO 
+				hack := SYSTEM.VAL(Module,  m.imports[i]);
+				Free (hack.name, TRUE, r); INC (i);
+			END 
+		END; 
+		A := 0;
+		WHILE A < m.size DO SYSTEM.PUT(SYSTEM.VAL(LONGINT, m.entries)+ A, 0CCX); INC(A) END;
+	END;
+	COPY(mod, File1);
+END Free;
+
+PROCEDURE^ Load*(mod: ARRAY OF CHAR; VAR m: Module; VAR res: INTEGER);
+
+PROCEDURE LoadModule (VAR mod: Module; VAR res: INTEGER; length: LONGINT);
+VAR i, j, noflink, refsize, dsize, consize, codesize, var, initialized: LONGINT;
+		m, m1, hack: Module;
+		body: Proc;
+		mods: ModTab;
+		links: LinkTab;
+		types: TypeTab;
+		here, mem: LONGINT;
+		name: Name32;
+		temp: ARRAY 34 OF CHAR (* << KR *);
+		codetag: SHORTINT;
+BEGIN
+	(* Don't read Tag and ID *)
+	Readx (SYSTEM.ADR(temp), 34)(* << KR *) ;
+	Read(codetag);
+	IF CHR(codetag) = 0F8X THEN LoadHigh := TRUE
+	ELSIF CHR(codetag) = 0F9X THEN LoadHigh := FALSE
+	ELSE ErrMsg(invalidObjFile) END;
+
+	IF KernelLoaded & LoadHigh THEN mem := SysNew(SIZE(ModuleDesc)) ELSE DOSNew(mem, SIZE(ModuleDesc)) END;	(* ALLOCATE *)
+	m := SYSTEM.VAL(Module, mem);
+	IF m = NIL THEN Close(Handle); res := notEnoughSpace; ErrMsg(notEnoughSpace); RETURN END;
+	m.init := FALSE; m.refcnt := 0;
+ 	
+	(* HEADERBLOCK *)
+	Read4 (refsize); refsize := length - refsize - 1 - 34; Read2 (m.nofentries); Read2 (m.nofcoms); Read2 (m.nofptrs);
+	Read2 (m.nofimps); Read2 (noflink);
+	Read2 (m.nofrecs); Read4 (dsize); Read2 (consize); Read4 (codesize); Read4 (m.key); ReadName (m.name, 32);
+	m.size := (m.nofentries + m.nofptrs + m.nofrecs)*4 + m.nofcoms*36;
+	m.size := m.size + (m.nofimps+1)*4 + dsize + consize + codesize + refsize + 16;
+	IF KernelLoaded & LoadHigh THEN mem := SysNew(m.size) ELSE DOSNew(mem, m.size) END;										(* ALLOCATE *)
+	m.entries := SYSTEM.VAL(Entries, mem);
+	IF m.entries = NIL THEN Close(Handle); Delete(m); res := notEnoughSpace; ErrMsg(notEnoughSpace); RETURN END; 
+	
+	m.cmds := SYSTEM.VAL(Commands, (SYSTEM.VAL(LONGINT, m.entries) + m.nofentries*4));
+	m.ptrTab := SYSTEM.VAL(PtrTab, (SYSTEM.VAL(LONGINT, m.cmds) + m.nofcoms*36));
+	m.tdescs := SYSTEM.VAL(TDesc, (SYSTEM.VAL(LONGINT, m.ptrTab) + m.nofptrs*4));
+	m.imports := SYSTEM.VAL(Imports, (SYSTEM.VAL(LONGINT, m.tdescs) + m.nofrecs*4));
+	m.SB := SYSTEM.VAL(LONGINT, m.imports) + (m.nofimps+1)*4 + dsize;
+	m.data := SYSTEM.VAL(Data, m.SB);
+	m.code := SYSTEM.VAL(Code, (SYSTEM.VAL(LONGINT, m.data) + consize + 15) DIV 16 * 16);
+	m.refs := SYSTEM.VAL(LONGINT, m.code) + codesize;
+	
+	(* ENTRYBLOCK *)
+	Check (81X);	(* Set absolute Entry *)
+	i := 0; WHILE i < m.nofentries DO Read4 (here); m.entries[i] := here + SYSTEM.VAL(LONGINT, m.code); INC(i) END;
+
+	(* COMMANDBLOCK *)
+	Check (82X);	(* Set absolute Entry *)
+	i := 0; WHILE i < m.nofcoms DO ReadName (m.cmds[i].name, 32); Read4 (m.cmds[i].absentry); INC(i) END;
+	
+	(* POINTERBLOCK *)
+	Check (83X);
+	i := 0; WHILE i < m.nofptrs DO Read4 (m.ptrTab[i]); INC(i) END;
+	
+	(* TDESCBLOCK *)
+	i := 0; WHILE i < m.nofrecs DO Read4 (m.tdescs[i]); INC(i) END;
+
+	(* PROCVARBLOCK *)
+	Check (84X);
+
+	(* IMPORTBLOCK *)
+	Check (85X);
+	i := 0; WHILE i < (m.nofimps) DO Read4 (mods[i].key); ReadName (mods[i].name, 32); INC (i) END;
+	
+	(* LINKBLOCK *)
+	Check (86X);
+	i := 0; WHILE i < noflink DO Read (links[i].m); Read (links[i].n); Read2 (links[i].link); INC (i) END;
+
+	(* FIXUPBLOCK *)
+	Check (87X);
+				
+	(* CODE- /CONSTANTBLOCK *)
+	Check (88X); 
+	Readx (SYSTEM.VAL(LONGINT, m.data), consize);
+	Readx (SYSTEM.VAL(LONGINT, m.code), codesize);
+
+	(* TYPEDESCRIPTORBLOCK *)
+	Check (89X);
+	ReadTypes (m, m.nofrecs, types, res);
+
+	IF res # done THEN Close (Handle); mod := NIL; Delete (m); ErrMsg(res); RETURN END;
+	
+	(* REFERENCEBLOCK *)
+	Check (8AX);
+	Readx (m.refs, refsize);
+	Close (Handle);
+
+	i := 0; initialized := 0;
+	m.imports[0] := SYSTEM.VAL(LONGINT, m);
+	IF res = done THEN 
+		WHILE (i < m.nofimps)  DO name := mods[i].name;
+			j := 0; WHILE name[j] # 0X DO INC(j) END;
+			name[j] := "."; name[j+1] := "O"; name[j+2] := "b"; name[j+3] := "j"; name[j+4] := 0X;
+			Load(name, m1, res);
+			IF (res = done) & (m1.key # mods[i].key) THEN 
+				res := keyMismatch; File1 := m.name; File2 := mods[i].name; initialized := i; i := m.nofimps END;
+			IF res = done THEN INC(i); INC(m1.refcnt); m.imports[i] := SYSTEM.VAL(LONGINT, m1) 
+			ELSE File1 := mods[i].name; RETURN END; (* << KR *)
+		END;
+	END;
+	m.next := modules; modules := m;
+	IF res = done THEN
+		Fixup(m, noflink, links);
+		InitTypes(m.nofrecs, types);
+		InitVars(m, dsize);
+		IF m.name = "Kernel" THEN InitKernel (m);
+		ELSE body := SYSTEM.VAL(Proc, m.entries[0]); 
+			m.init := TRUE; m.trapped := TRUE; 
+			body; 
+			m.trapped := FALSE 
+		END; (* CALL Body *)
+		IF m.name = "System" THEN SystemLoaded := TRUE END;
+		IF m.name = "Files" THEN FilesLoaded := TRUE; SYSTEM.GET(TableRoot, First) END;
+	ELSE ErrMsg(res);
+		WHILE initialized > 0 DO hack := SYSTEM.VAL(Module, m.imports[i]); DEC(hack.refcnt); DEC(initialized) END; 
+		Delete(m); 
+	END;
+	mod := m;
+END LoadModule;
+
+PROCEDURE GetName(VAR name, path: ARRAY OF CHAR);
+VAR n: ARRAY 32 OF CHAR; f, start: LONGINT; 
+BEGIN 
+	SYSTEM.GET(First, f); (* f = Ptr to Table *)
+	start := f;	(* Sentinel *)
+	SYSTEM.GET(f+128, f);	(* first element *)
+	WHILE f # start (* NIL *) DO	(* end of ring *)
+		SYSTEM.MOVE(f, SYSTEM.ADR(n), 32);
+		IF n = name THEN 
+			SYSTEM.MOVE(f+32, SYSTEM.ADR(name), 13); 
+			SYSTEM.MOVE(f+64, SYSTEM.ADR(path), 64);
+			RETURN END;
+		SYSTEM.GET(f+128, f)
+	END;
+	name[0] := 0X;
+END GetName;
+
+PROCEDURE Load* (name: ARRAY OF CHAR; VAR m: Module; VAR res: INTEGER);
+VAR length: LONGINT; mod, path : ARRAY 64 OF CHAR; 
+BEGIN
+	COPY(name, mod);
+	Find(mod, m);
+	IF m = NIL THEN COPY(mod, FileName); 
+		IF FilesLoaded THEN GetName(mod, path); 
+			IF mod # "" THEN MakeFileName(path, mod, mod) ELSE res := 1; RETURN END;
+		ELSIF main # "" THEN MakeFileName(main, mod, mod) END;
+		Open (mod, res, length);
+		IF res = done THEN LoadModule (m, res, length); 
+		ELSE File1 := FileName END;
+	ELSE
+		IF ~m.init THEN res := cyclicImport; COPY(mod, File1) ELSE res := done END;
+	END;
+	ErrMsg(res)
+END Load;
+
+PROCEDURE GetProc* (cmd: ARRAY OF CHAR; m: Module; VAR command: Proc; VAR res: INTEGER);
+VAR i: LONGINT; help: Name32; end: BOOLEAN;
+BEGIN
+	i := 0; res := done; end := FALSE;
+	WHILE (i < m.nofcoms) & ~end DO 
+		COPY(m.cmds[i].name, help); IF cmd # help THEN INC(i) ELSE end := TRUE END 
+	END;
+	IF i = m.nofcoms THEN res := cmdNotFound; COPY(cmd, File1);
+	ELSE command := SYSTEM.VAL (Proc, m.cmds[i].absentry) END;
+END GetProc;
+
+PROCEDURE Execute* (mod, cmd: ARRAY OF CHAR; VAR res: INTEGER);
+VAR m: Module; command: Proc;
+BEGIN
+	Load (mod, m, res);
+	IF res = done THEN GetProc(cmd, m, command, res);
+		IF res = done THEN command END;
+	END;
+END Execute;
+
+PROCEDURE InitKernel (m: Module);
+VAR data: LONGINT;
+		body: Proc; p1: Proc1; p2: Proc2; p3: Proc3; p4: Proc4; 
+BEGIN
+	data := m.SB;
+	m.refcnt := 1;					(* Kernel can't be unloaded *)
+	DEC(data, 4); p2 := INT; SYSTEM.PUT (data, SYSTEM.VAL(LONGINT, p2));
+	DEC(data, 4); SYSTEM.PUT (data, SYSTEM.ADR(Reg));
+	DEC(data, 4); SYSTEM.PUT (data, SYSTEM.ADR(Transfer[0]));
+	DEC(data, 4); SYSTEM.PUT (data, heapAdr);
+	DEC(data, 4); SYSTEM.PUT (data, heapSize);
+	DEC(data, 4); SYSTEM.PUT(data, StackOrg); 			(* Stackorigin *)
+	DEC(data, 4); SYSTEM.PUT(data, IntTransfer); 			(* Address of int transfer buffer *)
+	DEC(data, 4); SYSTEM.PUT (data, SYSTEM.ADR(modules));
+	DEC(data, 4); p1 := Load; SYSTEM.PUT (data, SYSTEM.VAL(LONGINT, p1));
+	DEC(data, 4); p3 := GetProc; SYSTEM.PUT (data, SYSTEM.VAL(LONGINT, p3));
+	DEC(data, 4); p4 := Free; SYSTEM.PUT (data, SYSTEM.VAL(LONGINT, p4));
+	DEC(data, 4); SYSTEM.PUT (data, SYSTEM.ADR(main));
+	DEC(data, 4); SYSTEM.PUT (data, SYSTEM.ADR(File1));
+	DEC(data, 4); SYSTEM.PUT (data, SYSTEM.ADR(File2));
+	DEC(data, 4); SYSTEM.PUT (data, Display);
+	DEC(data, 4); SYSTEM.PUT (data, BufBeg);
+	DEC(data, 4); TableRoot := data; 
+	body := SYSTEM.VAL(Proc, m.entries[0]);
+	m.init := TRUE;
+	body ; 
+	DEC(data, 4); SYSTEM.GET(data, Routine[0]);			(* NEW *)
+	DEC(data, 4); SYSTEM.GET(data, Routine[1]); 			(* SYSTEM.NEW *)
+	SysNew := SYSTEM.VAL(sysnew, Routine[1]);
+	New := SYSTEM.VAL(new, Routine[0]);
+	DEC(data, 22);  SYSTEM.PUT (data, DS);
+	DEC(data, 2);  SYSTEM.PUT (data, ES);
+	DEC(data, 4);  SYSTEM.PUT (data, OldSegment);
+	DEC(data, 12);  SYSTEM.PUT (data, PageDir);
+	KernelLoaded := TRUE;
+END InitKernel;
+
+PROCEDURE GetEnvVar;
+(* The extender copies the string found in the PSP into variable main *)
+VAR i: INTEGER;
+BEGIN
+	i := 0;
+	WHILE main[i] # 0X DO INC(i) END;
+	WHILE (i > 0) & (main[i-1] # "\") DO DEC(i) END; main[i] := 0X;
+END GetEnvVar;
+	
+PROCEDURE InitModules;
+VAR i: INTEGER;
+BEGIN
+	SystemLoaded := FALSE;
+	FilesLoaded := FALSE;
+	modules := NIL;
+	Routine[0] := 0; Routine[1] := 0;
+	KernelLoaded := FALSE;
+	GetEnvVar; 
+	P := SYSTEM.VAL(RegPtr, SYSTEM.ADR(Reg));
+END InitModules;
+
+BEGIN 
+	InitModules;
+	WriteString("Loading Oberon System 3  V1.5"); WriteLn; 
+	Execute("Modules.Obj", "Dummy", res);
+END Loader.

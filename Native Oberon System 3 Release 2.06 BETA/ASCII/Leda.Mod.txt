@@ -1,0 +1,1000 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Leda;	(* uh, Tue, 21-Dec-1993 *)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaBox, LedaIO, LedaFrames, 
+		Files, Objects, Texts, Oberon, MenuViewers;
+	
+CONST
+	ModName = "Leda";	ModVersion = " [uh/3.1]";
+	DocModule = "LedaDoc";	(* module implementing default document *)
+	DocNewCmd = "DC";	(* DC -> deposit control *)
+	StdPrtModule = "LedaPrinter";	(* module that implements standard printer *)
+	DialogModule = "LedaGadget";	(* module implementing default dialog [gadgets] *)
+	StdPict = "LedaImage";	PictName = "picture";	(* picture handling [module and type name] *)
+	StdGadg = "LedaGadget";	GadgName = "gadget";	(* gadget handling [module and type anme] *)
+	LogFile = "Leda.Name.Log";	(* register names of stored files *)
+	OptionChars = "/%";
+	
+	PrtRetries = 5;
+(*
+	PrtDef0Name = "Pluto";	PrtDef0MargX = 127;	PrtDef0MargY = 0;	(* printer margins in attribute units *)
+	PrtDef1Name = "Ganymed";	PrtDef1MargX = 80;	PrtDef1MargY = 40;
+*)
+	
+	LedaCmds = "System.Close  System.Copy  System.Grow  Leda.GetAttr  Leda.Search  Leda.Replace  Leda.Store";
+	AttrCmds = "System.Close  Leda.GetAttr  Leda.GetStyle";
+	AttrTitle = "LedaAttributes";
+	NotDef = -1;
+	
+	SPatRange = 64;
+
+TYPE
+	CharPattern = ARRAY SPatRange OF CHAR;
+	SearchDsc = RECORD
+		p: CharPattern;	(* search pattern; terminated with 0X *)
+		d: ARRAY SPatRange OF INTEGER;	(* displacement vector for pattern *)
+		l: INTEGER	(* length of pattern *)
+	END;
+
+VAR
+	search: SearchDsc;
+	replace: LedaCtrl.Buffer;	(* replace buffer *)
+	srTime: LONGINT;	(* most recent time for search and replace *)
+	fndStyle: LedaBase.PieceCtrl;	(* used in CheckStyle and LocateStyle *)
+	fndTime: LONGINT;	(* most recent time for find style *)
+	attr: RECORD
+		T: Texts.Text;
+		V: MenuViewers.Viewer;
+		W, Wn: Texts.Writer
+	END;
+	log: RECORD f: Files.File; r: Files.Rider END;		(* for names of stored documents *)
+	ledaCmds: ARRAY 128 OF CHAR;
+
+(*--- get parameters ---*)
+	
+	PROCEDURE RegardSel(VAR S: Texts.Scanner);
+		VAR text: Texts.Text;	beg, end, time: LONGINT;
+	BEGIN
+		text := NIL; time := NotDef; Oberon.GetSelection(text, beg, end, time);
+		IF (text = NIL) OR (time = NotDef) THEN S.class := Texts.Inval
+		ELSE Texts.OpenScanner(S, text, beg); Texts.Scan(S)
+		END
+	END RegardSel;
+
+	PROCEDURE GetCmdSpec(VAR S: Texts.Scanner);
+	BEGIN
+		IF S.class = Texts.Inval THEN RETURN END;	(*###*)
+		IF S.class = NotDef THEN	(* define scanner *)
+			Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+			IF (S.line > 0) OR ((S.class = Texts.Char) & (S.c = "^")) THEN RegardSel(S) END
+		ELSIF S.class # Texts.Inval THEN
+			Texts.Scan(S);
+			IF S.class = Texts.Char THEN
+				IF S.c = "^" THEN RegardSel(S) ELSIF S.c = 0X THEN S.class := Texts.Inval END
+			END
+		END
+	END GetCmdSpec;
+	
+	PROCEDURE GetAndPutPar;
+		VAR S: Texts.Scanner;
+	BEGIN
+		LedaBox.ParReset(-1);
+		S.class := NotDef;
+		REPEAT
+			GetCmdSpec(S);
+			IF (S.class = Texts.String) OR (S.class = Texts.Name) THEN LedaBox.ParPutStr(S.s)
+			ELSIF S.class = Texts.Int THEN LedaBox.ParPutInt(S.i)
+			ELSE S.class := Texts.Inval
+			END
+		UNTIL S.class = Texts.Inval
+	END GetAndPutPar;
+
+(*--- name log ---*)
+
+	PROCEDURE WriteDate(VAR r: Files.Rider; t, d: LONGINT);
+
+		PROCEDURE WritePair(ch: CHAR; x: LONGINT);
+		BEGIN
+			Files.Write(r, ch);
+			Files.Write(r, CHR(x DIV 10 + 30H)); Files.Write(r, CHR(x MOD 10 + 30H))
+		END WritePair;
+
+	BEGIN
+		WritePair(" ", d MOD 32); WritePair(".", d DIV 32 MOD 16); WritePair(".", d DIV 512 MOD 128);
+		WritePair(" ", t DIV 4096 MOD 32); WritePair(":", t DIV 64 MOD 64);
+		(* WritePair(":", t MOD 64) *)
+	END WriteDate;
+	
+	PROCEDURE UpdateNameLog(name: LedaSys.String);
+		VAR t, d: LONGINT;	i: INTEGER;
+	BEGIN
+		IF log.f # NIL THEN
+			Oberon.GetClock (t, d); WriteDate(log.r, t, d);
+			Files.Write(log.r, " "); Files.Write(log.r, " ");
+			i := 0; WHILE name[i] # 0X DO Files.Write(log.r, name[i]); INC(i) END;
+			Files.Write(log.r, 0DX);
+			Files.Close(log.f)	(* to flush buffers *)
+		END	
+	END UpdateNameLog;
+	
+(*--- commands ---*)
+
+	PROCEDURE Neutralize(F: LedaFrames.Frame);
+		VAR M: Oberon.ControlMsg;
+	BEGIN
+		M.id := Oberon.neutralize; M.F := NIL;
+		M.res := -1; M.x := 0; M.y := 0; Objects.Stamp(M);
+		LedaFrames.ControlMarks(F, M)
+	END Neutralize;
+	
+	PROCEDURE InStr(part: ARRAY OF CHAR; VAR s: ARRAY OF CHAR): BOOLEAN;
+	(** returns true if the string part is contained in string s *)
+		VAR i, j: INTEGER;
+	BEGIN
+		i := 0; j := 0;
+		WHILE (s[i] # 0X) & (part[j] # 0X) DO
+			IF part[j] = s[i] THEN INC(i); INC(j)
+			ELSE INC(i); j := 0
+			END
+		END;
+		RETURN part[j] = 0X
+	END InStr;
+
+	PROCEDURE DisplayDoc*(doc: LedaBase.Box; name: LedaSys.String);
+		VAR m: LedaBase.BoxMsg;	V: MenuViewers.Viewer;	X, Y, menuH: INTEGER;
+	BEGIN
+		IF InStr("Templ", name) THEN name := "New.Doc" END;
+		m.id := LedaBase.DocOriginId; m.l1 := 0; m.l2 := 0; doc.do.handle(doc, m);	(* gets the origin [upper left] *)
+		IF Oberon.Par.vwr # NIL THEN X := Oberon.Par.vwr.X ELSE X := Oberon.UserTrack(0) END;
+		Oberon.AllocateUserViewer(X, X, Y);
+		V := MenuViewers.New(
+				LedaFrames.GetMenu(LedaSys.dialogMod, "DM", name, ledaCmds, menuH),	(* menu frame [gadget or standard] *)
+				LedaFrames.New(LedaFrames.Handle, doc, m.l1, m.l2, LedaFrames.VarHeight),	(* leda frame *)
+				menuH, X, Y);
+	END DisplayDoc;
+	
+	PROCEDURE New*;
+		VAR doc: LedaBase.Box;	name: LedaSys.String;
+	BEGIN
+		GetAndPutPar;
+		doc := LedaBox.New(DocModule, DocNewCmd, NIL);	(* get new default document *)
+		IF doc # NIL THEN
+			LedaBox.ParPopStr(name); IF name = "" THEN name := "New.Doc" END;		(* document name *)
+			DisplayDoc(doc, name)
+		ELSE
+			LedaSys.OutT(ModName, 0); LedaSys.OutT(".New  not done", 0);
+			LedaSys.OutT("  [no document available]", 1)
+		END;
+		LedaBox.ParReset(-1)
+	END New;
+	
+	PROCEDURE Store*;
+		VAR S: Texts.Scanner;	F: LedaFrames.Frame;	name: LedaSys.String;
+	BEGIN
+		F := NIL; name := "";
+		LedaSys.OutT(ModName, 0); LedaSys.OutT(".Store ", 0);
+		IF LedaFrames.InMain(F) THEN	(* F is set to the content frame *)
+			IF Oberon.Par.vwr IS MenuViewers.Viewer THEN
+				MenuViewers.GetName(Oberon.Par.vwr(MenuViewers.Viewer), name)
+			END
+		ELSE
+			F := LedaFrames.Marked();
+			S.class := NotDef; GetCmdSpec(S);	(* document name *)
+			IF S.class = Texts.Name THEN COPY(S.s, name) END
+		END;
+		IF name = "" THEN LedaSys.OutT("not done [name invalid]", 1)
+		ELSIF F = NIL THEN LedaSys.OutT("not done [no document]", 1)
+		ELSE
+			LedaSys.OutT(name, 1);
+			LedaFrames.Mark(F, -1);
+			Neutralize(F);
+			LedaBase.StoreDocument(F.box, name);
+			UpdateNameLog(name);
+			LedaFrames.Mark(F, 1)
+		END
+	END Store;
+	
+	PROCEDURE Open*;
+		VAR doc: LedaBase.Box;	S: Texts.Scanner;	name: LedaSys.String;
+	BEGIN
+		S.class := NotDef; GetCmdSpec(S);	(* document name *)
+		IF S.class = Texts.Name THEN
+			COPY(S.s, name);
+			LedaBase.LoadDocument(doc, name);
+			IF doc = NIL THEN
+				LedaSys.OutT(ModName, 0); LedaSys.OutT(".Open ", 0);
+				LedaSys.OutT(name, 0); LedaSys.OutT("  not done [not a document]", 1)
+			ELSE
+				DisplayDoc(doc, name)
+			END
+		END
+	END Open;
+	
+	PROCEDURE Recall*;
+		VAR foc: LedaBase.Box;	P: LedaSys.Port;
+	BEGIN
+		LedaBox.Focus(foc, P);
+		IF foc # NIL THEN LedaBase.Recall(foc, P) END
+	END Recall;
+	
+	PROCEDURE Do*;
+		VAR F: LedaFrames.Frame;	M: Oberon.InputMsg;
+	BEGIN
+		GetAndPutPar;
+		F := LedaFrames.Marked();
+(*
+		IF ~ Oberon.Pointer.on OR (F = NIL) THEN
+			LedaSys.OutT(ModName, 0); LedaSys.OutT(".Execute  not done ", 0);
+			IF F = NIL THEN LedaSys.OutT("[not a document]", 1)
+			ELSE LedaSys.OutT("[marker not visible]", 1)
+			END
+*)
+		IF Oberon.Pointer.on & (F # NIL) THEN
+			M.id := Oberon.track; M.X := Oberon.Pointer.X; M.Y := Oberon.Pointer.Y;
+			M.res := -1; M.keys := {LedaSys.MX}; LedaFrames.Button(F, M)
+		END;
+		LedaBox.ParReset(-1)
+	END Do;
+	
+	PROCEDURE GetAndPutCmd(VAR S: Texts.Scanner);
+		VAR s: LedaSys.String;	i, j: INTEGER;
+	BEGIN	(* S.nextCh is option character *)
+		Texts.Read(S, S.nextCh); Texts.Scan(S);
+		IF S.class = Texts.Name THEN
+			i := 0; WHILE (S.s[i] # 0X) & (S.s[i] # ".") DO s[i] := S.s[i]; INC(i) END;
+			s[i] := 0X; IF s # "" THEN LedaBox.ParPutStr(s) END;
+			IF S.s[i] = "." THEN
+				INC(i); j := 0; WHILE S.s[i] # 0X DO s[j] := S.s[i]; INC(i); INC(j) END;
+				s[j] := 0X; IF s # "" THEN LedaBox.ParPutStr(s) END
+			END
+		END
+	END GetAndPutCmd;
+
+	PROCEDURE InsertKey*;
+		VAR F: LedaFrames.Frame;	S: Texts.Scanner;
+			name: LedaSys.Name;	m: Oberon.InputMsg;
+	BEGIN
+		m.ch := 0X; S.class := NotDef; GetCmdSpec(S);
+		IF S.class = Texts.Name THEN
+			LedaSys.CopyStr(S.s, name); LedaCtrl.GetChCode(name, m.ch);
+			IF m.ch = 0X THEN	(* not [yet] found *)
+				IF name = GadgName THEN LedaSys.Execute(StdGadg, "")
+				ELSIF name = PictName THEN LedaSys.Execute(StdPict, "")
+				END;
+				LedaCtrl.GetChCode(name, m.ch)
+			END
+		END;
+		F := LedaFrames.Focus();
+(*
+		IF (F = NIL) OR (S.class # Texts.Name) OR (m.ch = 0X) THEN
+			LedaSys.OutT(ModName, 0); LedaSys.OutT(".InsertKey  not done ", 0);
+			IF F = NIL THEN LedaSys.OutT("[caret not in document]", 1)
+			ELSIF S.class # Texts.Name THEN LedaSys.OutT("[no specification]", 1)
+			ELSE LedaSys.OutT("[unknown key]", 1)
+			END
+*)
+		IF (F # NIL) & (S.class = Texts.Name) & (m.ch # 0X) THEN
+			LedaBox.ParReset(-1);
+			IF LedaSys.EqualCh(OptionChars, S.nextCh) THEN GetAndPutCmd(S) END;
+			m.id := Oberon.consume; m.fnt := Oberon.CurFnt; m.col := Oberon.CurCol; m.voff := Oberon.CurOff;
+			F.handle(F, m)
+		END
+	END InsertKey;
+	
+	PROCEDURE PrintDoc(doc: LedaBase.Box; copies, first, last: INTEGER;
+											mrgnX, mrgnY: LONGINT; P: LedaSys.PrtPort);
+		VAR pageW, pageH: LONGINT;	M: LedaIO.OutPageMsg;	m: LedaBox.Msg;	try: INTEGER;
+	BEGIN
+		IF doc = NIL THEN LedaSys.OutT("not done [not a document]", -1); RETURN END;
+		IF first = -1 THEN	(* get page number of first page *)
+			m.id := LedaBox.PageNbrId; m.op := 1; m.caller := doc.dsc; m.l1 := 1;
+			doc.do.handle(doc, m);
+			first := SHORT(m.l1)
+		END;
+		IF last < first THEN LedaSys.OutT("invalid page range", -1)
+		ELSE
+			LedaBox.GetSize(doc, LedaBase.WA4, LedaBase.HA4, pageW, pageH);
+			LedaIO.SetOutDevice("StdPrinter");	(* output procedures set *)
+				try := 0; P.printer.open(P, pageW, pageH, mrgnX, mrgnY);
+				WHILE (P.status # "") & (P.status # "no permission") & (try < PrtRetries) DO
+					LedaSys.OutC("-", -1); INC(try);
+					P.printer.open(P, pageW, pageH, mrgnX, mrgnY)
+				END;
+				IF P.status = "" THEN
+					INCL(P.state, LedaSys.PrintFlag);
+					WHILE (P.status = "") & (first <= last) DO
+						P.printer.initPage(P, 0, 0);	(* external reference of document *)
+						M.pageNbr := first; M.pX := 0; M.pY := 0; M.P := P; M.stop := FALSE;
+						doc.do.handle(doc, M); 	(* print page *)
+						P.printer.termPage(P, copies);
+						LedaSys.OutC(".", -1);
+						IF M.stop THEN first := last + 1 ELSE INC(first) END
+					END;
+				END;
+				IF P.status = "" THEN P.printer.close(P) ELSE LedaSys.OutT(P.status, -1) END;
+			LedaIO.SetOutDevice("Screen");	(* output procedures reset *)
+		END
+	END PrintDoc;
+	
+	PROCEDURE PrintSpec(VAR S: Texts.Scanner; VAR first, last,  copies: INTEGER);
+	BEGIN
+		first := -1; last := MAX(INTEGER) - 1; copies := 1;
+		IF LedaSys.EqualCh(OptionChars, S.nextCh) THEN
+			Texts.Read(S, S.nextCh); Texts.Scan(S);
+			IF S.class = Texts.Int THEN
+				copies := SHORT(S.i); LedaSys.OutC("#", 0); LedaSys.OutI(copies, 0);  LedaSys.OutC(" ", -1)
+			END
+		END;
+		Texts.Scan(S);
+		IF S.class = Texts.Int THEN
+			first := SHORT(S.i); Texts.Scan(S);
+			IF S.class = Texts.Int THEN
+				last := SHORT(S.i); Texts.Scan(S)
+			END
+		END
+	END PrintSpec;
+	
+	PROCEDURE PrintMargin(VAR S: Texts.Scanner; VAR mrgnX, mrgnY: LONGINT);
+		VAR ch: CHAR;
+	BEGIN
+		IF LedaSys.EqualCh(OptionChars, S.nextCh) THEN	(* check for user defined margins *)
+			Texts.Read(S, ch);
+			IF LedaSys.EqualCh("xym", ch) THEN Texts.Read(S, S.nextCh) ELSE S.nextCh := ch; ch := "x" END;
+			Texts.Scan(S);
+			IF S.class = Texts.Int THEN LedaSys.OutT(" [", 0);
+				IF (ch = "x") OR (ch = "m") THEN
+					LedaSys.OutT("x: ", 0); LedaSys.OutI(S.i, 0); mrgnX := S.i * LedaBox.attrUnit
+				END;
+				IF ch = "m" THEN
+					Texts.Scan(S); IF S.class # Texts.Int THEN ch := " " ELSE LedaSys.OutT("; ", 0) END
+				END;
+				IF (ch = "y") OR (ch = "m") THEN
+					LedaSys.OutT("y: ", 0); LedaSys.OutI(S.i, 0); mrgnY := S.i * LedaBox.attrUnit
+				END;
+				LedaSys.OutC("]", 0)
+			END
+		END
+	END PrintMargin;
+	
+	PROCEDURE Print*;
+		VAR S: Texts.Scanner;	mrgnX, mrgnY: LONGINT;	copies, first, last: INTEGER;
+			P: LedaSys.Port;	F: LedaFrames.Frame;	doc: LedaBase.Box;	name: LedaSys.String;
+	BEGIN
+		P := LedaSys.ThisPrtPort(StdPrtModule);	(* P = NIL -> module for standard printer not available *)
+		LedaSys.OutT(ModName, 0); LedaSys.OutT(".Print", 0);
+		IF P = NIL THEN
+			LedaSys.OutT("  ", 1); LedaSys.OutT("  not done:  ", 0); LedaSys.OutT(StdPrtModule, 0);
+			LedaSys.OutT(".Obj missing or bad", 1)
+		ELSE
+			WITH P: LedaSys.PrtPort DO
+				S.class := NotDef; GetCmdSpec(S);
+				IF S.class # Texts.Name THEN
+					LedaSys.OutT("  ", 1); LedaSys.OutT("  server name missing", 0)
+				ELSE
+					COPY(S.s, P.name);	(* server name *)
+					LedaSys.OutC(" ", 0); LedaSys.OutT(S.s, 0);
+					mrgnX := 0; mrgnY := 0;
+					PrintMargin(S, mrgnX, mrgnY);	(* get user defined margins *)
+(*
+					IF (mrgnX = 0) & (mrgnY = 0) THEN
+						IF P.name = PrtDef0Name THEN
+							mrgnX := PrtDef0MargX * LedaBox.attrUnit; mrgnY := PrtDef0MargY * LedaBox.attrUnit
+						ELSIF P.name = PrtDef1Name THEN
+							mrgnX := PrtDef1MargX * LedaBox.attrUnit; mrgnY := PrtDef1MargY * LedaBox.attrUnit
+						END
+					END;
+*)
+					Texts.Scan(S); IF (S.class = Texts.Char) & (S.c = "^") THEN RegardSel(S) END;
+					IF (S.class = Texts.Char) & (S.c = "*") THEN		(* marked viewer *)
+						LedaSys.OutT(" * ", -1);
+						PrintSpec(S, first, last, copies);
+						F := LedaFrames.Marked(); IF F # NIL THEN doc := F.box ELSE doc := NIL END;
+						PrintDoc(doc, copies, first, last, mrgnX, mrgnY, P)
+					ELSE
+						WHILE S.class = Texts.Name DO
+							LedaSys.OutC(" ", 1); LedaSys.OutT("  ", 0); LedaSys.OutT(S.s, 0); LedaSys.OutC(" ", -1);
+							COPY(S.s, name); LedaBase.LoadDocument(doc, name);
+							PrintSpec(S, first, last, copies);
+							PrintDoc(doc, copies, first, last, mrgnX, mrgnY, P);
+						END	
+					END
+				END;
+				LedaSys.OutT("  ", 1)
+			END
+		END
+	END Print;
+	
+	PROCEDURE OpenImage*;
+	BEGIN
+		LedaSys.execRes := LedaBase.DefStamp();
+		LedaSys.Execute(StdPict, "Open");
+		IF LedaSys.execRes = LedaBase.CurStamp() THEN RETURN END;	(*###*)
+		LedaSys.Execute(StdGadg, "Open")
+	END OpenImage;
+	
+(*--- attributes ---*)
+	
+	PROCEDURE *ShowAttributes(flags: SET; VAR M: LedaBox.AttributeMsg);
+	(* shows the attributes given in attribute message M *)
+		CONST Quote = 022X;
+		VAR i: INTEGER;
+		
+		PROCEDURE OpenNewLog;
+			VAR menuH, X, Y: INTEGER;
+		BEGIN
+			NEW(attr.T); Texts.Open(attr.T, "");
+			Oberon.AllocateSystemViewer(Oberon.Par.vwr.X, X, Y);
+			attr.V := MenuViewers.New(LedaFrames.NewMenu(AttrTitle, AttrCmds, menuH),
+															 LedaFrames.NewText(attr.T), menuH, X, Y)
+		END OpenNewLog;
+		
+		PROCEDURE Gap(n: INTEGER);
+		BEGIN
+			WHILE n > 0 DO Texts.Write(attr.W, " "); DEC(n) END
+		END Gap;
+		
+		PROCEDURE WriteNotes;
+		BEGIN
+			IF attr.Wn.buf.len > 0 THEN
+				Texts.WriteString(attr.W, "  ("); Texts.Append(attr.T, attr.W.buf);
+				Texts.Append(attr.T,  attr.Wn.buf);
+				Texts.Write(attr.W, ")")
+			END
+		END WriteNotes;
+		
+		PROCEDURE ProcessEnum(s: LedaSys.String; active: LONGINT; VAR i: INTEGER; VAR a: LedaBox.Attributes);
+			VAR j: INTEGER;	gap: CHAR;
+		BEGIN
+			IF s[0] = "v" THEN j := 1 ELSE j := 0 END;
+			IF attr.Wn.buf.len > 0 THEN Texts.Write(attr.Wn, ";"); gap := " " ELSE gap := 0X END;	(* separate notes *)
+			WHILE s[j] # 0X DO
+				IF s[j] = "-" THEN	(* inspect next attribute *)
+					IF gap # 0X THEN Texts.Write(attr.Wn, gap) END;
+					INC(i); gap := " ";
+					IF a[i].typ = LedaBox.Str THEN
+						Texts.WriteString(attr.Wn, a[i].s); IF active = 0 THEN Gap(1); Texts.WriteString(attr.W, a[i].s) END
+					ELSIF a[i].typ = LedaBox.Int THEN
+						Texts.WriteInt(attr.Wn, a[i].i, 0); IF active = 0 THEN Gap(1); Texts.WriteInt(attr.W, a[i].i, 0) END
+					ELSE
+						Texts.Write(attr.Wn, "?"); IF active = 0 THEN Gap(1); Texts.Write(attr.W, "?") END
+					END
+				ELSIF s[j] = "|" THEN DEC(active); gap := "/"
+				END;
+				INC(j);
+			END
+		END ProcessEnum;
+		
+	BEGIN
+		IF attr.W.buf.len > 0 THEN Texts.OpenBuf(attr.W.buf) END;	(* clear text buffer *)
+		IF attr.Wn.buf.len > 0 THEN Texts.OpenBuf(attr.Wn.buf) END;	(* clear text buffer *)
+		IF (attr.V = NIL) OR (attr.V.state <= 0) THEN OpenNewLog END;
+		IF attr.T.len > 0 THEN		(* clear attribute text *)
+			IF LedaBox.AddFlag IN flags THEN Texts.WriteLn(attr.W) ELSE Texts.Delete(attr.T, 0, attr.T.len) END
+		END;
+		(* build new attribute text *)
+		Texts.WriteString(attr.W, ModName);
+		IF LedaBox.StyleFlag IN flags THEN Texts.WriteString(attr.W, ".SetStyle")
+		ELSE Texts.WriteString(attr.W, ".SetAttr")
+		END;
+		IF M.name # "" THEN Gap(1);
+			Texts.Write(attr.W, Quote); Texts.WriteString(attr.W, M.name); Texts.Write(attr.W, Quote)
+		END;
+		i := 0;
+		LOOP
+			IF i >= M.nbr THEN EXIT END;	(*###*)
+			IF M.a[i].typ = LedaBox.NewLn THEN
+				WriteNotes; Texts.WriteLn(attr.W); Gap(2);
+				IF M.a[i].s # "" THEN Texts.WriteString(attr.Wn, M.a[i].s) END	(* write new note *)
+			ELSE
+				IF M.a[i].typ = LedaBox.Str THEN Gap(1); Texts.WriteString(attr.W, M.a[i].s)
+				ELSIF M.a[i].typ = LedaBox.Int THEN Gap(1); Texts.WriteInt(attr.W, M.a[i].i, 0)
+				ELSIF M.a[i].typ = LedaBox.Enum THEN ProcessEnum(M.a[i].s, M.a[i].i, i, M.a)
+				END
+			END;
+			INC(i)
+		END;
+		WriteNotes; Texts.WriteLn(attr.W);
+		Texts.Write(attr.W, "~"); Texts.Append(attr.T, attr.W.buf)
+	END ShowAttributes;
+	
+	PROCEDURE ScanAttributes(VAR M: LedaBox.AttributeMsg);
+		VAR S: Texts.Scanner;	i: INTEGER;
+	BEGIN
+		M.nbr := 0; M.name := ""; M.P := NIL;
+		S.class := NotDef; GetCmdSpec(S);
+		IF S.class = Texts.String THEN COPY(S.s, M.name); GetCmdSpec(S) END;	(* attribute name *)
+		i := 0;
+		LOOP
+			IF (S.class = Texts.String) OR (S.class = Texts.Name) THEN
+				M.a[i].typ := LedaBox.Str; COPY(S.s, M.a[i].s); INC(i)
+			ELSIF S.class = Texts.Int THEN
+				M.a[i].typ := LedaBox.Int; M.a[i].i := S.i; INC(i)
+			ELSIF (S.class = Texts.Char) & (S.c = "(") THEN
+				WHILE ~ S.eot & (S.nextCh # ")") DO Texts.Read(S, S.nextCh) END;	(* skip text in parentesis *)
+				IF ~ S.eot THEN Texts.Read(S, S.nextCh) ELSE EXIT END	(*###*)
+			ELSE EXIT	(*###*)
+			END;
+			GetCmdSpec(S)
+		END;
+		M.nbr := i
+	END ScanAttributes;
+	
+	PROCEDURE GetAttributes(id: INTEGER; VAR M: LedaBox.AttributeMsg);
+		VAR F: LedaFrames.Frame;	sel: LedaBase.Box;
+	BEGIN
+		M.id := id; M.nbr := 0; M.name := ""; M.P := NIL;
+		F := LedaFrames.Selection();
+		IF F # NIL THEN
+			sel := F.box.sel;
+			sel.do.handle(sel, M);
+		END
+	END GetAttributes;			
+			
+	PROCEDURE SendAttributes(first: BOOLEAN; VAR M: LedaBox.AttributeMsg);
+		VAR F: LedaFrames.Frame;	sel: LedaBase.Box;	p: LedaFrames.Port;	level: INTEGER;
+	BEGIN
+		F := LedaFrames.Selection();
+		IF F # NIL THEN
+			LedaFrames.GetPort(F.trailer, F.box, p, level);
+			IF level # 0 THEN LedaFrames.Reset; LedaFrames.GetPort(F.trailer, F.box, p, level) END;
+			sel := F.box.sel; M.P := p;
+			WHILE sel # NIL DO
+				sel.do.handle(sel, M);
+				IF first OR (sel.sel = sel) THEN sel := NIL ELSE sel := sel.sel END
+			END;
+			LedaFrames.UpdatePort(p, level)
+		END
+	END SendAttributes;
+	
+	PROCEDURE GetAttr*;
+	(** to get the attributes of the selection [value or style] *)
+		VAR M: LedaBox.AttributeMsg;	showAttrs: LedaBox.AttrProc;
+	BEGIN
+		GetAttributes(LedaBox.GetValue, M);
+		IF M.nbr > 0 THEN
+			LedaBox.GetAttrLog(showAttrs);
+			IF showAttrs = NIL THEN showAttrs := ShowAttributes END;
+			showAttrs({}, M)
+		END
+	END GetAttr;
+	
+	PROCEDURE SetAttr*;
+	(** to set the specified attributes at the selection [value or style] *)
+		VAR M: LedaBox.AttributeMsg;
+	BEGIN	
+		ScanAttributes(M);
+		IF M.nbr # 0 THEN
+			M.id := LedaBox.SetValue; SendAttributes(FALSE, M)
+		END
+	END SetAttr;
+	
+	PROCEDURE GetStyle*;
+	(** to get the attributes of the selected style *) 
+		VAR M: LedaBox.AttributeMsg;	showAttrs: LedaBox.AttrProc;
+	BEGIN
+		GetAttributes(LedaBox.GetStyle, M);
+		IF M.nbr > 0 THEN
+			LedaBox.GetAttrLog(showAttrs);
+			IF showAttrs = NIL THEN showAttrs := ShowAttributes END;
+			showAttrs({LedaBox.StyleFlag}, M)
+		END
+	END GetStyle;
+	
+	PROCEDURE SetStyle*;
+	(** to set the specified attributes of the selected style *)
+		VAR M: LedaBox.AttributeMsg;
+	BEGIN
+		ScanAttributes(M);
+		IF M.nbr # 0 THEN
+			M.id := LedaBox.SetStyle; SendAttributes(TRUE, M)
+		END
+	END SetStyle;
+	
+	PROCEDURE NewStyle*;
+	(** to create a new style with the specified attributes and replace the selected style *)
+		VAR M: LedaBox.AttributeMsg;
+	BEGIN
+		ScanAttributes(M);
+		IF M.nbr # 0 THEN
+			M.id := LedaBox.NewStyle; SendAttributes(TRUE, M)
+		END
+	END NewStyle;
+	
+(*--- search and replace ---*)
+
+	PROCEDURE SetSearchPattern(time: LONGINT; VAR p: CharPattern);
+		VAR i, j, d: INTEGER;
+	BEGIN
+		srTime := time; i := 0; j := 0;
+		WHILE p[i] # 0X DO	(* copy search pattern; eliminate soft separators *)
+			IF p[i] # LedaBase.Hyphen THEN search.p[j] := p[i]; INC(j) END;
+			INC(i)
+		END;
+		search.l := j; search.p[j] := 0X;	(* pattern length *)
+		i := 1; d := 1;	(* ranges:  search.p: [0..len-1]; search.d: [1..len] *)
+		WHILE i <= search.l DO	(* calculate displacement vector *)
+			j := 0; WHILE search.p[j] = search.p[j+d] DO INC(j) END;
+			WHILE i <= j + d DO search.d[i] := d; INC(i) END;
+			INC(d)
+		END
+	END SetSearchPattern;
+	
+	PROCEDURE LocatePattern(text: LedaCtrl.Text; pos: LONGINT; VAR beg, end: LONGINT);
+	(* locates the search pattern search.p in text text begining at position pos *)
+	(* returns the located pattern position in beg and end; beg < end: pattern located *)
+		VAR R: LedaCtrl.Reader;	ctrl: LedaBase.PieceCtrl;	ch: CHAR;	i: INTEGER;
+	BEGIN
+		beg := -1; end := -1;
+		LedaCtrl.InitReader(R, text); LedaCtrl.SetReader(R, pos);
+		LedaCtrl.ReadChar(R, ch, ctrl); i := 0;
+		WHILE ~ R.eot & (i # search.l) DO
+			WHILE ch = LedaBase.Hyphen DO LedaCtrl.ReadChar(R, ch, ctrl) END;
+			IF ch = search.p[i] THEN
+				INC(i); IF i = 1 THEN pos := LedaCtrl.ReaderPos(R) END;
+				IF i < search.l THEN LedaCtrl.ReadChar(R, ch, ctrl)
+				ELSE beg := pos - 1; end := LedaCtrl.ReaderPos(R)
+				END
+			ELSIF i = 0 THEN LedaCtrl.ReadChar(R, ch, ctrl)
+			ELSE DEC(i, search.d[i])
+			END
+		END
+	END LocatePattern;
+	
+	PROCEDURE GetTextLocation(F: LedaFrames.Frame; VAR text: LedaCtrl.Text; VAR pos: LONGINT);
+		VAR m: LedaBox.Msg;
+	BEGIN
+		m.id := LedaBox.LocateId; m.op := 1; m.text := NIL; m.l1 := -1;	(* get text location *)
+		F.box.do.handle(F.box, m);
+		text := m.text; pos := m.l1
+	END GetTextLocation;
+	
+	PROCEDURE MarkTextLocation(F: LedaFrames.Frame; text: LedaCtrl.Text; beg, end: LONGINT);
+		VAR m: LedaBox.Msg;	box: LedaBase.Box;	eX, eY, refY, fH: LONGINT;
+	BEGIN
+		text := LedaCtrl.TextLocate(text, end);
+		IF text.owner # NIL THEN
+			box := text.owner; LedaBox.ExtRef(box, eX, eY);
+			m.id := LedaBox.LocateId; m.op := 2;	(* get line bounds *)
+			m.text := text; m.l1 := end; m.l2 := 0; m.l3 := 0;
+			box.do.handle(box, m);
+			refY := m.l2 + eY; fH := (F.H - 10) * LedaSys.scnUnit;
+			IF ~ LedaSys.InRange(refY, F.refY, fH) THEN	(* scroll document *)
+				IF m.l2 # 0 THEN DEC(refY, fH DIV 4) END;
+				LedaFrames.Show(F, F.refX, refY)		(* removes all marks in document *)
+			END;
+			m.id := LedaBox.LocateId; m.op := 3;	(* mark text location *)
+			m.text := text; m.l1 := beg; m.l2 := end;
+			text.owner.do.handle(text.owner, m)
+		END
+	END MarkTextLocation;
+	
+	PROCEDURE DeletePattern(text: LedaCtrl.Text; beg, end: LONGINT);
+		VAR b: LONGINT;
+	BEGIN	(* no marks in document *)
+		REPEAT
+			text := LedaCtrl.TextLocate(text, end);
+			IF (end = text.beg) & (text.prev # NIL) THEN text := text.prev END;
+			b := beg; IF b < text.beg THEN b := text.beg END;
+			LedaCtrl.TextDelete(text, b, end - b); end := b
+		UNTIL end = beg
+	END DeletePattern;
+	
+	PROCEDURE InsertReplacePattern(text: LedaCtrl.Text; pos: LONGINT);
+		VAR B: LedaCtrl.Buffer;
+	BEGIN	(* no marks in document *)
+		text := LedaCtrl.TextLocate(text, pos);
+		LedaCtrl.InitBuffer(B); LedaCtrl.CopyBuffer(replace, B);
+		LedaCtrl.TextInsert(text, pos, B)
+	END InsertReplacePattern;
+	
+	PROCEDURE GetPatternBegin(text: LedaCtrl.Text; end: LONGINT; VAR beg: LONGINT);
+	(* tests if the search patterns ends at position pos in text text *)
+	(* and returns the begin position of the pattern in beg *)
+		VAR R: LedaCtrl.Reader;	ctrl: LedaBase.PieceCtrl;	ch: CHAR;	i: INTEGER;
+	BEGIN
+		LedaCtrl.InitReader(R, text);
+		beg := end; i := search.l;
+		LOOP
+			DEC(beg); IF beg = 0 THEN beg := end; EXIT END;	(*###*)
+			LedaCtrl.SetReader(R, beg); LedaCtrl.ReadChar(R, ch, ctrl);
+			IF ch # LedaBase.Hyphen THEN DEC(i);
+				IF ch # search.p[i] THEN beg := end; EXIT	(*###*)
+				ELSIF i = 0 THEN EXIT	(*###*)	(* saerch pattern found *)
+				END
+			END
+		END
+	END GetPatternBegin;
+	
+	PROCEDURE Search*;
+		VAR F: LedaFrames.Frame;	text: LedaCtrl.Text;
+			p: CharPattern;	beg, end, time: LONGINT;
+	BEGIN
+		IF ~ LedaFrames.InMain(F) THEN
+			F := LedaFrames.Focus();
+			IF F = NIL THEN F := LedaFrames.Marked() END
+		END;
+		IF F = NIL THEN
+			LedaSys.OutT(ModName, 0); LedaSys.OutT(".Search  not done ", 0);
+			LedaSys.OutT("[no document specified]", 1)
+		ELSE
+			GetTextLocation(F, text, beg);
+			LedaFrames.GetCharSel(time, p);
+			IF (time > srTime) & (p # "") THEN SetSearchPattern(time, p) END;
+			IF (search.l > 0) & (text # NIL) THEN
+				LedaFrames.Mark(F, -1);
+				LocatePattern(text, beg, beg, end);
+				IF beg < end THEN
+					MarkTextLocation(F, text, beg, end); srTime := LedaSys.Time()
+				ELSE Neutralize(F)
+				END;
+				LedaFrames.Mark(F, 1)
+			END
+		END
+	END Search;
+
+	PROCEDURE Replace*;
+		VAR F: LedaFrames.Frame;	text: LedaCtrl.Text;	P: LedaSys.Port;
+			B: LedaCtrl.Buffer;	beg, end, time: LONGINT;
+	BEGIN
+		IF ~ LedaFrames.InMain(F) THEN
+			F := LedaFrames.Focus();
+			IF F = NIL THEN F := LedaFrames.Marked() END
+		END;
+		IF F = NIL THEN
+			LedaSys.OutT(ModName, 0); LedaSys.OutT(".Replace  not done ", 0);
+			LedaSys.OutT("[no document specified]", 1)
+		ELSE
+			GetTextLocation(F, text, end);
+			LedaCtrl.InitBuffer(B); LedaFrames.GetTextSel(time, B);
+			IF (time > srTime) & (B.len > 0) THEN replace := B; srTime := time END;	(* set replace pattern *)
+			IF (search.l > 0) & (text # NIL) & (replace.len > 0) THEN
+				GetPatternBegin(text, end, beg);
+				IF beg < end THEN
+					LedaBox.GetPort(F.box, P);
+					LedaBox.RemSel(F.box, P); LedaBox.RemFoc(F.box, P);	(* remove all marks *)
+					DeletePattern(text, beg, end);
+					InsertReplacePattern(text, beg);
+					INC(beg, replace.len)
+				END;
+				LedaFrames.Mark(F, -1);
+				LocatePattern(text, beg, beg, end);
+				IF beg < end THEN
+					MarkTextLocation(F, text, beg, end); srTime := LedaSys.Time()
+				ELSE Neutralize(F)
+				END;
+				LedaFrames.Mark(F, 1)
+			END
+		END
+	END Replace;
+	
+	PROCEDURE *CheckStyle(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	(* check if the given style ctrl is equal to global given style fndStyle *)
+		VAR m: LedaBase.CtrlMsg;
+	BEGIN
+		IF LedaBase.Unstamped(ctrl.stamp) THEN
+			ctrl.stamp := LedaBase.CurStamp();
+			m.id := LedaBase.ReplaceId; m.ch := "="; m.ctrl := fndStyle; m.ctrlId := -1;
+			ctrl.doOp(ctrl, m);
+			stop := m.ctrlId = 1
+		ELSE stop := FALSE
+		END;
+		RETURN stop
+	END CheckStyle;
+
+	PROCEDURE GetFindStyle(VAR time: LONGINT; VAR ctrl: LedaBase.PieceCtrl);
+	(* get the most recent selected style of a document *)
+		VAR sel, doc: LedaBase.Box;	m: LedaCtrl.TextMsg;
+			R: LedaCtrl.Reader;	ch: CHAR;
+	BEGIN
+		ctrl := NIL;
+		LedaBox.Selection(sel);
+		IF sel # NIL THEN
+			doc := LedaBox.Root(sel); time := doc.bL;	(* doc.bL -> selection time *)
+			m.id := LedaCtrl.SelectedTextId; m.text := NIL; m.beg := 0; m.len := 0;
+			sel.do.handle(sel, m);	(* get text selection *)
+			IF (m.text # NIL) & (m.len > 0) THEN
+				LedaCtrl.InitReader(R, m.text); LedaCtrl.SetReader(R, m.beg);
+				LedaCtrl.ReadChar(R, ch, ctrl)
+			END
+		END
+	END GetFindStyle;
+
+	PROCEDURE FindStyle*;
+		VAR F: LedaFrames.Frame;	text: LedaCtrl.Text;
+			ctrl: LedaBase.PieceCtrl;	beg, len, time: LONGINT;
+	BEGIN
+		IF ~ LedaFrames.InMain(F) THEN
+			F := LedaFrames.Focus();
+			IF F = NIL THEN F := LedaFrames.Marked() END
+		END;
+		IF F = NIL THEN
+			LedaSys.OutT(ModName, 0); LedaSys.OutT(".FindStyle  not done ", 0);
+			LedaSys.OutT("[no document specified]", 1)
+		ELSE
+			GetTextLocation(F, text, beg);
+			GetFindStyle(time, ctrl);
+			IF (time > fndTime) & (ctrl # NIL) THEN fndStyle := ctrl END;	(* new style to search for *)
+			IF (text # NIL) & (fndStyle # NIL) THEN
+				LedaFrames.Mark(F, -1);
+				LedaBase.NewStamp;
+				LedaCtrl.TextSearch(CheckStyle, text, beg, len, ctrl);
+				IF ctrl # NIL THEN	(* style found *)
+					MarkTextLocation(F, text, beg, beg+len); fndTime := LedaSys.Time()
+				ELSE Neutralize(F)
+				END;
+				LedaFrames.Mark(F, 1)
+			END
+		END
+	END FindStyle;
+	
+	PROCEDURE LocateLine(VAR text: LedaCtrl.Text; pos: LONGINT; VAR beg, len, W: LONGINT; VAR cr: BOOLEAN);
+		VAR m: LedaBox.Msg;	box: LedaBase.Box;
+	BEGIN
+		text := LedaCtrl.TextLocate(text, pos);
+		IF pos > text.beg + text.len THEN box := NIL ELSE box := text.owner END;
+		m.id := LedaBox.LocateId; m.op := 4;	(* get line block containing position pos *)
+		m.l1 := pos; m.l2 := pos; m.l3 := 0; m.l4 := ORD(LedaCtrl.NoSep);
+		IF box # NIL THEN box.do.handle(box, m) END;
+		W := m.l1; beg := m.l2; len := m.l3; cr := CHR(m.l4) # LedaCtrl.EndSep;
+	END LocateLine;
+	
+		PROCEDURE FindBigSpace*;
+		VAR S: Texts.Scanner;	F: LedaFrames.Frame;	R: LedaCtrl.Reader;	
+			text: LedaCtrl.Text;	ctrl: LedaBase.PieceCtrl;	ch, sepKind: CHAR;
+			W, blkW, chW, gapW, pos, len, procent, time: LONGINT;	chw: INTEGER;	cr: BOOLEAN;
+	BEGIN
+		S.class := NotDef; GetCmdSpec(S);	(* maximum gap width [value in procent] *)
+		IF (S.class = Texts.Int) & (S.i > 0) THEN procent := S.i ELSE procent := 200 END;
+		IF ~ LedaFrames.InMain(F) THEN
+			F := LedaFrames.Focus();
+			IF F = NIL THEN F := LedaFrames.Marked() END
+		END;
+		IF F # NIL THEN
+			GetTextLocation(F, text, pos);
+			IF text # NIL THEN
+				LedaFrames.Mark(F, -1);
+				LedaCtrl.InitReader(R, text);
+				LOOP
+					LocateLine(text, pos, pos, len, blkW, cr);
+					IF len = 0 THEN pos := -1; EXIT END;	(*###*)
+					LedaCtrl.SetReader(R, pos); INC(pos, len);
+					W := 0; gapW := 0;
+					REPEAT
+						LedaCtrl.ReadChar(R, ch, ctrl); DEC(len);
+						chW := 0; chw:= 0; sepKind := 0X;
+						ctrl.width(ctrl, ch, NIL, chW, chw, sepKind);		(* get width *)
+						INC(W, chW);
+						IF sepKind = LedaCtrl.GapSep THEN INC(gapW, chW) END
+					UNTIL len = 0;
+					IF sepKind = LedaCtrl.GapSep THEN DEC(W, chW); DEC(gapW, chW)
+					ELSIF (sepKind # LedaCtrl.NoSep) & (sepKind # LedaCtrl.TabSep)
+								& (sepKind # LedaCtrl.BreakSep) THEN DEC(W, chW)
+					END;
+					IF (gapW > 0) & (W - gapW + gapW * procent DIV 100 < blkW) THEN EXIT END;	(*###*)
+				END;
+				IF pos >= 0 THEN MarkTextLocation(F, text, pos, pos)
+				ELSE Neutralize(F)
+				END;
+				LedaFrames.Mark(F, 1)
+			END
+		END
+	END FindBigSpace;
+		
+(*--- settings ---*)	
+	
+	PROCEDURE *ERP(foc: LedaBase.Box; P: LedaSys.Port); BEGIN END ERP;
+	
+	PROCEDURE EnableNameLog;
+	BEGIN
+		log.f := Files.Old(LogFile);
+		IF log.f = NIL THEN log.f := Files.New(LogFile); Files.Register(log.f) END;
+		Files.Set(log.r, log.f, Files.Length(log.f))
+	END EnableNameLog;
+	
+	PROCEDURE Adjust*;
+	(** to adjust basic settings of module *)
+		CONST Quote = 022X;	(* " *) 
+		VAR S: Texts.Scanner;	s: LedaSys.String;	i: INTEGER;
+	BEGIN
+		S.class := NotDef; GetCmdSpec(S);
+		IF S.class = Texts.Name THEN
+			IF S.s = "debug" THEN
+				Texts.Scan(S); IF S.class # Texts.Name THEN RETURN END;	(*###*)
+				IF S.s = "on" THEN LedaSys.In("debug on"); LedaSys.OutT("  debug: on", 1)
+				ELSIF S.s = "off" THEN LedaSys.In("debug off"); LedaSys.OutT("  debug: off", 1)
+				END
+			ELSIF LedaSys.EqualStr("nam", S.s) THEN
+				Texts.Scan(S); IF S.class # Texts.Name THEN RETURN END;	(*###*)
+				IF S.s = "on" THEN
+					EnableNameLog; LedaSys.OutT("  namelog: on", 1)
+				ELSIF S.s = "off" THEN log.f := NIL; Files.Set(log.r, log.f, 0);
+					LedaSys.OutT("  namelog: off", 1)
+				END
+			ELSIF LedaSys.EqualStr("dial", S.s) THEN
+				Texts.Scan(S); IF S.class # Texts.Name THEN RETURN END;	(*###*)
+				IF LedaSys.EqualStr("stand", S.s) THEN
+					LedaSys.dialogMod := ""; LedaSys.OutT("  dialog: standard", 1)
+				ELSIF LedaSys.EqualStr("gad", S.s) THEN
+					LedaSys.dialogMod := DialogModule; LedaSys.OutT("  dialog: gadgets", 1)
+				END
+			ELSIF S.s = "menu" THEN
+				WHILE S.nextCh = " " DO Texts.Read(S, S.nextCh) END;
+				IF S.nextCh = Quote THEN
+					Texts.Read(S, S.nextCh); i := 0;
+					WHILE ~ S.eot & (i < LEN(ledaCmds) - 1) & (S.nextCh # Quote) DO
+						ledaCmds[i] := S.nextCh; INC(i); Texts.Read(S, S.nextCh)
+					END;
+					ledaCmds[i] := 0X; LedaSys.OutT("  menu: commands set", 1)
+				ELSE
+					Texts.Scan(S); IF S.class # Texts.Name THEN RETURN END;	(*###*)
+					IF LedaSys.EqualStr("stand", S.s) THEN
+						ledaCmds := LedaCmds; LedaSys.OutT("  menu: standard commands", 1)
+					END
+				END
+			ELSIF S.s = "color" THEN
+				Texts.Scan(S); IF S.class # Texts.Name THEN RETURN END;	(*###*)
+				LedaSys.CopyStr(S.s, s);
+				Texts.Scan(S); IF S.class # Texts.Int THEN RETURN END;	(*###*)
+				IF LedaSys.EqualStr("inv", s) THEN
+					LedaFrames.ResetMarks(NIL); LedaSys.inv := SHORT(S.i);
+					LedaSys.OutT("  color: invert ", 0); LedaSys.OutI(LedaSys.inv, 1)
+				ELSIF LedaSys.EqualStr("back", s) THEN
+					LedaSys.bg := SHORT(S.i); LedaFrames.Redraw(NIL);	(* redraw all frames *)
+					LedaSys.OutT("  color: background ", 0); LedaSys.OutI(LedaSys.bg, 1)
+				ELSIF LedaSys.EqualStr("fore", s) THEN
+					LedaSys.fg := SHORT(S.i); LedaFrames.Redraw(NIL);	(* redraw all frames *)
+					LedaSys.OutT("  color: foreground ", 0); LedaSys.OutI(LedaSys.fg, 1)
+				ELSE RETURN	(*###*)
+				END
+			ELSIF S.s = "reset" THEN
+				LedaBase.Recall := ERP;
+				LedaBase.LockStamp(MAX(INTEGER));	(* reset stamp lock *)
+				LedaFrames.Reset;
+				LedaCtrl.Reset;
+				LedaIO.SetInDevice; LedaIO.SetOutDevice("Screen");
+				LedaBox.ParReset(-1); LedaBox.bcFlags := {};
+				attr.V := NIL; attr.T := NIL; Texts.OpenWriter(attr.W); Texts.OpenWriter(attr.Wn);
+				LedaSys.OutT("  reset: done", 1)
+			END
+		END
+	END Adjust;
+				
+
+BEGIN
+	LedaSys.OutT(ModName, 0); LedaSys.OutT(ModVersion, 1);
+	
+	(*--- initialize ---*)
+	ledaCmds := LedaCmds;	(* standard menu *)
+	attr.V := NIL; attr.T := NIL;
+	Texts.OpenWriter(attr.W);
+	Texts.OpenWriter(attr.Wn);
+	LedaBase.Recall := ERP;	(* initalize recall procedure *)
+	srTime := -1;
+	search.p := ""; search.l := 0;
+	fndTime := -1; fndStyle := NIL;
+	LedaCtrl.InitBuffer(replace);
+	log.f := NIL;	(* name log off *)
+	EnableNameLog;
+	
+	(*--- preloading ---*)
+	LedaSys.Execute("LedaDoc", "");
+	LedaSys.Execute("LedaPage", "");
+	LedaSys.Execute("LedaText", "");
+	LedaSys.Execute("LedaChar", "");
+	LedaSys.Execute("LedaLetter", "");
+	LedaSys.Execute("LedaPlane", "");
+	LedaSys.Execute("LedaContainer", "");
+	LedaSys.Execute(DialogModule, "")
+END Leda.

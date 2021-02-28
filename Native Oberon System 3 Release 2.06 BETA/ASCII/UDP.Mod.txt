@@ -1,0 +1,175 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE UDP;	(* 31.01.96 mg / 01.02.96 pm *)
+
+IMPORT
+	SYSTEM, PT := Ports, IP, NetBase, EtherNet, Oberon;
+
+CONST
+	Done* = 0; LocalPortInUse* = 3; DescriptorInUse* = 4;
+	
+CONST
+	HLen = 8; MaxQSize = 20;
+	
+TYPE
+	Header* = POINTER TO HeaderDesc;
+
+	HeaderDesc* = RECORD
+		src*: INTEGER;
+		dst*: INTEGER;
+		len*: INTEGER;
+		chksum*: INTEGER
+	END;
+
+	Connection* = POINTER TO ConnectionDesc;
+
+	ConnectionDesc = RECORD (PT.PortDesc)
+		rq: NetBase.Queue
+	END;
+
+VAR
+	udprc, udpsd: LONGINT;
+
+PROCEDURE Min (n, m: LONGINT): LONGINT;
+BEGIN IF n < m THEN RETURN n ELSE RETURN m END
+END Min;
+
+PROCEDURE ChkSum* (iph: IP.Header; udph: Header; len: INTEGER): LONGINT;
+VAR
+	udpph: RECORD src, dst: IP.IpAdr; proto, len: INTEGER END;
+	data: EtherNet.Data;
+	chksum: LONGINT;
+BEGIN
+	NetBase.Copy(iph.src, udpph.src, IP.IpAdrLen); NetBase.Copy(iph.dst, udpph.dst, IP.IpAdrLen);
+	udpph.proto := IP.UDP; NetBase.Host2Net(udpph.proto);
+	udpph.len := len; NetBase.Host2Net(udpph.len);
+	chksum := NetBase.Sum(udpph, 12);
+	IF len MOD 2 # 0 THEN
+		data := SYSTEM.VAL(EtherNet.Data, udph); data.data[len] := 0X; INC(len)
+	END;
+	chksum := NetBase.ChkSum(udph^, len, chksum);
+	RETURN chksum
+END ChkSum;
+
+PROCEDURE * Input (item: NetBase.Item);
+VAR
+	udph: Header;
+	iph: IP.Header;
+	com: PT.Port;
+	dmy: ARRAY 1 OF SYSTEM.BYTE;
+	iphlen, i, j: INTEGER;
+	len, chksum: LONGINT;
+BEGIN iph := SYSTEM.VAL(IP.Header, item.data);
+	udph := SYSTEM.VAL(Header, SYSTEM.ADR(item.data.data[IP.MinHLen]));
+	NetBase.Net2Host(udph.len); udprc := (udprc + 1) MOD MAX(LONGINT);
+	chksum := udph.chksum; udph.chksum := 0;
+	IF (udph.chksum = 0) OR (SHORT(ChkSum(iph, udph, udph.len)) = chksum) THEN
+		NetBase.Net2Host(udph.src); NetBase.Net2Host(udph.dst);
+		IF PT.Search(IP.ipadr, udph.dst, iph.src, udph.src, TRUE, com) THEN
+			IF com IS Connection THEN
+				WITH com: Connection DO
+					IF com.rq.n < MaxQSize THEN NetBase.PutItem(com.rq, item)
+					ELSE NetBase.PutItem(NetBase.itq, item)
+					END
+				END
+			ELSE HALT(99)
+			END
+		ELSE (* IP.IcmpSend(IP.ipadr, iph.src, IP.unreach, 3, 0, 0, dmy); *)
+			NetBase.PutItem(NetBase.itq, item)
+		END
+	ELSE NetBase.PutItem(NetBase.itq, item)
+	END
+END Input;
+
+PROCEDURE Open* (VAR C: Connection; lport: INTEGER; radr: IP.IpAdr; rport: INTEGER; VAR res: INTEGER);
+BEGIN
+	IF PT.Available(IP.ipadr, lport, radr, rport) THEN NEW(C); NetBase.Reset(C.rq);
+		IF PT.Access(C, IP.ipadr, lport, radr, rport, PT.conctless) THEN res := Done
+		ELSE res := DescriptorInUse
+		END 
+	ELSE res := LocalPortInUse
+	END
+END Open;
+
+PROCEDURE Close* (C: Connection);
+BEGIN PT.Release(C); NetBase.Reset(C.rq)
+END Close;
+
+PROCEDURE Available* (C: Connection): LONGINT;
+VAR
+	me: Oberon.Task;
+BEGIN IP.Timer(me); NetBase.Demux(me); IP.IpDemux(me);
+	RETURN C.rq.n
+END Available;
+
+PROCEDURE Send* (C: Connection; radr: IP.IpAdr; rport: INTEGER; VAR buf: ARRAY OF SYSTEM.BYTE; beg, len: LONGINT);
+VAR
+	item: NetBase.Item;
+	iph: IP.Header;
+	udph: Header;
+	offs: INTEGER;
+	dst, l: LONGINT;
+BEGIN
+	WHILE len > 0 DO NetBase.NewItem(item);
+		offs := IP.MinHLen + HLen; l := Min(1500 - offs, len);
+		dst := SYSTEM.ADR(item.data.data[offs]);
+		NetBase.FastCopy(SYSTEM.ADR(buf[beg]), dst, l);
+		item.len := offs + SHORT(l); INC(beg, l); DEC(len, l);
+
+		udph := SYSTEM.VAL(Header, SYSTEM.ADR(item.data.data[IP.MinHLen]));
+		udph.src := C.lport; NetBase.Host2Net(udph.src);
+		udph.dst := rport; NetBase.Host2Net(udph.dst);
+		udph.len := SHORT(l) + HLen; NetBase.Host2Net(udph.len);
+
+		iph := SYSTEM.VAL(IP.Header, item.data);
+		NetBase.Copy(C.lip, iph.src, IP.IpAdrLen); NetBase.Copy(radr, iph.dst, IP.IpAdrLen);
+
+		udph.chksum := 0; udph.chksum := SHORT(ChkSum(iph, udph, SHORT(l) + HLen));
+		udpsd := (udpsd + 1) MOD MAX(LONGINT);
+		IP.IpSend(item, IP.UDP)
+	END
+END Send;
+
+PROCEDURE Receive* (C: Connection; VAR radr: IP.IpAdr; VAR rport: INTEGER; VAR buf: ARRAY OF SYSTEM.BYTE;
+	beg: LONGINT; VAR len: LONGINT);
+VAR
+	me: Oberon.Task;
+	item: NetBase.Item;
+	udph: Header;
+	iph: IP.Header;
+	offs: INTEGER;
+	dst: LONGINT;
+BEGIN IP.Timer(me); NetBase.Demux(me); IP.IpDemux(me);
+	IF C.rq.n > 0 THEN NetBase.GetItem(C.rq, item);
+		iph := SYSTEM.VAL(IP.Header, item.data);
+		udph := SYSTEM.VAL(Header, SYSTEM.ADR(item.data.data[IP.MinHLen]));
+		NetBase.Copy(iph.src, radr, IP.IpAdrLen); rport := udph.src;
+		offs := IP.MinHLen + HLen; len := udph.len - HLen;
+		dst := SYSTEM.ADR(buf[beg]);
+		NetBase.FastCopy(SYSTEM.ADR(item.data.data[offs]), dst, len)
+	ELSE len := -1
+	END
+END Receive;
+
+PROCEDURE Start*;
+BEGIN IP.InstallDemux(Input, IP.UDP);
+	udprc := 0; udpsd := 0
+END Start;
+
+PROCEDURE Stop*;
+BEGIN IP.RemoveDemux(IP.UDP)
+END Stop;
+
+BEGIN udprc := 0; udpsd := 0
+END UDP.

@@ -1,0 +1,656 @@
+MODULE DOCC;  (*NW 30.5.87 / 6.11.91 // ARD 7. 7. 92 *)
+(* ARD 20.07.93, EntryLength = 128, MaxComs = 128 *)
+(* ARD Mon, 13-Jun-1994, no saving of float registers  *)
+
+	IMPORT Files, DOCS, DOCT, SYSTEM, Texts;
+
+	CONST CodeLength = 64000; LinkLength = 250;
+				ConstLength = 8000; EntryLength = 128;
+				CodeLim = CodeLength - 100; 
+				MaxPtrs = 128; MaxRecs = 32; MaxComs = 128; MaxExts = 16; MaxTBP = 16;
+
+		(*object and item modes*)
+			Var   =  1; VarX  =  2; Ind = 3; IndX  =  4; RegI  =  5;
+			RegX  =  6; Abs   =  7; Con   =  8; Stk   =  9; Coc   = 10;
+			Reg   = 11; Fld   = 12; Typ   = 13; LProc = 14; XProc = 15;
+			SProc = 16; CProc = 17; IProc = 18; Mod   = 19; Head  = 20;
+
+		(*structure forms*)
+			Undef = 0; Byte = 1; Bool = 2; Char = 3; SInt = 4; Int = 5; LInt = 6;
+			Real = 7; LReal = 8; Set = 9; String = 10; NilTyp = 11; NoTyp = 12;
+			Pointer = 13; ProcTyp = 14; Array = 15; DynArr = 16; Record = 17;
+			TbTyp = 18;
+			 
+		(* Registernumbers *)
+			eax = 0; ecx = 1; edx = 2; ebx = 3; esp = 4; ebp = 5; esi = 6; edi = 7; 
+			
+		(* Register sets *)
+			byteregs* = {eax, ebx, ecx, edx}; genregs* = {eax, ebx, ecx, edx, edi, esi};
+			
+	TYPE Argument = RECORD mod2, gen, form, d1, d2: LONGINT END;
+			
+			(* forms:
+				0: -
+				1: -
+				2: RegNr in z.gen
+				3: RegNr in z.gen, offset in z.d1
+				4: z.d1: Module, z.d2: Offset for Fixup
+				5: z.d2: Absolute Address
+				6: Index: With BaseReg, Offset in z.d1 
+				7: Index: Without base reg, with modnr, offset for Fixup
+				8: - *)
+
+	TYPE StopList* = POINTER TO StopListDesc;	(* mb *)
+			StopListDesc* = RECORD
+				pc*, pos*: LONGINT;
+				scope*: DOCT.Object;
+				next*:StopList
+			END;
+		
+	VAR pc*: LONGINT;
+			level*: INTEGER;
+			wasderef*: DOCT.Object;
+			typchk*, low*: BOOLEAN;
+			RegSet*: SET;
+			lnkx, conx*, nofptrs, nofrec: INTEGER;
+			PtrTab: ARRAY MaxPtrs OF LONGINT;
+			RecTab*: ARRAY MaxRecs OF DOCT.Struct;
+			constant*: ARRAY ConstLength OF CHAR;
+			code*:  POINTER TO ARRAY CodeLength OF CHAR;
+			link*:  ARRAY LinkLength OF RECORD mod*, ent*: SHORTINT; link*: LONGINT END;
+			entry*: ARRAY EntryLength OF LONGINT;
+			FStack*: SHORTINT;
+			flag: BOOLEAN;
+			noftbp: INTEGER;
+			TBPTab: ARRAY MaxTBP OF LONGINT;
+			endPc* : LONGINT; (* << KR *)
+			endPos* : LONGINT; (* << KR *)
+			
+			PcList: StopList;
+
+	PROCEDURE GetByteReg*(VAR x: DOCT.Item);
+	BEGIN
+		x.mode := Reg;
+		IF ~(0 IN RegSet) & (0 IN byteregs) THEN x.a0 := 0; INCL(RegSet,0)
+		ELSIF ~(3 IN RegSet) & (3 IN byteregs) THEN x.a0 := 3; INCL(RegSet,3)
+		ELSIF ~(2 IN RegSet) & (2 IN byteregs) THEN x.a0 := 2; INCL(RegSet,2)
+		ELSIF ~(1 IN RegSet) & (1 IN byteregs) THEN x.a0 := 1; INCL(RegSet,1)
+		ELSE x.a0 := 0; DOCS.Mark(215) END;		(* Only four Byteregisters *)
+	END GetByteReg;
+	
+	PROCEDURE GetGenReg*(VAR x: DOCT.Item);
+	BEGIN
+		x.mode := Reg;
+		IF ~(0 IN RegSet) & (0 IN genregs) THEN x.a0 := 0; INCL(RegSet,0)
+		ELSIF ~(3 IN RegSet) & (3 IN genregs) THEN x.a0 := 3; INCL(RegSet,3)
+		ELSIF ~(2 IN RegSet) & (2 IN genregs) THEN x.a0 := 2; INCL(RegSet,2)
+		ELSIF ~(7 IN RegSet) & (7 IN genregs) THEN x.a0 := 7; INCL(RegSet,7)
+		ELSIF ~(6 IN RegSet) & (6 IN genregs) THEN x.a0 := 6; INCL(RegSet,6)
+		ELSIF ~(1 IN RegSet) & (1 IN genregs) THEN x.a0 := 1; INCL(RegSet,1)
+		ELSE x.a0 := 0; DOCS.Mark(215) END;		(* Only Six General Registers *)
+	END GetGenReg;
+	
+	PROCEDURE GetThisReg*(reg: INTEGER; VAR x: DOCT.Item; VAR ok: BOOLEAN);
+	BEGIN
+		x.mode := Reg; x.a0 := reg; ok := ~(reg IN RegSet); INCL(RegSet,reg) 
+	END GetThisReg;
+	
+	PROCEDURE Register*(L: INTEGER; VAR gen: DOCT.Item);
+	BEGIN
+		IF L = 0 THEN GetByteReg(gen) ELSE GetGenReg(gen) END;
+	END Register;
+	
+	PROCEDURE FreeRegs*(r: SET);
+	BEGIN RegSet := r; FStack := 0;
+	END FreeRegs;
+	
+	PROCEDURE FreeReg*(x: DOCT.Item);
+	BEGIN 
+		IF (x.mode = Reg) OR (x.mode = RegI) OR (x.mode = RegX) THEN EXCL(RegSet, x.a0) END;
+		IF (x.mode = VarX) OR (x.mode = IndX) OR (x.mode = RegX) THEN EXCL(RegSet, x.a2) END
+	END FreeReg;
+	
+	PROCEDURE AllocInt*(k: LONGINT);
+	BEGIN
+		IF conx < ConstLength-1 THEN
+			constant[conx] := CHR(k); INC(conx);
+			constant[conx] := CHR(k DIV 100H); INC(conx);
+		ELSE DOCS.Mark(230); conx := 0 END
+	END AllocInt;
+
+	PROCEDURE AllocString*(VAR s: ARRAY OF CHAR; VAR x: DOCT.Item);
+		VAR i: INTEGER; ch: CHAR;
+	BEGIN INC(conx, (-conx) MOD 4); i := 0;
+		REPEAT ch := s[i]; INC(i);
+			IF conx >= ConstLength THEN DOCS.Mark(230); conx := 0 END;
+			constant[conx] := ch; INC(conx)
+		UNTIL ch = 0X;
+		x.lev := 0; x.a0 := conx - i; x.a1 := i
+	END AllocString;
+
+	PROCEDURE AllocBounds*(min, max: LONGINT; VAR adr: LONGINT);
+	BEGIN INC(conx, (-conx) MOD 4); adr := conx;
+		AllocInt(max); AllocInt(min)
+	END AllocBounds;
+	
+	PROCEDURE AllocArrayBounds*(max: LONGINT; VAR adr: LONGINT);
+	BEGIN INC(conx, (-conx) MOD 4); adr := conx;
+		AllocInt(max MOD 10000H); AllocInt(max DIV 10000H)
+	END AllocArrayBounds;
+	
+	PROCEDURE IncPc;
+	BEGIN
+		INC(pc);
+		IF pc > endPc THEN endPos := Texts.Pos(DOCS.R); endPc := MAX(LONGINT); DOCS.scanerr := TRUE END;
+		IF (PcList#NIL) & (pc>PcList.pc) THEN PcList.pos:=Texts.Pos(DOCS.R); PcList.scope:=DOCT.topScope; PcList:=PcList.next END; 
+		END IncPc;
+			
+	PROCEDURE PutByte*(x: LONGINT);
+	BEGIN code[pc] := CHR(x); IncPc
+	END PutByte;
+
+	PROCEDURE PutWord*(x: LONGINT);
+	BEGIN code[pc] := CHR(x); IncPc; code[pc] := CHR(x DIV 100H); IncPc
+	END PutWord;
+
+	PROCEDURE PutDbl*(x: LONGINT);	(* Also used for displacements. Only 32-bit-displacements *)
+	BEGIN 
+		code[pc] := CHR(x); IncPc; code[pc] := CHR(x DIV 100H); IncPc;
+		code[pc] := CHR(x DIV 10000H); IncPc; code[pc] := CHR(x DIV 1000000H); IncPc
+	END PutDbl;
+	
+	PROCEDURE PutData(size, data: LONGINT);
+	BEGIN
+		IF size = 1 THEN PutByte(data) ELSIF size = 2 THEN PutWord(data) ELSE PutDbl(data) END
+	END PutData;
+	
+	PROCEDURE Push*(reg: INTEGER);
+	BEGIN PutByte(50H + reg) END Push;
+	
+	PROCEDURE Pop*(reg: INTEGER);
+	BEGIN PutByte(58H + reg); INCL(RegSet, reg) END Pop;
+	
+	PROCEDURE Operand(VAR x: DOCT.Item; VAR z: Argument; reg: INTEGER);
+	VAR c: DOCT.Item;
+	
+		PROCEDURE GenMov(code: LONGINT);
+		BEGIN
+			PutByte(8BH);
+			IF (x.a0 <= MAX(SHORTINT)) & (x.a0 >= MIN(SHORTINT)) THEN PutByte(code); PutByte(x.a0)
+			ELSE PutByte(code+64); PutDbl(x.a0) END
+		END GenMov;
+
+		PROCEDURE downlevel(VAR gen: LONGINT);	
+		VAR n: INTEGER; b: DOCT.Item;
+		BEGIN n := level - x.lev; GetGenReg(b); gen := b.a0; flag := TRUE;
+			PutByte(8BH); PutByte(64 + gen*8 + ebp); PutByte(8);														(* MOV Reg, [EBP+8] *)
+			WHILE n > 1 DO DEC(n); PutByte(8BH); PutByte(64 + gen*8 + gen); PutByte(8) END;		(* MOV Reg, [Reg+8] *)
+		END downlevel;
+
+		PROCEDURE index;
+		VAR s: LONGINT;
+		BEGIN s := x.typ.size; z.mod2 := x.a2*8;
+			IF s = 1 THEN 
+			ELSIF s = 2 THEN INC(z.mod2, 64);
+			ELSIF s = 4 THEN INC(z.mod2, 128);
+			ELSIF s = 8 THEN INC(z.mod2, 192);
+			ELSE  
+				IF (s < MAX(SHORTINT)) & (s > MIN(SHORTINT)) THEN 
+					PutByte(6BH); PutByte(192 + x.a2*8 + x.a2); PutByte(s);				(* IMUL Reg, Reg, s *)
+				ELSE PutByte(69H); PutByte(192 + x.a2*8 + x.a2); PutDbl(s) END;
+			END;
+		END index;
+		
+	BEGIN flag := FALSE;
+		CASE x.mode OF
+			 Var: IF x.lev <= 0 THEN (*EXT and global*)													(* mode := Abs *)
+						z.gen := 5; z.d1 := x.a0; z.d2 := -x.lev; z.form := 4
+					ELSIF x.lev = level THEN z.d1 := x.a0; z.form := 3; z.gen := ebp				(* mode := RegI *)
+					ELSE downlevel(z.gen); z.d1 := x.a0; z.form := 3									(* mode := RegI *)
+					END
+		 | RegI: z.d1 := x.a1; z.form := 3; z.gen := x.a0														(* mode := RegI *)
+		 | Ind: IF x.lev <= 0 THEN 
+						IF reg < 0 THEN GetGenReg(c); flag := TRUE ELSE c.a0 := reg END; 	(*EXT and global*)	(* <-- NEW *)
+						PutByte(8BH); PutByte(c.a0*8 + 5); 
+						PutWord(link[-x.lev].link); 
+						PutWord(x.a0); link[-x.lev].link := pc - 4;												(* MOV Reg, adr[SB] *)
+						z.gen := c.a0;
+					ELSIF x.lev = level THEN 
+						IF reg < 0 THEN GetGenReg(c); flag := TRUE ELSE c.a0 := reg END; 		(* <-- NEW *)
+						GenMov(64 + c.a0*8 + ebp);																	(* MOV Reg, adr[EBP] *)
+						z.gen := c.a0;
+					ELSE downlevel(z.gen); GenMov(64 + z.gen*8 + z.gen)
+					END;
+					z.d1 := x.a1; z.form := 3;
+		 | IndX: index;
+					IF x.lev <= 0 THEN GetGenReg(c); 															(*EXT and global*)
+						flag := TRUE;																						(* <-- ARD, Fri, 30-Apr-93 *)
+						PutByte(8BH); PutByte(c.a0*8 + 5); 
+						PutWord(link[-x.lev].link); 
+						PutWord(x.a0); link[-x.lev].link := pc - 4;												(* MOV Reg, adr[SB] *)
+						z.gen := c.a0;
+					ELSIF x.lev = level THEN GetGenReg(c); GenMov(64 + c.a0*8 + ebp);		(* MOV Reg, adr[EBP] *)
+						z.gen := c.a0; flag := TRUE;																		(* <-- ARD, Fri, 30-Apr-93 *)
+					ELSE downlevel(z.gen); GenMov(64 + z.gen*8 + z.gen)
+					END;
+					z.mod2 := z.mod2 + z.gen; z.d1 := x.a1; z.form := 6;
+					(*EXCL(RegSet, x.a2)*)																					(* x.a2 no more used *)
+		 | VarX: index;
+					IF x.lev <= 0 THEN (*EXT and global*)														(* mode := AbsX *)
+						z.mod2 := z.mod2 + 5; z.d1 := x.a0; z.d2 := -x.lev; z.form := 7				(* No base reg *)
+					ELSIF x.lev = level THEN																			(* mode := RegX *)
+						z.mod2 := z.mod2 + ebp ; z.d1 := x.a0; z.form := 6									(* base reg *)
+					ELSE downlevel(z.gen); 
+						z.mod2 := z.mod2 + z.gen; z.d1 := x.a0; z.form := 6								(* mode := RegX *)
+					END;
+					(*EXCL(RegSet, x.a2)*)																					(* x.a2 no more used *)
+		 | RegX: index; z.mod2 := z.mod2 + x.a0; z.d1 := x.a1; z.form := 6; 						(* mode := RegX *)
+					(*EXCL(RegSet, x.a2)*)																					(* x.a2 no more used *)
+		 | Reg: z.form := 2; z.gen := x.a0																				(* mode := Reg *)
+		 | Abs: z.form := 5; z.d2 := x.a0																					(* mode := Abs *)
+		 | Coc, Fld .. Head, Stk, Con: DOCS.Mark(126); x.mode := Var; z.form := 0
+		 ELSE DOCS.Mark(126); x.mode := Var; z.form := 0
+		END
+	END Operand;
+	
+	PROCEDURE SetModFields(z: Argument; reg: INTEGER);
+	VAR form: LONGINT;
+	BEGIN form := z.form;
+		IF (form >= 2) & ( form <= 7) THEN
+			CASE form OF
+				2: PutByte(192 + reg*8 + z.gen);|
+				3: IF (z.d1 <= MAX(SHORTINT)) & (z.d1 >= MIN(SHORTINT)) THEN PutByte(64 + reg*8 + z.gen); PutByte(z.d1) 
+					ELSE PutByte(128 + reg*8 + z.gen); PutDbl(z.d1) END;
+					IF flag THEN EXCL(RegSet, z.gen); flag := FALSE END|
+				4: PutByte(reg*8 + z.gen); PutWord(link[z.d2].link); PutWord(z.d1); link[z.d2].link := pc - 4;|
+				5: PutByte(reg*8 + 5); PutDbl(z.d2);|
+				6: IF (z.d1 <= MAX(SHORTINT)) & (z.d1 >= MIN(SHORTINT)) THEN 
+						PutByte(64 + reg*8 + 4); PutByte(z.mod2); PutByte(z.d1) 
+					ELSE PutByte(128 + reg*8 + 4); PutByte(z.mod2); PutDbl(z.d1) END;
+					IF flag THEN EXCL(RegSet, z.gen); flag := FALSE END|
+				7: PutByte(reg*8 + 4); PutByte(z.mod2);
+					PutWord(link[z.d2].link); PutWord(z.d1); link[z.d2].link := pc - 4;| 
+			END;
+		ELSE DOCS.Mark(326)
+		END
+	END SetModFields;
+	
+	PROCEDURE PutO*(type: INTEGER; opc: LONGINT);
+	BEGIN 
+		IF type = 1 THEN DEC(opc) ELSIF type = 2  THEN PutByte(66H) END; 						(* OPSIZE: *)
+		IF (0 <= opc) & (opc < 100H) THEN PutByte(opc)
+		ELSE PutByte(opc DIV 100H); PutByte(opc) 
+		END
+	END PutO;
+	
+	PROCEDURE PutOM*(opsize, opc, ttt: INTEGER; VAR mem: DOCT.Item);
+	VAR z: Argument;
+	BEGIN 
+		IF (opc = 8AH) OR (opc = 8BH) THEN Operand(mem, z, ttt) ELSE Operand(mem, z, -1) END;		(* <-- NEW *)
+		PutO(opsize, opc); SetModFields(z, ttt) 
+	END PutOM;
+	
+	PROCEDURE PutOD*(opsize, datasize: INTEGER; opc, data: LONGINT);
+	BEGIN PutO(opsize, opc); PutData(datasize, data) END PutOD;
+  
+	PROCEDURE PutOMD*(opsize, datasize, opc, ttt: INTEGER; mem: DOCT.Item; data: LONGINT);
+	BEGIN PutOM(opsize, opc, ttt, mem); PutData(datasize, data) END PutOMD;
+
+	PROCEDURE PutORM*(opsize, opc: INTEGER; reg: LONGINT; VAR mem: DOCT.Item);
+	BEGIN PutOM(opsize, opc, SHORT(reg), mem) END PutORM;
+    
+	PROCEDURE PutORMD*(opsize, datasize, opc: INTEGER; reg: LONGINT; mem: DOCT.Item; data: LONGINT);
+	BEGIN PutORM(opsize, opc, reg, mem); PutData(datasize, data) END PutORMD;
+	
+	PROCEDURE AllocTypDesc*(typ: DOCT.Struct);   (* typ.form = Record *)
+	BEGIN INC(conx, (-conx) MOD 4); typ.mno := 0; typ.adr := conx;
+		IF typ.n > MaxExts THEN DOCS.Mark(233)
+		ELSIF nofrec < MaxRecs THEN
+			RecTab[nofrec] := typ; INC(nofrec);
+			AllocInt(0); AllocInt(0)
+		ELSE DOCS.Mark(223)
+		END
+	END AllocTypDesc;
+
+	PROCEDURE InitTypDescs*;
+		VAR x, y, reg, reg2: DOCT.Item; i: INTEGER; typ: DOCT.Struct;
+	BEGIN
+		GetGenReg(reg2); GetGenReg(reg); x.lev := 0; y.mode := Var; i := 0;
+		WHILE i < nofrec DO typ := RecTab[i]; INC(i); 
+			x.a0 := typ.adr; x.mode := Var; 
+			IF typ.BaseTyp # NIL THEN PutORM(4, 8BH, reg.a0, x); x.a0 := reg.a0; x.mode := RegI END;	(* load(x) *)
+			WHILE typ.BaseTyp # NIL DO (*initialization of base tag fields *)
+				x.a1 := - 4 - typ.n * 4; y.lev := -typ.mno; y.a0 := typ.adr;				(* As in DOSOP2 *)
+				PutORM(4, 8BH, reg2.a0, y); PutORM(4, 89H, reg2.a0, x);	(* MOV Reg, y; MOV x, Reg *)
+				typ := typ.BaseTyp
+			END
+		END;
+	END InitTypDescs;
+
+	PROCEDURE SaveRegisters*(VAR gR: SET; VAR fR: SHORTINT; VAR x: DOCT.Item);
+		VAR i, j: INTEGER; t: SET; y: DOCT.Item;
+	BEGIN t := RegSet;
+		IF x.mode IN {Reg, RegI, RegX} THEN EXCL(RegSet, x.a0) END;
+		IF x.mode IN {VarX, RegX, IndX} THEN EXCL(RegSet, x.a2) END;
+		gR := RegSet; fR := FStack;
+		IF RegSet # {} THEN
+			i := 0; 
+			REPEAT
+				IF i IN RegSet THEN PutO(4, 50H + i) END;			(* <-- ARD, PUSH reg *)
+				INC(i)
+			UNTIL i = 8;
+		END;
+		RegSet := t - RegSet; i := 0;
+	END SaveRegisters;
+
+	PROCEDURE RestoreRegisters*(gR: SET; fR: SHORTINT; VAR x: DOCT.Item);
+		VAR i, j: INTEGER; y: DOCT.Item;
+	BEGIN RegSet := gR; FStack := fR; i := 8;
+		(*set result mode*) x.mode := Reg; x.a0 := 0;
+		IF (x.typ.form = Real) OR (x.typ.form = LReal) THEN
+		ELSE
+			IF 0 IN gR THEN GetGenReg(y); PutORM(4, 89H, x.a0, y); x.a0 := y.a0 END;			(* <-- ARD: MOV Ry, EAX *)
+			INCL(RegSet, 0)
+		END;
+		IF gR # {} THEN
+			i := 8; 
+			REPEAT DEC(i);
+				IF i IN gR THEN PutO(4, 58H + i) END;			(* <-- ARD, POP reg *)
+			UNTIL i = 0;
+		END
+	END RestoreRegisters;
+
+	PROCEDURE DynArrAdr*(VAR x, y: DOCT.Item);	(* x := ADR(y) *)
+		VAR l, help: DOCT.Item;
+	BEGIN
+		GetGenReg(help); 
+		WHILE y.typ.form = DynArr DO	(* index with 0 *)
+			IF y.mode = IndX THEN
+				l.mode := Var; 
+				l.a0 := y.a0 + y.typ.adr; l.lev := y.lev;
+				(* l = actual dimension length - 1 *)
+				PutORM(4, 0FBFH, help.a0, l); PutO(4, 40H+help.a0);
+				PutORM(4, 0FAFH, y.a2, help);	(* IMUL inxreg, l *)
+			END;
+			y.typ := y.typ.BaseTyp
+		END; FreeReg(help);
+		IF (y.mode = Var) OR (y.mode = Ind) & (y.a1 = 0) THEN y.mode := Var;
+			IF x.mode = Reg THEN PutORM(4, 8BH, x.a0, y)  	(* MOVD *)
+			ELSIF x.mode = Stk THEN PutOM(4, 0FFH, 6, y)
+			ELSE GetGenReg(help); PutORM(4, 8BH, help.a0, y); PutORM(4, 89H, help.a0, x); FreeReg(help) END;
+		ELSE
+			IF x.mode = Reg THEN PutORM(4, 8DH, x.a0, y)
+			ELSIF x.mode = Stk THEN GetGenReg(help); PutORM(4, 8DH, help.a0, y); PutO(4, 50H + help.a0); FreeReg(help)
+			ELSE GetGenReg(help); PutORM(4, 8DH, help.a0, y); PutORM(4, 89H, help.a0, x); FreeReg(help) END;
+			x.a1 := 0	(* ADDR *)
+		END
+	END DynArrAdr;
+
+	PROCEDURE Entry*(i: INTEGER): LONGINT;
+	BEGIN RETURN entry[i]
+	END Entry;
+
+	PROCEDURE SetEntry*(i: INTEGER);
+	BEGIN entry[i] := pc
+	END SetEntry;
+
+	PROCEDURE LinkAdr*(m: INTEGER; n: LONGINT): INTEGER;
+	BEGIN
+		IF lnkx >= LinkLength THEN DOCS.Mark(231); lnkx := 0 END;
+		link[lnkx].mod := SHORT(m); link[lnkx].ent := SHORT(SHORT(n)); link[lnkx].link := 0;
+		INC(lnkx); RETURN lnkx-1
+	END LinkAdr;
+	
+	PROCEDURE SetLinkTable*(n: INTEGER);
+	BEGIN (*base addresses of imported modules*) lnkx := 0;
+		WHILE lnkx < n DO 
+			link[lnkx].mod := SHORT(lnkx); link[lnkx].ent := -1; link[lnkx].link := 0;
+			INC(lnkx) 
+		END
+	END SetLinkTable;
+
+	PROCEDURE fixup*(loc: LONGINT);  (*enter pc at loc*)
+		VAR x: LONGINT;
+	BEGIN x := pc - loc - 4; 
+		IF (code[loc-1] = 90X) & (code[loc-2] = 90X) THEN code[loc-1] := 0E9X;
+			code[loc] := 0X; code[loc+1] := 0X; code[loc+2] := 0X; code[loc+3] := 0X
+		ELSE 
+			code[loc] := CHR(x);
+			code[loc+1] := CHR(SYSTEM.LSH(x, -8));
+			(*IF x < 0 THEN *)code[loc+2] := CHR(SYSTEM.LSH(x, -16)); code[loc+3] := CHR(SYSTEM.LSH(x, -24))(* END*)
+		END
+	END fixup;
+
+	PROCEDURE fixupL*(loc: LONGINT);
+		VAR x: LONGINT;
+	BEGIN x := pc - loc - 4;
+		IF x > 0 THEN code[loc] := CHR(x); code[loc+1] := CHR(x DIV 100H);  code[loc+2] := 0X; code[loc+3] := 0X;
+		ELSE DEC(pc, 5)
+		END
+	END fixupL;
+
+	PROCEDURE FixLink*(L: LONGINT);
+		VAR L1: LONGINT;
+	BEGIN 
+		WHILE L # 0 DO
+			L1 := ORD(code[L]) + LONG(ORD(code[L+1]))*100H;
+			fixup(L); L := L1;
+		END
+	END FixLink;
+
+	PROCEDURE FixupWith*(L, val: LONGINT);
+	BEGIN 
+		IF ABS(val) >= 8000H THEN DOCS.Mark(208) END;
+		code[L] := CHR(val); 
+		code[L+1] := CHR(SYSTEM.LSH(val, -8));
+		IF val < 0 THEN code[L+2] := CHR(SYSTEM.LSH(val, -16)); code[L+3] := CHR(SYSTEM.LSH(val, -24)) END
+	END FixupWith;
+
+	PROCEDURE FixLinkWith*(L, val: LONGINT);
+		VAR L1: LONGINT;
+	BEGIN 
+		WHILE L # 0 DO
+			L1 := ORD(code[L]) + LONG(ORD(code[L+1]))*100H;
+			FixupWith(L, val-4 - L); L := L1
+		END
+	END FixLinkWith;
+
+	PROCEDURE MergedLinks*(L0, L1: LONGINT): LONGINT;
+		VAR L2, L3: LONGINT;
+	BEGIN (*merge chains of the two operands of AND and OR *)
+		IF L0 # 0 THEN L2 := L0;
+			LOOP L3 := ORD(code[L2]) + LONG(ORD(code[L2+1]))*100H;
+				IF L3 = 0 THEN EXIT END;
+				L2 := L3
+			END;
+			code[L2] := CHR(L1); code[L2+1] := CHR(L1 DIV 100H); 
+			RETURN L0
+		ELSE RETURN L1
+		END
+	END MergedLinks;
+
+	PROCEDURE Init*(initPcList: StopList);
+		VAR i: INTEGER;
+	BEGIN pc := 0; level := 0; lnkx := 0; conx := 12; nofptrs := 0; nofrec := 0;	(* conx := 12 <-- ARD *)
+		RegSet := {}; FStack := 0;
+		i := 0; 
+		WHILE i < ConstLength DO constant[i] := 0X; INC(i) END;
+		i := 0;
+		REPEAT entry[i] := 0; INC(i) UNTIL i = EntryLength;
+		PcList := initPcList
+	END Init;
+
+	PROCEDURE OutCode*(VAR name, progid: ARRAY OF CHAR; key: LONGINT; entno: INTEGER; datasize: LONGINT);
+	CONST ObjMark = 0F8X; ObjLowMark = 0F9X;
+	VAR f, i: INTEGER;
+			s, refpos, m: LONGINT;
+			nofcom, comsize, align: INTEGER;
+			obj: DOCT.Object;
+			typ: DOCT.Struct;
+			ObjFile:   Files.File;
+			out: Files.Rider;
+			ComTab: ARRAY MaxComs OF DOCT.Object;
+			zero: LONGINT;
+
+		PROCEDURE W(n: INTEGER);
+		BEGIN Files.Write(out, CHR(n)); Files.Write(out, CHR(n DIV 100H))
+		END W;
+
+		PROCEDURE WriteName(VAR name: ARRAY OF CHAR);
+			VAR i: INTEGER; ch: CHAR;
+		BEGIN i := 0;
+			REPEAT ch := name[i]; Files.Write(out, ch); INC(i) UNTIL ch = 0X;
+		END WriteName;
+		
+		PROCEDURE FindPtrs(typ: DOCT.Struct; adr: LONGINT);
+		VAR fld: DOCT.Object; btyp: DOCT.Struct;
+				i, n, s: LONGINT;
+		BEGIN 
+			IF typ.form = Pointer THEN
+				IF nofptrs < MaxPtrs THEN PtrTab[nofptrs] := adr; INC(nofptrs) ELSE DOCS.Mark(222) END
+			ELSIF typ.form = Record THEN
+				btyp := typ.BaseTyp;
+				IF btyp # NIL THEN FindPtrs(btyp, adr) END;
+				fld := typ.link;
+				WHILE fld # NIL DO
+					IF fld.name # "" THEN FindPtrs(fld.typ, fld.a0 + adr)
+					ELSIF nofptrs < MaxPtrs THEN PtrTab[nofptrs] := fld.a0 + adr; INC(nofptrs)
+					ELSE DOCS.Mark(222)
+					END;
+					fld := fld.next
+				END
+			ELSIF typ.form = Array THEN
+				btyp := typ.BaseTyp; n := typ.n;
+				WHILE btyp.form = Array DO n := btyp.n * n; btyp := btyp.BaseTyp END;
+				IF (btyp.form = Pointer) OR (btyp.form = Record) THEN
+					i := 0; s := btyp.size;
+					WHILE i < n DO FindPtrs(btyp, i*s + adr); INC(i) END
+				END
+			END;
+		END FindPtrs;
+
+		PROCEDURE PtrsAndComs;
+			VAR obj, par: DOCT.Object; u: INTEGER; help: BOOLEAN;
+		BEGIN obj := DOCT.topScope.next;
+			WHILE obj # NIL DO
+				IF obj.mode = XProc THEN par := obj.dsc; help := (par = NIL) OR (par.mode > 3) OR (par.a0 < 0);
+					IF entry[SHORT(obj.a0)] = 0 THEN DOCS.Mark(129)
+					ELSIF (obj.marked) & (obj.typ = DOCT.notyp) & help THEN (*command*)
+						u := 0;
+						WHILE obj.name[u] > 0X DO INC(comsize); INC(u) END;
+						INC(comsize, 3);
+						IF nofcom < MaxComs THEN ComTab[nofcom] := obj; INC(nofcom)
+						ELSE DOCS.Mark(232); nofcom := 0; comsize := 0
+						END
+					END
+				ELSIF obj.mode = Var THEN
+					FindPtrs(obj.typ, obj.a0)
+				END;
+				obj := obj.next
+			END
+		END PtrsAndComs;
+
+		PROCEDURE OutRefBlk(first: DOCT.Object; pc: LONGINT; name: ARRAY OF CHAR);
+			VAR obj: DOCT.Object; help: BOOLEAN;
+		BEGIN obj := first;
+			WHILE obj # NIL DO
+				IF obj.mode IN {LProc, XProc, IProc} THEN OutRefBlk(obj.dsc, obj.a2, obj.name) END;
+				obj := obj.next
+			END;
+			Files.Write(out, ObjMark); Files.WriteBytes(out, pc, 2); WriteName(name);
+			obj := first;
+			WHILE obj # NIL DO
+				IF (obj.mode = Var) OR (obj.mode = Ind) THEN
+					f := obj.typ.form; help := (f = Array) & (obj.typ.BaseTyp.form = Char) & (obj.typ.size <= 64);
+					IF (f IN {Byte .. Set, Pointer}) OR help THEN
+						Files.Write(out, CHR(obj.mode)); Files.Write(out, CHR(f));
+						Files.WriteBytes(out, obj.a0, 4); WriteName(obj.name)
+					END
+				END;
+				obj:= obj.next
+			END
+		END OutRefBlk;
+
+	BEGIN ObjFile := Files.New(name); zero := 0;
+		IF ObjFile # NIL THEN
+			Files.Set(out, ObjFile, 0);
+			WHILE pc MOD 4 # 0 DO PutByte (90H) END; (*NOP*)
+			INC(conx, (-conx) MOD 4);
+			nofcom := 0; comsize := 1;
+			PtrsAndComs; align := comsize MOD 2; INC(comsize, align);
+		(*header block*)
+			IF low THEN Files.Write(out, ObjLowMark) ELSE Files.Write(out, ObjMark) END;
+			Files.WriteBytes(out, refpos, 4);
+			W(entno); W(nofcom); W(nofptrs); W(DOCT.nofGmod);
+			W(lnkx); W(nofrec); Files.WriteBytes(out, datasize, 4); W(conx); m := pc; Files.WriteBytes(out, m, 4);
+			Files.WriteBytes(out, key, 4); WriteName(progid);
+		(*entry block*)
+			Files.Write(out, 81X); Files.WriteBytes(out, entry, 4*entno);
+		(*command block*)
+			Files.Write(out, 82X);
+			i := 0;  (*write command names and entry addresses*)
+			WHILE i < nofcom DO obj := ComTab[i]; WriteName(obj.name); Files.WriteBytes(out, entry[obj.a0], 4); INC(i) END;
+		(*pointer block*)
+			Files.Write(out, 83X); i := 0;
+			WHILE i < nofptrs DO Files.WriteBytes(out, PtrTab[i], 4); INC(i) END;
+			i := 0; 
+			WHILE i < nofrec DO Files.WriteBytes(out, RecTab[i].adr, 4); INC(i) END;		(* typedescs *)
+		(*procedurevariable block*)
+			Files.Write(out, 84X); 
+		(*import block*)
+			Files.Write(out, 85X); i := 0;
+			WHILE i < DOCT.nofGmod DO
+				obj := DOCT.GlbMod[i];
+				Files.WriteBytes(out, obj.a1, 4); WriteName(obj.name); INC(i)
+			END;
+		(*link block*)
+			Files.Write(out, 86X); 
+			(*Files.WriteBytes(out, link, 4*lnkx);		(* 4: <-- ARD *)*)
+			i := 0;
+			WHILE i < lnkx DO
+				Files.Write(out, link[i].mod);
+				Files.Write(out, link[i].ent);
+				Files.Write(out, CHR(link[i].link));
+				Files.Write(out, CHR(link[i].link DIV 100H));
+				INC(i);
+			END;
+		(*fixup block*)
+			Files.Write(out, 87X);
+		(*code, data block*)
+			Files.Write(out, 88X); 
+			Files.WriteBytes(out, constant, conx);
+			Files.WriteBytes(out, code^, pc);
+		(*type block*)
+			Files.Write(out, 89X); i := 0;
+			WHILE i < nofrec DO
+				typ := RecTab[i]; nofptrs := 0; noftbp := 0; FindPtrs(typ, 0);
+				s := (nofptrs+2)*4 + (MaxExts+MaxTBP+6)*4 + 32;
+				W(SHORT(s));								(*td size*)
+				Files.WriteBytes(out, typ.adr, 4);	(*td adr*)
+				s := typ.size; Files.WriteBytes(out, s, 4);
+(*  			  s := 0; j := 0;
+  			  WHILE j < MaxExts DO Files.WriteBytes(out, s, 4); INC(j) END;*)		(* not used *)
+  			  W(nofptrs); W(noftbp); 
+   			 Files.WriteBytes(out, PtrTab,nofptrs*4);
+   			 Files.WriteBytes(out, TBPTab,noftbp*4);
+				INC(i)
+			END;
+		(*ref block*)
+			refpos := Files.Pos(out); Files.Write(out, 8AX);
+			OutRefBlk(DOCT.topScope.next, pc, "$$");
+			Files.Set(out, ObjFile, 1); Files.WriteBytes(out, refpos, 4);
+  	  	IF ~DOCS.scanerr THEN Files.Register(ObjFile) END
+		ELSE DOCS.Mark(153)
+		END
+	END OutCode;
+
+	PROCEDURE Close*;
+		VAR i: INTEGER;
+	BEGIN i := 0;
+		WHILE i < MaxRecs DO RecTab[i] := NIL; INC(i) END
+	END Close;
+	
+BEGIN 
+	NEW(wasderef);
+	SYSTEM.NEW(code, CodeLength)
+END DOCC.

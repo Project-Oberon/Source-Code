@@ -1,0 +1,238 @@
+MODULE  Modules;  (*NW 16.2.86 / 22.9.92*)
+	IMPORT SYSTEM, Kernel, Files;
+
+	CONST ModNameLen* = 24; ObjMark = 0F5X; maximps = 32; headersize = 64;
+
+	TYPE Module* = POINTER TO ModDesc;
+		Command* = PROCEDURE;
+		ModuleName* = ARRAY ModNameLen OF CHAR;
+
+		ModDesc* = RECORD next*: Module;
+				size*, IB*, EB*, RB*, CB*, PB*, refcnt*, key*: LONGINT;
+				name*: ModuleName
+			END ;
+
+	VAR res*: INTEGER;
+		importing*, imported*: ModuleName;
+		loop: Command;
+
+	(*Exported procedures: ThisMod, Free, ThisProc*)
+
+	PROCEDURE ReadName(VAR R: Files.Rider; VAR s: ModuleName);
+		VAR ch: CHAR; i: INTEGER;
+	BEGIN i := 0;
+		REPEAT Files.Read(R, ch); s[i] := ch; INC(i)
+		UNTIL ch = 0X
+	END ReadName;
+
+	PROCEDURE OpenFile(VAR F: Files.File; VAR name: ARRAY OF CHAR);
+		VAR i: INTEGER; ch: CHAR;
+			Fname: ARRAY 32 OF CHAR;
+	BEGIN i := 0; ch := name[0]; (*make file name*)
+		WHILE ch > 0X DO Fname[i] := ch; INC(i); ch := name[i] END ;
+		Fname[i] := "."; Fname[i+1] := "o"; Fname[i+2] := "b"; Fname[i+3] := "j"; Fname[i+4] := 0X;
+		F := Files.Old(Fname)
+	END OpenFile;
+
+	PROCEDURE disp(a: LONGINT): LONGINT;
+		VAR d: LONGINT; i: INTEGER;
+	BEGIN d := 0; a := a MOD 40000000H + 0C0000000H; i := 0;
+		REPEAT d := SYSTEM.LSH(d, 8) + (a MOD 100H); a := SYSTEM.LSH(a, -8); INC(i)
+		UNTIL i = 4;
+		RETURN d
+	END disp;
+
+	PROCEDURE ThisMod*(name: ARRAY OF CHAR): Module;
+		(*search module in list; if not found, load module*)
+
+		VAR
+			mod, impmod, desc: Module;
+			ch: CHAR; k: SHORTINT;
+			i, j, offset, align, tdsize, tdadr: INTEGER;
+			nofimps, nofentries, nofptrs, comsize, constsize, codesize, nofrecs: INTEGER;
+			size, varsize, key, impkey, p, q, pb, eb: LONGINT;
+			init: Command;
+			F: Files.File; R: Files.Rider;
+			impname, modname: ModuleName;
+			import: ARRAY maximps OF Module;
+
+		PROCEDURE err(n: INTEGER);
+		BEGIN res := n; COPY(name, importing)
+		END err;
+
+	BEGIN res := 0; mod := SYSTEM.VAL(Module, Kernel.ModList);
+		LOOP
+			IF name = mod.name THEN EXIT END ;
+			mod := mod.next;
+			IF mod = NIL THEN EXIT END
+		END ;
+		IF mod = NIL THEN (*load*)
+			OpenFile(F, name);
+			IF F # NIL THEN
+				Files.Set(R, F, 0); Files.Read(R, ch); (*header*)
+				IF ch # ObjMark THEN err(2); RETURN NIL END ;
+				Files.Read(R, ch); Files.ReadBytes(R, varsize, 4);  (*skip*)
+				Files.ReadBytes(R, nofimps, 2); Files.ReadBytes(R, nofentries, 2);
+				Files.ReadBytes(R, nofptrs, 2); Files.ReadBytes(R, comsize, 2);
+				Files.ReadBytes(R, constsize, 2); Files.ReadBytes(R, varsize, 4);
+				Files.ReadBytes(R, codesize, 2); Files.ReadBytes(R, nofrecs, 2);
+				Files.ReadBytes(R, key, 4); ReadName(R, modname);
+				align := (-((nofentries + nofptrs)*2 + comsize)) MOD 4;
+
+				(*imports*) res := 0; i := 0;
+				WHILE (i < nofimps) & (res = 0) DO
+					Files.ReadBytes(R, impkey, 4); ReadName(R, impname);
+					impmod := ThisMod(impname);
+					IF res = 0 THEN
+						IF impmod.key = impkey THEN import[i] := impmod; INC(i); INC(impmod.refcnt)
+						ELSE err(3); imported := impname
+						END
+					END
+				END ;
+				IF res # 0 THEN (*undo*)
+					WHILE i > 0 DO DEC(i); DEC(import[i].refcnt) END ;
+					RETURN NIL
+				END ;
+
+				size := headersize + (nofentries +  nofptrs)*2 + nofimps*4 + comsize + 
+					varsize + codesize + constsize + align;
+				Kernel.AllocBlock(p, size); mod := SYSTEM.VAL(Module, p);
+				IF p = 0 THEN err(7); RETURN NIL END ;
+				mod.size := size;
+				mod.IB := p + headersize;
+				mod.EB := mod.IB + nofimps*4;
+				mod.RB := mod.EB + nofentries*2;
+				mod.CB := mod.RB + nofptrs*2;
+				mod.PB := mod.CB + comsize + align + constsize + varsize;
+				mod.refcnt := 0; mod.key := key;
+				COPY(modname, mod.name);
+
+				p := mod.IB; i := 0;
+				WHILE i < nofimps DO SYSTEM.PUT(p, import[i]); INC(p, 4); INC(i) END ;
+
+				(*entries*) q :=  nofentries*2 + p;
+				WHILE p < q DO Files.ReadBytes(R, i, 2); SYSTEM.PUT(p, i); INC(p, 2) END ;
+
+				(*pointer references*) q := nofptrs*2 + p;
+				WHILE p < q DO
+					Files.ReadBytes(R, i, 2); SYSTEM.PUT(p, i); INC(p, 2)
+				END ;
+
+				(*commands*) q := p + comsize;
+				WHILE p < q DO Files.Read(R, ch); SYSTEM.PUT(p, ch); INC(p) END ;
+				p := p + align;
+
+				(*constants*) q := p + constsize;
+				WHILE p < q DO Files.Read(R, ch); SYSTEM.PUT(p, ch); INC(p) END ;
+
+				(*variables*) q := p + varsize;
+				WHILE p < q DO SYSTEM.PUT(p, 0); INC(p) END ;
+
+				(*code*) q := p + codesize;
+				WHILE p < q DO Files.Read(R, ch); SYSTEM.PUT(p, ch); INC(p) END ;
+
+				(*link*) i := 0;
+				WHILE i < nofimps DO
+					pb := import[i].PB; eb := import[i].EB;
+					Files.ReadBytes(R, offset, 2); p := offset;
+					WHILE p # 0 DO  (*abs chain*)
+						INC(p, mod.PB); SYSTEM.GET(p, q);
+						SYSTEM.GET((q DIV 100H) MOD 100H * 2 + eb, offset);
+						SYSTEM.PUT(p, disp(pb + offset)); p := q DIV 10000H
+					END ;
+					Files.ReadBytes(R, offset, 2); p := offset;
+					WHILE p # 0 DO  (*pc-rel chain*)
+						INC(p, mod.PB); SYSTEM.GET(p, q);
+						SYSTEM.GET((q DIV 100H) MOD 100H * 2 + eb, offset);
+						SYSTEM.PUT(p, disp((pb + offset) - (p - 1))); p := q DIV 10000H
+					END ;
+					INC(i)
+				END ;
+
+				(*type descriptors*) i := 0;
+				WHILE i < nofrecs DO
+					Files.ReadBytes(R, tdsize, 2); Files.ReadBytes(R, tdadr, 2);
+					SYSTEM.NEW(desc, tdsize); SYSTEM.PUT(mod.PB + tdadr, desc);
+					p := SYSTEM.VAL(LONGINT, desc);
+					Files.ReadBytes(R, size, 4); SYSTEM.PUT(p, size); INC(p, 4);   (*header*)
+					Files.Read(R, k); j := 0;
+					WHILE j < k DO (*base tags*)
+						Files.Read(R, ch); Files.ReadBytes(R, q, 4); (*offset or eno*)
+						IF ch = 0X THEN INC(q, mod.PB)
+						ELSE SYSTEM.GET(import[ORD(ch)-1].EB + q*2, offset);
+							q := import[ORD(ch)-1].PB + offset
+						END ;
+						SYSTEM.GET(q, q); SYSTEM.PUT(p, q); INC(p, 4); INC(j)
+					END ;
+					WHILE j < 7 DO q := 0; SYSTEM.PUT(p, q); INC(p, 4); INC(j) END ;
+					Files.Read(R, k); j := 0;
+					WHILE j < k DO (*offsets*)
+						Files.ReadBytes(R, offset, 2); SYSTEM.PUT(p, offset); INC(p, 2); INC(j)
+					END ;
+					INC(i)
+				END ;
+
+				init := SYSTEM.VAL(Command, mod.PB); init; res := 0
+			ELSE COPY(name, imported); err(1)
+			END
+		END ;
+		RETURN mod
+	END ThisMod;
+
+	PROCEDURE ThisCommand*(mod: Module; name: ARRAY OF CHAR): Command;
+		VAR i: INTEGER; ch: CHAR;
+				comadr: LONGINT; com: Command;
+	BEGIN com := NIL;
+		IF mod # NIL THEN
+			comadr := mod.CB; res := 5;
+			LOOP SYSTEM.GET(comadr, ch); INC(comadr);
+				IF ch = 0X THEN (*not found*) EXIT END ;
+				i := 0;
+				LOOP
+					IF ch # name[i] THEN EXIT END ;
+					INC(i);
+					IF ch = 0X THEN res := 0; EXIT END ;
+					SYSTEM.GET(comadr, ch); INC(comadr)
+				END ;
+				IF res = 0 THEN (*match*)
+					SYSTEM.GET(comadr, i); com := SYSTEM.VAL(Command, mod.PB + i); EXIT
+				ELSE
+					WHILE ch > 0X DO SYSTEM.GET(comadr, ch); INC(comadr) END ;
+					INC(comadr, 2)
+				END
+			END
+		END ;
+		RETURN com
+	END ThisCommand;
+
+	PROCEDURE unload(mod: Module; all: BOOLEAN);
+		VAR p: LONGINT; imp: Module;
+	BEGIN p := mod.IB;
+		WHILE p < mod.EB DO  (*scan imports*)
+			SYSTEM.GET(p, imp);
+			IF imp # NIL THEN
+				DEC(imp.refcnt);
+				IF all & (imp.refcnt = 0) THEN unload(imp, all) END
+			END ; 
+			INC(p, 4)
+		END ;
+		Kernel.FreeBlock(SYSTEM.VAL(LONGINT, mod))
+	END unload;
+
+	PROCEDURE Free*(name: ARRAY OF CHAR; all: BOOLEAN);
+		VAR mod: Module;
+	BEGIN mod :=  SYSTEM.VAL(Module, Kernel.ModList);
+		LOOP
+			IF mod = NIL THEN res := 1; EXIT END ;
+			IF name = mod.name THEN
+				IF mod.refcnt = 0 THEN unload(mod, all); res := 0 ELSE res := 2 END ;
+				EXIT
+			END ;
+			mod := mod.next
+		END
+	END Free;
+
+BEGIN
+	IF Kernel.err = 0 THEN loop := ThisCommand(ThisMod("Oberon"), "Loop") END ;
+	loop
+END Modules.

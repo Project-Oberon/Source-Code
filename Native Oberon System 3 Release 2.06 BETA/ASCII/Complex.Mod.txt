@@ -1,0 +1,94 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+(*
+	Complex.Mod, jm 8.11.93
+	
+	Example of how to program an own abstract gadget. Note that this gadget
+	should do its own type conversion when the values "Real" or "Imag" are set.
+*)
+
+MODULE Complex;
+
+IMPORT
+	Files, Objects, Attributes, Gadgets;
+	
+TYPE
+	Complex* = POINTER TO ComplexDesc;
+	ComplexDesc* = RECORD (Gadgets.ObjDesc)
+		real*, imag*: REAL
+	END;
+	
+PROCEDURE Handler*(obj: Objects.Object; VAR M: Objects.ObjMsg);
+VAR obj0: Complex; x: LONGREAL;
+BEGIN
+	WITH obj: Complex DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF M.id = Objects.get THEN
+					IF M.name = "Gen" THEN M.class := Objects.String; COPY("Complex.New", M.s); M.res := 0
+					ELSIF M.name = "Real" THEN M.class := Objects.Real; M.x := obj.real; M.res := 0
+					ELSIF M.name = "Imag" THEN M.class := Objects.Real; M.x := obj.imag; M.res := 0
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.set THEN
+					IF M.name = "Real" THEN
+						IF M.class = Objects.Real THEN obj.real := M.x; M.res := 0
+						ELSIF M.class = Objects.String THEN Attributes.StrToReal(M.s, x); obj.real := SHORT(x); M.res := 0
+						END
+					ELSIF M.name = "Imag" THEN
+						IF M.class = Objects.Real THEN obj.imag := M.x; M.res := 0
+						ELSIF M.class = Objects.String THEN Attributes.StrToReal(M.s, x); obj.imag := SHORT(x); M.res := 0
+						END
+					ELSIF M.name = "Value" THEN (* cannot be set *)
+					ELSE Gadgets.objecthandle(obj, M)
+					END
+				ELSIF M.id = Objects.enum THEN
+					M.Enum("Real"); M.Enum("Imag");  Gadgets.objecthandle(obj, M)
+				END
+			END
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				IF M.stamp = obj.stamp THEN M.obj := obj.dlink	(* copy msg arrives again *)
+				ELSE (* first time copy message arrives *)
+					NEW(obj0); obj.stamp := M.stamp; obj.dlink := obj0;
+					obj0.handle := obj.handle; obj0.real := obj.real; obj0.imag := obj.imag;
+					M.obj := obj0
+				END
+			END
+		ELSIF M IS Objects.FileMsg THEN
+			WITH M: Objects.FileMsg DO
+				IF M.id = Objects.store THEN
+					Files.WriteReal(M.R, obj.real);
+					Files.WriteReal(M.R, obj.imag);
+					Gadgets.objecthandle(obj, M)
+				ELSIF M.id = Objects.load THEN
+					Files.ReadReal(M.R, obj.real);
+					Files.ReadReal(M.R, obj.imag);
+					Gadgets.objecthandle(obj, M)
+				END
+			END
+		ELSE Gadgets.objecthandle(obj, M)
+		END
+	END
+END Handler;
+
+PROCEDURE New*;
+VAR obj: Complex;
+BEGIN
+	NEW(obj); obj.handle := Handler; obj.real := 0.0; obj.imag := 0.0; Objects.NewObj := obj;
+END New;
+
+END Complex.
+
+Gadgets.Insert TextFields.NewTextField Complex.New ~

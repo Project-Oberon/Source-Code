@@ -1,0 +1,320 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Find;	(* tk 12.12.95 / pr 12.12.95 *)
+
+(*
+	Changes & Updates:
+		12.12.95 pr:
+			Ported for Native Oberon (directories removed)
+*)
+
+(* Searching a pattern in all files of a filepath *)
+
+	IMPORT Objects, Attributes, Gadgets, Oberon, Files, Lists, Texts, Desktops, TextGadgets, Documents, FileDir, Strings;
+
+	TYPE
+		File = POINTER TO FileDesc;
+		FileDesc = RECORD
+			name: ARRAY 32 OF CHAR;
+			next: File
+		END;
+(* 12.12.95 pr
+		Path = POINTER TO PathDesc;
+		PathDesc = RECORD
+			path: ARRAY 128 OF CHAR;
+			link: Path;
+		END;
+*)		
+	VAR
+		(* root, last: Path;	12.12.95 pr *)
+		pos:INTEGER; spat, pat: ARRAY 64 OF CHAR; PathChar: ARRAY 2 OF CHAR;
+		(*ScanSub,*) Output, CommandLine: BOOLEAN;
+		progress, list: Objects.Object;
+		file: File; out: Texts.Text;
+		W: Texts.Writer;
+		ppos: INTEGER;
+
+	PROCEDURE ScanPar (VAR s: Texts.Scanner);	
+		VAR t: Texts.Text; beg, end, time: LONGINT;
+	BEGIN
+		Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(s);
+		IF (s.class = Texts.Char) & (s.c = "^") THEN
+			Oberon.GetSelection(t, beg, end, time);
+			IF time >= 0 THEN	Texts.OpenScanner(s, t, beg); Texts.Scan(s)	END
+		END
+	END ScanPar;
+	
+	PROCEDURE OpenViewer(name: ARRAY OF CHAR; T: Texts.Text);	
+		VAR D: Objects.Object; F: TextGadgets.Frame;
+	BEGIN
+		D:=Gadgets.CreateObject("TextDocs.NewDoc");
+		IF	D#NIL	THEN
+			WITH	D: Documents.Document	DO
+				NEW(F); TextGadgets.Init(F, T, FALSE); D.W:=300; COPY(name, D.name);
+				Documents.Init(D, F); Desktops.ShowDoc(D)
+			END
+		END	END OpenViewer;
+	
+	PROCEDURE BrowseFile(filename: ARRAY OF CHAR);
+		CONST CR = 0DX; TAB = 09X; bufSize = 31744; (*2**15 - 1024*)
+		VAR	F: Files.File; R: Files.Rider; n, pos: LONGINT; m, i, j, i0, b, e: INTEGER;
+				ch, patj: CHAR; found: BOOLEAN; tab: ARRAY 265 OF SHORTINT; buffer: ARRAY bufSize OF CHAR;
+	BEGIN
+		F:=Files.Old(filename);
+		IF F=NIL THEN RETURN END;
+		Files.Set(R, F, 0); pos:=0;
+
+		m:=0; WHILE spat[m]#0X DO INC(m) END; 
+		FOR i := 0 TO 255 DO tab[i] := SHORT(m) END;
+		FOR i := 0 TO m-2 DO tab[ORD(spat[i])] := SHORT(m - i - 1) END;
+		patj := spat[m-1]; found := FALSE;
+		LOOP
+			(*----- read buffer[0..n-1] *)
+			n:=Files.Length(F)-pos;
+			IF n>bufSize THEN n:=bufSize END;
+			IF n<m THEN EXIT END;
+			Files.Set(R, F, pos); Files.ReadBytes(R, buffer, n);
+			
+			(*----- search spat in buffer[0..n-1] *)
+			i := m - 1; j := i;			
+			WHILE i < n DO
+				IF buffer[i] = patj THEN i0 := i;
+					REPEAT DEC(i); DEC(j) UNTIL (j < 0) OR (buffer[i] # spat[j]);
+						IF j < 0 THEN
+						(*------ found: print result *)
+						found := TRUE; 
+						IF CommandLine OR Output THEN
+							b:=i-30; IF b<0 THEN b:=0 END;
+							Texts.WriteString(W, filename); Texts.Write(W, 09X);
+							Files.Set(R, F, pos + b); e:=b+60;
+							REPEAT 
+								Files.Read(R, ch); 
+								IF ch>" " THEN Texts.Write(W, ch) ELSE Texts.Write(W, " ") END;
+								INC(b) 
+							UNTIL (b=e) OR (R.eof); Texts.WriteLn(W); Texts.Append(out, W.buf);
+						END
+					ELSE i := i + tab[ORD(buffer[i])]
+					END;
+					IF i <= i0 THEN i := i0 + 1 END;
+					j := m - 1
+				ELSE i := i + tab[ORD(buffer[i])]
+				END
+			END;
+			pos := pos + i - m + 1
+		END;
+		IF found & (list#NIL) THEN  
+			Lists.InsertItem(list(Lists.List), filename); Gadgets.Update(list);
+		 END;
+	END BrowseFile;
+(*	12.12.95 pr
+	PROCEDURE AddSearchPath(path: ARRAY OF CHAR);
+		VAR p: Path;
+	BEGIN	NEW(last.link); COPY(path, last.link.path); last:=last.link
+	END AddSearchPath;
+*)
+(*	PROCEDURE *ListFiles(path, name: ARRAY OF CHAR; time, data, size: LONGINT; isdir: BOOLEAN);	*)
+	PROCEDURE *ListFiles(name: FileDir.FileName; sec: LONGINT; VAR continue: BOOLEAN);
+		VAR A: Objects.AttrMsg; newpath: ARRAY 128 OF CHAR; 
+			i0, i1, j0, j1: INTEGER; f: BOOLEAN;
+	BEGIN
+(*		IF	isdir & ScanSub	THEN
+			newpath:="";
+			IF	path=""	THEN	Strings.Append(newpath,PathChar)	END;
+			Strings.Append(newpath, path);
+			IF	path#""	THEN	Strings.Append(newpath, PathChar)	END;
+			Strings.Append(newpath, name); 
+			AddSearchPath(newpath);
+		ELSIF ~isdir THEN 	*)
+			i0 := ppos; j0 := ppos; f := TRUE;	(* code from System.Directory *)
+		    LOOP
+				IF pat[i0] = "*" THEN INC(i0);
+					IF pat[i0] = 0X THEN EXIT END
+				ELSE
+					IF name[j0] # 0X THEN f := FALSE END;
+					EXIT
+				END;
+				f := FALSE;
+				LOOP
+					IF name[j0] = 0X THEN EXIT END;
+					i1 := i0; j1 := j0;
+					LOOP
+						IF (pat[i1] = 0X) OR (pat[i1] = "*") THEN f := TRUE; EXIT END;
+						IF pat[i1] # name[j1] THEN EXIT END;
+						INC(i1); INC(j1)
+					END;
+					IF f THEN j0 := j1; i0 := i1; EXIT END;
+					INC(j0)
+				END;
+				IF ~f THEN EXIT END
+			END;
+			IF f & (progress # NIL) THEN
+(*				COPY(path, newpath); IF path#"" THEN Strings.Append(newpath, PathChar) END;	*)
+(*				Strings.Append(newpath, name);*)
+				A.id:=Objects.set; A.name:="Value"; A.class:=Objects.String; 
+				COPY(name, A.s); progress.handle(progress, A); Gadgets.Update(progress)
+			END;
+			IF f THEN BrowseFile(name) END;
+(*		END;	*)
+		continue:=TRUE
+	END ListFiles;
+
+(*
+(*	PROCEDURE GetDir(path : ARRAY OF CHAR);	*)
+	PROCEDURE GetDir;
+		VAR pre : ARRAY 32 OF CHAR; i : INTEGER; 
+	BEGIN
+(*		IF path="" THEN COPY(".", path) END;
+		FileDir.EnumerateFiles(path, pat, FALSE, ListFiles);	*)
+				FileDir.Enumerate(pat, ListFiles);
+	END GetDir;
+*)
+
+(*
+	PROCEDURE Separate(pattern: ARRAY OF CHAR; VAR path, pat: ARRAY OF CHAR);
+		VAR i, j, l: INTEGER; ch: CHAR;
+	BEGIN
+		i:=0; j:=0; l:=0; ch:=pattern[i];
+		WHILE	(ch > " ")	DO
+			path[i]:=ch; pat[j]:=ch;
+			IF	ch=FileDir.PathChar	THEN	l:=i; j:=0	ELSE	INC(j)	END;
+			INC(i);
+			ch:=pattern[i];
+		END;
+		path[l]:=0X; pat[j]:=0X	
+	END Separate;
+*)
+	(* commands part *)
+
+	PROCEDURE GetStrAttr(obj: Objects.Object; name: ARRAY OF CHAR; VAR str: ARRAY OF CHAR);
+		VAR A: Objects.AttrMsg;
+	BEGIN
+		A.id := Objects.get;
+		A.s := "";
+		COPY(name, A.name);
+		obj.handle(obj, A);
+		COPY(A.s, str)
+	END GetStrAttr;
+
+	PROCEDURE Search*;	(* "listname" "progressname" "pattern" "path" *)
+		VAR S: Attributes.Scanner; path: ARRAY 128 OF CHAR; A: Objects.AttrMsg;
+			i: INTEGER;  pre: ARRAY 32 OF CHAR;  search: Objects.Object;
+	BEGIN
+		Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Attributes.Scan(S);
+		IF (S.class = Attributes.Name) OR (S.class = Attributes.String) THEN 
+			list := Gadgets.FindObj(Gadgets.context, S.s); Attributes.Scan(S);
+			WITH list: Lists.List DO list.beg:=NIL; list.items:=NIL; list.noitems:=0; Gadgets.Update(list) END;
+			IF (S.class = Attributes.Name) OR (S.class = Attributes.String) THEN
+				progress := Gadgets.FindObj(Gadgets.context, S.s); Attributes.Scan(S);
+				IF (S.class = Attributes.Name) OR (S.class = Attributes.String) THEN
+					search := Gadgets.FindObj(Gadgets.context, S.s);
+					GetStrAttr(search, "Value", spat);
+					(*COPY(S.s, spat);*)
+					Attributes.Scan(S); (* NEW(root); last:=root;
+					WHILE (S.class = Attributes.Name) OR (S.class = Attributes.String) DO
+						Separate(S.s, path, pat);
+						AddSearchPath(path); Attributes.Scan(S)
+					END; 	*)
+					COPY(S.s, pat); Attributes.Scan(S);
+					CommandLine:=FALSE;
+					IF	Output	THEN	NEW(out); Texts.Open(out, ""); OpenViewer(spat, out)	END;
+(*					root:=root.link; WHILE root#NIL DO
+						GetDir(root.path); root:=root.link
+					END;	*)
+					(*GetDir;*)
+					i := 0;  WHILE pat[i] > "*" DO pre[i] := pat[i]; INC(i) END;
+					pre[i] := 0X;  ppos := i;
+					FileDir.Enumerate(pre, ListFiles);
+					IF progress#NIL THEN
+						A.id:=Objects.set; A.name:="Value"; A.class:=Objects.String; A.s:="done";
+						progress.handle(progress, A); Gadgets.Update(progress)
+					END
+				END
+			END
+		END
+	END Search;
+	
+(*	12.12.95 pr / Not needed anymore (no dirs!)
+	PROCEDURE SetScanSub*;
+		VAR S: Attributes.Scanner; 
+	BEGIN
+		Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Attributes.Scan(S);
+		IF (S.class = Attributes.Name) OR (S.class = Attributes.String) THEN
+			ScanSub:=(S.s#"");
+		END;
+	END SetScanSub;
+*)	
+	PROCEDURE SetDetOutput*;
+			VAR S: Texts.Scanner; 
+	BEGIN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Name) OR (S.class = Texts.String) THEN
+			Output := (S.s#"");
+		END
+	END SetDetOutput;
+	
+	PROCEDURE Domain*;	(* {filename} ~ *)	
+		VAR s: Texts.Scanner; f, last: File;
+	BEGIN file := NIL; last := NIL;
+		ScanPar(s);
+		WHILE s.class = Texts.Name DO
+			NEW(f); f.next := NIL;
+			IF last = NIL THEN file := f ELSE last.next := f END;
+			last := f;
+			COPY(s.s, f.name);
+			Texts.Scan(s);
+			WHILE (s.class = Texts.Char) & (s.c = Oberon.OptionChar) DO Texts.Scan(s); Texts.Scan(s) END
+		END
+	END Domain;
+	
+	PROCEDURE All*;	(* ^ *)	
+	VAR pat: ARRAY 128 OF CHAR; m: INTEGER; f: File;
+	
+	PROCEDURE ReadPattern (VAR pat: ARRAY OF CHAR);	
+		VAR t: Texts.Text; r: Texts.Reader; m, beg, end, time: LONGINT; ch: CHAR;
+	BEGIN
+		Oberon.GetSelection(t, beg, end, time);
+		IF time > 0 THEN
+			Texts.OpenReader(r, t, beg); m := 0;
+			WHILE beg < end DO Texts.Read(r, ch);
+				IF m < 127 THEN pat[m] := ch END;
+				INC(m); INC(beg)
+			END;
+			pat[m] := 0X
+		END;
+	END ReadPattern;
+	
+BEGIN
+	ReadPattern(spat); CommandLine:=TRUE;
+	NEW(out); Texts.Open(out, ""); 
+	OpenViewer(spat, out); f := file;
+	WHILE f # NIL DO
+		BrowseFile(f.name);
+		f := f.next
+	END
+END All;
+
+
+BEGIN	Output:=FALSE; Texts.OpenWriter(W); (*ScanSub:=TRUE; PathChar[0]:=FileDir.PathChar; PathChar[1]:=0X;*)
+END Find.
+
+
+(*--------------------------------------------------------------------------
+Find.Domain ~
+	Specify the files in which Find.All should search for a pattern.
+Find.All ^
+	Searches the selection in the files specified with Find.Domain.
+	Lists all lines containing the pattern.
+--------------------------------------------------------------------------*)
+
+System.Free Find ~

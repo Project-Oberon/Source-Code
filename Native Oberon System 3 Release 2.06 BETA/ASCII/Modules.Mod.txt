@@ -1,0 +1,683 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Modules;	(* rc/mh/jm/ard/pjm 22.01.96 *)
+
+(**
+ The Modules module implements the dynamic module loader of the Oberon system. 
+ It is responsible for loading and freeing modules.
+*)
+
+IMPORT Kernel, Files, SYSTEM;
+
+CONST
+	ModNameLen* = 32;
+
+	done = 0;
+	fileNotFound = 1;
+	invalidObjFile = 2;
+	keyMismatch = 3;
+	corruptedObjFile = 4;
+	cmdNotFound = 5;
+	moduleNotFound = 6;
+	notEnoughSpace = 7;
+	refCntNotZero = 8;
+	cyclicImport = 9;
+
+	ExtTabWordSize = 16;
+	Tag0WordOffset = -2;
+	Mth0WordOffset = Tag0WordOffset - ExtTabWordSize;
+
+TYPE
+	Command* = Kernel.Proc;
+	Module* = Kernel.Module;
+	ModuleDesc* = Kernel.ModuleDesc;
+	ModuleName* = Kernel.Name;
+	ADDRESS = LONGINT;
+
+VAR
+	imported*, importing*: ModuleName;	(** Specifies the modules involved in a key mismatch. *)
+	res*: INTEGER;	(** Error code for ThisMod and ThisCommand. res = 0 indicates succes. *)
+	resMsg*: ARRAY 256 OF CHAR;	(** Explanation of res, if res # 0 *)
+	
+	(** The res codes are listed in the table below.
+		done = 0;
+		fileNotFound = 1
+		invalidObjFile = 2
+		keyMismatch = 3
+		corruptedObjFile = 4
+		cmdNotFound = 5
+		moduleNotFound = 6
+		notEnoughSpace = 7
+		refCntNotZero = 8
+		cyclicImport = 9
+	*)
+	
+	KernelRoutines: ARRAY 3 OF ADDRESS;
+	disp: ARRAY 10 OF CHAR;
+
+TYPE
+	Header = RECORD (* data in object file header *)
+		nofDataEntries: INTEGER;
+		nofEntries: INTEGER;
+		nofCommands: INTEGER;
+		nofPointers: INTEGER;
+		nofTypes: INTEGER;
+		nofImports: INTEGER;
+		nofLinks: INTEGER;
+		nofDataLinks: INTEGER;
+		codeSize, dataSize, refSize: LONGINT;
+		constSize: INTEGER
+	END;
+
+	LinkTab = ARRAY 256 OF RECORD
+		mod, entry: CHAR;
+		link: LONGINT
+	END;
+
+	DataLinkTab = ARRAY 128 OF RECORD
+		mod: CHAR;
+		entry: INTEGER;
+		nofFixups: INTEGER;
+		offset: POINTER TO ARRAY OF LONGINT
+	END;
+
+PROCEDURE LSW(x: LONGINT): LONGINT;
+BEGIN (* least significant word (unsigned) *)
+	RETURN SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET, x) * {0..15})
+END LSW;
+
+PROCEDURE MSW(x: LONGINT): LONGINT;
+BEGIN (* most significant word (unsigned) *)
+	RETURN SYSTEM.LSH(x, -16)
+	(* RETURN x *)
+END MSW;
+
+PROCEDURE ReadUnsigned(VAR R: Files.Rider; VAR u: LONGINT);
+	(* read unsigned, 16 bit, little endian value *)
+	VAR low, high: CHAR;
+BEGIN
+	Files.Read(R, low); Files.Read(R, high);
+	u := 256*LONG(ORD(high)) + ORD(low);
+END ReadUnsigned;
+
+PROCEDURE Find(modname: ARRAY OF CHAR; VAR m: Module);
+BEGIN
+	m := Kernel.modules;
+	WHILE m # NIL DO
+		IF m.name = modname THEN RETURN END;
+		m := m.next
+	END;
+END Find;
+
+PROCEDURE ErrMsg(res: INTEGER);
+
+	PROCEDURE Append(VAR a: ARRAY OF CHAR; b: ARRAY OF CHAR);
+	VAR i, j: INTEGER;
+	BEGIN
+		i := 0; WHILE a[i] # 0X DO INC(i) END;
+		j := 0; WHILE b[j] # 0X DO a[i] := b[j]; INC(i); INC(j) END;
+		a[i] := 0X
+	END Append;
+	
+BEGIN
+	IF res # 0 THEN
+		resMsg := "";
+		Append(resMsg, importing);
+		IF (res = fileNotFound) OR (res = moduleNotFound) THEN Append(resMsg, " not found")
+		ELSIF res = invalidObjFile THEN Append(resMsg, " not an obj-file")
+		ELSIF res = keyMismatch THEN
+			Append(resMsg, " imports "); Append(resMsg, imported); Append(resMsg, " with bad key")
+		ELSIF res = corruptedObjFile THEN Append(resMsg, " corrupted obj file")
+		ELSIF res = notEnoughSpace THEN Append(resMsg, " not enough space")
+		ELSIF res = refCntNotZero THEN Append(resMsg, " reference count not zero")
+		ELSIF res = cyclicImport THEN Append(resMsg, " cyclic import")
+		ELSIF res = cmdNotFound THEN Append(resMsg, " not found");  (* assumes importing = procedure name *)
+		ELSE resMsg := " unknown error code"
+		END;
+		Kernel.WriteString("Modules: ");  Kernel.WriteString(resMsg);  Kernel.WriteLn
+	END
+END ErrMsg;
+
+PROCEDURE Fixup(m: Module; VAR head: Header; VAR dataLink: DataLinkTab; VAR link: LinkTab);
+	VAR i, j, val, offs, disp: LONGINT;
+		modNo, entryNo, nofFixups: INTEGER;
+		codebase: ADDRESS;
+		from: Module;
+BEGIN
+	(* global and imported variables *)
+	i := 0; codebase := SYSTEM.ADR(m.code[0]);
+	WHILE i < head.nofDataLinks DO
+		modNo := ORD(dataLink[i].mod); nofFixups := dataLink[i].nofFixups;
+		IF modNo = 0 THEN (* global variable *)
+			j := 0;
+			WHILE j < nofFixups DO
+				SYSTEM.GET(codebase + dataLink[i].offset[j], val);
+				SYSTEM.PUT(codebase + dataLink[i].offset[j], val + m.sb);
+				INC(j);
+			END;
+		ELSE (* imported variable from module from *)
+			from := m.imports[modNo]; entryNo := dataLink[i].entry; j :=0;
+			WHILE j < nofFixups DO
+				SYSTEM.GET(codebase + dataLink[i].offset[j], val);
+				SYSTEM.PUT(codebase + dataLink[i].offset[j], val + from.varEntries[entryNo]);
+				INC(j);
+			END;
+		END;
+		INC(i)
+	END;
+
+	(* Kernel.NewRec, Kernel.NewSys, Kernel.NewArr, local Procedure assignments, case table and imported procedures *)
+	i := 0;
+	WHILE i < head.nofLinks DO
+		IF ORD(link[i].mod) = 0 THEN
+			(* Kernel.NewRec, Kernel.NewSys, Kernel.NewArr, local Procedure assignments, case table *)
+			CASE ORD(link[i].entry) OF
+				255:	(* case table fixup in constant area *)
+					offs := link[i].link;
+					WHILE offs # 0FFFFH DO
+						SYSTEM.GET(m.sb + offs, val); SYSTEM.PUT(m.sb + offs, codebase + LSW(val));
+						offs := MSW(val);
+					END
+			|   254:	(* local procedure assignment *)
+					offs := link[i].link;
+					WHILE offs # 0FFFFH DO
+						SYSTEM.GET(codebase + offs, val); SYSTEM.PUT(codebase + offs, m.entries[LSW(val)]);
+						offs := MSW(val);
+					END
+			|   253:	(* Kernel.NewRec *)
+					offs := link[i].link; 
+					WHILE offs # 0FFFFH DO
+						SYSTEM.GET(codebase + offs, val); SYSTEM.PUT(codebase + offs, KernelRoutines[0] - (codebase + offs + 4));
+						offs := MSW(val);
+					END
+			|   252:	(* Kernel.NewSys *)
+					offs := link[i].link;
+					WHILE offs # 0FFFFH DO
+						SYSTEM.GET(codebase + offs, val); SYSTEM.PUT(codebase + offs, KernelRoutines[1] - (codebase + offs + 4));
+						offs := MSW(val);
+					END
+			|   251:	(* Kernel.NewArr *)
+					offs := link[i].link;
+					WHILE offs # 0FFFFH DO
+						SYSTEM.GET(codebase + offs, val); SYSTEM.PUT(codebase + offs, KernelRoutines[2] - (codebase + offs + 4));
+						offs := MSW(val);
+					END
+			END
+		ELSE	(* imported procedure from module from *)
+			from := m.imports[ORD(link[i].mod)];
+			entryNo := ORD(link[i].entry);
+			offs := link[i].link;
+			WHILE offs # 0FFFFH DO
+				SYSTEM.GET(codebase + offs, val);
+				IF LSW(val) = 0FFFFH THEN (* insert absolute address *)
+					SYSTEM.PUT(codebase + offs, from.entries[entryNo])
+				ELSE (* insert relative address *)
+					disp := from.entries[entryNo] - (offs + codebase + 4);
+					SYSTEM.PUT(codebase + offs, disp)
+				END;
+				offs := MSW(val);
+			END
+		END;
+		INC(i)
+	END
+END Fixup;
+
+PROCEDURE ^Load (name: ARRAY OF CHAR; VAR m: Module);
+
+PROCEDURE LoadModule (VAR R: Files.Rider; VAR m: Module);
+	TYPE TDesc = POINTER TO RECORD word: ARRAY 32000 OF LONGINT END;
+	VAR
+		i, j: LONGINT; m1: Module;
+		head: Header;
+		linkTab: LinkTab; dataLinks: DataLinkTab;
+		e, k, t: LONGINT;
+		name: ModuleName; ch: CHAR; body: Command;
+		types: ARRAY 128 OF RECORD
+			initialized: BOOLEAN;
+			tdesc: TDesc;
+			entry, root, nofMeth, nofInhMeth, baseMod, baseEntry: INTEGER
+		END;
+		mods: ARRAY 32 OF RECORD
+			key: LONGINT;
+			name: ModuleName
+		END;
+		arrPtr: POINTER TO RECORD a, b, c, len, data: LONGINT END;
+
+	PROCEDURE Expect (tag: CHAR): BOOLEAN;
+		VAR ch: CHAR;
+	BEGIN Files.Read(R, ch);
+		IF ch # tag THEN res := corruptedObjFile; ErrMsg(res); RETURN FALSE
+		ELSE RETURN TRUE
+		END
+	END Expect;
+	
+	PROCEDURE ReadTypes (VAR R: Files.Rider);
+		VAR i, j, k, tdsize, recordSize: LONGINT;
+			tdEntry, nofMethods, nofNewMeths, mthNo, nofPointers, root, entryNo: INTEGER;
+			td: TDesc; name: ModuleName; ch: CHAR;
+	BEGIN
+		i := 0;
+		WHILE i < LEN(m.tdescs^) DO
+			types[i].initialized := FALSE;
+			Files.ReadLInt(R, recordSize);
+			Files.ReadInt(R, tdEntry); types[i].entry := tdEntry;
+			Files.ReadInt(R, types[i].baseMod);
+			Files.ReadInt(R, types[i].baseEntry); Files.ReadInt(R, nofMethods);
+			types[i].nofMeth := nofMethods; Files.ReadInt(R, types[i].nofInhMeth);
+			Files.ReadInt(R, nofNewMeths); Files.ReadInt(R, nofPointers);
+			Files.ReadString(R, name);
+			root := 13 (* fields tdsize..mdesc *) + nofMethods + ExtTabWordSize + 1 (* tag *);
+			INC(root, (-root+2) MOD 4);	(* ADR(td.word[root]) MOD 16 = 8 ! *)
+			types[i].root := root;
+			tdsize := (root + 1 (* recsize *) + nofPointers + 1 (* sentinel *) )*4;
+			IF Kernel.LargestAvailable() < tdsize THEN res := notEnoughSpace; ErrMsg(res); RETURN END;
+			SYSTEM.NEW(td, tdsize - 24 (* overhead of SysBlk header *) );
+			IF td = NIL THEN RETURN END;
+			DEC(SYSTEM.VAL(ADDRESS, td), 24);	(* overhead of SysBlk header *)
+			types[i].tdesc := td;
+			td.word[0] := tdsize;
+			td.word[1] := -4; (* sentinel *)
+			td.word[2] := SYSTEM.ADR(td.word[root]) (* self *);
+			td.word[3] := 0; (* extlev *)
+			k := SYSTEM.ADR(td.word[4]); j := 0;
+			REPEAT ch := name[j]; SYSTEM.PUT(k, ch); INC(j); INC(k) UNTIL ch = 0X;
+			td.word[12] := SYSTEM.ADR(m^); (* mdesc *)
+			j := 0;
+			WHILE j < nofNewMeths DO
+				Files.ReadInt(R, mthNo); Files.ReadInt(R, entryNo);
+				td.word[root + Mth0WordOffset - mthNo] := m.entries[entryNo];
+				INC(j)
+			END;
+			td.word[root - 1] := SYSTEM.ADR(td.word[0]); (* tag of subobj *)
+			td.word[root] := recordSize;
+			SYSTEM.PUT(m.varEntries[tdEntry], SYSTEM.ADR(td.word[root]));
+			m.tdescs[i] := SYSTEM.ADR(td.word[root]);
+			j := 0;
+			WHILE j < nofPointers DO Files.ReadLInt(R, td.word[root+1+j]); INC(j) END;
+			td.word[root+1+nofPointers] := -(nofPointers+1)*4; (* sentinel *)
+			INC(i)
+		END
+	END ReadTypes;
+
+	PROCEDURE InitType (i: LONGINT);
+		VAR t, baseType, tag, entry: LONGINT; extlev, n, root, baseModNo: INTEGER; td: TDesc; baseMod: Module;
+	BEGIN
+		IF ~types[i].initialized THEN
+			td := types[i].tdesc; baseModNo := types[i].baseMod; extlev := 0; root := types[i].root;
+			IF baseModNo # -1 THEN (* extended type *)
+				IF baseModNo = 0 THEN (* base type in this module, initialize first! *)
+					t := 0;
+					WHILE (t < LEN(m^.tdescs^)) & (types[t].entry # types[i].baseEntry) DO INC(t) END;
+					InitType(t)
+				END;
+				(* copy base type tags *)
+				baseMod := m.imports[baseModNo];
+				SYSTEM.GET(baseMod.varEntries[types[i].baseEntry], baseType);
+				SYSTEM.GET(baseType + Tag0WordOffset*4, tag);
+				WHILE tag # 0 DO
+					td.word[root + Tag0WordOffset - extlev] := tag;
+					INC(extlev);
+					SYSTEM.GET(baseType + (Tag0WordOffset - extlev)*4, tag)
+				END;
+				(* copy non-overwritten base methods *)
+				n := types[i].nofInhMeth;
+				WHILE n > 0 DO DEC(n);
+					entry := td.word[root + Mth0WordOffset - n];
+					IF entry = 0 THEN
+						SYSTEM.GET(baseType + (Mth0WordOffset - n)*4, td.word[root + Mth0WordOffset - n])
+					END
+				END
+			END;
+			td.word[3] := extlev;
+			td.word[root + Tag0WordOffset - extlev] := SYSTEM.ADR(td.word[root]); (* own type tag *)
+			types[i].initialized := TRUE
+		END
+	END InitType;
+
+	PROCEDURE InitTypes;
+		VAR i: LONGINT;
+	BEGIN i := 0;
+		WHILE i < LEN(m.tdescs^) DO InitType(i); INC(i) END
+	END InitTypes;
+
+	PROCEDURE BuildModuleBlock (m: Module; VAR head: Header);
+		VAR t, size, gvarSize: LONGINT;
+			arrPtr: POINTER TO RECORD a, b, c, len, data: LONGINT END;
+	BEGIN
+		size := 16 * ((head.nofDataEntries*4 + 35) DIV 16 + (head.nofEntries*4 + 35) DIV 16
+			+ (head.nofCommands*SIZE(Kernel.Cmd) + 35) DIV 16 + (head.nofPointers*4 + 35) DIV 16
+			+ (head.nofTypes*4 + 35) DIV 16 + ((head.nofImports+1)*4 + 35) DIV 16
+			+ (head.dataSize + (-head.dataSize) MOD 8 + head.constSize + 35) DIV 16
+			+ (head.codeSize + 35) DIV 16 + (head.refSize + 35) DIV 16);
+
+		IF Kernel.LargestAvailable() < size + 24 THEN
+			importing := m.name; res := notEnoughSpace; ErrMsg(res); RETURN
+		END;
+		SYSTEM.NEW(arrPtr, size);
+		SYSTEM.GET(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		
+		SYSTEM.PUT(SYSTEM.ADR(m.varEntries), arrPtr);
+		arrPtr.len := head.nofDataEntries;
+		INC(SYSTEM.VAL(ADDRESS, arrPtr), ((LONG(head.nofDataEntries)*4 + 35) DIV 16)*16);
+
+		SYSTEM.PUT(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		SYSTEM.PUT(SYSTEM.ADR(m.entries), arrPtr);
+		arrPtr.len := head.nofEntries;
+		INC(SYSTEM.VAL(ADDRESS, arrPtr), ((LONG(head.nofEntries)*4 + 35) DIV 16)*16);
+
+		SYSTEM.PUT(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		SYSTEM.PUT(SYSTEM.ADR(m.cmds), arrPtr);
+		arrPtr.len := head.nofCommands;
+		INC(SYSTEM.VAL(ADDRESS, arrPtr), ((LONG(head.nofCommands)*SIZE(Kernel.Cmd) + 35) DIV 16)*16);
+
+		SYSTEM.PUT(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		SYSTEM.PUT(SYSTEM.ADR(m.ptrTab), arrPtr);
+		arrPtr.len := head.nofPointers;
+		INC(SYSTEM.VAL(ADDRESS, arrPtr), ((LONG(head.nofPointers)*4 + 35) DIV 16)*16);
+
+		SYSTEM.PUT(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		SYSTEM.PUT(SYSTEM.ADR(m.tdescs), arrPtr);
+		arrPtr.len := head.nofTypes;
+		INC(SYSTEM.VAL(ADDRESS, arrPtr), ((LONG(head.nofTypes)*4 + 35) DIV 16)*16);
+
+		SYSTEM.PUT(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		SYSTEM.PUT(SYSTEM.ADR(m.imports), arrPtr);
+		arrPtr.len := head.nofImports+1;
+		INC(SYSTEM.VAL(ADDRESS, arrPtr), (((LONG(head.nofImports)+1)*4 + 35) DIV 16)*16);
+
+		SYSTEM.PUT(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		SYSTEM.PUT(SYSTEM.ADR(m.data), arrPtr);
+		gvarSize := head.dataSize + (-head.dataSize) MOD 8;
+		m.sb := SYSTEM.ADR(arrPtr.data) + gvarSize;
+		arrPtr.len := (gvarSize + head.constSize + 3);	(* >> +3 noetig ?? *)
+		INC(SYSTEM.VAL(ADDRESS, arrPtr), ((gvarSize + head.constSize + 35) DIV 16)*16);
+
+		SYSTEM.PUT(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		SYSTEM.PUT(SYSTEM.ADR(m.code), arrPtr);
+		arrPtr.len := head.codeSize;
+		INC(SYSTEM.VAL(ADDRESS, arrPtr), ((head.codeSize + 35) DIV 16)*16);
+
+		SYSTEM.PUT(SYSTEM.VAL(ADDRESS, arrPtr) - 4, t);
+		SYSTEM.PUT(SYSTEM.ADR(m.refs), arrPtr);
+		arrPtr.len := head.refSize
+	END BuildModuleBlock;
+
+BEGIN (* LoadModule *)
+	res := done;  resMsg := "";
+	IF Kernel.LargestAvailable() < SIZE(ModuleDesc) THEN importing := ""; res := notEnoughSpace; ErrMsg(res); RETURN END;
+	NEW(m);
+	m.init := FALSE; m.refcnt := 0; m.term := NIL;
+	(* HeaderBlk *)
+	Files.ReadLInt(R, head.refSize); Files.ReadInt(R, head.nofDataEntries); Files.ReadInt(R, head.nofEntries);
+	Files.ReadInt(R, head.nofCommands);
+	Files.ReadInt(R, head.nofPointers); Files.ReadInt(R, head.nofTypes); Files.ReadInt(R, head.nofImports);
+	Files.ReadInt(R, head.nofDataLinks); Files.ReadInt(R, head.nofLinks);
+	Files.ReadLInt(R, head.dataSize); Files.ReadInt(R, head.constSize); ReadUnsigned(R, head.codeSize);
+	Files.ReadLInt(R, m.key); Files.ReadString(R, m.name);
+	BuildModuleBlock(m, head);
+	IF res # done THEN m := NIL; RETURN END;
+
+	Kernel.WriteHex(SYSTEM.ADR(m.code[0]), 8);  Kernel.WriteChar(" ");
+	Kernel.WriteString(m.name);  Kernel.WriteLn;
+	
+	(* VarEntries *)
+	IF ~Expect(08CX) THEN RETURN END;
+	i := 0; t := m.sb;
+	WHILE i < head.nofDataEntries DO
+		Files.ReadLInt(R, e); m.varEntries[i] := t + e;
+		INC(i)
+	END;
+
+	(* EntryBlk *)
+	IF ~Expect(082X) THEN RETURN END;
+	i := 0; t := SYSTEM.ADR(m.code[0]);
+	WHILE i < head.nofEntries DO ReadUnsigned(R, e); m.entries[i] := t + e; INC(i) END;
+
+	(* CmdBlk *)
+	IF ~Expect(083X) THEN RETURN END;
+	i := 0;
+	WHILE i < head.nofCommands DO
+		Files.ReadString(R, m.cmds[i].name); ReadUnsigned(R, e);
+		m.cmds[i].adr := t + e;
+		INC(i)
+	END;
+
+	(* PtrBlk *)
+	IF ~Expect(084X) THEN RETURN END;
+	i := 0; t := m.sb;
+	WHILE i < head.nofPointers DO
+		Files.ReadLInt(R, k); m.ptrTab[i] := t + k;
+		INC(i)
+	END;
+
+	(* Import Block *)
+	IF ~Expect(085X) THEN RETURN END;
+	i := 0;
+	WHILE i < head.nofImports DO
+		Files.ReadLInt(R, mods[i].key); Files.ReadString(R, mods[i].name);
+		INC(i)
+	END;
+
+	(* Data Link Block *)
+	IF ~Expect(08DX) THEN RETURN END;
+	i := 0;
+	WHILE i < head.nofDataLinks DO
+		Files.Read(R, dataLinks[i].mod); Files.ReadInt(R, dataLinks[i].entry); Files.ReadInt(R, dataLinks[i].nofFixups);
+		IF dataLinks[i].nofFixups > 0 THEN
+			NEW(dataLinks[i].offset , dataLinks[i].nofFixups);
+			j := 0;
+			WHILE j < dataLinks[i].nofFixups DO
+				ReadUnsigned(R, dataLinks[i].offset[j]);
+				INC(j)
+			END;
+		ELSE dataLinks[i].offset := NIL
+		END;
+		INC(i)
+	END;
+
+	(* Link Block *)
+	IF ~Expect(086X) THEN RETURN END;
+	i := 0;
+	WHILE i < head.nofLinks DO
+		Files.Read(R, linkTab[i].mod); Files.Read(R, linkTab[i].entry); ReadUnsigned(R, linkTab[i].link);
+		INC(i)
+	END;
+
+	(* Const Block *)
+	IF ~Expect(087X) THEN RETURN END;
+	i := 0; t := m.sb;
+	WHILE i < head.constSize DO Files.Read(R, ch); SYSTEM.PUT(t, ch); INC(t); INC(i) END;
+
+	(* Code Block *)
+	IF ~Expect(088X) THEN RETURN END;
+	Files.ReadBytes(R, m.code^, head.codeSize);
+
+	(* TypeBlk *)
+	IF ~Expect(089X) THEN RETURN END;
+	ReadTypes(R);
+	IF res # done THEN RETURN END;
+
+	(* Reference Block *)
+	IF ~Expect(08BX) THEN RETURN END;
+	Files.ReadBytes(R, m.refs^, head.refSize);
+
+	(* load imported modules *)
+	m.imports[0] := m;  i := 0;
+	IF res = done THEN
+		LOOP
+			IF i >= head.nofImports THEN EXIT END;
+			Load(mods[i].name, m1);
+			IF res # done THEN EXIT END;
+			IF m1.key # mods[i].key THEN
+				res := keyMismatch; importing := m.name; imported := mods[i].name; ErrMsg(res);
+				EXIT
+			END;
+			INC(i);
+			m.imports[i] := m1
+		END
+	END;
+	IF res = done THEN
+		Find(m.name, m1);
+		IF m1 # NIL THEN (* cyclic load, we're done *) m := m1; RETURN END;
+		WHILE i > 0 DO m1 := m.imports[i]; INC(m1.refcnt); DEC(i) END;
+		Fixup(m, head, dataLinks, linkTab);
+		InitTypes;
+		m.next := Kernel.modules; Kernel.modules := m;
+		m.init := TRUE;
+		SYSTEM.PUT(SYSTEM.ADR(body), SYSTEM.ADR(m.code[0]));
+		body
+	ELSE m := NIL
+	END
+END LoadModule;
+
+PROCEDURE Load (name: ARRAY OF CHAR; VAR m: Module);
+	VAR f: Files.File; R: Files.Rider; i, j: INTEGER; fname: ARRAY 64 OF CHAR; tag: CHAR;
+BEGIN
+	Find(name, m);  res := done;  resMsg := "";
+	IF m = NIL THEN
+		i := 0;  j := 0;
+		IF name = "Display" THEN
+			WHILE disp[j] # 0X DO fname[i] := disp[j]; INC(i); INC(j) END
+		END;
+		j := 0;
+		WHILE name[j] # 0X DO fname[i] := name[j]; INC(i); INC(j) END;
+			(* add ".Obj" *)
+		fname[i] := "."; fname[i+1] := "O"; fname[i+2] := "b"; fname[i+3] := "j"; fname[i+4] := 0X;
+		f := Files.Old(fname);
+		IF f = NIL THEN
+			COPY(name, importing); res := fileNotFound; ErrMsg(res);
+			RETURN
+		END;
+		Files.Set(R, f, 0); Files.Read(R, tag);
+		IF tag = 0F8X THEN
+			Files.Read(R, tag);
+			IF tag = 036X THEN LoadModule(R, m)
+			ELSE res := invalidObjFile; ErrMsg(res)
+			END
+		ELSE
+			res := invalidObjFile; ErrMsg(res)
+		END
+	ELSIF ~m.init THEN res := cyclicImport; ErrMsg(res)
+	END
+END Load;
+
+(** Returns a handle to an already loaded module, or loads a module and all its imported modules. *)
+
+PROCEDURE ThisMod* (name: ARRAY OF CHAR): Module;
+	VAR mod: Module;
+BEGIN
+	Load(name, mod);
+	RETURN mod
+END ThisMod;
+
+(** Returns a procedure variable representing an exported command in a module. 
+Calling this procedure executes the command. *)
+
+PROCEDURE ThisCommand* (mod: Module; name: ARRAY OF CHAR): Command;
+	VAR cmd: Command; i: LONGINT;
+BEGIN
+	IF mod # NIL THEN
+		i := LEN(mod.cmds^);
+		WHILE i > 0 DO DEC(i);
+			IF mod.cmds[i].name = name THEN
+				res := done;  resMsg := "";
+				RETURN SYSTEM.VAL(Command, mod.cmds[i].adr)
+			END
+		END;
+		COPY(name, importing); res := cmdNotFound; ErrMsg(res)
+	END;
+	RETURN NIL
+END ThisCommand;
+
+PROCEDURE Delete (m: Module);
+	VAR m1: Module;
+BEGIN
+	m1 := Kernel.modules;
+	IF m = m1 THEN
+		Kernel.modules := m.next
+	ELSE
+		WHILE m1.next # m DO m1 := m1.next END;
+		m1.next := m.next
+	END
+END Delete;
+
+(** Free a module from memory. Only modules with no clients can be freed. The all flag 
+requests that all imported modules should be freed too (i.e. a recursive call to Free). *)
+
+PROCEDURE Free* (name: ARRAY OF CHAR; all: BOOLEAN);
+	VAR m, m1: Module; i, j: LONGINT; h: Kernel.TerminationHandler;
+BEGIN
+	res := done;  resMsg := "";
+	Find(name, m);
+	IF m = NIL THEN COPY(name, importing); res := moduleNotFound; ErrMsg(res)
+	ELSIF m.refcnt # 0 THEN importing := m.name; res := refCntNotZero; ErrMsg(res)
+	ELSE
+		IF m.term # NIL THEN h := m.term; m.term := NIL; h END;
+		i := LEN(m.imports^);
+		WHILE i > 1 DO DEC(i); m1 := m.imports[i]; DEC(m1.refcnt) END;
+		IF all THEN i := LEN(m.imports^);
+			WHILE i > 1 DO DEC(i); m1 := m.imports[i]; Free(m1.name, TRUE) END;
+			res := done;  resMsg := ""
+		END;
+		Delete(m);
+			(* now clear the module block *)
+		i := SYSTEM.VAL(ADDRESS, m.varEntries);	(* start of module block *)
+		SYSTEM.GET(i-4, j);	(* start of sysblk *)
+		SYSTEM.GET(j, j);	(* size of sysblk *)
+		j := i + j-24;	(* end of sysblk *)
+		WHILE i < j DO SYSTEM.PUT(i, 0CCCCCCCCH);  INC(i, 4) END	(* clear *)
+	END
+END Free;
+
+PROCEDURE Init;
+VAR
+	newRec: PROCEDURE(VAR p: ADDRESS;  tag: Kernel.Tag);
+	newSys: PROCEDURE(VAR p: ADDRESS;  size: LONGINT);
+	newArr: PROCEDURE(VAR p: ADDRESS;  eltag: Kernel.Tag;  nofelem, nofdim: LONGINT);
+BEGIN
+	newRec := Kernel.NewRec;
+	newSys := Kernel.NewSys;
+	newArr := Kernel.NewArr;
+	KernelRoutines[0] := SYSTEM.VAL(ADDRESS, newRec);
+	KernelRoutines[1] := SYSTEM.VAL(ADDRESS, newSys);
+	KernelRoutines[2] := SYSTEM.VAL(ADDRESS, newArr)
+END Init;
+
+PROCEDURE Start;
+VAR loop: Command;
+BEGIN
+	loop := ThisCommand(ThisMod("Oberon"), "Loop");
+	IF loop # NIL THEN loop END	(* should never return *)
+END Start;
+
+BEGIN
+	Kernel.GetConfig("Display", disp);
+	Init;  Start
+END Modules.
+
+(** Remarks:
+
+1. Oberon uses reference counting to determine how many clients of a module are loaded. 
+A module can only be freed when the reference count is 0.
+
+2. The res codes are not the same numerically on all Oberon platforms. It is advisable to use 
+the resMsg as a correct indication of the error condition.
+
+3. Module and command names are single words consisting of A to Z, a to z, and 0 to 9. 
+Names must not start with a digit.
+
+4. Care should be taken freeing modules. Oberon cannot detect if a client has a procedure 
+variable still "pointing" at code in a freed module. Calling such a procedure can be 
+unpredictable at times, although the system generates a trap most of the time.
+*)

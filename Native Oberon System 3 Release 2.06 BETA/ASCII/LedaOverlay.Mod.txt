@@ -1,0 +1,363 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaOverlay;	(* uh, Mon, 18-Oct-1993 *)
+
+	IMPORT LedaSys, LedaBase, LedaBox, LedaIO;
+	
+	(*---
+		- LedaOverlay provides basic functionality to handle boxes
+			overlaying a single standard box
+		- boxes overlaying the standard box are called planes [image area]
+	---*)
+	
+CONST
+	ColRng = 5;	LineRng = 128;
+	DefColMarg = 6 * LedaBase.MM;
+	DefRaster = 4;	MinFree = 3;
+
+
+TYPE
+	Overlay* = RECORD
+		raster*: INTEGER;	(* height of raster field *)
+		cols*, lines*: INTEGER;	(* partion of area *)
+		colW*: LONGINT;	(* width of column *)
+		colDX*: LONGINT;	(* margin between columns *)
+		lastW*: LONGINT;	(* width of last column [different in marginal mode] *)
+		lsp*: LONGINT;	(* line spacing *)
+		f: ARRAY ColRng, LineRng OF SHORTINT
+	END;
+	(*---
+		- the overlay area [area of standard box] is divided into fields;
+			the size of a single field is: 
+			- horizontal: width of column [without column margin]
+			- vertical: line space decremented by a screen pixel
+	---*)
+	
+	
+	PROCEDURE PointToField*(VAR o: Overlay; X, Y: LONGINT; VAR c, l: INTEGER);
+	(* returns the field c, l that contains the point X, Y *)
+		VAR cX, lY, offX: LONGINT;
+	BEGIN
+		c := 0; offX := o.colW + o.colDX; cX := offX;	(* cX: start of next field *)
+		WHILE (c < o.cols - 1) & (X >= cX) DO INC(c); INC(cX, offX) END;
+		l := 0; lY := o.lsp;	(* lY: start of next field *)
+		WHILE (l < o.lines - 1) & (Y >= lY) DO INC(l); INC(lY, o.lsp) END
+	END PointToField;
+
+	PROCEDURE RecToField*(VAR o: Overlay; X, Y, W, H: LONGINT; VAR c0, c1, l0, l1: INTEGER);
+	(* returns for area X, Y, W, H the field range [c0..c1], [l0..l1] *)
+		VAR cX, lY, offX: LONGINT;	c, l: INTEGER;
+	BEGIN
+		c := 0; offX := o.colW + o.colDX; cX := offX;	(* cX: start of next field *)
+		WHILE (c < o.cols - 1) & (X >= cX) DO INC(c); INC(cX, offX) END;
+		c0 := c; INC(X, W); WHILE (c < o.cols - 1) & (X > cX) DO INC(c); INC(cX, offX) END; c1 := c;
+		l := 0; lY := o.lsp;	(* lY: start of next field *)
+		WHILE (l < o.lines - 1) & (Y >= lY) DO INC(l); INC(lY, o.lsp) END;
+		l0 := l; INC(Y, H); WHILE (l < o.lines - 1) & (Y > lY) DO INC(l); INC(lY, o.lsp) END; l1 := l
+	END RecToField;
+	
+	PROCEDURE FieldToRec*(VAR o: Overlay; c0, c1, l0, l1: INTEGER; VAR X, Y, W, H: LONGINT);
+	BEGIN	(* area [c0..c1], [l0..l1] is valid *)
+		X := c0 * (o.colW + o.colDX); Y := l0 * o.lsp;
+		W := (c1 - c0) * (o.colW + o.colDX);
+		IF c1 = o.cols - 1 THEN INC(W, o.lastW) ELSE INC(W, o.colW) END;
+		H := (l1 - l0) * o.lsp + o.lsp - LedaSys.scnUnit
+	END FieldToRec;
+	
+	PROCEDURE Init*(VAR o: Overlay; page: LedaBase.Box; W, H: LONGINT);
+		VAR m: LedaBox.Msg;	bd: LedaBase.BaseData;	c, l, raster: INTEGER;
+	BEGIN
+		(*- get data for overlay -*) 
+		m.id := LedaBox.CtrlId; m.op := 3; m.l1 := DefRaster; m.ctrl := NIL;
+		LedaBox.GetInfo(page.anc, m);	(* ask for overlay data *)
+		IF (m.ctrl # NIL) & (m.ctrl IS LedaBase.FormBase) THEN
+			bd := m.ctrl(LedaBase.FormBase).data; raster := SHORT(m.l1)
+		ELSE LedaSys.Halt("overlay info not available")
+		END;
+		(*- set overlay -*)
+		IF bd.cols = "m" THEN	(* marginal format mode *)
+			o.cols := 2; o.colDX := DefColMarg;
+			o.colW := bd.colDX - DefColMarg; o.lastW := W - bd.colDX
+		ELSE
+			o.cols := ORD(bd.cols) - ORD("0"); o.colDX := bd.colDX;
+			IF o.cols > ColRng THEN o.cols := ColRng END;	(* assertion *)
+			o.colW := (W - (o.cols-1) * bd.colDX) DIV o.cols; o.lastW := o.colW
+		END;
+		o.lsp := bd.lsp; o.raster := raster;
+		o.lines := SHORT((H + o.lsp - LedaSys.scnUnit) DIV o.lsp);	(* number of lines *)
+		IF o.lines > LineRng THEN o.lines := LineRng END;	(* assertion *)
+		c := 0;
+		WHILE c < o.cols DO
+			l := 0; WHILE l < o.lines DO o.f[c, l] := -1; INC(l) END;
+			INC(c)
+		END;
+	END Init;
+	
+	PROCEDURE Set*(VAR o: Overlay; c0, c1, l0, l1, nr: INTEGER);
+	(* sets the fields of the area [c0..c1], [l0..l1] to nr *)
+		VAR c, l: INTEGER;
+	BEGIN	(* area [c0..c1], [l0..l1] is valid *)
+		c := c0;
+		WHILE c <= c1 DO
+			l := l0; WHILE l <= l1 DO o.f[c, l] := SHORT(nr); INC(l) END;
+			INC(c)
+		END
+	END Set;
+	
+	PROCEDURE Available*(VAR o: Overlay; c0, c1, l0, l1: INTEGER): BOOLEAN;
+	(* returns true if the given area [c0..c1], [l0..l1] is available *)
+		VAR c, l, f: INTEGER;
+	BEGIN
+		IF (c0 < 0) OR (c0 >= o.cols) THEN RETURN FALSE END;	(*###*)
+		IF (c1 < 0) OR (c1 >= o.cols) THEN RETURN FALSE END;	(*###*)
+		IF (l0 < 0) OR (l0 >= o.lines) THEN RETURN FALSE END;	(*###*)
+		IF (l1 < 0) OR (l1 >= o.lines) THEN RETURN FALSE END;	(*###*)
+		c := c0; l := l0;
+		LOOP
+			IF o.f[c, l] >= 0 THEN RETURN FALSE END;	(*###*)
+			INC(l);
+			IF l > l1 THEN
+				l := l0; INC(c);
+				IF c > c1 THEN EXIT END;	(*###*)
+			END
+		END;	(* given area is unused [free] *)
+		c := c0; l := 0; f := 0;
+		LOOP
+			IF o.f[c, l] < 0 THEN INC(f) END;
+			INC(l);
+			IF l = o.lines THEN
+				IF f < MinFree + l1 - l0 + 1 THEN RETURN FALSE	(*###*)
+				ELSE
+					l := 0; INC(c); f := 0;
+					IF c > c1 THEN RETURN TRUE END	(*###*)
+				END
+			END
+		END
+	END Available;
+	
+	PROCEDURE Place*(VAR o: Overlay; VAR c0, c1, l0, l1: INTEGER; VAR done: BOOLEAN);
+	(* tries to place the given area [c0..c1], [l0..l1] in the overlay *)
+	(* returns the found location in [c0..c1], [l0..l1] if done is true *)
+		VAR dx, dy, incx, incy: INTEGER;
+	BEGIN
+		dx := 0; incx := 1; WHILE c0 + dx < 0 DO INC(dx) END;	(* search to right *)
+		LOOP
+			dy := 0; incy := 1; WHILE l0 + dy < 0 DO INC(dy) END;	(* search to bottom *)
+			LOOP
+				IF l1 + dy > o.lines THEN dy := -1; incy := -1; WHILE l1 + dy > o.lines DO DEC(dy) END	(* search to top *)
+				ELSIF l0 + dy < 0 THEN done := FALSE; EXIT	(*###*)
+				ELSIF Available(o, c0+dx, c1+dx, l0+dy, l1+dy) THEN done := TRUE; EXIT	(*###*)
+				ELSE INC(dy, incy)
+				END
+			END;
+			IF done THEN EXIT	(*###*)	(* found in column *)
+			ELSIF o.colW # o.lastW THEN EXIT	(*###*)	(* unequal column width *)
+			ELSE INC(dx, incx);			(* change column *)
+				IF c1 + dx > o.cols THEN
+					dx := -1; incx := -1; WHILE c1 + dx > o.cols DO DEC(dx) END
+				END;	(* search to left *)
+				IF c0 + dx < 0 THEN done := FALSE; EXIT END	(*###*)
+			END
+		END;
+		IF done THEN INC(c0, dx); INC(c1, dx); INC(l0, dy); INC(l1, dy) END
+	END Place;
+	
+	PROCEDURE FitLine*(VAR o: Overlay; VAR l: INTEGER);
+	(* fits given line l to begin of a raster field *)
+		VAR i: INTEGER;
+	BEGIN
+		IF l < o.lines DIV 2 THEN	(* top adjust *)
+			i := 0; WHILE l >= i + o.raster DO INC(i, o.raster) END
+		ELSE	(* bottom adjust *)
+			i := o.lines; WHILE l < i DO DEC(i, o.raster) END
+		END;
+		l := i
+	END FitLine;
+	
+	PROCEDURE AreaToField*(VAR o: Overlay; c0, l0: INTEGER; W, H: LONGINT;
+												raster: BOOLEAN; VAR c1, l1: INTEGER);
+	(* returns for the area size W, H starting at field c0, l0 the end field c1, l1 *)
+		VAR w: LONGINT;	v: INTEGER;
+	BEGIN
+		c1 := c0;
+		LOOP
+			IF c1 = o.cols - 1 THEN w := o.lastW ELSE w := o.colW END;
+			IF W < w DIV 2 THEN DEC(c1); EXIT END;	(*###*)
+			DEC(W, w + o.colDX);
+			IF W <= 0 THEN EXIT END;	(*###*)
+			INC(c1)
+		END;
+		IF c1 < c0 THEN c1 := c0 ELSIF c1 - c0 >= o.cols - 1 THEN c1 := c0 + o.cols - 1 END;
+		v := SHORT((H + o.lsp DIV 2) DIV o.lsp);
+		IF raster THEN
+			v := (v + o.raster DIV 2) DIV o.raster;
+			IF v < 1 THEN v := 1
+			ELSIF v > (o.lines - MinFree) DIV o.raster THEN v := (o.lines - MinFree) DIV o.raster
+			END;
+			v := v * o.raster
+		ELSE
+			IF v < 1 THEN v := 1
+			ELSIF v > o.lines - MinFree THEN v := o.lines - MinFree
+			END
+		END;
+		l1 := l0 + v - 1
+	END AreaToField;
+	
+	PROCEDURE GetSequence*(VAR o: Overlay; VAR s: ARRAY OF INTEGER);
+	(* returns in array s the sequence of the plane boxes [numbers occuring in overlay] *)
+	(* array s is terminated with a sentinel [-1] *)
+		VAR c, l, nr, i, maxI: INTEGER;
+	BEGIN
+		c := 0; i := 0; maxI := SHORT(LEN(s) - 1);
+		WHILE c < o.cols DO l := 0;
+			WHILE l < o.lines DO nr := o.f[c, l];
+				IF nr >= 0 THEN
+					IF (c-1 < 0) OR (o.f[c-1, l] # nr) THEN
+						IF i < maxI THEN s[i] := nr; INC(i) END	(* add to sequence *)
+					END;
+					REPEAT INC(l) UNTIL (l >= o.lines) OR (o.f[c, l] # nr)
+				ELSE INC(l)
+				END
+			END;
+			INC(c)
+		END;
+		s[i] := -1	(* terminate sequence *)
+	END GetSequence;
+	
+	PROCEDURE  MarkFields(VAR o: Overlay; c, l, h, v: INTEGER; eX, eY: LONGINT; P: LedaSys.Port);
+		VAR X, Y, W, H: LONGINT;
+	BEGIN
+		FieldToRec(o, c, c + h, l, l + v, X, Y, W, H);
+		LedaIO.out.rectangle(P, eX+X, eY+Y, W, H, 4*LedaSys.scnUnit, LedaSys.Grey2, LedaSys.inv, LedaIO.Invert)
+	END MarkFields;
+	
+	PROCEDURE  FrameFields(VAR o: Overlay; c0, c1, l0, l1: INTEGER; eX, eY: LONGINT; P: LedaSys.Port);
+		VAR X, Y, W, H: LONGINT;
+	BEGIN
+		FieldToRec(o, c0, c1, l0, l1, X, Y, W, H);
+		LedaIO.out.rectangle(P, eX+X, eY+Y, W, H, 4*LedaSys.scnUnit, LedaSys.Grey2, LedaSys.inv, LedaIO.Invert)
+	END FrameFields;
+	
+	PROCEDURE MoveOK(VAR o: Overlay; ox, oy: INTEGER; VAR x, y: INTEGER; dx, dy, h, v: INTEGER): BOOLEAN;
+		VAR d, maxd, n, c0, c1, l0, l1: INTEGER;	plus: BOOLEAN;
+	BEGIN
+		IF (ox # x) OR (oy # y) THEN
+			c0 := x + dx; c1 := c0 + h;
+			l0 := y + dy; l1 := l0 + v;
+			d := 0; maxd := (l1 - l0) DIV 2; INC(maxd);
+			n := 0; plus := (l0 + l1) > o.lines;
+			LOOP
+				IF Available(o, c0, c1, l0+d, l1+d) THEN INC(y, d); EXIT END;	(*###*)
+				IF plus THEN INC(d) ELSE DEC(d) END;
+				IF ABS(d) >= maxd THEN
+					plus := ~plus; d := 0; INC(n); IF n = 2 THEN EXIT END	(*###*)
+				END
+			END;
+			RETURN ((ox # x) OR (oy # y)) & (n < 2)
+		ELSE RETURN FALSE
+		END
+	END MoveOK;
+
+	PROCEDURE TrackMoveArea*(VAR o: Overlay; oX, oY: LONGINT; P: LedaSys.Port;
+									 	VAR c0, c1, l0, l1: INTEGER; VAR ml, mr, noMove: BOOLEAN);
+	(* tracks the moving of the area [c0..c1], [l0..l1]; returns moved area and ml, mr, noMove *)
+	(* oX, oY: absolute coordinates of the overlay area *)
+		VAR mX, mY: LONGINT;	keys: SET;	x, y, nx, ny, h, v, dx, dy: INTEGER;
+	BEGIN
+		LedaIO.in.mouse(P, keys, mX, mY);
+		PointToField(o, mX-oX, mY-oY, x, y);	(* get field containing mX, mY*)
+		dx := c0 - x; dy := l0 - y; h := c1 - c0; v := l1 - l0;
+		MarkFields(o, c0, l0, h, v, oX, oY, P);
+		ml := FALSE; mr := FALSE;
+		WHILE (keys # {}) & ~(ml & mr) DO	(* LedaSys.MM action button *)
+			PointToField(o, mX-oX, mY-oY, nx, ny);	(* get field containing mX, mY*)
+			IF MoveOK(o, x, y, nx, ny, dx, dy, h, v) THEN
+				MarkFields(o, x+dx, y+dy, h, v, oX, oY, P);	(* unhighlight *)
+				x := nx; y := ny; MarkFields(o, x+dx, y+dy, h, v, oX, oY, P)	(* highlight *)
+			END;
+			LedaIO.in.mouse(P, keys, mX, mY);
+			ml := ml OR (LedaSys.ML IN keys); mr := mr OR (LedaSys.MR IN keys)
+		END;
+		MarkFields(o, x+dx, y+dy, h, v, oX, oY, P);	(* unhighlight *)
+		noMove := (x + dx = c0) & (y + dy = l0);	(* same location; no move *)
+		c0 := x + dx; c1 := c0 + h; l0 := y + dy; l1 := l0 + v;
+		IF ml & mr THEN LedaIO.in.waitNoKeys(P) END	(* CANCEL *)
+	END TrackMoveArea;
+	
+	PROCEDURE SwitchDir(crd: INTEGER; VAR lo, hi, dir: INTEGER);
+		VAR hcrd: INTEGER;
+	BEGIN
+		IF (dir < 0) & (crd > hi) THEN
+			dir := ABS(dir) - 1; IF lo # dir THEN lo := dir END;
+			dir := hi + 1
+		ELSIF (dir > 0) & (crd < lo) THEN
+			dir := ABS(dir) - 1; IF hi # dir THEN hi := dir END;
+			dir := -(lo + 1)
+		ELSIF dir = 0 THEN
+			IF (crd > hi) OR ((crd = hi) & (lo < hi)) THEN dir := hi + 1
+			ELSIF (crd < lo) OR ((crd = lo) & (lo < hi))  THEN dir := -(lo + 1)
+			END
+		END
+	END SwitchDir;
+		
+	PROCEDURE FieldSize(crd, raster, dir, lo, hi: INTEGER; VAR nlo, nhi: INTEGER);
+		VAR n: INTEGER;
+	BEGIN
+		IF (dir > 0) & (lo <= crd) THEN
+			IF raster > 1 THEN n := (crd - lo + raster) DIV raster; nhi  := lo + n * raster - 1
+			ELSE nhi := crd
+			END;
+			nlo := lo
+		ELSIF (dir < 0) & (crd <= hi) THEN
+			IF raster > 1 THEN n := (hi - crd + raster) DIV raster; nlo := hi - n * raster + 1
+			ELSE nlo := crd
+			END;
+			nhi := hi
+		ELSE nlo := lo; nhi := hi
+		END
+	END FieldSize;
+
+	PROCEDURE TrackSizeArea*(VAR o: Overlay; oX, oY: LONGINT; P: LedaSys.Port; raster: BOOLEAN;
+										VAR c0, c1, l0, l1: INTEGER; VAR mm, mr, noDH, noDV: BOOLEAN);
+	(* tracks the sizing of the area [c0..c1], [l0..l1]; returns sized area and mm, mr, noDH, noDV *)
+	(* oX, oY: absolute coordinates of the overlay area *)
+		VAR mX, mY: LONGINT;	keys: SET;	x, y, h, v, nc0, nc1, nl0, nl1, cdir, ldir, r: INTEGER;
+	BEGIN
+		IF raster THEN r := o.raster ELSE r := 1 END;
+		LedaIO.in.mouse(P, keys, mX, mY);
+		FrameFields(o, c0, c1, l0, l1, oX, oY, P);
+		h := c1 - c0; v := l1 - l0;
+		mm := FALSE; mr := FALSE; cdir := 0; ldir := 0;
+		WHILE (keys # {}) & ~(mm & mr) DO	(* LedaSys.ML action button *)
+			PointToField(o, mX-oX, mY-oY, x, y);	(* get field containing mX, mY*)
+			FieldSize(x, 1, cdir, c0, c1, nc0, nc1); SwitchDir(x, nc0, nc1, cdir);
+			FieldSize(y, r, ldir, l0, l1, nl0, nl1); SwitchDir(y, nl0, nl1, ldir);
+			IF (c0 # nc0) OR (c1 # nc1) OR (l0 # nl0) OR (l1 # nl1) THEN
+				IF Available(o, nc0, nc1, nl0, nl1) THEN					(* size change okay *)
+					FrameFields(o, c0, c1, l0, l1, oX, oY, P);	(* unhighlight *)
+					c0 := nc0; c1 := nc1; l0 := nl0; l1 := nl1;
+					FrameFields(o, c0, c1, l0, l1, oX, oY, P)	(* highlight *)
+				END
+			END;
+			LedaIO.in.mouse(P, keys, mX, mY);
+			mm := mm OR (LedaSys.MM IN keys); mr := mr OR (LedaSys.MR IN keys)
+		END;
+		FrameFields(o, c0, c1, l0, l1, oX, oY, P);	(* unhighlight *)
+		noDH := h = c1 - c0;	(* no horizontal change *)
+		noDV := v = l1 - l0;	(* no vertical change *)
+		IF mm & mr THEN LedaIO.in.waitNoKeys(P) END	(* CANCEL *)
+	END TrackSizeArea;
+			
+	
+END LedaOverlay.

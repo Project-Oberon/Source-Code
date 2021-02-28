@@ -1,0 +1,238 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Tasks;
+
+IMPORT Kernel, SYSTEM, Texts, Modules, Oberon, Input, Ports, NetBase, IP, Viewers,
+	TextFrames, MenuViewers, NetSystem, Display;
+
+CONST
+(* send/receive buffer size *)
+	BufSize = 2 * 4096;
+
+TYPE
+	Connection = POINTER TO ConnectionDesc;
+	Listener = POINTER TO ListenerDesc;
+	Task = POINTER TO TaskDesc;
+	TaskDesc = RECORD (Oberon.TaskDesc)
+		C: Connection
+	END;
+	Handler = PROCEDURE (C: Connection; item: NetBase.Item);
+	ListenerDesc = RECORD (Ports.PortDesc)
+		state, res: SHORTINT;
+		lqfirst, lqlast: Connection;
+		lqn: INTEGER
+	END;
+	ConnectionDesc = RECORD (Ports.PortDesc)
+		rbuf, sbuf: ARRAY BufSize OF SYSTEM.BYTE;	(* receive/send buffer *)
+		rfst, rlst, sfst, slst: LONGINT;	(* buffer admin indexes *)
+		rcnt, scnt: LONGINT;	(* number of bytes in buffer *)
+		instate, outstate: SHORTINT;	(* I/O - state machines *)
+		res: SHORTINT;
+		xcnt: INTEGER;	(* number of retransmissions *)
+		xamt, pamt: LONGINT;	(* retransmission/persist delays *)
+		code, flags: SET;
+		smss, rmss: INTEGER;
+		swin, swl1, swl2, slast: LONGINT;
+		iss, irs, suna, snext, rnext, cwin: LONGINT;
+		rup: INTEGER;
+		ocsem: INTEGER;
+		pcon: Listener;
+		lq: Connection;
+		this: Task;
+		rq: NetBase.Queue;
+		handle: Handler
+	END;
+	Entry = POINTER TO EntryDesc;
+	EntryDesc = RECORD
+		next: Entry;
+		ip: IP.IpAdr;  name: ARRAY 64 OF CHAR
+	END;
+	
+VAR
+	W: Texts.Writer;
+	top: LONGINT;
+	cache: Entry;
+
+PROCEDURE GetRef(mod, proc, var: ARRAY OF CHAR;  VAR mode, form: SHORTINT;  VAR ofs, adr: LONGINT);
+VAR m: Kernel.Module;  a, v: LONGINT;  ch: CHAR;  name: ARRAY 32 OF CHAR;  found: BOOLEAN;
+
+	PROCEDURE Get;
+	BEGIN
+		ch := m.refs[a];  INC(a)
+	END Get;
+
+	PROCEDURE Get4;
+	BEGIN
+		SYSTEM.GET(SYSTEM.ADR(m.refs[a]), v);  INC(a, 4);  Get
+	END Get4;
+	
+	PROCEDURE GetName;
+	VAR i: SHORTINT;
+	BEGIN
+		i := 0;  WHILE ch # 0X DO name[i] := ch; INC(i); Get END;
+		Get;  name[i] := 0X
+	END GetName;
+
+	PROCEDURE GetNum;
+		VAR n: LONGINT; s: SHORTINT;
+	BEGIN
+		s := 0; n := 0;
+		WHILE ORD(ch) >= 128 DO INC(n, ASH(ORD(ch) - 128, s)); INC(s, 7); Get END;
+		v := n + ASH(ORD(ch) MOD 64 - ORD(ch) DIV 64 * 64, s);
+		Get
+	END GetNum;
+	
+BEGIN
+	m := Modules.ThisMod(mod);  a := 0;  Get;
+	WHILE ch = 0F8X DO
+		GetNum;  GetName;  found := (name = proc);
+		WHILE (ch # 0F8X) & (ch # 0X) DO
+			mode := SHORT(ORD(ch));  Get;  form := SHORT(ORD(ch));  Get;
+			GetNum;  ofs := v;  adr := m.sb+ofs;  GetName;
+			IF found & (name = var) THEN RETURN END
+		END
+	END;
+	mode := 0;  form := 0;  ofs := 0;  adr := 0
+END GetRef;
+
+PROCEDURE WriteAdr(ip: IP.IpAdr;  port: INTEGER);
+VAR i: SHORTINT;  name: ARRAY 64 OF CHAR;  e: Entry;
+BEGIN
+	e := cache;
+	WHILE (e # NIL) & (SYSTEM.VAL(LONGINT, e.ip) # SYSTEM.VAL(LONGINT, ip)) DO
+		e := e.next
+	END;
+	IF e = NIL THEN
+		NetSystem.GetName(SYSTEM.VAL(NetSystem.IPAdr, ip), name);
+		IF name # "" THEN
+			NEW(e);  e.ip := ip;  COPY(name, e.name);
+			e.next := cache;  cache := e
+		END
+	ELSE
+		COPY(e.name, name)
+	END;
+	IF name = "" THEN
+		FOR i := 0 TO 3 DO
+			Texts.WriteInt(W, ORD(SYSTEM.VAL(CHAR, ip[i])), 1);
+			IF i # 3 THEN Texts.Write(W, ".") END
+		END
+	ELSE
+		i := 0;
+		WHILE name[i] # 0X DO
+			IF (name[i] >= "A") & (name[i] <= "Z") THEN
+				name[i] := CHR(ORD(name[i])+32)
+			END; 
+			INC(i) 
+		END;
+		Texts.WriteString(W, name)
+	END;
+	Texts.Write(W, ":");  Texts.WriteInt(W, port, 1)
+END WriteAdr;
+
+PROCEDURE Peek(t: Task);
+VAR c: Connection;
+BEGIN
+	Texts.SetColor(W, 3);
+	c := t.C;  Texts.WriteString(W, " ");
+	IF c = NIL THEN
+		Texts.WriteString(W, "NIL")
+	ELSE
+		CASE c.instate OF
+			0: Texts.WriteString(W, "closed")
+			|1: Texts.WriteString(W, "listen")
+			|2: Texts.WriteString(W, "sent")
+			|3: Texts.WriteString(W, "rcvd")
+			|4: Texts.WriteString(W, "estab")
+			|5: Texts.WriteString(W, "finw1")
+			|6: Texts.WriteString(W, "finw2")
+			|7: Texts.WriteString(W, "clwait")
+			|8: Texts.WriteString(W, " clos")
+			|9: Texts.WriteString(W, "lack")
+			|10: Texts.WriteString(W, "tiwait")
+		END;
+		Texts.WriteString(W, " ");
+		CASE c.outstate OF
+			0: Texts.WriteString(W, "idle")
+			|1: Texts.WriteString(W, "trans")
+			|2: Texts.WriteString(W, "retrans")
+			|3: Texts.WriteString(W, "persist")
+		END;
+		Texts.WriteString(W, " ");
+		WriteAdr(c.lip, c.lport);  Texts.WriteString(W, " -> ");  WriteAdr(c.rip, c.rport)
+	END;
+	Texts.SetColor(W, Display.FG)
+END Peek;
+
+PROCEDURE Show*;
+VAR
+	mode, form: SHORTINT;  ofs, adr, t: LONGINT;  n, s: Oberon.Task;  m: Kernel.Module;
+	T: Texts.Text;
+	V: Viewers.Viewer;
+	X, Y: INTEGER;
+	time, date: LONGINT;
+BEGIN
+	IF Oberon.Par.frame = Oberon.Par.vwr.dsc THEN
+		V := Oberon.Par.vwr;
+		T := V.dsc.next(TextFrames.Frame).text;
+		(*Texts.Delete(T, 0, T.len)*)
+		TextFrames.Show(V.dsc.next(TextFrames.Frame), T.len)
+	ELSE
+		T := TextFrames.Text("");
+		Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+		V := MenuViewers.New(TextFrames.NewMenu("Tasks.Show", 
+			"System.Close System.Copy System.Grow Tasks.Show Edit.Search Edit.Store"),
+			TextFrames.NewText(T, 0), TextFrames.menuH, X, Y)
+	END;
+	GetRef("Oberon", "$$", "NextTask", mode, form, ofs, adr);
+	IF (mode = 1) & (form = 13) THEN
+		Texts.WriteString(W, "Time");
+		Oberon.GetClock(time, date); Texts.WriteDate(W, time, date); Texts.WriteLn(W);
+		t := Input.Time();
+		SYSTEM.GET(adr, n);  adr := SYSTEM.VAL(LONGINT, n);  s := n;
+		REPEAT
+			SYSTEM.GET(adr, n);  adr := SYSTEM.VAL(LONGINT, n)
+		UNTIL (n = s) OR (SYSTEM.VAL(LONGINT, n) = top);
+		IF n = s THEN top := SYSTEM.VAL(LONGINT, n)
+		ELSE s := n
+		END;
+		REPEAT
+			ofs := SYSTEM.VAL(LONGINT, n.handle);  m := Kernel.GetMod(ofs);
+			Texts.WriteString(W, m.name);  Texts.WriteString(W, "  PC = ");  
+			Texts.WriteInt(W, ofs-SYSTEM.ADR(m.code[0]), 1);
+			IF n.safe THEN Texts.WriteString(W, "  safe  ")
+			ELSE Texts.WriteString(W, "  unsafe  ")
+			END;
+			Texts.WriteInt(W, n.time, 1);
+			IF n.time <= t THEN 
+				Texts.WriteString(W, " active")
+			ELSE
+				Texts.WriteString(W, " waiting ");  Texts.WriteInt(W, (n.time-t)*1000 DIV Input.TimeUnit, 1);  
+				Texts.WriteString(W, "ms");
+			END;
+			IF m.name = "TCP" THEN Peek(SYSTEM.VAL(Task, n)) END;
+			Texts.WriteLn(W);
+			Texts.Append(T, W.buf);
+			SYSTEM.GET(adr, n);  adr := SYSTEM.VAL(LONGINT, n)	(* next *)
+		UNTIL n = s;
+		Texts.WriteLn(W);  Texts.Append(T, W.buf)
+	END
+END Show;
+
+BEGIN
+	Texts.OpenWriter(W);  top := 0;  cache := NIL
+END Tasks.
+
+Tasks.Show
+
+Net.Directory XX*

@@ -1,0 +1,871 @@
+MODULE DOS; (* Interface to MS-DOS *)
+
+(* ARD, OB 10. 2. 93 *)
+(* ARD 31.08.93, New segments and parameters *)
+
+IMPORT SYSTEM, Kernel;
+
+(* Erweiterung vom DOS-Interface.
+	
+	Die Aufrufe auf die neudefinierte Schnittstelle sollen erweitert werden
+	um den Parameter: ReadWriteDenyAll.
+
+	Dies ist ƒquivalent zur alten Funktion ohne Parameter, d.h. Oberon
+	System verhƒlt sich unverƒndert lokal wie im Netzwerk. In den …ber-
+	geordneten Modulen, m…ssen dann die €nderungen durchgef…hrt
+	werden, damit es netzwerkfƒhig ist.
+
+	Wenn man als Parameter z.B.: ReadWriteDenyNone angeben w…rde,
+	k„nnten die Stationen im Netzwerk sich gegenseitig die Dateien
+	zerst„ren.
+
+	BufferingRecommended
+		dient dazu, sich vom System eine Empfehlung zu holen, ob €nderungen
+		sofort wieder zur…chgeschrieben werden m…ssen, oder ob man sie lokal
+		puffern kann.
+
+	IsHandleRemote
+		DOS-Funktion, die ermittelt, ob ein Handle auf eine Datei auf einen 
+		File-Server "zeigt".
+
+	LockFileAccess / UnlockFileAccess
+		Dateibereiche vor fremdem Zugriff sch…tzen, bzw. Schutz aufheben.
+		Der Parameter "shareable" wird von DOS nicht unterst…tzt, jedoch
+		gibt es einige Netzwerksysteme die dies unterst…tzen.
+*)
+
+CONST 
+	(* access modes *)
+	ReadOnlyCompatibility* = 0;
+	ReadOnlyDenyAll* = 10H;
+	ReadOnlyDenyWrite* = 20H;
+	ReadOnlyDenyRead* = 30H;
+	ReadOnlyDenyNone* = 40H;
+	WriteOnlyCompatibility* = 1;
+	WriteOnlyDenyAll* = 11H;
+	WriteOnlyDenyWrite* = 21H;
+	WriteOnlyDenyRead* = 31H;
+	WriteOnlyDenyNone* = 41H;
+	ReadWriteCompatibility* = 2;
+	ReadWriteDenyAll* = 12H;
+	ReadWriteDenyWrite* = 22H;
+	ReadWriteDenyRead* = 32H;
+	ReadWriteDenyNone* = 42H;
+
+TYPE Proc = PROCEDURE;
+		Terminator = POINTER TO TermRecord;
+		TermRecord = RECORD
+			next: Terminator;
+			Arnold: Proc;
+		END;
+			
+VAR Done*, CoAvail*: BOOLEAN;
+		Drive*: INTEGER;
+		DispHeight*, DispWidth*: INTEGER;
+		tag* : ARRAY 3 OF CHAR;
+		FirstTerm: Terminator;
+		DRV*: ARRAY 4 OF CHAR;	(* no more used *)
+		DTAaddr: LONGINT;
+		last: LONGINT; 	(* time *)
+		NewLine: BOOLEAN;
+		MaxDosLineCurr: INTEGER;
+		
+PROCEDURE BufferingRecommended*(AccessMode: INTEGER; FileRemote: BOOLEAN; 
+																VAR BufferedRead, BufferedWrite: BOOLEAN);
+BEGIN
+END BufferingRecommended;
+
+PROCEDURE IsHandleRemote*(handle: LONGINT): BOOLEAN;
+BEGIN
+	RETURN FALSE;
+END IsHandleRemote;
+
+PROCEDURE LockFileAccess*(handle, Offset, Length: LONGINT; shareable: BOOLEAN): BOOLEAN;
+END LockFileAccess;
+
+PROCEDURE UnlockFileAccess*(handle, Offset, Length: LONGINT; shareable: BOOLEAN): BOOLEAN;
+END UnlockFileAccess;
+
+PROCEDURE SetCursor(x, y: INTEGER);
+BEGIN 
+	Kernel.Reg.AX := 200H; 
+	Kernel.Reg.DX := x + 100H * y; 
+	Kernel.INT(Kernel.Reg, 10H);
+	IF x = 0 THEN NewLine := TRUE END
+END SetCursor;
+
+PROCEDURE GetCursor(VAR x, y: INTEGER);
+BEGIN
+	Kernel.Reg.AX := 300H; 
+	Kernel.Reg.BX := 0; 
+	Kernel.INT(Kernel.Reg, 10H);
+	x := Kernel.Reg.DX MOD 100H;	
+	y := Kernel.Reg.DX DIV 100H
+END GetCursor;
+
+PROCEDURE ScrollUp;
+	VAR Line: INTEGER;
+BEGIN
+	Kernel.Reg.AX := 600H + 1; 
+	Kernel.Reg.BX := 0;
+	Kernel.Reg.CX := 0; (* upper left corner *) 
+	Kernel.Reg.DX := MaxDosLineCurr * 100H + 79; (* lower right corner *)
+	Kernel.INT(Kernel.Reg, 10H);
+	SetCursor(0, MaxDosLineCurr)
+END ScrollUp;
+
+PROCEDURE WriteChar*(ch: CHAR);
+VAR Column, Line: INTEGER;
+BEGIN
+	IF ~NewLine THEN GetCursor(Column, Line);
+		IF Column >= 79 THEN IF Line >= MaxDosLineCurr THEN ScrollUp ELSE SetCursor(0, Line + 1) END
+		ELSE SetCursor(Column+1, Line) END
+	END;
+	Kernel.Reg.AX := 900H+ORD(ch); 
+	Kernel.Reg.BX := 15; Kernel.Reg.CX := 1; 
+	Kernel.INT(Kernel.Reg, 10H);
+	NewLine := FALSE
+END WriteChar;
+
+PROCEDURE WriteString*(s: ARRAY OF CHAR);
+VAR i: LONGINT;
+BEGIN 
+	i := 0; WHILE s[i] # 0X DO WriteChar(s[i]); INC(i) END;
+END WriteString;
+
+PROCEDURE WriteInt*(i: LONGINT);
+VAR j: INTEGER; buf: ARRAY 12 OF CHAR;
+BEGIN
+	IF i = MIN(LONGINT) THEN buf := "-2147483648"
+	ELSE 
+		IF i < 0 THEN buf[0] := "-"; i := -i ELSE buf[0] := " " END;
+		j := LEN(buf) - 2; 
+		REPEAT buf[j] := CHR((i MOD 10) + ORD("0")); i := i DIV 10; DEC(j) UNTIL	i = 0;
+		WHILE j > 0 DO buf[j] := "0"; DEC(j) END; buf[LEN(buf)-1] := 0X
+	END;
+	WriteString(buf)
+END WriteInt;
+	
+PROCEDURE WriteLn*;
+	VAR Column, Line: INTEGER;
+BEGIN
+	GetCursor(Column, Line);
+	IF Line >= MaxDosLineCurr THEN ScrollUp ELSE SetCursor(0, Line + 1) END
+END WriteLn;
+
+PROCEDURE WriteHex*(i: SYSTEM.BYTE);
+VAR j: CHAR;
+BEGIN
+	j := SYSTEM.VAL(CHAR, i);
+	IF (ORD(j) DIV 16) > 9 THEN WriteChar(CHR((ORD(j) DIV 16) + 48 + 7)) ELSE WriteChar(CHR((ORD(j) DIV 16) + 48)) END;
+	IF (ORD(j) MOD 16) > 9 THEN WriteChar(CHR((ORD(j) MOD 16) + 48 + 7)) ELSE WriteChar(CHR((ORD(j) MOD 16) + 48)) END;
+	WriteChar(" ");WriteChar(" ");
+END WriteHex;
+
+PROCEDURE Wait*;
+BEGIN
+	Kernel.Reg.AX := 700H;
+	Kernel.INT(Kernel.Reg, 21H);
+END Wait;
+		
+PROCEDURE InitSerialPort*(port, wlength, stopbits, parity, baud: INTEGER);
+BEGIN
+	Kernel.Reg.AX := wlength + stopbits*4 + parity*8 + baud*32;
+	Kernel.Reg.DX := port;
+	Kernel.INT(Kernel.Reg, 14H);
+END InitSerialPort;
+
+PROCEDURE RecCharSer*(port: INTEGER; VAR ch: CHAR);
+BEGIN
+	Kernel.Reg.AX := 200H;
+	Kernel.Reg.DX := port;
+	Kernel.INT(Kernel.Reg, 14H);
+	ch := CHR(Kernel.Reg.AX)
+END RecCharSer;
+
+PROCEDURE SendCharSer*(port: INTEGER; ch: CHAR);
+BEGIN
+	Kernel.Reg.AX := 100H + ORD(ch);
+	Kernel.Reg.DX := port;
+	Kernel.INT(Kernel.Reg, 14H);
+END SendCharSer;
+
+PROCEDURE GetStatusSer*(port: INTEGER; VAR status: INTEGER);
+BEGIN
+	Kernel.Reg.AX := 300H;
+	Kernel.Reg.DX := port;
+	Kernel.INT(Kernel.Reg, 14H);
+	status := Kernel.Reg.AX DIV 100H
+END GetStatusSer;
+
+PROCEDURE InitParallelPort*(port: INTEGER);
+BEGIN
+	Kernel.Reg.AX := 100H;
+	Kernel.Reg.DX := port;
+	Kernel.INT(Kernel.Reg, 17H);
+END InitParallelPort;
+
+PROCEDURE PrintChar*(port: INTEGER; VAR ch: CHAR);
+BEGIN
+	Kernel.Reg.AX := ORD(ch);
+	Kernel.Reg.DX := port;
+	Kernel.INT(Kernel.Reg, 17H);
+	ch := CHR(Kernel.Reg.AX)
+END PrintChar;
+
+PROCEDURE GetStatusPar*(port: INTEGER; VAR status: INTEGER);
+BEGIN
+	Kernel.Reg.AX := 200H;
+	Kernel.Reg.DX := port;
+	Kernel.INT(Kernel.Reg, 17H);
+	status := Kernel.Reg.AX DIV 100H
+END GetStatusPar;
+
+PROCEDURE AllocTermProc*(proc: Proc);
+VAR new: Terminator;
+BEGIN NEW(new);
+	new.next := FirstTerm;
+	FirstTerm := new;
+	new.Arnold := proc;
+END AllocTermProc;
+		
+PROCEDURE Quit*;
+BEGIN
+	WHILE FirstTerm # NIL DO FirstTerm.Arnold; FirstTerm := FirstTerm.next END;
+	Kernel.INT(Kernel.Reg, 98);
+END Quit;
+		
+PROCEDURE Format*(density: CHAR);
+VAR FCh: CHAR; BL: SHORTINT; cyl, drv, count, err, i: INTEGER; adr, retry: LONGINT; page: SET;
+BEGIN
+	(* Get diskette parameter table *)
+	Kernel.Reg.AX := 351EH;
+	Kernel.INT(Kernel.Reg, 21H);
+	adr := Kernel.Reg.ES * 16 + Kernel.Reg.BX;
+	(* Change settings *)
+	IF density = "H" THEN 
+		SYSTEM.PUT(adr, 0AFX); SYSTEM.PUT(adr+4, 012X); SYSTEM.PUT(adr+5, 1BX); 
+		SYSTEM.PUT(adr+7, 6CX); SYSTEM.PUT(adr+12, 0X)
+	ELSE
+		SYSTEM.PUT(adr, 0DFX); SYSTEM.PUT(adr+4, 09X); SYSTEM.PUT(adr+5, 2AX); 
+		SYSTEM.PUT(adr+7, 50X); SYSTEM.PUT(adr+12, 80X)
+	END;
+	Kernel.Reg.AX := 0H;
+	Kernel.Reg.DX := Drive;
+	Kernel.INT(Kernel.Reg, 13H);	(* Reset Drive *)
+	IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN err := Kernel.Reg.AX MOD 100H; HALT(61) END;
+	Kernel.Reg.AX := 1800H;
+	Kernel.Reg.DX := Drive;
+	IF density = "H" THEN Kernel.Reg.CX := 4F12H ELSE Kernel.Reg.CX := 4F09H END;	(* Media type for Drive *)
+	Kernel.INT(Kernel.Reg, 13H);
+	IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN err := Kernel.Reg.AX MOD 100H; HALT(62) END;
+	FOR cyl := 0 TO 79 DO drv := Drive; FCh := 0X;
+		FOR BL:= 0 TO 1 DO 
+			count := 3; Done := FALSE;
+			WHILE (count > 0) & ~Done DO
+				IF density = "H" THEN Kernel.Reg.AX := 512H ELSE Kernel.Reg.AX := 509H END;
+				Kernel.Reg.CX := cyl*100H;
+				Kernel.Reg.DX := drv;
+				Kernel.Reg.BX := Kernel.DX;	(* Address field list *)
+				Kernel.Reg.DS := Kernel.DS;
+				Kernel.Reg.ES := Kernel.ES;
+				Kernel.Transfer[0] := CHR(cyl); Kernel.Transfer[1] := FCh; Kernel.Transfer[2] := 1X; Kernel.Transfer[3] := 2X;
+				Kernel.Transfer[4] := CHR(cyl); Kernel.Transfer[5] := FCh; Kernel.Transfer[6] := 2X; Kernel.Transfer[7] := 2X;
+				Kernel.Transfer[8] := CHR(cyl); Kernel.Transfer[9] := FCh; Kernel.Transfer[10] := 3X; Kernel.Transfer[11] := 2X;
+				Kernel.Transfer[12] := CHR(cyl); Kernel.Transfer[13] := FCh; Kernel.Transfer[14] := 4X; Kernel.Transfer[15] := 2X;
+				Kernel.Transfer[16] := CHR(cyl); Kernel.Transfer[17] := FCh; Kernel.Transfer[18] := 5X; Kernel.Transfer[19] := 2X;
+				Kernel.Transfer[20] := CHR(cyl); Kernel.Transfer[21] := FCh; Kernel.Transfer[22] := 6X; Kernel.Transfer[23] := 2X;
+				Kernel.Transfer[24] := CHR(cyl); Kernel.Transfer[25] := FCh; Kernel.Transfer[26] := 7X; Kernel.Transfer[27] := 2X;
+				Kernel.Transfer[28] := CHR(cyl); Kernel.Transfer[29] := FCh; Kernel.Transfer[30] := 8X; Kernel.Transfer[31] := 2X;
+				Kernel.Transfer[32] := CHR(cyl); Kernel.Transfer[33] := FCh; Kernel.Transfer[34] := 9X; Kernel.Transfer[35] := 2X;
+				Kernel.Transfer[36] := CHR(cyl); Kernel.Transfer[37] := FCh; Kernel.Transfer[38] := 0AX; Kernel.Transfer[39] := 2X;
+				Kernel.Transfer[40] := CHR(cyl); Kernel.Transfer[41] := FCh; Kernel.Transfer[42] := 0BX; Kernel.Transfer[43] := 2X;
+				Kernel.Transfer[44] := CHR(cyl); Kernel.Transfer[45] := FCh; Kernel.Transfer[46] := 0CX; Kernel.Transfer[47] := 2X;
+				Kernel.Transfer[48] := CHR(cyl); Kernel.Transfer[49] := FCh; Kernel.Transfer[50] := 0DX; Kernel.Transfer[51] := 2X;
+				Kernel.Transfer[52] := CHR(cyl); Kernel.Transfer[53] := FCh; Kernel.Transfer[54] := 0EX; Kernel.Transfer[55] := 2X;
+				Kernel.Transfer[56] := CHR(cyl); Kernel.Transfer[57] := FCh; Kernel.Transfer[58] := 0FX; Kernel.Transfer[59] := 2X;
+				Kernel.Transfer[60] := CHR(cyl); Kernel.Transfer[61] := FCh; Kernel.Transfer[62] := 10X; Kernel.Transfer[63] := 2X;
+				Kernel.Transfer[64] := CHR(cyl); Kernel.Transfer[65] := FCh; Kernel.Transfer[66] := 11X; Kernel.Transfer[67] := 2X;
+				Kernel.Transfer[68] := CHR(cyl); Kernel.Transfer[69] := FCh; Kernel.Transfer[70] := 12X; Kernel.Transfer[71] := 2X;
+				Kernel.INT(Kernel.Reg, 13H);
+				Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+				IF ~Done THEN DEC(count); IF count = 0 THEN err := Kernel.Reg.AX DIV 100H; HALT(63) END END;
+			END;
+			INC(drv, 100H); FCh := 1X
+		END
+	END;
+	(* WriteBootSector *)
+	FOR i := 0 TO 511 DO Kernel.Transfer[i] := 0X END;
+	IF density = "H" THEN 
+		Kernel.Transfer[11] := 0X; Kernel.Transfer[12] := 2X;	(* Bytes per sector *)
+		Kernel.Transfer[13] := 1X; 	(* Sectors per alloc unit *)
+		Kernel.Transfer[14] := 1X; Kernel.Transfer[15] := 0X;	(* reserved sectors *)
+		Kernel.Transfer[16] := 2X; 	(* Nof FATs *)
+		Kernel.Transfer[17] := 0E0X; Kernel.Transfer[18] := 0X;	(* root directory entries *)
+		Kernel.Transfer[19] := 40X; Kernel.Transfer[20] := 0BX;	(* Nof sectors *)
+		Kernel.Transfer[21] := 0F0X; 	(* Media desc *)
+		Kernel.Transfer[22] := 09X; Kernel.Transfer[23] := 0X;	(* Sectors per FAT *)
+		Kernel.Transfer[24] := 012X; Kernel.Transfer[25] := 0X;	(* Sectors per track *)
+		Kernel.Transfer[26] := 02X; Kernel.Transfer[27] := 0X;	(* Number of heads *)
+		Kernel.Transfer[28] := 0X; Kernel.Transfer[29] := 0X;	(* Hidden sectors *)
+	ELSE
+		Kernel.Transfer[11] := 0X; Kernel.Transfer[12] := 2X;	(* Bytes per sector *)
+		Kernel.Transfer[13] := 2X; 	(* Sectors per alloc unit *)
+		Kernel.Transfer[14] := 1X; Kernel.Transfer[15] := 0X;	(* reserved sectors *)
+		Kernel.Transfer[16] := 2X; 	(* Nof FATs *)
+		Kernel.Transfer[17] := 70X; Kernel.Transfer[18] := 0X;	(* root directory entries *)
+		Kernel.Transfer[19] := 0A0X; Kernel.Transfer[20] := 05X;	(* Nof sectors *)
+		Kernel.Transfer[21] := 0F9X; 	(* Media desc *)
+		Kernel.Transfer[22] := 03X; Kernel.Transfer[23] := 0X;	(* Sectors per FAT *)
+		Kernel.Transfer[24] := 09X; Kernel.Transfer[25] := 0X;	(* Sectors per track *)
+		Kernel.Transfer[26] := 02X; Kernel.Transfer[27] := 0X;	(* Number of heads *)
+		Kernel.Transfer[28] := 0X; Kernel.Transfer[29] := 0X;	(* Hidden sectors *)
+	END;
+	retry := 3; Done := FALSE;
+	WHILE ~Done & (retry > 0) DO
+		Kernel.Reg.AX := 301H;
+		Kernel.Reg.BX := Kernel.DX;
+		Kernel.Reg.CX := 1;
+		Kernel.Reg.DX := Drive;	
+		Kernel.Reg.DS := Kernel.DS;
+		Kernel.Reg.ES := Kernel.ES;
+		Kernel.INT(Kernel.Reg, 13H); 
+		Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+		IF ~Done THEN err := Kernel.Reg.AX DIV 100H END;
+		DEC(retry)
+	END;
+	IF retry = 0 THEN HALT(64) END
+END Format;
+
+PROCEDURE ResetDrive*;
+BEGIN
+	Kernel.Reg.AX := 0;
+	Kernel.Reg.DX := Drive;	(* Drive *)
+	Kernel.INT(Kernel.Reg, 13H);
+END ResetDrive;
+
+PROCEDURE GetSector*(sec, cyl, head: INTEGER); 
+BEGIN
+	Kernel.Reg.AX := 201H;
+	Kernel.Reg.BX := Kernel.DX;
+	Kernel.Reg.CX := cyl * 256 + sec;
+	Kernel.Reg.DX := head * 256 + Drive;	
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.Reg.ES := Kernel.ES;
+	Kernel.INT(Kernel.Reg, 13H); 
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END GetSector;
+
+PROCEDURE PutSector*(sec, cyl, head: INTEGER); 
+BEGIN
+	Kernel.Reg.AX := 301H;
+	Kernel.Reg.BX := Kernel.DX;
+	Kernel.Reg.CX := cyl * 256 + sec;
+	Kernel.Reg.DX := head * 256 + Drive;	
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.Reg.ES := Kernel.ES;
+	Kernel.INT(Kernel.Reg, 13H); 
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END PutSector;
+		
+PROCEDURE InitDisplay*(mode: INTEGER);
+BEGIN MaxDosLineCurr := 29;
+	Kernel.Reg.AX := mode;	
+	Kernel.INT(Kernel.Reg, 10H);
+END InitDisplay;
+
+PROCEDURE GetClock*(VAR time, date: LONGINT);
+VAR s, min, h, d, m, y: SHORTINT;
+BEGIN
+	SYSTEM.PORTOUT(70H, 0); SYSTEM.PORTIN(71H, s);
+	SYSTEM.PORTOUT(70H, 2); SYSTEM.PORTIN(71H, min);
+	SYSTEM.PORTOUT(70H, 4); SYSTEM.PORTIN(71H, h);
+	SYSTEM.PORTOUT(70H, 7); SYSTEM.PORTIN(71H, d);
+	SYSTEM.PORTOUT(70H, 8); SYSTEM.PORTIN(71H, m);
+	SYSTEM.PORTOUT(70H, 9); SYSTEM.PORTIN(71H, y);
+	date := LONG(d) DIV 10H MOD 10H * 10 + d MOD 10H;								(* Day *)
+	date := date + LONG(LONG(m) DIV 10H MOD 10H * 10 + m MOD 10H) * 32;		(* Month *)
+	date := date + LONG(LONG(y) DIV 10H MOD 10H * 10 + y MOD 10H) * 512;	(* Year *)
+	time := LONG(LONG(s)) DIV 10H MOD 10H * 10 + LONG(LONG(s)) MOD 10H;							(* Second *)
+	time := time + LONG(LONG(min) DIV 10H MOD 10H * 10 + LONG(min) MOD 10H) * 64;		(* Minute *)
+	time := time + LONG(LONG(h) DIV 10H MOD 10H * 10 + LONG(h) MOD 10H) * 4096;	(* Hour *)
+END GetClock;
+
+PROCEDURE GetTicks*(): LONGINT;
+VAR time, set1, set2: LONGINT; d, m, y: SHORTINT; cx, dx: INTEGER; al: SHORTINT; page: SET;
+BEGIN
+	SYSTEM.GET(46EH, cx); SYSTEM.GET(46CH, dx); SYSTEM.GET(470H, al);
+	set1 := dx;		(* CX: Hrs, Min (0 - 23, 0 - 59), DX: Sec, 1/100 Sec (0 - 59, 0 - 99) *);
+	set2 := LONG(cx) MOD 10000H * 10000H;
+	set1 := SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET, set1) * {0 .. 15});
+	time := SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET, set2) + SYSTEM.VAL(SET, set1));
+	WHILE (last > time) & (time < (MAX(LONGINT)-17FE80H) DIV 16) DO INC(time, 17FE80H) END;
+	IF (last > time) & (time >= (MAX(LONGINT)-17FE80H) DIV 16) THEN time := time MOD 17FE80H END; (* Reset after 85 Days *)
+	last := time;
+	RETURN (time*16) + (time*12) DIV 25 + (time * 7) DIV 2000;
+END GetTicks;
+
+PROCEDURE SetClock*(time, date: LONGINT);
+VAR help: LONGINT;
+BEGIN
+	help := time DIV 4096; 
+	SYSTEM.PORTOUT(70H, 4); SYSTEM.PORTOUT(71H, SHORT(SHORT(help DIV 10 * 10H + help MOD 10)));
+	help := time DIV 64 MOD 64;
+	SYSTEM.PORTOUT(70H, 2); SYSTEM.PORTOUT(71H, SHORT(SHORT(help DIV 10 * 10H + help MOD 10)));
+	help := time MOD 64;
+	SYSTEM.PORTOUT(70H, 0); SYSTEM.PORTOUT(71H, SHORT(SHORT(help DIV 10 * 10H + help MOD 10)));
+	help := date DIV 512;
+	SYSTEM.PORTOUT(70H, 9); SYSTEM.PORTOUT(71H, SHORT(SHORT(help DIV 10 * 10H + help MOD 10))); 
+	help := date DIV 32 MOD 16;
+	SYSTEM.PORTOUT(70H, 8); SYSTEM.PORTOUT(71H, SHORT(SHORT(help DIV 10 * 10H + help MOD 10)));
+	help := date MOD 32;
+	SYSTEM.PORTOUT(70H, 7); SYSTEM.PORTOUT(71H, SHORT(SHORT(help DIV 10 * 10H + help MOD 10)));
+END SetClock;
+
+PROCEDURE KBAvail*(): BOOLEAN;
+BEGIN
+	Kernel.Reg.AX := 1100H;
+	Kernel.INT(Kernel.Reg, 16H);
+	RETURN ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 6);
+END KBAvail;
+
+PROCEDURE ControlKeys*(VAR Keys: INTEGER);
+BEGIN
+	Kernel.Reg.AX := 200H; 
+	Kernel.INT(Kernel.Reg, 16H);
+	Keys := Kernel.Reg.AX MOD 100H;
+END ControlKeys;
+
+PROCEDURE GetChar* (VAR ch: CHAR; VAR ext: BOOLEAN);
+BEGIN 
+	Kernel.Reg.AX := 0;
+	Kernel.INT(Kernel.Reg, 16H);
+	ch := CHR(Kernel.Reg.AX); ext := FALSE;
+	IF ch = 0X THEN ch := CHR(Kernel.Reg.AX DIV 100H); ext := TRUE END;
+END GetChar;
+
+PROCEDURE SetMouse* (x, y: INTEGER);
+BEGIN
+	Kernel.Reg.AX := 4H;		(* Set Mouse Coordinates to x, y *)
+	Kernel.Reg.CX := x;
+	Kernel.Reg.DX := DispHeight - y;
+	Kernel.INT(Kernel.Reg, 33H);
+END SetMouse;
+	
+PROCEDURE InitMouse*;
+BEGIN
+	Kernel.Reg.AX := 0;		(* Reset Mouse *)
+	Kernel.INT(Kernel.Reg, 33H);
+	Done := (Kernel.Reg.AX MOD 100H # 0);
+	IF Kernel.Reg.BX # 3 THEN Done := FALSE END; (* mouse buttons *)
+	Kernel.Reg.AX := 7H;		(* Set Horizontal Limits *)
+	Kernel.Reg.CX := 0;
+	IF DispWidth <= 640  THEN Kernel.Reg.DX := DispWidth ELSE Kernel.Reg.DX := DispWidth*8 END;
+	Kernel.INT(Kernel.Reg, 33H);
+	Kernel.Reg.AX := 8H;		(* Set Vertical Limits *)
+	Kernel.Reg.CX := 0;
+	IF DispHeight <= 480 THEN Kernel.Reg.DX := DispHeight ELSE Kernel.Reg.DX := DispHeight*8 END;
+	Kernel.INT(Kernel.Reg, 33H);
+	Kernel.Reg.AX := 0FH;		(* Set Mickey-Pixel-Ratio *)
+	IF DispWidth <= 640  THEN Kernel.Reg.CX := 8; Kernel.Reg.DX := 8
+	ELSE Kernel.Reg.CX := 1; Kernel.Reg.DX := 1 END;
+	Kernel.INT(Kernel.Reg, 33H);
+	SetMouse(0, DispHeight);
+END InitMouse;
+
+PROCEDURE GetMouseInfo* (VAR x, y, buttons: INTEGER); 
+BEGIN
+	Kernel.Reg.AX := 03H;
+	Kernel.INT(Kernel.Reg, 33H);
+	IF DispWidth <= 640  THEN x := Kernel.Reg.CX; y := DispHeight-2 - Kernel.Reg.DX
+	ELSE x := Kernel.Reg.CX DIV 8; y := DispHeight-2 - Kernel.Reg.DX DIV 8 END;
+	buttons := Kernel.Reg.BX;
+	IF x >= DispWidth THEN x := DispWidth-1 END; 
+END GetMouseInfo;
+
+PROCEDURE Length*(VAR len: LONGINT; handle: LONGINT);
+VAR i: LONGINT; 
+BEGIN
+	Kernel.Reg.AX := 4202H;		(* returned offset relativ to eof *)
+	Kernel.Reg.BX := SHORT(handle);
+	Kernel.Reg.CX := 0;
+	Kernel.Reg.DX := 0;
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	IF Done THEN
+		IF Kernel.Reg.AX < 0 THEN i := Kernel.Reg.AX + 10000H ELSE i := Kernel.Reg.AX END;
+		len := Kernel.Reg.DX * 10000H + i;
+		Kernel.Reg.AX := 4200H;		(* returned offset relative to beginning *)
+		Kernel.Reg.BX := SHORT(handle);
+		Kernel.Reg.CX := 0;
+		Kernel.Reg.DX := 0;
+		Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	END
+END Length;
+
+PROCEDURE GetDateTime*(VAR date, time: LONGINT; handle: LONGINT);
+VAR help: LONGINT;
+BEGIN
+	Kernel.Reg.AX := 5700H;
+	Kernel.Reg.BX := SHORT(handle);
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	IF Done THEN 
+		help := Kernel.Reg.DX;
+		date := help +  80*512;
+		help := Kernel.Reg.CX;
+		time := (help MOD 32) + (help DIV 32 MOD 64 * 64) + help DIV 2048 * 4096;
+	ELSE date := 0; time := 0 END
+END GetDateTime;
+
+PROCEDURE CreateAndClose(VAR name: ARRAY OF CHAR);
+VAR err, i: INTEGER; handle: LONGINT;
+BEGIN
+	Kernel.Reg.AX := 3C00H;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.CX := 0; 		(* Normal File *)
+	Kernel.Reg.DS := Kernel.DS;
+	i := 0; REPEAT Kernel.Transfer[i] := name[i]; INC (i) UNTIL name[i] = 0X; Kernel.Transfer [i] := 0X; 
+	Kernel.INT(Kernel.Reg, 21H); 
+	IF ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN
+		Done := TRUE;
+		IF Kernel.Reg.AX < 0 THEN handle := Kernel.Reg.AX + 10000H ELSE handle := Kernel.Reg.AX END;
+		(* close file *)
+		Kernel.Reg.AX := 3E00H;
+		Kernel.Reg.BX := SHORT(handle);
+		Kernel.INT(Kernel.Reg, 21H);
+		IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN err := Kernel.Reg.AX MOD 100H; HALT(65) END;
+	ELSE err := Kernel.Reg.AX MOD 100H; HALT(64) END;
+END CreateAndClose;
+
+PROCEDURE Open*(VAR name: ARRAY OF CHAR; new: BOOLEAN; VAR handle: LONGINT; accessmode: INTEGER);
+VAR i: INTEGER;
+BEGIN
+	IF new THEN CreateAndClose(name) END;
+	Kernel.Reg.AX := 3D00H + accessmode;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	i := 0; REPEAT Kernel.Transfer[i] := name [i]; INC(i) UNTIL name[i] = 0X; Kernel.Transfer[i] := 0X; 
+	Kernel.INT(Kernel.Reg, 21H); 
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	IF Done THEN INC(Kernel.nofiles);
+		IF Kernel.Reg.AX < 0 THEN handle := Kernel.Reg.AX + 10000H ELSE handle := Kernel.Reg.AX END;
+	END; 
+END Open;
+
+PROCEDURE Close*(handle: LONGINT);
+BEGIN  
+	Kernel.Reg.AX := 3E00H;
+	Kernel.Reg.BX := SHORT(handle);
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	IF Done THEN DEC(Kernel.nofiles) END
+END Close;
+
+PROCEDURE DoubleHandle*(handle: LONGINT): LONGINT;
+VAR err: INTEGER; 
+BEGIN
+	IF (handle >  0) & (handle < 256) THEN (* valid handles *)
+		Kernel.Reg.BX := SHORT(handle);
+		Kernel.Reg.AX := 4500H;
+		Kernel.INT(Kernel.Reg, 21H); 
+		INC(Kernel.nofiles);
+		IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN err := Kernel.Reg.AX MOD 100H; HALT(66)
+		ELSE IF Kernel.Reg.AX < 0 THEN RETURN Kernel.Reg.AX + 10000H ELSE RETURN Kernel.Reg.AX END;
+		END;
+	ELSE HALT(51) END
+END DoubleHandle;
+
+PROCEDURE Write*(size, adr, handle: LONGINT);
+VAR i, transferred: LONGINT; 
+BEGIN Done := TRUE; 
+	IF (handle > 0) & (handle < 256) THEN (* valid handles *) 
+			WHILE size > 0 DO
+			SYSTEM.MOVE(adr, SYSTEM.VAL(LONGINT, Kernel.Transfer), size);		(* Transfer to low memory *)
+			Kernel.Reg.AX := 4000H;
+			Kernel.Reg.BX := SHORT(handle);
+			Kernel.Reg.CX := SHORT(size);
+			Kernel.Reg.DX := Kernel.DX;
+			Kernel.Reg.DS := Kernel.DS;
+			Kernel.INT(Kernel.Reg, 21H);
+			IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) OR (Kernel.Reg.AX = 0) & (size > 0) THEN Done := FALSE; size := 0
+			ELSE
+				IF Kernel.Reg.AX < 0 THEN transferred := Kernel.Reg.AX + 10000H ELSE transferred := Kernel.Reg.AX END;
+				INC(adr, transferred);
+				DEC(size, transferred)
+			END
+		END
+	ELSE HALT(51) END
+END Write;
+
+PROCEDURE Read*(size, adr, handle: LONGINT; VAR read: LONGINT);
+VAR transferred: LONGINT; 
+BEGIN read := 0; Done := TRUE;
+	IF (handle > 0) & (handle < 256) THEN (* valid handles *)
+		LOOP
+			Kernel.Reg.AX := 3F00H;
+			Kernel.Reg.BX := SHORT(handle);
+			Kernel.Reg.CX := SHORT(size);
+			Kernel.Reg.DX := Kernel.DX;
+			Kernel.Reg.DS := Kernel.DS;
+			Kernel.INT(Kernel.Reg, 21H);
+			IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN Done := FALSE; read := Kernel.Reg.AX; EXIT
+			ELSE
+				IF Kernel.Reg.AX < 0 THEN transferred := Kernel.Reg.AX + 10000H ELSE transferred := Kernel.Reg.AX END;
+				INC(read, transferred); 
+				SYSTEM.MOVE(SYSTEM.VAL(LONGINT, Kernel.Transfer), adr, transferred);
+				DEC(size, transferred);
+				(*Man muss auch auf "transferred=0" testen, da "transferred=0" ohne Fehler eintreten kann.*)
+				IF (size <= 0) OR (transferred=0) THEN EXIT END;
+				INC(adr, transferred)
+			END
+		END
+	ELSE HALT(51) END
+END Read;
+
+PROCEDURE SetPos*(pos, handle: LONGINT);
+BEGIN
+	IF (handle > 0) & (handle < 256) THEN (* valid handles *)
+		Kernel.Reg.AX := 4200H;
+		Kernel.Reg.BX := SHORT(handle);
+		Kernel.Reg.CX := SHORT(pos DIV 10000H);
+		Kernel.Reg.DX := SHORT(pos MOD 10000H);
+		Kernel.INT(Kernel.Reg, 21H);
+		Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	ELSE HALT(51) END
+END SetPos;
+
+PROCEDURE GetID*(VAR ID: ARRAY OF CHAR; handle: LONGINT);
+VAR err: INTEGER; 
+BEGIN
+	IF (handle > 0) & (handle < 256) THEN (* valid handles *) 
+		SetPos(2 (* << KR *), handle);
+		Kernel.Reg.AX := 3F00H;
+		Kernel.Reg.BX := SHORT(handle);
+		Kernel.Reg.CX := 32;
+		Kernel.Reg.DX := Kernel.DX;
+		Kernel.Reg.DS := Kernel.DS;
+		Kernel.INT(Kernel.Reg, 21H);
+		IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN err := Kernel.Reg.AX MOD 100H; HALT(52)
+		ELSE SYSTEM.MOVE(SYSTEM.VAL(LONGINT, Kernel.Transfer), SYSTEM.ADR(ID), 32);		(* Transfer to high memory *)
+		END
+	ELSE HALT(51) END
+END GetID;
+
+PROCEDURE GetTag*(VAR tag: ARRAY OF CHAR; handle: LONGINT);
+VAR err: INTEGER; 
+BEGIN
+	IF (handle > 0) & (handle < 256) THEN (* valid handles *) 
+		SetPos(0, handle);
+		IF Done THEN
+			Kernel.Reg.AX := 3F00H;
+			Kernel.Reg.BX := SHORT(handle);
+			Kernel.Reg.CX := 2 (* << KR *) ;
+			Kernel.Reg.DX := Kernel.DX;
+			Kernel.Reg.DS := Kernel.DS;
+			Kernel.INT(Kernel.Reg, 21H);
+			IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN err := Kernel.Reg.AX MOD 100H; HALT(52) END;
+			SYSTEM.MOVE(SYSTEM.VAL(LONGINT, Kernel.Transfer), SYSTEM.ADR(tag), 2 (* << KR *));		(* Transfer to high memory *)
+			tag[2] := 0X;
+		ELSE err := Kernel.Reg.AX MOD 100H; HALT(53) END
+	ELSE HALT(51) END
+END GetTag;
+
+PROCEDURE SetID*(ID: ARRAY OF CHAR; handle: LONGINT);
+VAR i, err: INTEGER; name: ARRAY 34 OF CHAR; (* << KR *)
+BEGIN
+	IF (handle > 0) & (handle < 256) THEN (* valid handles *) 
+		SetPos(0, handle);
+		IF Done THEN
+			name[0] := tag[0]; name[1] := tag[1]; (* << KR  *)
+			i := 0;
+			WHILE (i < 32) & (ID[i] # 0X) DO name[i+2] (* << KR *) := ID[i]; INC(i) END; name[i+2] := 0X;
+			SYSTEM.MOVE(SYSTEM.ADR(name), SYSTEM.VAL(LONGINT, Kernel.Transfer), 34(* << KR *));		(* Transfer to low memory *)
+			Kernel.Reg.AX := 4000H;
+			Kernel.Reg.BX := SHORT(handle);
+			Kernel.Reg.CX := 34 (* << KR *);
+			Kernel.Reg.DX := Kernel.DX;
+			Kernel.Reg.DS := Kernel.DS;
+			Kernel.INT(Kernel.Reg, 21H);
+			IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN err := Kernel.Reg.AX MOD 100H; HALT(67) END
+		ELSE err := Kernel.Reg.AX MOD 100H; HALT(53) END
+	ELSE HALT(51) END
+END SetID;
+
+PROCEDURE Delete*(name: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN i := 0;
+	Kernel.Reg.AX := 4100H;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	REPEAT Kernel.Transfer[i] := name[i]; INC(i) UNTIL name[i] = 0X; Kernel.Transfer[i] := 0X; 
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END Delete;
+
+PROCEDURE Rename*(old, new: ARRAY OF CHAR);
+VAR i, k: INTEGER;
+BEGIN i := 0;
+	Delete(new);
+	Kernel.Reg.AX := 5600H;
+(*	Kernel.Reg.CX := 3EH;*)
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.Reg.ES := Kernel.ES;
+	REPEAT Kernel.Transfer[i] := old[i]; INC(i) UNTIL old[i] = 0X; Kernel.Transfer[i] := 0X;
+	Kernel.Reg.DI := Kernel.DX + i+2; k := i+2;
+	Kernel.Reg.BX := Kernel.Reg.DI;		(* One book says BX, the other DI !!??*)
+	i := 0;
+	REPEAT Kernel.Transfer[k] := new[i]; INC(i); INC(k) UNTIL new[i] = 0X; Kernel.Transfer[k] := 0X;
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END Rename;
+
+PROCEDURE GetFirstFile*(VAR name: ARRAY OF CHAR);
+VAR i: INTEGER; 
+BEGIN
+(*	IF (name[1] = ":") & (CAP(name[0]) # CAP(DRV[0])) THEN Done := FALSE; RETURN END;*)
+	i := 0; WHILE name[i] # 0X DO Kernel.Transfer[i] := name[i]; INC(i) END; Kernel.Transfer[i] := 0X;
+	Kernel.Reg.AX := 4E00H;
+	Kernel.Reg.CX := 1H;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	IF Done THEN SYSTEM.MOVE(SYSTEM.ADR(Kernel.Transfer[0])+2078, SYSTEM.ADR(name[0]), 13) END;
+END GetFirstFile;
+
+PROCEDURE GetNextFile*(VAR name: ARRAY OF CHAR; VAR end: BOOLEAN);
+VAR i: INTEGER;  
+BEGIN
+	Kernel.Reg.AX := 4F00H;
+	Kernel.INT(Kernel.Reg, 21H);
+	end := SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	SYSTEM.MOVE(SYSTEM.ADR(Kernel.Transfer[0])+2078, SYSTEM.ADR(name[0]), 13);
+END GetNextFile;
+
+PROCEDURE DirOpt*(dos: ARRAY OF CHAR; VAR time, date, size: LONGINT);
+VAR handle: LONGINT; tg : ARRAY 4 OF CHAR;
+BEGIN
+	Open(dos, FALSE, handle, ReadWriteDenyAll);
+	IF handle # -1 THEN GetTag(tg,handle);
+		GetDateTime(date, time, handle); Length(size, handle); Close(handle) ;
+		IF tg = tag THEN DEC(size,34) END
+	END;
+END DirOpt;
+
+PROCEDURE SetFileCount*(no: INTEGER);
+BEGIN
+	Kernel.Reg.AX := 6700H;
+	Kernel.Reg.BX := no;
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END SetFileCount;
+
+PROCEDURE Co(): BOOLEAN;
+BEGIN
+	Kernel.INT(Kernel.Reg, 11H);
+	RETURN (Kernel.Reg.AX DIV 2 MOD 2) = 1
+END Co;
+
+PROCEDURE ChangeDir*(name: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN
+	i := 0;
+	REPEAT Kernel.Transfer[i] := name[i]; INC(i) UNTIL name[i] = 0X; Kernel.Transfer[i] := 0X;
+	Kernel.Reg.AX := 3B00H;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END ChangeDir;
+
+PROCEDURE MakeDir*(name: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN
+	i := 0;
+	REPEAT Kernel.Transfer[i] := name[i]; INC(i) UNTIL name[i] = 0X; Kernel.Transfer[i] := 0X;
+	Kernel.Reg.AX := 3900H;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END MakeDir;
+
+PROCEDURE RemoveDir*(name: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN
+	i := 0;
+	REPEAT Kernel.Transfer[i] := name[i]; INC(i) UNTIL name[i] = 0X; Kernel.Transfer[i] := 0X;
+	Kernel.Reg.AX := 3A00H;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END RemoveDir;
+
+PROCEDURE GetDir*(drv: ARRAY OF CHAR; VAR name: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN
+	Kernel.Reg.AX := 4700H;
+	Kernel.Reg.DX := SHORT(ORD(CAP(drv[0]))-40H);
+	Kernel.Reg.SI := Kernel.DX;		(* HACK!!! Should be SI. Patched in Macro.asm *)
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.INT(Kernel.Reg, 21H);
+	i := 0;
+	REPEAT name[i] := Kernel.Transfer[i]; INC(i) UNTIL Kernel.Transfer[i] = 0X; name[i] := 0X;
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+END GetDir;
+
+PROCEDURE GetDrive*(VAR drv: ARRAY OF CHAR);
+BEGIN
+	Kernel.Reg.AX := 1900H;
+	Kernel.INT(Kernel.Reg, 21H);
+	drv[0] := CHR(Kernel.Reg.AX + ORD("A"))
+END GetDrive;
+
+PROCEDURE SetDrive*(drv: CHAR);
+BEGIN
+	Kernel.Reg.AX := 0E00H;
+	Kernel.Reg.DX := ORD(drv) - ORD("A");
+	Kernel.INT(Kernel.Reg, 21H);
+END SetDrive;
+
+PROCEDURE StartDOSDir*(VAR name: ARRAY OF CHAR);
+VAR i: INTEGER; 
+BEGIN
+(*	IF (CAP(name[0]) # CAP(DRV[0])) & (name[1] = ":") THEN Done := FALSE; RETURN END;
+*)	i := 0; WHILE name[i] # 0X DO Kernel.Transfer[i] := name[i]; INC(i) END; Kernel.Transfer[i] := 0X;
+	Kernel.Reg.AX := 4E00H;
+	Kernel.Reg.CX := 17H;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.INT(Kernel.Reg, 21H);
+	Done := ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0);
+	IF Done THEN SYSTEM.MOVE(SYSTEM.ADR(Kernel.Transfer[0])+2078, SYSTEM.ADR(name[0]), 13) END;
+END StartDOSDir;
+
+PROCEDURE GetFileAttr*(VAR path, name: ARRAY OF CHAR; VAR attr: INTEGER);
+VAR i, j: INTEGER;
+BEGIN
+	i := 0; WHILE path[i] # 0X DO Kernel.Transfer[i] := path[i]; INC(i) END; 
+	j := 0; WHILE name[j] # 0X DO Kernel.Transfer[i] := name[j]; INC(i); INC(j) END; Kernel.Transfer[i] := 0X;
+	Kernel.Reg.AX := 4300H;
+	Kernel.Reg.DX := Kernel.DX;
+	Kernel.Reg.DS := Kernel.DS;
+	Kernel.INT(Kernel.Reg, 21H);
+	attr := Kernel.Reg.CX;
+END GetFileAttr;
+
+PROCEDURE GetDTA;
+BEGIN
+	Kernel.Reg.AX := 2F00H;
+	Kernel.INT(Kernel.Reg, 21H);
+	DTAaddr := Kernel.Reg.ES*16 + Kernel.Reg.BX+ 30;
+END GetDTA;
+
+BEGIN GetDTA; GetDrive(DRV);
+	Kernel.nofiles := 0; tag := "oB"; Drive := 0; DispHeight := 479; DispWidth := 640; 
+	CoAvail := Co(); FirstTerm := NIL; last := 0; NewLine := TRUE; MaxDosLineCurr := 24
+END DOS.

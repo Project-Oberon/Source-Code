@@ -1,0 +1,777 @@
+MODULE Browser;		(* J.Templ 16.8.89 / 24.11.89 *)
+
+(* ARD, 25.05.93,  typebound procedures *)
+(* ARD, 22.04.94,  same order as defined in module *)
+
+IMPORT
+	Files, Texts, MenuViewers, TextFrames, Oberon, SYSTEM;
+
+CONST
+	IdBufLeng = 12000;
+	IdBufLim = IdBufLeng - 100;
+	maxImps = 30; SFtag = 0FAX; firstStr = 16;
+	
+	(*object modes*)
+			Var   =  1; VarX  =  2; Ind   =  3; IndX  =  4; RegI  =  5;
+			RegX  =  6; Abs   =  7; Con   =  8; Stk   =  9; Coc   = 10;
+			Reg   = 11; Fld   = 12; Typ   = 13; LProc = 14; XProc = 15;
+			SProc = 16; CProc = 17; IProc = 18; Mod   = 19; Head  = 20;
+			Method = 22; Message = 23; InvisibleTyp = 24;
+
+	(*Structure forms*)
+			Undef = 0; Byte = 1; Bool = 2; Char = 3; SInt = 4; Int = 5; LInt = 6;
+			Real = 7; LReal = 8; Set = 9; String = 10; NilTyp = 11; NoTyp = 12;
+			Pointer = 13; ProcTyp = 14; Array = 15; DynArr = 16; Record = 17;
+			Class = 18; Msg =19; TbTyp = 20; 
+
+TYPE	
+		Object = POINTER TO ObjDesc;
+		Struct = POINTER TO StrDesc;
+
+		ObjDesc = RECORD
+								left, right, link: Object;
+								typ:  Struct;
+								name: INTEGER;
+								mode: SHORTINT;
+								marked: BOOLEAN;
+								a0, a1:  LONGINT;	(* a0 gives org in module list *)
+								next: Object; 		(* next module *)
+							END;
+
+		StrDesc = RECORD
+								form, n, mno, ref, level: INTEGER;
+								size, adr: LONGINT;	(* adr gives org in class hierarchie *)
+								BaseTyp: Struct;
+								link, strobj: Object;
+								sub, next: Struct			(* list of sub classes, brother class *)
+							END;
+							
+VAR	
+	W: Texts.Writer;
+	
+	id: INTEGER;
+	err: BOOLEAN;
+
+	universe, topScope: Object;
+	undftyp, bytetyp, booltyp, chartyp, sinttyp, inttyp, linttyp,
+	realtyp, lrltyp, settyp, stringtyp, niltyp, notyp: Struct;
+
+	nofGmod: INTEGER;   (*nof imports*)
+
+	option: CHAR;
+	first, showObj: BOOLEAN;
+	GlbMod: ARRAY maxImps OF Object;
+	IdBuf: ARRAY IdBufLeng OF CHAR;
+	classes: Struct;
+
+	symFileExt: ARRAY 8 OF CHAR;
+
+	(*needed for detecting import of SYSTEM *)
+	syspos: LONGINT;
+	impSystem: BOOLEAN;	(* insert "SYSTEM, " at imppos or "	IMPORT SYSTEM; cr cr" at -imppos *)
+	noorder: BOOLEAN;
+
+
+	PROCEDURE Ws(s: ARRAY OF CHAR); BEGIN Texts.WriteString(W, s) END Ws;
+	PROCEDURE Wch(ch: CHAR); BEGIN Texts.Write(W, ch) END Wch;
+	PROCEDURE Wln; BEGIN Texts.WriteLn(W) END Wln;
+
+	PROCEDURE WriteName(obj: Object);	
+	VAR name: ARRAY 32 OF CHAR; i, n: INTEGER;
+	BEGIN n := obj^.name;
+		i := -1; REPEAT INC(i); name[i] := IdBuf[n + i] UNTIL name[i] =0X;
+		Ws(name)
+	END WriteName;
+
+	PROCEDURE WAdr(obj: Object);	
+	BEGIN IF option = "X" THEN Texts.WriteInt(W, obj^.a0, 0); Wch(" ") END
+	END WAdr;
+
+	PROCEDURE Indent(i: INTEGER);	
+	BEGIN WHILE i > 0 DO Wch(9X); DEC(i) END
+	END Indent;
+
+	PROCEDURE WriteClasses(cl: Struct; i: INTEGER);	(* classes plus records *)
+	BEGIN
+		WHILE cl # NIL DO
+			Indent(i);
+			WriteName(GlbMod[cl.mno]); Wch("."); WriteName(cl.strobj); 
+			Wln; WriteClasses(cl^.sub, i + 1);
+			cl := cl^.next
+		END
+	END WriteClasses;
+
+	PROCEDURE WriteModules(m: Object);	
+	BEGIN
+		WHILE m # NIL DO
+			m^.a0 := W.buf.len;
+			WriteName(m); Wln;
+			m := m^.next
+		END
+	END WriteModules;
+
+	PROCEDURE^ WriteType(typ: Struct; i: INTEGER);
+
+	PROCEDURE WriteBase(typ: Struct);	
+	BEGIN
+		IF typ^.BaseTyp # NIL THEN
+			Ws(" ("); WriteType(typ^.BaseTyp, 0);
+			IF option = "x" THEN WriteBase(typ^.BaseTyp) END;
+			Wch(")")
+		END;
+	END WriteBase;
+
+	PROCEDURE WriteFields(VAR obj: Object; i: INTEGER);	
+	BEGIN
+		WAdr(obj); WriteName(obj);
+		WHILE (obj^.link # NIL) & (obj^.link^.mode = obj^.mode) & (obj^.link^.typ = obj^.typ) DO
+			obj := obj^.link; Ws(", "); WAdr(obj); WriteName(obj)
+		END;
+		Ws(": "); WriteType(obj^.typ, i + 1);
+		obj := obj^.link
+	END WriteFields;
+
+	PROCEDURE WriteFieldList(obj: Object; i: INTEGER);	
+	BEGIN
+		WHILE (obj # NIL) & (obj^.mode = Fld) DO
+			Indent(i); WriteFields(obj, i); Wch(";"); Wln
+		END
+	END WriteFieldList;
+
+	PROCEDURE WriteInstVars(cl: Struct; i: INTEGER);	
+	BEGIN
+		IF cl # NIL THEN
+			IF option = "x" THEN WriteInstVars(cl^.BaseTyp, i) END;
+			WriteFieldList(cl^.link, i);
+			IF (option = "x") & (cl^.form = Class) THEN Wln END
+		END
+	END WriteInstVars;
+
+	PROCEDURE WriteForm(typ: Struct; i: INTEGER);	
+	VAR param: Object;
+	BEGIN
+		IF typ^.form = Record THEN
+			Ws("RECORD"); WriteBase(typ);
+			IF (typ^.link # NIL) OR (option = "x") THEN Wln; WriteInstVars(typ, i); Indent(i-1) ELSE Wch(" ") END;
+			Ws("END ")
+		ELSIF typ^.form = TbTyp THEN
+			Ws(" Typebound PROCEDURE (");
+			param := typ^.link;
+			WHILE param # NIL DO
+				IF param.mode = Ind THEN Ws("VAR ") END;
+				IF param.name = 0 THEN
+					WriteType(param.typ, 0);
+					param := param.link;
+					IF param # NIL THEN Ws(", ") END
+				ELSE
+					WriteFields(param, 0);
+					IF param # NIL THEN Ws("; ") END
+				END
+			END;
+			Wch(")");
+			IF typ^.BaseTyp # notyp THEN Ws(": "); WriteType(typ^.BaseTyp, i) END
+		ELSIF typ^.form = Array THEN Ws("ARRAY "); Texts.WriteInt(W, typ^.n, 0); Ws(" OF "); WriteType(typ^.BaseTyp, i)
+		ELSIF typ^.form = DynArr THEN Ws("ARRAY OF "); WriteType(typ^.BaseTyp, i)
+		ELSIF typ^.form = Pointer THEN Ws("POINTER TO "); WriteType(typ^.BaseTyp, i)
+		ELSIF typ^.form = ProcTyp THEN
+			Ws("PROCEDURE (");
+			param := typ^.link;
+			WHILE param # NIL DO
+				IF param.mode = Ind THEN Ws("VAR ") END;
+				IF param.name = 0 THEN
+					WriteType(param.typ, 0);
+					param := param.link;
+					IF param # NIL THEN Ws(", ") END
+				ELSE
+					WriteFields(param, 0);
+					IF param # NIL THEN Ws("; ") END
+				END
+			END;
+			Wch(")");
+			IF typ^.BaseTyp # notyp THEN Ws(": "); WriteType(typ^.BaseTyp, i) END
+		END
+	END WriteForm;
+
+	PROCEDURE WriteType(typ: Struct; i: INTEGER);	
+	BEGIN
+		IF typ^.strobj # NIL THEN
+			IF typ = bytetyp THEN impSystem := TRUE END;
+			IF (typ^.mno > 1) OR ((typ^.mno = 1) & showObj) THEN WriteName(GlbMod[typ^.mno]); Wch(".") END;
+			WriteName(typ^.strobj)
+		ELSE WriteForm(typ, i) END
+	END WriteType;
+
+	PROCEDURE WriteProc(obj: Object);
+	VAR param: Object;
+	BEGIN
+		IF (option ="X") & (obj^.mode # CProc) THEN Texts.WriteInt(W, obj^.a0, 2); Indent(1) END;
+		Ws("PROCEDURE "); IF obj^.mode = CProc THEN Wch("-") END; WriteName(obj);
+		param := obj^.link;
+		IF (param # NIL) OR (obj^.typ # notyp) THEN
+			Ws(" (");
+			WHILE param # NIL DO
+				IF param.mode = Ind THEN Ws("VAR ") END;
+				WriteFields(param, 0);
+				IF param # NIL THEN Ws("; ") END
+			END;
+			Wch(")")
+		END;
+		IF obj^.typ # notyp THEN Ws(": "); WriteType(obj^.typ, 0) END;
+		IF obj^.mode = CProc THEN Wch(" "); Texts.WriteInt(W, obj^.a0, 0) END;
+		Wch(";")
+	END WriteProc;
+	
+	PROCEDURE ^WriteScope(obj: Object; mode: INTEGER);	
+
+	PROCEDURE WriteMethods(cl: Struct);	
+	BEGIN
+		IF cl # NIL THEN
+			IF option = "x" THEN WriteMethods(cl^.BaseTyp) END;
+			first := TRUE; WriteScope(cl^.link, Method);
+			IF ~ first & (option = "x") THEN Wln END
+		END
+	END WriteMethods;
+
+	PROCEDURE WriteClass(cl: Struct);	
+	BEGIN
+		Indent(1); Ws("CLASS ");
+		WriteName(cl^.strobj); WriteBase(cl); Wch(";"); Wln;
+		WriteInstVars(cl, 2); WriteMethods(cl);
+		Indent(1); Ws("END "); WriteName(cl^.strobj); Wch(";"); Wln
+	END WriteClass;
+
+	PROCEDURE WriteVal(obj: Object);	
+	VAR i: INTEGER; lr: LONGREAL; s: SET; ch: CHAR;
+	BEGIN
+		CASE obj.typ^.form OF
+			SInt, Int, LInt:	Texts.WriteInt(W, obj^.a0, 0) |
+			Real: Texts.WriteReal(W, SYSTEM.VAL(REAL, obj^.a0), 16) |
+			LReal: SYSTEM.MOVE(SYSTEM.ADR(obj^.a0), SYSTEM.ADR(lr), 8); Texts.WriteLongReal(W, lr, 23) |
+			Bool: IF obj^.a0 = 0 THEN Ws("FALSE") ELSE Ws("TRUE") END |
+			Char: IF (obj^.a0 >= 32) & (obj^.a0 <= 126) THEN 
+							Wch(22X); Wch(CHR(obj^.a0)); Wch(22X)
+						ELSE
+							i := SHORT(obj^.a0 DIV 16);
+							IF i > 9 THEN Wch(CHR(55 + i)) ELSE Wch(CHR(48 + i)) END;
+							i := SHORT(obj^.a0 MOD 16);
+							IF i > 9 THEN Wch(CHR(55 + i)) ELSE Wch(CHR(48 + i)) END;
+							Wch("X")
+						END |
+			Set: Wch("{"); i := 0; s := SYSTEM.VAL(SET, obj^.a0);
+						WHILE i <= MAX(SET) DO
+							IF i IN s THEN Texts.WriteInt(W, i, 0); EXCL(s, i);
+								IF s # {} THEN Ws(", ") END
+							END;
+							INC(i)
+						END;
+						Wch("}") |
+			NilTyp: Ws("NIL") |
+			String: i := SHORT(obj^.a0); ch := IdBuf[i]; Wch(22X);
+						WHILE ch # 0X DO Wch(ch); INC(i); ch := IdBuf[i] END;
+						Wch(22X)
+		END
+	END WriteVal;
+
+	PROCEDURE WriteObject(obj: Object; mode: INTEGER);
+	BEGIN
+		IF obj.mode = mode THEN
+			IF mode = Con THEN
+				IF first THEN Indent(1); Ws("CONST"); Wln; first := FALSE END;
+				Indent(2); WriteName(obj); Ws(" = "); WriteVal(obj); Wch(";");
+				Wln
+			ELSIF mode = Var THEN
+				IF first THEN Indent(1); Ws("VAR"); Wln; first := FALSE END;
+				Indent(2); WAdr(obj); WriteName(obj); Ws(": "); WriteType(obj^.typ, 3); Wch(";");
+				Wln
+			ELSIF (mode = Typ) & (obj^.marked) & ((obj^.typ^.form # Pointer) OR (obj^.typ^.BaseTyp^.form # Class)) THEN
+				IF first THEN Indent(1); Ws("TYPE"); Wln; first := FALSE END;
+				Indent(2); WriteName(obj); Ws(" = ");
+				IF obj^.typ^.strobj # obj THEN WriteType(obj^.typ, 0)	(* alias type *)
+				ELSE WriteForm(obj^.typ, 3)
+				END;
+				Wch(";"); Wln;
+				IF showObj & (obj^.typ^.form = Pointer) & (obj^.typ^.BaseTyp^.strobj # NIL) THEN
+					WriteObject(obj^.typ^.BaseTyp^.strobj, obj^.typ^.BaseTyp^.strobj.mode)
+				END
+			ELSIF mode IN {XProc, CProc} THEN first := FALSE; Indent(1); WriteProc(obj); Wln
+			ELSIF mode = Method THEN first := FALSE; Indent(2); WriteProc(obj); Wln
+			ELSIF mode = Mod THEN
+				IF first THEN Indent(1); Ws("IMPORT "); first := FALSE; syspos := W.buf.len ELSE Ws(", ") END;
+				WriteName(obj);
+				IF option = "X" THEN Texts.WriteHex(W, obj^.a1) END
+			END
+		ELSIF (obj.mode = Typ) & (mode = -1) & (obj^.typ^.form = Pointer) & (obj^.typ^.BaseTyp^.form = Class) THEN
+			WriteClass(obj^.typ^.BaseTyp); Wln
+		END
+	END WriteObject;
+	
+	PROCEDURE WriteScope(obj: Object; mode: INTEGER);
+	BEGIN
+		IF obj # NIL THEN
+			WriteScope(obj^.left, mode);
+			WriteObject(obj, mode);
+			WriteScope(obj^.right, mode)
+		END
+	END WriteScope;
+
+	PROCEDURE WriteModule(mod: Object);	
+	BEGIN
+		Ws("DEFINITION "); WriteName(mod);
+		IF option = "X" THEN Texts.WriteHex(W, mod^.a1) END;
+		Wch(";"); Wln; Wln;
+		syspos := - W.buf.len; impSystem := FALSE;
+		first := TRUE; WriteScope(mod^.link, Mod); IF ~first THEN Wch(";"); Wln; Wln END;
+		first := TRUE; WriteScope(mod^.link, Con); IF ~first THEN Wln END;
+		first := TRUE; WriteScope(mod^.link, Typ); IF ~first THEN Wln END;
+		first := TRUE; WriteScope(mod^.link, Var); IF ~first THEN Wln END;
+		WriteScope(mod^.link, -1); (* classes *)
+		first := TRUE; WriteScope(mod^.link, CProc); IF ~first THEN Wln END;
+		first := TRUE; WriteScope(mod^.link, XProc); IF ~first THEN Wln END;
+		Ws("END "); WriteName(mod); Wch("."); Wln
+	END WriteModule;
+
+
+	PROCEDURE Diff(i, j: INTEGER): INTEGER;
+	VAR d: INTEGER; ch: CHAR;
+	BEGIN IF noorder THEN RETURN 1 END;
+		REPEAT ch := IdBuf[i]; d := ORD(ch) - ORD(IdBuf[j]); INC(i); INC(j)
+		UNTIL (d # 0) OR (ch = 0X);
+		RETURN d
+	END Diff;
+	
+	PROCEDURE Index(name: ARRAY OF CHAR): INTEGER;	
+	VAR id0, j: INTEGER; ch: CHAR; (*enter identifier*)
+	BEGIN
+		id0 := id; j := 0;
+		IF id < IdBufLim THEN
+			REPEAT ch := name[j]; IdBuf[id] := ch; INC(id); INC(j)
+			UNTIL ch = 0X
+		ELSE err := TRUE END;
+		RETURN id0
+	END Index;
+	
+	PROCEDURE Insert(name: INTEGER; VAR obj: Object);	
+		VAR d: INTEGER; ob0, ob1: Object;
+	BEGIN
+		ob0 := topScope; ob1 := ob0^.right; d := 1;
+		LOOP
+			IF ob1 # NIL THEN
+				d := Diff(name, ob1^.name);
+				IF d < 0 THEN ob0 := ob1; ob1 := ob0^.left
+				ELSIF d > 0 THEN ob0 := ob1; ob1 := ob0^.right
+				ELSE ob1 := NIL (* already defined, cause duplication *)
+				END
+			ELSE (*insert*) NEW(ob1);
+				IF d < 0 THEN ob0^.left := ob1 ELSE ob0^.right := ob1 END;
+				ob1^.left := NIL; ob1^.right := NIL; ob1^.name := name;
+				ob1^.marked := FALSE; EXIT
+			END
+		END;
+		obj := ob1
+	END Insert;
+	
+	PROCEDURE InsertSubClass(base, sub: Struct);	
+	VAR prev: Struct;
+		
+		PROCEDURE Less(cl1, cl2: Struct): BOOLEAN;	(* return cl1 < cl2 *)
+		VAR i: INTEGER;
+		BEGIN
+			i := Diff(GlbMod[cl1^.mno]^.name, GlbMod[cl2^.mno]^.name);
+			IF i < 0 THEN RETURN TRUE
+			ELSIF i = 0 THEN RETURN Diff(cl1^.strobj^.name, cl2^.strobj^.name) < 0
+			ELSE RETURN FALSE END
+		END Less;
+		
+	BEGIN
+		prev := base^.sub;
+		IF (prev = NIL) OR Less(sub, prev) THEN sub^.next := base^.sub; base^.sub := sub
+		ELSE
+			WHILE (prev^.next # NIL) & Less(prev^.next, sub) DO prev := prev^.next END;
+			sub^.next := prev^.next; prev^.next := sub
+		END
+	END InsertSubClass;
+	
+	PROCEDURE InsertImport(obj, root: Object; VAR old: Object);	
+	VAR ob0, ob1: Object; d: INTEGER;
+	BEGIN ob0 := root; ob1 := ob0^.right; d := 1;
+		LOOP
+			IF ob1 # NIL THEN
+				d := Diff(obj^.name, ob1^.name);
+				IF d < 0 THEN ob0 := ob1; ob1 := ob1^.left
+				ELSIF d > 0 THEN ob0 := ob1; ob1 := ob1^.right
+				ELSE old := ob1; EXIT
+				END
+			ELSE ob1 := obj;
+				IF d < 0 THEN ob0^.left := ob1 ELSE ob0^.right := ob1 END;
+				ob1^.left := NIL; ob1^.right := NIL; old := NIL; EXIT
+			END
+		END
+	END InsertImport;
+
+	PROCEDURE Append(VAR d: ARRAY OF CHAR; s: ARRAY OF CHAR);
+	VAR i, j: INTEGER; ch: CHAR;
+	BEGIN
+		i := 0; WHILE d[i] # 0X DO INC(i) END;
+		j := 0; REPEAT ch := s[j]; d[i] := ch; INC(i); INC(j) UNTIL ch = 0X
+	END Append;
+
+	PROCEDURE ReadSym(name: ARRAY OF CHAR; VAR obj: Object);	
+	VAR i, j, m, s, class: INTEGER; k: LONGINT;
+			nofLmod, strno, parlev, fldlev: INTEGER;
+			old, mod, clBody: Object;
+			typ, oldclass: Struct;
+			ch, ch1, ch2: CHAR;
+			si: SHORTINT;
+			xval: REAL; yval: LONGREAL;
+			LocMod:  ARRAY 20 OF Object;
+			struct:  ARRAY 127 OF Struct;
+			param, lastpar, fldlist, lastfld: ARRAY 6 OF Object;
+			FileName: ARRAY 32 OF CHAR;
+			SymFile: Files.File;
+			SF: Files.Rider;
+				
+		PROCEDURE ReadInt(VAR i: INTEGER); BEGIN Files.ReadBytes(SF, i, 2) END ReadInt;
+		PROCEDURE ReadXInt(VAR k: LONGINT); VAR i: INTEGER; BEGIN Files.ReadBytes(SF, i, 2); k := i END ReadXInt;
+		PROCEDURE ReadLInt(VAR k: LONGINT); BEGIN Files.ReadBytes(SF, k, 4) END ReadLInt;
+	
+		PROCEDURE ReadId;	
+		VAR i: INTEGER; ch: CHAR;
+		BEGIN i := id;
+			REPEAT Files.Read(SF, ch); IdBuf[i] := ch; INC(i) UNTIL ch = 0X;
+			id := i
+		END ReadId;
+	
+		PROCEDURE Err(s: ARRAY OF CHAR);	
+		BEGIN
+			Ws(name); Ws(" -- "); Ws(s);
+			Wln; Texts.Append(Oberon.Log, W.buf)
+		END Err;
+	
+		PROCEDURE reverseList(p: Object);	
+		VAR q, r: Object;
+		BEGIN q := NIL;
+			WHILE p # NIL DO r := p^.link; p^.link := q; q := p; p := r END
+		END reverseList;
+
+	BEGIN	(* ReadSym *)
+		err := TRUE;
+		nofLmod := 0; strno := firstStr;
+		parlev := 0; fldlev := 0;
+		clBody := NIL;
+		COPY(name, FileName); Append(FileName, symFileExt);
+		SymFile := Files.Old(FileName);
+		IF SymFile # NIL THEN
+			Files.Set(SF, SymFile, 0); Files.Read(SF, ch);
+			IF ch = SFtag THEN
+				struct[Undef] := undftyp; struct[Byte] := bytetyp;
+				struct[Bool] := booltyp;  struct[Char] := chartyp;
+				struct[SInt] := sinttyp;  struct[Int] := inttyp;
+				struct[LInt] := linttyp;  struct[Real] := realtyp;
+				struct[LReal] := lrltyp;  struct[Set] := settyp;
+				struct[String] := stringtyp; struct[NilTyp] := niltyp;
+				struct[NoTyp] := notyp; 
+				LOOP (*read next item from symbol file*)
+					Files.Read(SF, ch); class := ORD(ch);
+					IF SF.eof THEN EXIT END;
+					IF class < 8 THEN (*object*)
+						NEW(obj); m := 0;
+						Files.Read(SF, ch); s := ORD(ch); obj^.typ := struct[s];
+						CASE class OF
+							1: obj^.mode := Con;
+										CASE obj^.typ^.form OF
+											2,4: Files.Read(SF, si); obj^.a0 := si
+										| 1,3: Files.Read(SF, ch); obj^.a0 := ORD(ch)
+										| 5: ReadXInt(obj^.a0)
+										| 6,7,9: ReadLInt(obj^.a0)
+										| 8: ReadLInt(obj^.a0); ReadLInt(obj^.a1)
+										| 10: obj^.a0 := id; ReadId
+										| 11: (*NIL*)
+										END
+							|2,3: obj^.mode := Typ; Files.Read(SF, ch); m := ORD(ch);
+										IF obj^.typ^.strobj = NIL THEN obj^.typ^.strobj := obj END;
+										obj^.marked := class = 2
+							|4: obj^.mode := Var; ReadLInt(obj^.a0)
+							|5,6,7: IF class = 5 THEN obj^.mode := XProc; Files.Read(SF, ch);
+											IF fldlev # 0 THEN obj^.mode := Method END
+										ELSIF class = 6 THEN obj^.mode := IProc; Files.Read(SF, ch)
+										ELSE obj^.mode := CProc; Files.Read(SF, ch1); i := 1;
+											IF ORD(ch1) # 2 THEN RETURN
+											ELSE Files.Read(SF, ch2);
+												IF ORD(ch2) # 226 THEN RETURN END;
+												Files.Read(SF, ch); i := 3;
+											END;
+											WHILE i <= ORD(ch1) DO Files.Read(SF, ch2); INC(i) END;
+										END;
+										obj^.a0 := ORD(ch); obj^.a1 := 0;  (*link adr*)
+										reverseList(lastpar[parlev]);
+										obj^.link := param[parlev]^.right; DEC(parlev)
+						END;
+						obj^.name := id; ReadId;
+						IF (class = 5) & (fldlev > 0) THEN InsertImport(obj, fldlist[fldlev], old)
+						ELSE
+							IF IdBuf[obj^.name] # 0X THEN
+								InsertImport(obj, LocMod[m], old);
+								IF (old # NIL) & (obj^.mode = Typ) THEN struct[s] := old^.typ
+								ELSIF (obj^.mode = Typ) & (obj^.typ^.form = Record) THEN 
+									IF typ^.BaseTyp = NIL THEN InsertSubClass(classes, typ)
+									ELSE InsertSubClass(typ^.BaseTyp, typ)
+									END
+								END
+							ELSE clBody := obj END
+						END
+					ELSIF (class < 13) OR (class = 23) OR (class = 25) THEN (*structure*)
+						NEW(typ); typ^.strobj := NIL; typ^.ref := 0;
+						Files.Read(SF, ch); typ^.BaseTyp := struct[ORD(ch)];
+						Files.Read(SF, ch); typ^.mno := SHORT(LocMod[ORD(ch)]^.a0);
+						CASE class OF
+							 8: typ^.form := Pointer; typ^.size := 4; typ^.n := 0
+						|  9: typ^.form := ProcTyp; typ^.size := 4; 
+									reverseList(lastpar[parlev]);
+									typ^.link := param[parlev]^.right; DEC(parlev)
+						| 10: typ^.form := Array; ReadLInt(typ^.size);
+									ReadXInt(typ^.adr); ReadLInt(k); typ^.n := SHORT(k)
+						| 11: typ^.form := DynArr; ReadLInt(typ^.size); ReadXInt(typ^.adr)
+						| 12, 23: ReadLInt(typ^.size);
+									reverseList(lastfld[fldlev]);
+									typ^.link := fldlist[fldlev]^.right; DEC(fldlev);
+									typ^.level := typ^.BaseTyp^.level;
+									IF typ^.BaseTyp = notyp THEN typ^.BaseTyp := NIL END;
+									ReadXInt(typ^.adr);  (*of descriptor*)
+									IF class = 23 THEN
+										typ^.form := Class; ReadInt(typ^.n);  (* no of methods *)
+										typ^.strobj := clBody; clBody := NIL;
+										Files.Read(SF, ch); oldclass := struct[ORD(ch)]^.BaseTyp;
+										IF oldclass^.form # Undef THEN typ := oldclass END;
+										typ^.strobj := struct[ORD(ch)]^.strobj;
+										IF typ # oldclass THEN
+											IF typ^.BaseTyp = NIL THEN InsertSubClass(classes, typ)
+											ELSE InsertSubClass(typ^.BaseTyp, typ)
+											END
+										END
+									ELSE typ^.form := Record; typ^.n := 0;
+									END
+						| 25: ReadLInt(typ^.size);
+								reverseList(lastpar[parlev]); 
+								typ^.link := param[parlev]^.right; DEC(parlev);
+								typ^.level := typ^.BaseTyp^.level;
+								ReadXInt(typ^.adr);  (*of descriptor*)
+								typ^.form := TbTyp; 
+								typ^.n := 0;
+						END;
+						struct[strno] := typ; INC(strno)
+					ELSIF class = 13 THEN (*parameter list start*)
+						NEW(obj); obj^.mode := Head; obj^.right := NIL;
+						IF parlev < 6 THEN INC(parlev); param[parlev] := obj; lastpar[parlev] := NIL
+						ELSE RETURN END
+					ELSIF class < 16 THEN (*parameter*)
+						NEW(obj);
+						IF class = 14 THEN obj^.mode := Var ELSE obj^.mode := Ind END;
+						Files.Read(SF, ch); obj^.typ := struct[ORD(ch)];
+						ReadXInt(obj^.a0); obj^.name := id; ReadId;
+						InsertImport(obj, param[parlev], old);
+						obj^.link := lastpar[parlev]; lastpar[parlev] := obj
+					ELSIF class = 16 THEN (*start field list*)
+						NEW(obj); obj^.mode := Head; obj^.right := NIL;
+						IF fldlev < 5 THEN INC(fldlev); fldlist[fldlev] := obj; lastfld[fldlev] := NIL
+						ELSE RETURN END
+					ELSIF class = 17 THEN (*field*)
+						NEW(obj); obj^.mode := Fld; Files.Read(SF, ch);
+						obj^.typ := struct[ORD(ch)]; ReadLInt(obj^.a0);
+						obj^.name := id; ReadId;
+						obj^.link := lastfld[fldlev]; lastfld[fldlev] := obj;
+						InsertImport(obj, fldlist[fldlev], old)
+					ELSIF class = 18 THEN (*skip hidden pointer field*) ReadLInt(k)
+					ELSIF class = 19 THEN (*hidden procedure field*) ReadLInt(k)
+					ELSIF class = 20 THEN (*fixup pointer typ*)
+						Files.Read(SF, ch); typ := struct[ORD(ch)];
+						Files.Read(SF, ch1);
+						IF typ^.BaseTyp = undftyp THEN typ^.BaseTyp := struct[ORD(ch1)] END
+					ELSIF class = 21 THEN (*skip sysflag*) Files.Read(SF, ch); ReadInt(i)
+					ELSIF class = 22 THEN (*module anchor*)
+						ReadLInt(k); m := id; ReadId; i := 0;
+						WHILE (i < nofGmod) & (Diff(m, GlbMod[i]^.name) # 0) DO INC(i) END;
+						IF i < nofGmod THEN (*module already present*)
+							IF k # GlbMod[i]^.a1 THEN Err("invalid module key"); RETURN END;
+							obj := GlbMod[i]
+						ELSE NEW(obj);
+							obj^.mode := Head; obj^.name := m;
+							obj^.a1 := k; obj^.a0 := nofGmod; obj^.right := NIL;
+							IF nofGmod < maxImps THEN GlbMod[nofGmod] := obj; INC(nofGmod)
+							ELSE RETURN END
+						END;
+						IF nofLmod < 20 THEN LocMod[nofLmod] := obj; INC(nofLmod)
+						ELSE Err("too many imports"); RETURN END;
+						IF nofLmod > 1 THEN NEW(mod); mod^.name := obj^.name; mod^.mode := Mod; mod^.a1 := k;
+							InsertImport(mod, LocMod[0], old)
+						END
+					ELSIF class = 22 THEN (*fixup pointer typ*)
+						Files.Read(SF, ch); typ := struct[ORD(ch)];
+						Files.Read(SF, ch1);
+						IF typ^.BaseTyp = undftyp THEN typ^.BaseTyp := struct[ORD(ch1)] END
+					ELSE (*error*) END
+				END (*LOOP*) ;
+				Insert(Index(name), obj);
+				obj^.mode := Mod; obj^.link := LocMod[0]^.right;
+				obj^.a0  := LocMod[0]^.a0; obj^.a1  := LocMod[0]^.a1; obj^.typ := notyp;
+			ELSE Err("not a symbol file"); RETURN END
+		ELSE Err("symbol file not found"); RETURN END;
+		err := FALSE
+	END ReadSym;
+
+	PROCEDURE SearchObject(obj: Object; VAR name: ARRAY OF CHAR; VAR res: Object); (* search in scope obj *)
+	VAR id, d: INTEGER;
+	BEGIN
+		id:=Index(name);
+		LOOP
+			IF obj = NIL THEN EXIT END;
+			d := Diff(id, obj^.name);
+			IF d < 0 THEN obj := obj^.left
+			ELSIF d > 0 THEN obj := obj^.right
+			ELSE EXIT END
+		END;
+		res := obj
+	END SearchObject;
+
+	PROCEDURE DisplayW(name: ARRAY OF CHAR);	
+	VAR mV: MenuViewers.Viewer; T: Texts.Text; x, y: INTEGER;
+	BEGIN
+		T := TextFrames.Text(""); Texts.Append(T, W.buf);
+		IF (syspos # 0) & impSystem THEN
+			IF syspos > 0 THEN Ws("SYSTEM, ") ELSE Wch(09X); Ws("IMPORT SYSTEM;"); Wln; Wln END;
+			Texts.Insert(T, ABS(syspos), W.buf);
+			syspos := 0
+		END;
+		Oberon.AllocateUserViewer(Oberon.Mouse.X, x, y);
+		mV := MenuViewers.New(
+			TextFrames.NewMenu(name, "System.Close  System.Copy  System.Grow  Edit.Search Edit.Store"),
+			TextFrames.NewText(T, 0),
+			TextFrames.menuH, x, y)
+	END DisplayW;
+
+	PROCEDURE InitStruct(VAR typ: Struct; f: INTEGER);	
+	BEGIN NEW(typ); typ^.form := f; typ^.ref := f; typ^.size := 1
+	END InitStruct;
+
+	PROCEDURE Init;
+	
+		PROCEDURE EnterTyp(name: ARRAY OF CHAR; form, size: INTEGER; VAR res: Struct);	
+		VAR obj: Object; typ: Struct;
+		BEGIN Insert(Index(name), obj);
+			NEW(typ); obj^.mode := Typ; obj^.typ := typ;
+			typ^.form := form; typ^.strobj := obj; typ^.size := size;
+			typ^.mno := 0; typ^.ref := form; res := typ
+		END EnterTyp;
+		
+		PROCEDURE OpenScope(level: INTEGER; owner: Object);	
+		VAR head: Object;
+		BEGIN NEW(head);
+			head^.mode := Head; head^.a0 := level; head^.link := owner;
+			head^.left := topScope; head^.right := NIL; topScope := head
+		END OpenScope;
+
+	BEGIN
+		IdBuf[0] := 0X; id := 1; topScope := NIL; OpenScope(0, NIL);
+		EnterTyp("CHAR", Char, 1, chartyp);
+		EnterTyp("SET", Set, 4, settyp);
+		EnterTyp("REAL", Real, 4, realtyp);
+		EnterTyp("INTEGER", Int, 2, inttyp);
+		EnterTyp("LONGINT",  LInt, 4, linttyp);
+		EnterTyp("LONGREAL", LReal, 8, lrltyp);
+		EnterTyp("SHORTINT", SInt, 1, sinttyp);
+		EnterTyp("BOOLEAN", Bool, 1, booltyp);
+		EnterTyp("SYSTEM.BYTE", Byte, 1, bytetyp);
+		universe := topScope; topScope^.right := NIL;
+		nofGmod := 1; topScope^.name := 0; GlbMod[0] := topScope; OpenScope(0, NIL);
+		NEW(classes);
+	END Init;
+	
+	PROCEDURE GetArgs(VAR S: Texts.Scanner);
+	VAR text: Texts.Text; beg, end, time: LONGINT;
+	BEGIN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.line#0) OR (S.class#Texts.Name) THEN
+			Oberon.GetSelection(text, beg, end, time);
+			IF time>=0 THEN Texts.OpenScanner(S, text, beg); Texts.Scan(S) END
+		END
+	END GetArgs;
+	
+	PROCEDURE Option(VAR S: Texts.Scanner);
+	BEGIN option := 0X;
+		Texts.Scan(S);
+		IF (S.class=Texts.Char) & (S.c="/") THEN Texts.Scan(S);
+			IF S.class=Texts.Name THEN option := S.s[0]; Texts.Scan(S) END
+		END
+	END Option;
+	
+	PROCEDURE QualIdent(VAR name, first, second: ARRAY OF CHAR);
+	VAR i, j: INTEGER; ch: CHAR;
+	BEGIN
+		i:=0; ch:=name[0];
+		WHILE (ch#".") & (ch#0X) DO first[i]:=ch; INC(i); ch:=name[i] END;
+		first[i]:=0X; INC(i); j:=0; ch:=name[i];
+		WHILE ch#0X DO second[j]:=ch; INC(i); INC(j); ch:=name[i] END;
+		second[j]:=0X
+	END QualIdent;
+	
+	PROCEDURE ShowDef*;
+	VAR S: Texts.Scanner;
+			mod, dummy: ARRAY 32 OF CHAR;
+			obj: Object;
+	BEGIN
+		GetArgs(S);
+		IF S.class=Texts.Name THEN
+			QualIdent(S.s, mod, dummy); Option(S);
+			Init;
+			ReadSym(mod, obj);
+			IF err THEN RETURN END;
+			showObj := FALSE; WriteModule(obj);
+			Append(mod, ".Def"); DisplayW(mod)
+		END
+	END ShowDef;
+	
+	PROCEDURE ShowObj*;
+	VAR S: Texts.Scanner;
+			mod, objName, qualid: ARRAY 32 OF CHAR;
+			obj: Object;
+	BEGIN noorder := FALSE;
+		GetArgs(S);
+		IF S.class=Texts.Name THEN
+			COPY(S.s, qualid); QualIdent(S.s, mod, objName); Option(S);
+			Init;
+			ReadSym(mod, obj); IF err THEN RETURN END;
+			SearchObject(obj^.link, objName, obj); IF obj=NIL THEN RETURN END;
+			showObj := TRUE; first := TRUE;
+			IF (obj^.mode = Typ) & (obj^.typ^.form = Pointer) & (obj^.typ^.BaseTyp^.form = Class) THEN
+				WriteObject(obj, -1);
+			ELSE WriteObject(obj, obj^.mode) END;
+			DisplayW(qualid)
+		END;
+		noorder := TRUE;
+	END ShowObj;
+	
+	PROCEDURE ShowTree*;
+	VAR S: Texts.Scanner;
+			modName, dummy: ARRAY 32 OF CHAR;
+			obj: Object;
+	BEGIN
+		GetArgs(S); Init;
+		WHILE S.class = Texts.Name DO
+			QualIdent(S.s, modName, dummy); Option(S);
+			ReadSym(modName, obj); IF err THEN RETURN END
+		END;
+		WriteClasses(classes^.sub, 1);
+		DisplayW("Browser.ShowTree")
+	END ShowTree;
+
+	PROCEDURE SetExtension*;	(* "sym file extension"*)
+	VAR S: Texts.Scanner;
+	BEGIN GetArgs(S);
+		IF S.class = Texts.String THEN COPY(S.s, symFileExt) END
+	END SetExtension;
+	
+BEGIN noorder := TRUE;
+	Texts.OpenWriter(W);
+	InitStruct(undftyp, Undef); InitStruct(notyp, NoTyp);
+	InitStruct(stringtyp, String); InitStruct(niltyp, NilTyp);
+	symFileExt := ".Sym"; syspos := 0
+END Browser.

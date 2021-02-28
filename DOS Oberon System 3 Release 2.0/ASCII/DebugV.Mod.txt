@@ -1,0 +1,784 @@
+MODULE DebugV;
+
+(* Module: DebugV, produce textual view of debugging information *)
+(* Author: Martin Buechi *)
+(* Language: Oberon(-1) including FOR loops *)
+(* System: Oberon System 3 DOS Release 1.5, Pharlap Release 1.5, Process System Release 2.0, Seminative Version 1.5 *)
+(* Version: 1.0 *)
+(* Date of last change: 18.02.1995 *)
+
+
+	IMPORT
+		SYSTEM, Kernel, Modules, Objects, Fonts, Texts, Oberon, DOCT, DebugT, DebugD, DebugS;
+		
+	CONST
+		AlreadyColor=3; (* color for items that have previously been displayed *)
+		InheritedColor=1; (* color for inherited field of records *)
+		DefaultColor=15;
+		StringShowLen=64; (* number of characters of string to be displayed directly *)
+		NumberSign*="&"; (* sign displayed in front of item number *)
+		LevelSign*="\"; (* sign to separate item number and identation level *)
+		MemDumpFont="Courier10.Scn.Fnt"; (* font for memory dumps *)
+		Tab*=09X; CR*=0DX; Quote=22X; ord0*= 48; ordA*= 65; (* ASCII values *)
+		BytesPerLine*=16; (* number of bytes per line in memory dump (must be multiple of SIZE(LONGINT)) *)
+		FirstLine=90; FollowingLines=150; (* number of characters per line in Search *)
+		noflen=5; (* number of characters reserved for number in find path *)
+		MaxProc=64; (* number of procedures on stack to show *) 
+		LastProcs=16; (* show again last n procedures on stack *)
+		
+	TYPE
+		ExpandMsg*=RECORD (DebugS.ItemMsg)
+			W*: Texts.Writer;
+			level*: LONGINT
+		END;
+		
+	VAR
+		ShowTypes*, ShowAddresses*, LongintAsPointer*, ShowFullStack*: BOOLEAN;
+		lint: DOCT.Object; (* longint as type of addresses *)
+		W: Texts.Writer;
+		Reset*: PROCEDURE();
+		oldColor: SHORTINT;
+
+
+	(* ______________________________ forward declarations ____________________________ *)
+	
+	PROCEDURE ^ DispObj(o: DOCT.Object; mod: DebugS.myModule; base: LONGINT; showind: BOOLEAN; VAR W: Texts.Writer);
+	PROCEDURE ^ Disp(typ: DOCT.Struct; base, offset, level, index, sizeadr: LONGINT;
+			VAR name: ARRAY OF CHAR; indirect, showind: BOOLEAN; mod: DebugS.myModule; VAR W: Texts.Writer);
+	
+		
+	(* ______________________________ auxiliary functions ____________________________ *)
+	
+	PROCEDURE ReadableChar(ch : CHAR): BOOLEAN;
+	(* checks whether character should be displayed *)
+	BEGIN
+		CASE ORD(ch) OF
+			32..126, 128..149, 155 : RETURN TRUE
+			ELSE RETURN FALSE
+		END
+	END ReadableChar;
+	
+	PROCEDURE DecToHex(d : LONGINT): CHAR;
+	(* decimal to hexadecimal conversion (0<= d < 16) *)
+	BEGIN
+		IF d < 10 THEN d := d + ord0 ELSE d := d + ordA - 10 END;
+		RETURN CHR(d)
+	END DecToHex;
+	
+	PROCEDURE MemName(adr: LONGINT; VAR name: ARRAY OF CHAR);
+	(* make name = "Mem[" adr "H]". *)
+		VAR i: LONGINT;
+	BEGIN
+		COPY("Mem[12345678H]", name);
+		FOR i:=11 TO 4 BY -1 DO name[i]:=DecToHex(adr MOD 10H); adr:=adr DIV 10H END
+	END MemName;
+	
+	PROCEDURE strlen(s: ARRAY OF CHAR): LONGINT;
+	(* length of 0X terminated string *)
+		VAR i: LONGINT;
+	BEGIN
+		i:=0; WHILE (i<LEN(s)) & (s[i]#0X) DO INC(i) END;
+		RETURN i
+	END strlen;
+	
+	PROCEDURE WriteLn(VAR W: Texts.Writer);
+	BEGIN
+		IF W.col=AlreadyColor THEN Texts.SetColor(W, oldColor) END;
+		Texts.WriteLn(W)
+	END WriteLn;		
+	
+	
+	(* ______________________________ item number & addresses ____________________________ *)
+	
+	PROCEDURE DispNo(item: DebugS.Item; new: BOOLEAN; level: LONGINT; VAR W: Texts.Writer);
+	(* display item number *)
+		VAR
+			i: LONGINT;
+	BEGIN
+		FOR i:=1 TO level DO Texts.WriteString(W, "  ") END;
+		IF item#NIL THEN (* write number *)
+			oldColor:=W.col; IF ~new THEN Texts.SetColor(W, AlreadyColor) END;
+			Texts.Write(W, NumberSign); Texts.WriteInt(W, item.no, 0);
+			IF level>0 THEN Texts.Write(W, LevelSign); Texts.WriteInt(W, level,1) END; Texts.Write(W, " ")
+		END
+	END DispNo;
+	
+	PROCEDURE DispAdr(base, offset, adr: LONGINT; showind: BOOLEAN; VAR W: Texts.Writer);
+	(* display offset and addresse(s) *)
+	BEGIN
+		IF ShowAddresses THEN
+			Texts.WriteInt(W, offset, 1); Texts.Write(W, ",");
+			Texts.WriteHex(W, base+offset); Texts.Write(W, "H");
+			IF showind & (adr#base+offset) THEN Texts.Write(W, ","); Texts.WriteHex(W, adr); Texts.Write(W, "H") END;
+			Texts.Write(W, " ")
+		END
+	END DispAdr;
+	
+	
+	(* ______________________________ types ____________________________ *)
+		
+	PROCEDURE DispType(typ: DOCT.Struct; mod: DebugS.myModule; supress: BOOLEAN; VAR W: Texts.Writer);
+	(* display type *)
+	BEGIN
+		IF ShowTypes THEN
+			IF (typ.strobj#NIL) & (typ#DebugS.pointertyp) & (typ.form>=DebugS.fPointer) THEN
+				IF (typ.mno#0) OR (typ.form>DebugS.fNoTyp) THEN
+					IF typ.mno=0 THEN Texts.WriteString(W, mod.name)
+					ELSE Texts.WriteString(W, mod.GlbMod[typ.mno-1].name)
+					END; Texts.Write(W, ".")
+				END;
+				Texts.WriteString(W, typ.strobj.name)
+			ELSIF ~supress THEN
+				CASE typ.form OF
+				| DebugS.fByte: Texts.WriteString(W, "BYTE")
+				| DebugS.fBool: Texts.WriteString(W, "BOOLEAN")
+				| DebugS.fChar: Texts.WriteString(W, "CHAR")
+				| DebugS.fSInt: Texts.WriteString(W, "SHORTINT")
+				| DebugS.fInt: Texts.WriteString(W, "INTEGER")
+				| DebugS.fLInt: Texts.WriteString(W, "LONGINT")
+				| DebugS.fReal: Texts.WriteString(W, "REAL")
+				| DebugS.fLReal: Texts.WriteString(W, "LONGREAL")
+				| DebugS.fSet: Texts.WriteString(W, "SET")
+				| DebugS.fString: Texts.WriteString(W, "STRING")
+				| DebugS.fNoTyp: Texts.WriteString(W, "POINTER")
+				| DebugS.fPointer: Texts.WriteString(W, "POINTER")
+				| DebugS.fProcTyp: Texts.WriteString(W, "PROCEDURE")
+				| DebugS.fArray, DebugS.fDynArr: Texts.WriteString(W, "ARRAY")
+				| DebugS.fRecord: Texts.WriteString(W, "RECORD")
+				ELSE
+					Texts.WriteInt(W, typ.form, 1)
+				END
+			END
+		END	
+	END DispType;
+	
+	PROCEDURE DispActualType(ptr: DebugS.Pointer; VAR W: Texts.Writer);
+	(* display actual type of pointer *)
+	BEGIN
+		IF ShowTypes & (ptr#NIL) & (ptr.td#NIL) THEN
+			Texts.Write(W, "("); 
+			IF ptr.td.ptr#NIL THEN (* pointer type name *)
+				Texts.WriteString(W, ptr.td.ptrmod.name); Texts.Write(W, "."); Texts.WriteString(W, ptr.td.ptr.name)
+			ELSIF (ptr.td.typ#NIL) & (ptr.td.typ.form=DebugS.fArray) THEN (* pointer to array: display actual size *)
+				Texts.WriteString(W, "ARRAY "); Texts.WriteInt(W, DebugS.PtrArrLen(ptr), 1);
+				Texts.WriteString(W, " OF "); DispType(ptr.td.typ.BaseTyp, ptr.mod, FALSE, W)
+			ELSE (* anonymous pointer type or symbol information not available *)
+				Texts.WriteString(W, "POINTER TO "); Texts.WriteString(W, ptr.td.mod.name); Texts.Write(W, ".");
+				IF (ptr.td.typ#NIL) & (ptr.td.typ.strobj#NIL) THEN (* display as POINTER TO dereferenced record *)
+					Texts.WriteString(W, ptr.td.typ.strobj.name)
+				ELSE
+					Texts.Write(W, "?") (* no symbol information of dereferenced record *)
+				END
+			END;
+			Texts.Write(W, ")")
+		END
+	END DispActualType;
+	
+	PROCEDURE DispActualRecordType(show: BOOLEAN; rec: DebugS.Record; VAR W: Texts.Writer);
+	(* display actual type of record (VarPar) *)
+	BEGIN
+		IF ShowTypes & show THEN
+			Texts.Write(W, "(");
+			IF rec.td#NIL THEN
+				Texts.WriteString(W, rec.td.mod.name); Texts.Write(W, ".");
+				IF rec.typ.strobj#NIL THEN Texts.WriteString(W, rec.typ.strobj.name) ELSE Texts.Write(W, "?") END;
+			ELSE Texts.Write(W, "?")
+			END; Texts.Write(W, ")")
+		END
+	END DispActualRecordType;
+	
+	
+	(* ______________________________ values ____________________________ *)
+	
+	PROCEDURE DispString(adr, len: LONGINT; VAR W: Texts.Writer);
+	(* display first StringShowLen characters of string *)
+		VAR
+			i: LONGINT;
+			ch: CHAR;
+			res: BOOLEAN;
+	BEGIN
+		Texts.Write(W, Quote); i:=0;
+		LOOP
+			IF (i=StringShowLen) OR (i=len) THEN EXIT END;
+			DebugD.GetChar(adr+i, ch, res);
+			IF ~res OR ~ReadableChar(ch) THEN EXIT END;
+			Texts.Write(W, ch); INC(i)
+		END; Texts.Write(W, Quote)
+	END DispString;
+	
+	PROCEDURE DispValue(adr: LONGINT; form: INTEGER; VAR W: Texts.Writer);
+	(* display value *)
+		VAR
+			ch: CHAR;
+			sval: SHORTINT;
+			ival, i, j: INTEGER;
+			val, refpos: LONGINT;
+			rval: REAL;
+			lrval: LONGREAL;
+			b, res, first: BOOLEAN;
+			s: SET;
+			name: ARRAY 2*DebugT.NameLen OF CHAR;
+			mod: DebugS.myModule;		
+	BEGIN
+		CASE form OF
+		| DebugS.fBool: DebugD.GetBool(adr, b, res);
+			IF b THEN Texts.WriteString(W, "TRUE")
+			ELSE Texts.WriteString(W, "FALSE")
+			END;
+		| DebugS.fByte, DebugS.fChar: DebugD.GetChar(adr, ch, res);
+			IF ReadableChar(ch) THEN
+				Texts.Write(W, Quote); Texts.Write(W, ch); Texts.Write(W, Quote); Texts.WriteString(W, " = ")
+			END;
+			Texts.Write(W, DecToHex(ORD(ch) DIV 10H)); Texts.Write(W, DecToHex(ORD(ch) MOD 10H)); Texts.Write(W, "X")
+		| DebugS.fSInt: DebugD.GetSInt(adr, sval, res); Texts.WriteInt(W, sval, 1);
+		| DebugS.fInt: DebugD.GetInt(adr, ival, res); Texts.WriteInt(W, ival, 1);
+		| DebugS.fLInt: DebugD.GetLInt(adr, val, res); Texts.WriteInt(W, val, 1);
+			Texts.WriteString(W, " ("); Texts.WriteHex(W, val); Texts.WriteString(W, "H)")
+		| DebugS.fReal: DebugD.GetReal(adr, rval, res); Texts.WriteReal(W, rval, 15);
+		| DebugS.fLReal: DebugD.GetLReal(adr, lrval, res); Texts.WriteLongReal(W, lrval, 24);
+		| DebugS.fSet: DebugD.GetLInt(adr, val, res); s:=SYSTEM.VAL(SET, val); i:=0; first:=TRUE; Texts.Write(W, "{");
+			WHILE i<DebugT.WordLen DO
+				IF i IN s THEN j:=i+1;
+					WHILE (j<DebugT.WordLen) & (j IN s) DO INC(j) END;
+					IF ~first THEN Texts.WriteString(W, ", ") ELSE first:=FALSE END;
+					Texts.WriteInt(W, i, 0);
+					IF j#i+1 THEN Texts.WriteString(W, ".."); Texts.WriteInt(W, j-1, 0) END;
+					i:=j+1
+				ELSE INC(i)
+				END
+			END;
+			Texts.WriteString(W, "} ("); Texts.WriteHex(W, val); Texts.WriteString(W, "H)")
+		| DebugS.fString: DispString(adr, MAX(LONGINT), W)
+		| DebugS.fNoTyp, DebugS.fPointer: DebugD.GetLInt(adr, val, res);
+			IF val=0 THEN Texts.WriteString(W, "NIL") ELSE Texts.WriteHex(W, val); Texts.Write(W, "H") END
+		| DebugS.fProcTyp: DebugD.GetLInt(adr, val, res); mod:=DebugS.GetMod(val);
+			IF mod#NIL THEN
+				Texts.WriteString(W, mod.name); Texts.Write(W, "."); DebugS.GetProcName(mod, val-mod.code, name, refpos, res);
+				Texts.WriteString(W, name)
+			ELSE Texts.WriteHex(W, val); Texts.Write(W, "H")
+			END
+		END
+	END DispValue;
+	
+	(* ______________________________ handles ____________________________ *)
+	
+	PROCEDURE PointerHandle(var:  DebugS.Item; VAR msg: DebugS.ItemMsg);
+	(* pointer handler *)
+		VAR
+			typ: DOCT.Struct;
+			adr, m, i, elemsize, val: LONGINT;
+			o: DOCT.Object;
+			nul: ARRAY 1 OF CHAR;
+			curmod: DebugS.myModule;
+			ptrs: DebugS.PTROff;
+			ptr: DebugS.Pointer;
+			new, res: BOOLEAN;
+	BEGIN
+		WITH var: DebugS.Pointer DO
+			IF msg IS ExpandMsg THEN
+				WITH msg: ExpandMsg DO
+					IF var.td.typ#NIL THEN
+						typ:=var.td.typ; curmod:=var.mod;
+						IF typ.form=DebugS.fArray THEN (* pointer to array *)
+							elemsize:=typ.size DIV typ.n; m:=DebugS.PtrArrLen(var);
+							FOR i:=0 TO m-1 DO
+								Disp(typ.BaseTyp, var.base, i*elemsize, msg.level+1, i, -1, nul, FALSE, FALSE, var.mod, msg.W)
+							END
+						ELSE (* pointer to record *)
+							IF (typ#NIL) & (typ.mno#0) THEN DebugS.GetImportedType(typ, curmod) END;
+							WHILE typ#NIL DO
+								o:=typ.link;
+								WHILE o#NIL DO
+									Disp(o.typ, var.base, o.a0, msg.level+1, -1, -1, o.name, FALSE, FALSE, curmod, msg.W);
+									o:=o.next;	
+								END;
+								typ:=typ.BaseTyp; Texts.SetColor(msg.W, InheritedColor);
+								IF (typ#NIL) & (typ.mno#0) THEN DebugS.GetImportedType(typ, curmod) END
+							END;
+							Texts.SetColor(msg.W, DefaultColor)
+						END
+					ELSE (* type of dereferenced record not available *)
+						ptrs:=var.td.ptroffs; adr:=var.base;
+						WHILE ptrs#NIL DO
+							DebugD.GetLInt(adr+ptrs.offset, val, res);
+							IF res THEN
+								DebugS.InsertPointer(val, NIL, NIL, var.handle, ptr, new);
+							ELSE ptr:=NIL;
+							END;
+							Texts.WriteString(msg.W, "  "); DispNo(ptr, new, msg.level+1, msg.W);
+							DispAdr(adr, ptrs.offset, adr+ptrs.offset, FALSE, msg.W); 
+							Texts.WriteString(msg.W, "unknown pointer = "); DispValue(adr+ptrs.offset, DebugS.fPointer, msg.W);
+							IF ShowTypes THEN Texts.WriteString(msg.W, ": "); DispActualType(ptr, msg.W) END;
+							Texts.WriteString(msg.W, "POINTER"); WriteLn(msg.W); ptrs:=ptrs.next
+						END
+					END
+				END
+			END
+		END
+	END PointerHandle;
+	
+	PROCEDURE AddressHandle(var:  DebugS.Item; VAR msg: DebugS.ItemMsg);
+	(* address handler *)
+		VAR name: DebugT.Name;
+	BEGIN
+		WITH var: DebugS.Address DO
+			IF msg IS ExpandMsg THEN
+				WITH msg: ExpandMsg DO
+					MemName(var.base, name);
+					Disp(lint.typ, var.base, 0, msg.level+1, -1, -1, name, FALSE, FALSE, NIL, msg.W)
+				END
+			END
+		END
+	END AddressHandle;
+			
+	PROCEDURE DynArrHandle(var:  DebugS.Item; VAR msg: DebugS.ItemMsg);
+	(* dynamic arrays handler *)
+		VAR
+			t, typ: DOCT.Struct;
+			adr, i, m, n, elemsize: LONGINT;
+			res: BOOLEAN;
+			nul: ARRAY 1 OF CHAR;
+	BEGIN
+		WITH var: DebugS.DynArray DO
+			IF msg IS ExpandMsg THEN
+				WITH msg: ExpandMsg DO
+					typ:=var.typ;
+					DebugD.GetLInt(var.sizeadr, n, res);
+					elemsize:=1; t:=typ.BaseTyp; adr:=var.sizeadr;
+					WHILE t.form=DebugS.fDynArr DO
+						DEC(adr, 4); DebugD.GetLInt(adr, m, res); elemsize:=elemsize*(m+1); t:=t.BaseTyp
+					END; elemsize:=elemsize*t.size;
+					FOR i:=0 TO n DO
+						Disp(typ.BaseTyp, var.base, i*elemsize, msg.level+1, i, var.sizeadr-4, nul, FALSE, FALSE, var.mod, msg.W)
+					END
+				END
+			END
+		END
+	END DynArrHandle;
+
+	PROCEDURE ArrayHandle(var:  DebugS.Item; VAR msg: DebugS.ItemMsg);
+	(* array handler *)
+		VAR
+			typ: DOCT.Struct;
+			elemsize, i: LONGINT;
+			nul: ARRAY 1 OF CHAR;
+	BEGIN
+		WITH var: DebugS.Array DO
+			IF msg IS ExpandMsg THEN
+				WITH msg: ExpandMsg DO
+					typ:=var.typ; elemsize:=typ.size DIV typ.n;
+					FOR i:=0 TO typ.n-1 DO
+						Disp(typ.BaseTyp, var.base, i*elemsize, msg.level+1, i, -1, nul, FALSE, FALSE, var.mod, msg.W)
+					END
+				END
+			END
+		END
+	END ArrayHandle;
+			
+	PROCEDURE RecordHandle(var:  DebugS.Item; VAR msg: DebugS.ItemMsg);
+	(* record handler *)
+		VAR
+			o: DOCT.Object;
+			typ: DOCT.Struct;
+			curmod: DebugS.myModule;
+	BEGIN
+		WITH var: DebugS.Record DO
+			IF msg IS ExpandMsg THEN
+				WITH msg: ExpandMsg DO
+					typ:=var.typ; curmod:=var.mod;
+					IF (typ#NIL) & (typ.mno#0) THEN DebugS.GetImportedType(typ, curmod) END;
+					WHILE typ#NIL DO
+						o:=typ.link;
+						WHILE o#NIL DO
+							Disp(o.typ, var.base, o.a0, msg.level+1, -1, -1, o.name, FALSE, FALSE, curmod, msg.W);
+							o:=o.next;	
+						END;
+						typ:=typ.BaseTyp; Texts.SetColor(msg.W, InheritedColor);
+						IF (typ#NIL) & (typ.mno#0) THEN DebugS.GetImportedType(typ, curmod) END
+					END;
+					Texts.SetColor(msg.W, DefaultColor)
+				END
+			END
+		END
+	END RecordHandle;
+	
+	PROCEDURE ProcHandle(proc: DebugS.Item; VAR msg: DebugS.ItemMsg);
+	(* procedure handler*)
+		VAR
+			base: LONGINT;
+			o: DOCT.Object;
+	BEGIN
+		WITH proc: DebugS.Proc DO
+			IF msg IS ExpandMsg THEN
+				WITH msg: ExpandMsg DO
+					o:=proc.desc.scope; base:=proc.fp;
+					WHILE o#NIL DO
+						DispObj(o, proc.mod, base, FALSE, msg.W); o:=o.next
+					END
+				END
+			END
+		END
+	END ProcHandle;
+	
+	PROCEDURE ModHandle(m: DebugS.Item; VAR msg: DebugS.ItemMsg);
+	(* module handler *)
+		VAR
+			base: LONGINT;
+			o: DOCT.Object;
+	BEGIN
+		WITH m: DebugS.Mod DO
+			IF msg IS ExpandMsg THEN
+				WITH msg: ExpandMsg DO
+					o:=m.mod.SymbolTable; base:=m.mod.SB;
+					WHILE o#NIL DO
+						DispObj(o, m.mod, base, FALSE, msg.W); o:=o.next
+					END
+				END
+			END
+		END
+	END ModHandle;
+	
+	(* ______________________________ objects ____________________________ *)
+	
+	PROCEDURE LegalAdr(res: BOOLEAN; VAR W: Texts.Writer);
+	(* report illegal addresses (this may only happen with illegal data structures) *)
+	BEGIN
+		IF ~res THEN Texts.WriteString(W, "illegal address") END
+	END LegalAdr;
+	
+	PROCEDURE Disp(typ: DOCT.Struct; base, offset, level, index, sizeadr: LONGINT;
+			VAR name: ARRAY OF CHAR; indirect, showind: BOOLEAN; mod: DebugS.myModule; VAR W: Texts.Writer);
+	(* display item *)
+		VAR
+			adr, len, val: LONGINT;
+			res, new: BOOLEAN;
+			ptr: DebugS.Pointer;
+			arr: DebugS.Array;
+			a: DebugS.Address;
+			openarr: DebugS.DynArray;
+			rec: DebugS.Record;
+			
+		PROCEDURE DispName;
+		(* display object name *)
+		BEGIN
+			IF index>=0 THEN
+				Texts.Write(W, "["); Texts.WriteInt(W, index,1); Texts.Write(W, "]")
+			ELSE
+				Texts.WriteString(W, name)
+			END
+		END DispName;
+			
+	BEGIN
+		Texts.WriteString(W, "  ");
+		adr:=base+offset;
+		IF indirect THEN DebugD.GetLInt(adr, adr, res); LegalAdr(res, W) END;
+		IF (typ.form IN {DebugS.fNoTyp, DebugS.fPointer}) OR (LongintAsPointer & (typ.form=DebugS.fLInt)) THEN
+			DebugD.GetLInt(adr, val, res); a:=NIL;
+			IF res THEN
+				DebugS.InsertPointer(val, typ.BaseTyp, mod, PointerHandle, ptr, new);
+				IF ptr=NIL THEN DebugS.InsertAddress(val, AddressHandle, a, new) END;
+			ELSE ptr:=NIL END;
+			IF a=NIL THEN (* pointer *)
+				DispNo(ptr, new, level, W); DispAdr(base, offset, adr, showind, W);
+				IF typ.form=DebugS.fNoTyp THEN Texts.WriteString(W, "hidden pointer = ")
+				ELSE DispName; Texts.WriteString(W, " = ")
+				END;
+				DispValue(adr, typ.form, W);
+				IF (ptr#NIL) & (typ.BaseTyp#NIL) & (typ.BaseTyp.form=DebugS.fArray) & (typ.BaseTyp.BaseTyp.form=DebugS.fChar) THEN
+					Texts.WriteString(W, " (= "); DispString(ptr.base, DebugS.PtrArrLen(ptr), W); Texts.Write(W, ")")
+				END;
+				IF ShowTypes THEN
+					Texts.WriteString(W, ": "); DispType(typ, mod, TRUE, W); DispActualType(ptr, W)
+				END; Texts.WriteString(W, " POINTER")
+			ELSE (* address *)
+				DispNo(a, new, level, W); DispAdr(base, offset, adr, showind, W);
+				DispName; Texts.WriteString(W, " = "); DispValue(adr, typ.form, W);
+				IF ShowTypes THEN
+					Texts.WriteString(W, ": "); DispType(typ, mod, TRUE, W);
+				END; Texts.WriteString(W, " ADDRESS")
+			END
+		ELSIF typ.form IN {DebugS.fArray, DebugS.fDynArr} THEN
+			IF typ.form=DebugS.fArray THEN
+				DebugS.InsertArray(adr, typ, mod, ArrayHandle, arr, new); len:=typ.n
+			ELSE (* typ.form=DebugS.fDynArr *)
+				DebugS.InsertDynArray(adr, typ, sizeadr, base+offset, mod, DynArrHandle, openarr, new);
+				DebugD.GetLInt(openarr.sizeadr, len, res); INC(len); arr:=openarr;
+			END;
+			DispNo(arr, new, level, W); DispAdr(base, offset, adr, showind, W); DispName;
+			IF typ.BaseTyp.form=DebugS.fChar THEN Texts.WriteString(W, " = "); DispString(adr, len, W)
+			ELSE Texts.Write(W, " ")
+			END;
+			IF ShowTypes THEN
+				Texts.WriteString(W,": "); DispType(typ, mod, TRUE, W); Texts.WriteString(W, " ARRAY");
+				Texts.Write(W, " "); Texts.WriteInt(W, len, 1); Texts.WriteString(W, " OF ");
+				DispType(typ.BaseTyp, mod, FALSE, W)
+			ELSE Texts.WriteString(W, " ARRAY")
+			END;
+		ELSIF typ.form=DebugS.fRecord THEN
+			DebugS.InsertRecord(base+offset, typ, mod, indirect, RecordHandle, rec, new);
+			DispNo(rec, new, level, W); DispAdr(base, offset, adr, showind, W); DispName;
+			IF ShowTypes THEN
+				Texts.WriteString(W, ": "); DispType(typ, mod, TRUE, W); DispActualRecordType(indirect, rec, W)
+			END;
+			Texts.WriteString(W, " RECORD")
+		ELSE (* non-composed type *)
+			DispNo(NIL, TRUE, level, W); DispAdr(base, offset, adr, showind, W); DispName; Texts.WriteString(W, " = ");
+			DispValue(adr, typ.form, W);
+			IF ShowTypes THEN Texts.WriteString(W, ": "); DispType(typ, mod, FALSE, W) END;
+		END;
+		WriteLn(W)
+	END Disp;
+	
+	PROCEDURE DispObj(o: DOCT.Object; mod: DebugS.myModule; base: LONGINT; showind: BOOLEAN; VAR W: Texts.Writer);
+	(* display object *)
+	BEGIN
+		IF (o.mode IN {DebugS.mVar, DebugS.mInd}) & (o.typ.form=DebugS.fDynArr) THEN
+			Disp(o.typ, base, o.a0, 0, -1, -1, o.name, TRUE, showind, mod, W)
+		ELSIF o.mode IN {DebugS.mVar,DebugS.mFld} THEN
+			Disp(o.typ, base, o.a0, 0, -1, -1, o.name, FALSE, showind, mod, W)
+		ELSIF o.mode=DebugS.mInd THEN
+			Disp(o.typ, base, o.a0 +o.a1, 0, -1, -1, o.name, TRUE, showind, mod, W);
+		END;
+	END DispObj;
+	
+		
+	(* ______________________________ find procedures ____________________________ *)
+	
+	PROCEDURE WriteName(VAR x: DebugS.SearchCriteria; VAR path: DebugS.Path; hd: LONGINT; VAR W: Texts.Writer);
+	(* display path to item *)
+		VAR
+			i, n, len: LONGINT;
+			firstline: BOOLEAN;
+	BEGIN
+		Texts.Write(W, NumberSign); Texts.WriteInt(W, x.ptr.no, 1); n:=0; firstline:=TRUE;
+		FOR i:=0 TO hd DO
+			Texts.Write(W, "."); 
+			len:=strlen(x.follow.field[path[i].no]);
+			IF (firstline & (len+noflen+n>FirstLine)) OR (~firstline & (len+noflen+n>FollowingLines)) THEN (* line break *)
+				Texts.WriteLn(W); Texts.WriteString(W, "  "); n:=len+noflen; firstline:=FALSE
+			ELSE INC(n, len+noflen)
+			END;
+			Texts.WriteString(W, x.follow.field[path[i].no]);
+			Texts.Write(W, "("); Texts.WriteInt(W, path[i].noffollowed,1); Texts.Write(W, ")")
+		END
+	END WriteName;
+	
+	PROCEDURE Search*(VAR x: DebugS.SearchCriteria; count: LONGINT; VAR W: Texts.Writer);
+	(* find item *)
+		VAR
+			hd, vlast, result: LONGINT;
+			new: BOOLEAN;
+			path: DebugS.Path;
+	BEGIN
+		x.handle:=PointerHandle;
+		IF count>=0 THEN (* find count'th item *)
+			DebugS.SearchCount(x, count, path, vlast, result, new); hd:=0;
+		ELSE (* find item satisfying condition *)
+			DebugS.SearchCond(x, path, hd, vlast, result, new);
+		END;
+		CASE result OF (* nil, invalid, nofollowfield, cycle, notd only for lists; notfound only for other structures *)
+		| DebugS.found:
+			DispNo(x.res, new, 0, W); DispAdr(vlast, 0, 0, FALSE, W); WriteName(x, path, hd, W); Texts.WriteString(W, " = ");
+			DispValue(vlast, DebugS.fPointer, W);
+			IF ShowTypes THEN
+				Texts.WriteString(W, ": ");
+				IF x.res.td.ptr#NIL THEN DispType(x.res.td.ptr.typ, x.res.td.mod, TRUE, W) END;
+				DispActualType(x.res, W)
+			END;
+			Texts.WriteString(W, " POINTER")
+		| DebugS.nil:
+			WriteName(x, path, hd, W); Texts.WriteString(W, " = NIL")
+		| DebugS.invalid:
+			WriteName(x, path, hd, W); Texts.WriteString(W, " = ");
+			Texts.WriteHex(W, vlast); Texts.WriteString(W, "H (not a valid pointer)")
+		| DebugS.notd:
+			WriteName(x, path, hd, W); Texts.WriteString(W, " type descriptor not found")
+		| DebugS.nofollowfield:
+			WriteName(x, path, hd, W); Texts.WriteString(W, " has no '"); Texts.WriteString(W, x.follow.field[0]);
+			Texts.WriteString(W, "' field")
+		| DebugS.notenoughmem:
+			Texts.WriteString(W, "not enough memory")
+		| DebugS.typenotfound:
+			Texts.WriteString(W, "type not found: "); Texts.WriteString(W, x.modname);
+			Texts.Write(W, "."); Texts.WriteString(W, x.typename)
+		| DebugS.cycle:
+			WriteName(x, path, hd, W);
+			Texts.WriteString(W, " is part of a cycle, none of whose elements satisfies the condition");
+		| DebugS.notfound:
+			Texts.WriteString(W, "no match")
+		ELSE
+		END; WriteLn(W)
+	END Search;
+		
+	(* ______________________________ dumps ____________________________ *)
+	
+	PROCEDURE MemDump*(adr: LONGINT; bytes: BOOLEAN; len: LONGINT; VAR W: Texts.Writer);
+	(* display memory dump as bytes or longints *)
+		VAR
+			i, j: LONGINT;
+			res: BOOLEAN;
+			oldfont: Objects.Library;
+			line: ARRAY BytesPerLine OF CHAR;
+			aline: ARRAY (BytesPerLine DIV SIZE(LONGINT)) OF LONGINT;
+	BEGIN
+		oldfont:=W.lib; Texts.SetFont(W, Fonts.This(MemDumpFont));
+		FOR i:=0 TO len-1 DO
+			Texts.WriteHex(W, adr); Texts.WriteString(W, "H:  ");
+			DebugD.GetBytes(adr, line, BytesPerLine, res);
+			IF res THEN
+				IF bytes THEN (* display hex parts as bytes *)
+					FOR j:=0 TO BytesPerLine-1 DO
+						Texts.Write(W, DecToHex(ORD(line[j]) DIV 10H)); Texts.Write(W, DecToHex(ORD(line[j]) MOD 10H));
+						Texts.Write(W, " ");
+						IF j IN {3, 7, 11} THEN Texts.WriteString(W, "- ") END
+					END
+				ELSE (* display hex part as longints *)
+					DebugD.GetBytes(adr, aline, BytesPerLine, res);
+					FOR j:=0 TO (BytesPerLine DIV SIZE(LONGINT)) -1 DO
+						Texts.WriteHex(W, aline[j]); Texts.WriteString(W, "H  ")
+					END
+				END;
+				Texts.WriteString(W, "  ");
+				FOR j:=0 TO BytesPerLine-1 DO
+					IF ReadableChar(line[j]) THEN Texts.Write(W, line[j]) ELSE Texts.Write(W, ".") END
+				END
+			ELSE
+				Texts.WriteString(W, "address not dumped")
+			END;
+			INC(adr, BytesPerLine); Texts.WriteLn(W)
+		END;
+		Texts.SetFont(W, oldfont)
+	END MemDump;
+	
+	PROCEDURE TypedDump*(adr: LONGINT; modname, typename: ARRAY OF CHAR; VAR W: Texts.Writer);
+	(* display memory according to type *)
+		VAR
+			t: DOCT.Struct;
+			mod: DebugS.myModule;
+			name: DebugT.Name;
+	BEGIN
+		DebugS.GetType(modname, typename, mod, t);
+		IF t#NIL THEN
+			IF DebugD.Available(adr, t.size) THEN
+				MemName(adr, name); Disp(t, adr, 0, -1, -1, -1, name, FALSE, FALSE, mod, W)
+			ELSE
+				Texts.WriteString(W, "address range not (fully) dumped: "); Texts.WriteHex(W, adr); Texts.Write(W, "H");
+				IF adr<MAX(LONGINT)-t.size THEN (* prevent overflow *)
+					Texts.WriteString(W, " -"); Texts.WriteHex(W, adr+t.size); Texts.Write(W, "H")
+				END;
+				Texts.WriteLn(W)
+			END
+		ELSE
+			Texts.WriteString(W, "type not found: "); Texts.WriteString(W, modname);
+			IF typename#"" THEN Texts.Write(W, "."); Texts.WriteString(W, typename) END; Texts.WriteLn(W)
+		END
+	END TypedDump;
+	
+	
+	(* ______________________________ ShowModules/ShowStack/ShowTrap ____________________________ *)
+
+	PROCEDURE ShowModules*(VAR W: Texts.Writer);
+	(* show module list *)
+		VAR
+			mod: DebugS.myModule;
+			m: DebugS.Mod;
+			new: BOOLEAN;
+	BEGIN
+		mod:=DebugS.ModuleList;
+		WHILE mod#NIL DO
+			DebugS.InsertMod(mod, ModHandle, m); DebugS.ActivateItem(m, new);
+			DispNo(m, new, 0, W); Texts.WriteString(W, mod.name); WriteLn(W); mod:=mod.next;
+		END
+	END ShowModules;
+		
+	PROCEDURE ShowStack*(VAR W: Texts.Writer);
+	(* show stack contents *)
+		VAR
+			n, i: LONGINT;
+			new: BOOLEAN;
+			stack, next: DebugS.Unit;
+			msg: ExpandMsg;
+	BEGIN		
+		stack:=DebugS.stack; n:=0; msg.level:=-1;
+		WHILE stack#NIL DO
+			DebugS.ActivateItem(stack, new); DispNo(stack, new, 0, W); Texts.WriteString(W, stack.mod.name); Texts.Write(W, ".");
+			IF stack IS DebugS.Proc THEN Texts.WriteString(W, stack(DebugS.Proc).name);
+				Texts.WriteString(W, " PC = "); Texts.WriteInt(W, stack.pc, 1);
+				Texts.WriteString(W, " (PC = "); Texts.WriteHex(W, stack.pc+stack.mod.code); Texts.WriteString(W, "H, FP =");
+				Texts.WriteHex(W, stack(DebugS.Proc).fp); Texts.WriteString(W, "H)"); WriteLn(W);
+			ELSE Texts.WriteString(W, "$$");
+				Texts.WriteString(W, " PC = "); Texts.WriteInt(W, stack.pc, 1);
+				Texts.WriteString(W, " (PC = "); Texts.WriteHex(W, stack.pc+stack.mod.code); Texts.WriteString(W, "H, FP =");
+				Texts.WriteHex(W, stack.mod.SB); Texts.WriteString(W, "H)"); WriteLn(W)
+			END;
+			DebugS.Recompile(stack.mod); msg.W:=W; stack.handle(stack, msg); W:=msg.W; INC(n);
+			IF (n=MaxProc) & ~ShowFullStack THEN
+				next:=stack; i:=0;
+				WHILE next#NIL DO next:=next.stacklink; INC(i) END;
+				IF i>LastProcs+1 THEN
+					Texts.WriteLn(W); Texts.WriteString(W, "... skipped "); Texts.WriteInt(W, i-LastProcs-1, 0);
+					Texts.WriteString(W, " procedure(s)"); Texts.WriteLn(W); Texts.WriteLn(W);
+					WHILE i>LastProcs+1 DO stack:=stack.stacklink; DEC(i) END
+				END
+			END;
+			stack:=stack.stacklink
+		END
+	END ShowStack;
+	
+	PROCEDURE Close*;
+	(* release memory allocated by debugger, close session *)
+	BEGIN
+		Reset; DebugS.Close; DebugD.Close
+	END Close;
+
+	PROCEDURE ShowTrap*;
+	(* show trap message *)
+		VAR
+			pc, fp, adr, refstart: LONGINT;
+			res: BOOLEAN;
+			procname: DebugT.Name;
+			mod: Modules.Module;
+	BEGIN
+		pc:=DebugT.pc; fp:=DebugT.fp;
+		Texts.WriteString(W, "TRAP "); Texts.WriteInt(W, DebugT.error, 0); 
+		SYSTEM.GET(Kernel.modules, adr); mod:=SYSTEM.VAL(Modules.Module, adr);
+		WHILE (mod#NIL) & ~((pc>=mod.code) & (pc<mod.size+mod.entries)) DO mod:=mod.link END;
+		IF mod#NIL THEN
+			Texts.WriteString(W, " PC="); Texts.WriteInt(W, pc-mod.code, 0); Texts.Write(W, " ");
+			DebugS.GetProcName(mod, pc-mod.code, procname, refstart, res);
+			Texts.WriteString(W, mod.name); Texts.Write(W, "."); Texts.WriteString(W, procname);
+		ELSE
+			Texts.WriteString(W, " PC="); Texts.WriteHex(W, pc); Texts.WriteString(W, "H no reference information")
+		END;
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+		Close
+	END ShowTrap;
+	
+	PROCEDURE Recursive*;
+	(* installed procedure for invocation after recursive trap *)
+	BEGIN
+		Texts.WriteString(W, "Recursive Trap");
+		IF DebugT.GCTrap THEN
+			Kernel.GCenabled:=FALSE; Texts.WriteString(W, " (GC trapped: GC has been disabled)")
+		END;
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END Recursive;
+
+	
+	(* ______________________________ init ____________________________ *)
+	
+	PROCEDURE Open*(VAR name: ARRAY OF CHAR; VAR res: BOOLEAN);
+	BEGIN
+		DebugS.Open(name, ProcHandle, ModHandle, res)
+	END Open;
+		
+	PROCEDURE Init;
+	(* init lint *)
+	BEGIN
+		NEW(lint); lint.mode:=DebugS.mVar; lint.name:="Mem[adr]"; lint.a0:=0; NEW(lint.typ); lint.typ.form:=DebugS.fLInt;
+		lint.next:=NIL; lint.dsc:=NIL; 
+	END Init;
+
+BEGIN
+	Init; Texts.OpenWriter(W)
+END DebugV.

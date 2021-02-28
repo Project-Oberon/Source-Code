@@ -1,0 +1,141 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Plotter;
+
+IMPORT Display, Display3, Gadgets, Objects, BasicGadgets, Input, Oberon;
+
+CONST MaxPoints = 362;
+
+TYPE
+	Plotter = POINTER TO PlotterDesc;
+	PlotterDesc = RECORD (Gadgets.FrameDesc)
+		points: ARRAY MaxPoints OF LONGINT;
+		min, max: LONGINT;
+		beg, end: INTEGER;
+	END;
+
+PROCEDURE Min(x, y: LONGINT): LONGINT;
+BEGIN  IF x < y THEN RETURN x ELSE RETURN y END
+END Min;
+
+PROCEDURE Max(x, y: LONGINT): LONGINT;
+BEGIN  IF x > y THEN RETURN x ELSE RETURN y END
+END Max;
+
+PROCEDURE DisplayPlotter(P: Plotter; X, Y, W, H: INTEGER; VAR M: Display3.Mask);
+VAR i, p : INTEGER; range, min: LONGINT;
+BEGIN
+	Display3.FilledRect3D(M, Display.black, Display.white, 12, X, Y, W, H, 1, Display.replace);
+	range := P.max - P.min + 10; min := P.min - 5;
+	IF range = 0 THEN range := 1 END;
+	
+	i := 0;  
+	WHILE i < P.end DO
+		p := SHORT((P.points[i] - min) * (H - 4) DIV range);
+		Display3.Dot(M, Display.white, X + i + 1, Y + p + 2, Display.replace);
+		INC(i);
+	END;
+	IF Gadgets.selected IN P.state THEN Display3.FillPattern(M, Display.white, Display3.selectpat, X, Y, X, Y, W, H, Display.paint) END
+END DisplayPlotter;
+
+PROCEDURE Plot(P: Plotter; value: LONGINT; X, Y, W, H: INTEGER; VAR M: Display3.Mask);
+VAR i, p, end : INTEGER; oldrange, range, min: LONGINT;
+BEGIN
+	oldrange := P.max - P.min + 10;
+	IF oldrange = 0 THEN oldrange := 1 END;
+	
+	end := P.end;
+	P.points[P.end] := value; P.end := (P.end + 1) MOD MaxPoints;
+	IF P.end = 0 THEN (* overflow *)
+		P.points[0] := value; P.end := 1;
+		DisplayPlotter(P, X, Y, W, H, M);
+		RETURN
+	END;
+	
+	P.min := MAX(LONGINT); P.max := MIN(LONGINT);
+	i := 0;
+	WHILE i # P.end DO
+		P.min := Min(P.min, P.points[i]); P.max := Max(P.max, P.points[i]);
+		i := (i + 1) MOD MaxPoints
+	END;
+	range := P.max - P.min + 10; min := P.min - 5;
+	IF range = 0 THEN range := 1 END;
+	
+	IF range # oldrange THEN DisplayPlotter(P, X, Y, W, H, M);
+	ELSE p := SHORT((value - min) * (H - 4) DIV range);
+		Display3.Dot(M, Display.white, X + end + 1, Y + p + 2, Display.replace);
+	END;
+	IF Gadgets.selected IN P.state THEN Display3.FillPattern(M, Display.white, Display3.selectpat, X, Y, X, Y, W, H, Display.paint) END
+END Plot;
+
+PROCEDURE *PlotterHandler(P: Objects.Object; VAR M: Objects.ObjMsg);
+VAR x, y, w, h: INTEGER; P0: Plotter; R: Display3.Mask;
+BEGIN
+	WITH P: Plotter DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF (M.id = Objects.get) & (M.name = "Gen") THEN M.s := "Plotter.NewPlotter"; M.res := 0; M.class := Objects.String
+				ELSE Gadgets.framehandle(P, M)
+				END
+			 END;
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				IF M.stamp = P.stamp THEN M.obj := P.dlink	(* copy msg arrives again *)
+				ELSE	(* first time copy message arrives *)
+					NEW(P0); P.stamp := M.stamp; P.dlink := P0; Gadgets.CopyFrame(M, P, P0); M.obj := P0
+				END
+			END
+		ELSIF M IS Display.FrameMsg THEN
+			WITH M: Display.FrameMsg DO
+				IF (M.F = NIL) OR (M.F = P) THEN	(* message addressed to this frame *)
+					x := M.x + P.X; y := M.y + P.Y; w := P.W; h := P.H; (* calculate actual display coordinates *)
+					IF M IS Display.DisplayMsg THEN
+						WITH M: Display.DisplayMsg  DO
+							IF (M.id = Display.frame) OR (M.F = NIL) THEN
+								Gadgets.MakeMask(P, x, y, M.dlink, R);
+								DisplayPlotter(P, x, y, w, h, R);
+							ELSIF M.id = Display.area THEN
+								Gadgets.MakeMask(P, x, y, M.dlink, R);
+								Display3.AdjustMask(R, x + M.u, y + h - 1 + M.v, M.w, M.h);
+								DisplayPlotter(P, x, y, w, h, R);
+							END;
+						END;
+					ELSIF  M IS Gadgets.UpdateMsg THEN
+						WITH M: Gadgets.UpdateMsg  DO
+							IF (M.obj = P.obj) & (M.obj IS BasicGadgets.Integer) THEN
+								Gadgets.MakeMask(P, x, y, M.dlink, R);
+								Plot(P, P.obj(BasicGadgets.Integer).val, x, y, w, h, R);
+							END
+						END
+					ELSIF M IS Oberon.InputMsg THEN
+						WITH M: Oberon.InputMsg DO
+							Gadgets.framehandle(P, M)
+						END
+					ELSE Gadgets.framehandle(P, M);
+					END
+				ELSE Gadgets.framehandle(P, M)
+				END
+			END
+		ELSE Gadgets.framehandle(P, M)
+		END
+	END
+END PlotterHandler;
+
+PROCEDURE NewPlotter*;
+VAR P: Plotter;
+BEGIN NEW(P); P.W := 130; P.H := 100; P.handle := PlotterHandler; Objects.NewObj := P
+END NewPlotter;
+
+END Plotter.
+

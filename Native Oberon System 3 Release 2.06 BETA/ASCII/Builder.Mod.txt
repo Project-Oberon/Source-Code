@@ -1,0 +1,712 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Builder;
+
+(*
+	29.3.94 - Check if module is missing
+	19.4.04 - Added support for /d compile option
+	11.5.94 - remove error gadgets from the text 
+	9.6.94 - Can compile from all text editors that keep to the Oberon conventions, does not import documents any more
+	17.11.94 - improved option char
+	15.11.94 - modified gettext
+	12.1.94 - fixed /f option compilation
+	18.1.95 - improved NextError
+	23.10.95 - fixed free trap
+	5.1.96 - increase filename length
+	10.02.96 pjm - Native Oberon
+	15.03.96 pjm - OptionChar
+	25.03.96 pjm - get message from Oberon.Text
+	11.07.96 pjm - fixed module message
+*)
+
+IMPORT
+	OCS := iOPS, OPM := iOPM, Compiler, Oberon, Display, Gadgets, Texts, Attributes, Objects, Icons, Modules,
+	Display3, Fonts, Effects, Files;
+	
+CONST
+	(* old Wirth compiler + DOS oberon 
+	module = 61; ident = 37; semicolon = 38; import = 60; 
+	*)
+	(* new Wirth compiler 
+	module = 63; ident = 37; semicolon = 38; import = 62;
+	*)
+	(* intel OP2 compiler *)
+	module = 63; ident = 38; semicolon = 39; import = 62; becomes = 34; comma = 19;
+	(* *)
+	
+TYPE
+	ErrorGadget* = POINTER TO ErrorGadgetDesc;
+	ErrorGadgetDesc* = RECORD (Gadgets.FrameDesc)
+		errno*: INTEGER;
+		msg*: POINTER TO ARRAY 128 OF CHAR;
+	END;
+
+	(* Module hierarchy *)
+	Mod* = POINTER TO ModDesc;
+	Ref* = POINTER TO RefDesc;
+	RefDesc* = RECORD
+		mod*: Mod;
+		next*: Ref;
+	END;
+	ModDesc* = RECORD 
+		name*, fname*: ARRAY 64 OF CHAR;
+		ref*, layer*: INTEGER;
+		impl*: Ref;
+		next*: Mod;
+	END;
+	
+	Tree* = RECORD
+		maxlayer*: INTEGER;
+		list*: Mod;
+	END;
+
+VAR
+	compiler, options: ARRAY 64 OF CHAR;
+	W: Texts.Writer;
+	sym: SHORTINT; (* << win *)
+	error: BOOLEAN;
+	
+	tt: Tree;
+
+(* version where textframes do not respond on LocateMsg and linkMsg
+PROCEDURE GetText(VAR par: Display.Frame): Texts.Text;
+VAR u, v: INTEGER; M: Objects.LinkMsg; t: Texts.Text; V: Viewers.Viewer;
+BEGIN
+	t := NIL;
+	(* IF Oberon.Pointer.on THEN *)
+		Gadgets.ThisFrame(Oberon.Pointer.X, Oberon.Pointer.Y, par, u, v);
+		IF par # NIL THEN
+			IF par IS TextFrames.Frame THEN
+				WITH par: TextFrames.Frame DO t := par.text END
+			ELSE
+				M.id := Objects.get; M.name := "Model"; M.obj := NIL; M.res := -1; par.handle(par, M);
+				IF (M.obj # NIL) & (M.obj IS Texts.Text) THEN t := M.obj(Texts.Text) END
+			END
+		ELSE
+			V := Oberon.MarkedViewer();
+			IF (V.dsc.next # NIL) & (V.dsc.next IS TextFrames.Frame) THEN
+				par := V.dsc.next;
+				t := V.dsc.next(TextFrames.Frame).text
+			END
+		END;
+	(* END; *)
+	RETURN t
+END GetText;
+*)
+
+(** Get the marked text *)
+PROCEDURE GetText(VAR par: Display.Frame): Texts.Text;
+VAR M: Objects.LinkMsg; t: Texts.Text; u, v: INTEGER;
+BEGIN
+	t := NIL;
+	Gadgets.ThisFrame(Oberon.Pointer.X, Oberon.Pointer.Y, par, u, v);
+	IF par # NIL THEN
+		M.id := Objects.get; M.name := "Model"; M.obj := NIL; M.res := -1; par.handle(par, M);
+		IF (M.obj # NIL) & (M.obj IS Texts.Text) THEN t := M.obj(Texts.Text) END
+	END;
+	RETURN t
+END GetText;
+
+(* ---------------- ErrorGadget -------------- *)
+
+PROCEDURE ErrorGadgetAttr(F: ErrorGadget; VAR M: Objects.AttrMsg);
+BEGIN
+	IF M.id = Objects.get THEN
+		IF M.name = "Gen" THEN M.class := Objects.String; COPY("Builder.NewErrorGadget", M.s); M.res := 0
+		ELSIF M.name = "LineupHY" THEN M.class := Objects.Int; M.i := ABS(Fonts.Default.minY) + 1; M.res := 0
+		ELSE Gadgets.framehandle(F, M)
+		END
+	ELSIF M.id = Objects.set THEN
+		Gadgets.framehandle(F, M);
+	ELSIF M.id = Objects.enum THEN
+		Gadgets.framehandle(F, M)
+	END
+END ErrorGadgetAttr;
+
+PROCEDURE RestoreErrorGadget(F: ErrorGadget; M: Display3.Mask; x, y, w, h: INTEGER);
+VAR s: ARRAY 128 OF CHAR;
+BEGIN
+(*
+	Display3.FilledRect3D(M, Display3.topC, Display3.bottomC, Display3.groupC, x, y, w, h, 1, Display.replace);
+*)
+	Display3.ReplConst(M, Display3.groupC, x, y, w, h, Display.replace);
+	IF F.msg # NIL THEN
+		Display3.CenterString(M, Display.FG, x, y, w, h, Fonts.Default, F.msg^, Display.paint)
+	ELSE
+		Attributes.IntToStr(ABS(F.errno), s);
+		Display3.CenterString(M, Display.FG, x, y, w, h, Fonts.Default, s, Display.paint)
+	END;
+	IF Gadgets.selected IN F.state THEN
+		Display3.FillPattern(M, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+	END
+END RestoreErrorGadget;
+
+PROCEDURE CopyErrorGadget*(VAR M: Objects.CopyMsg; from, to: ErrorGadget);
+BEGIN
+	to.errno := from.errno;
+	Gadgets.CopyFrame(M, from, to);
+END CopyErrorGadget;
+
+PROCEDURE GetErrMsg (errNr: INTEGER; VAR msg: ARRAY OF CHAR);	
+VAR s: Texts.Scanner; n: INTEGER; ch: CHAR;  warn: BOOLEAN;
+BEGIN Oberon.OpenScanner(s, "OP2.Errors");
+	IF s.class = Texts.Inval THEN msg[0] := 0X
+	ELSE
+		warn := (errNr < 0);  errNr := ABS(errNr);
+		REPEAT Texts.Scan(s) UNTIL s.eot OR (s.class = Texts.Int) & (s.i = 0);
+		WHILE ~ s.eot & ((s.class # Texts.Int) OR (s.i # errNr)) DO
+			Texts.Scan(s);  IF (s.class = Texts.Char) & (s.c = "}") THEN s.eot := TRUE END
+		END;
+		IF ~s.eot THEN Texts.Read(s, ch); n := 0;
+			IF warn THEN COPY("warning: ", msg);
+				WHILE msg[n] # 0X DO INC(n) END
+			END;
+			WHILE ~s.eot & (ch # 0DX) DO msg[n] := ch; INC(n); Texts.Read(s, ch) END;
+			msg[n] := 0X
+		END
+	END
+END GetErrMsg;
+
+PROCEDURE FlipMsg(F: ErrorGadget);
+VAR w, h, dsr: INTEGER; A: Display.ModifyMsg;
+BEGIN
+	IF F.msg = NIL THEN
+		NEW(F.msg); GetErrMsg(F.errno, F.msg^); Display3.StringSize(F.msg^, Fonts.Default, w, h, dsr);
+		INC(w, 5);
+	ELSE F.msg := NIL; w := 20
+	END;
+	A.F := F; A.id := Display.extend; A.mode := Display.display;
+	A.X := F.X; A.Y := F.Y; A.W := w; A.H := F.H;
+	A.dX := 0; A.dY := 0; A.dW := A.W - F.W; A.dH := 0;
+	Display.Broadcast(A);
+END FlipMsg;
+
+PROCEDURE ErrorGadgetHandler*(F: Objects.Object; VAR M: Objects.ObjMsg);
+VAR x, y, w, h: INTEGER; F0: ErrorGadget; R: Display3.Mask; keysum: SET;
+BEGIN
+	WITH F: ErrorGadget DO
+		IF M IS Display.FrameMsg THEN
+			WITH M: Display.FrameMsg DO
+				IF (M.F = NIL) OR (M.F = F) THEN	(* message addressed to this frame *)
+					x := M.x + F.X; y := M.y + F.Y; w := F.W; h := F.H; (* calculate display coordinates *)
+					IF M IS Display.DisplayMsg THEN
+						WITH M: Display.DisplayMsg  DO
+							IF (M.id = Display.frame) OR (M.F = NIL) THEN
+								Gadgets.MakeMask(F, x, y, M.dlink, R);
+								RestoreErrorGadget(F, R, x, y, w, h)
+							ELSIF M.id = Display.area THEN
+								Gadgets.MakeMask(F, x, y, M.dlink, R);
+								Display3.AdjustMask(R, x + M.u, y + h - 1 + M.v, M.w, M.h);
+								RestoreErrorGadget(F, R, x, y, w, h)
+							END
+						END
+					ELSIF M IS Oberon.InputMsg THEN
+						WITH M: Oberon.InputMsg DO
+							IF (M.id = Oberon.track) & Gadgets.InActiveArea(F, M) & (M.keys = {1}) THEN
+								Gadgets.MakeMask(F, x, y, M.dlink, R);
+								Effects.TrackHighlight(R, keysum, M.X, M.Y, x, y, w, h);
+								IF (keysum = {1}) & Effects.Inside(M.X, M.Y, x, y, w, h) THEN
+									FlipMsg(F);
+								END;
+								M.res := 0
+							ELSE Gadgets.framehandle(F, M)
+							END
+						END
+					ELSE Gadgets.framehandle(F, M)
+					END
+				END
+			END
+			
+		(* Object messages *)
+		
+		ELSIF M IS Objects.AttrMsg THEN ErrorGadgetAttr(F, M(Objects.AttrMsg))
+		ELSIF M IS Objects.FileMsg THEN
+			WITH M: Objects.FileMsg DO
+				IF M.id = Objects.store THEN
+					Files.WriteInt(M.R, F.errno);
+					IF F.msg # NIL THEN Files.WriteInt(M.R, 1); Files.WriteString(M.R, F.msg^) ELSE Files.WriteInt(M.R, 0) END;
+					Gadgets.framehandle(F, M)
+				ELSIF M.id = Objects.load THEN
+					Files.ReadInt(M.R, F.errno);
+					Files.ReadInt(M.R, x);
+					IF x = 1 THEN NEW(F.msg); Files.ReadString(M.R, F.msg^) END;
+					Gadgets.framehandle(F, M)
+				END
+			END
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				IF M.stamp = F.stamp THEN M.obj := F.dlink	(* copy msg arrives again *)
+				ELSE	(* first time copy message arrives *)
+					NEW(F0); F.stamp := M.stamp; F.dlink := F0; CopyErrorGadget(M, F, F0); M.obj := F0
+				END
+			END
+		ELSE	(* unknown msg, framehandler might know it *)
+			Gadgets.framehandle(F, M)
+		END
+	END
+END ErrorGadgetHandler;
+
+PROCEDURE NewErrorGadget*;
+VAR F: ErrorGadget;
+BEGIN NEW(F); F.W := 20; F.H := 14; F.errno := 255;F.handle := ErrorGadgetHandler; Objects.NewObj := F;
+END NewErrorGadget;
+
+PROCEDURE MarkErrorPos(T: Texts.Text; pos: LONGINT; err: INTEGER);
+VAR W: Texts.Writer; ref: INTEGER; M: Objects.BindMsg; obj: Objects.Object;
+BEGIN
+	NewErrorGadget; obj := Objects.NewObj; obj(ErrorGadget).errno := err;
+	IF T.obs = NIL THEN
+		NEW(T.obs); Objects.OpenLibrary(T.obs);
+	END;
+	T.obs.GenRef(T.obs, ref);
+	IF ref >= 0 THEN
+		M.lib := T.obs; obj.handle(obj, M);
+		Texts.OpenWriter(W);
+		Texts.SetFont(W, T.obs); Texts.SetOffset(W, Oberon.CurOff);
+		Texts.Write(W, CHR(ref));
+		Texts.Insert(T, pos, W.buf);
+	END
+END MarkErrorPos;
+
+PROCEDURE RemoveErrors(T: Texts.Text);
+VAR first: LONGINT; F: Texts.Finder; o: Objects.Object;
+BEGIN
+	first := -1;
+	LOOP
+		Texts.OpenFinder(F, T, 0);
+		IF F.eot THEN EXIT END;
+		first := F.pos;
+		Texts.FindObj(F, o);
+		LOOP
+			IF F.eot THEN EXIT END;
+			IF (o # NIL) & (o IS ErrorGadget) THEN EXIT
+			ELSE
+				first := F.pos;
+				Texts.FindObj(F, o);
+			END;
+		END;
+		IF F.eot THEN EXIT END;
+		IF (o # NIL) & (o IS ErrorGadget) THEN
+			Texts.Delete(T, first, first+1);
+			IF o.lib = T.obs THEN (* delete object *)
+				T.obs.FreeObj(T.obs, o.ref)
+			END
+		END
+	END
+END RemoveErrors;
+
+PROCEDURE MarkErrors*;
+VAR S: Texts.Scanner; par: Display.Frame; c, err: INTEGER; pos, beg, end, time: LONGINT; T, errtext: Texts.Text;
+	warn: BOOLEAN;  l: INTEGER;
+BEGIN
+	errtext := GetText(par);
+	IF errtext # NIL THEN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "^") OR (S.line # 0) THEN
+			Oberon.GetSelection(T, beg, end, time);
+			IF time >= 0 THEN Texts.OpenScanner(S, T, beg); Texts.Scan(S) END
+		END;
+		c := 0;
+		WHILE (S.class = Texts.Name) & (S.s = "pos") DO
+			Texts.Scan(S); pos := S.i; Texts.Scan(S);
+			warn := (S.class = Texts.Name) & (S.s = "warning");
+			Texts.Scan(S); err := SHORT(S.i);
+			IF warn THEN err := -err END;
+			MarkErrorPos(errtext, pos + c, err); INC(c);
+			l := S.line;  REPEAT Texts.Scan(S) UNTIL S.eot OR (S.line # l);
+		END
+	END
+END MarkErrors;
+
+PROCEDURE ClearErrors*;
+VAR T: Texts.Text; par: Display.Frame; 
+BEGIN
+	T := GetText(par);
+	IF T # NIL THEN RemoveErrors(T) END
+END ClearErrors;
+
+PROCEDURE ErrorAfter(T: Texts.Text; VAR pos: LONGINT);
+VAR F: Texts.Finder; o: Objects.Object; p: LONGINT;
+BEGIN
+	Texts.OpenFinder(F, T, pos);
+	p := F.pos; Texts.FindObj(F, o);
+	WHILE (o # NIL) & (~(o IS ErrorGadget) OR (p <= pos)) DO p := F.pos; Texts.FindObj(F, o) END;
+	IF (o # NIL) & (o IS ErrorGadget) THEN pos := p + 1 ELSE pos := -1 END;
+END ErrorAfter;
+
+PROCEDURE NextError*;
+VAR M: Oberon.CaretMsg; pos: LONGINT;
+BEGIN
+	M.F := NIL; M.id := Oberon.get; M.car := NIL; M.text := NIL; Display.Broadcast(M);
+	IF (M.car # NIL) & (M.text # NIL) THEN
+		pos := M.pos; ErrorAfter(M.text, pos);
+		IF pos >= 0 THEN
+			M.id := Oberon.set; M.F := M.car; M.pos := pos; Display.Broadcast(M)
+		ELSE (* no more errors *)
+			pos := 0; ErrorAfter(M.text, pos);
+			IF pos >= 0 THEN
+				M.id := Oberon.set; M.F := M.car; M.pos := pos; Display.Broadcast(M)
+			ELSE Oberon.Defocus
+			END
+		END
+	END
+END NextError;
+
+(* ---------------- hierarchy calculation -------------- *)
+
+PROCEDURE MatchSym(s: INTEGER): BOOLEAN;
+BEGIN
+	IF s = sym THEN
+		OCS.Get(sym); RETURN TRUE
+	ELSE RETURN FALSE END;
+END MatchSym;
+
+PROCEDURE Import(VAR T: Tree; M: Mod);
+VAR modname: ARRAY 64 OF CHAR; m: Mod; r: Ref;
+BEGIN
+	IF sym = ident THEN (* ident *)
+		COPY(OCS.name, modname); OCS.Get(sym);
+		IF sym = becomes THEN (* := *)
+			OCS.Get(sym);
+			IF sym = ident THEN
+				COPY(OCS.name, modname); OCS.Get(sym);
+			END;
+		END;
+		IF modname # "SYSTEM" THEN
+			m := T.list; (* find module in list *)
+			WHILE (m # NIL) & (m.name # modname) DO m := m.next END;
+			IF m = NIL THEN (* module not found in list *)
+				NEW(m); COPY(modname, m.name); m.next := T.list; T.list := m; (* insert in list *)
+			END;	
+			r := M.impl;
+			WHILE (r # NIL) & (r.mod # m) DO r := r.next END;
+			IF r = NIL THEN
+				NEW(r); r.mod := m; r.next := M.impl; M.impl := r; INC(m.ref);
+			END;
+		END;
+	END;
+END Import;
+
+PROCEDURE ImportList(VAR T: Tree; M: Mod);
+BEGIN
+	LOOP Import(T, M);
+		IF sym = semicolon THEN EXIT END; (* ; *)
+		IF sym # comma THEN EXIT ELSE OCS.Get(sym) END; (* , *)
+	END;
+END ImportList;	
+
+PROCEDURE AddModule*(VAR T: Tree; s: ARRAY OF CHAR);
+VAR M, m: Mod; t: Texts.Text; R: Texts.Reader;
+BEGIN
+	NEW(M); COPY(s, M.fname);
+	
+	NEW(t); Texts.Open(t, s);
+	IF t.len = 0 THEN Texts.WriteString(W, s); Texts.WriteString(W, " not found"); Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+	ELSE
+		Texts.OpenReader(R, t, 0); OPM.Init(R, Oberon.Log); (* << win *)
+		OCS.Init; OCS.Get(sym);
+		IF MatchSym(module) THEN (* module *)
+			IF sym = ident THEN (* ident *)
+				COPY(OCS.name, M.name);
+				OCS.Get(sym);
+				IF MatchSym(semicolon) & MatchSym(import) THEN (* ; IMPORT *)
+					m := T.list;
+					WHILE (m # NIL) & (m.name # M.name) DO m := m.next END;
+					IF m = NIL THEN (* not in there already *)
+						ImportList(T, M); M.next := T.list; T.list := M;
+					ELSE
+						IF m.fname[0] = 0X THEN (* already in list but has no file name *)
+							M := m; COPY(s, M.fname); ImportList(T, M);
+						END;
+					END;
+					error := FALSE; RETURN
+				ELSE
+					m := T.list;
+					WHILE (m # NIL) & (m.name # M.name) DO m := m.next END;
+					IF m = NIL THEN (* not in there already *)
+						M.next := T.list; T.list := M
+					ELSE
+						IF m.fname[0] = 0X THEN (* already in list but has no file name *)
+							M := m; COPY(s, M.fname); (* ImportList(T, M); *)
+						END
+					END;
+					error := FALSE; RETURN
+					(*
+					Texts.WriteString(W, s); Texts.WriteString(W, " IMPORT expected"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf);
+					*)
+				END;
+			ELSE
+				Texts.WriteString(W, s); Texts.WriteString(W, " identifier expected"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+			END;
+		ELSE
+			Texts.WriteString(W, s); Texts.WriteString(W, " MODULE expected"); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+		END
+	END;
+	error := TRUE
+END AddModule;
+
+PROCEDURE Mark(VAR T: Tree; m: Mod; layer: INTEGER);
+VAR r: Ref; m0: Mod;
+BEGIN
+	IF layer > m.layer THEN
+		IF layer > T.maxlayer THEN T.maxlayer := layer END;
+		m.layer := layer;
+		m0 := T.list;
+		WHILE m0 # NIL DO
+			r := m0.impl;
+			WHILE r # NIL DO
+				IF r.mod = m THEN Mark(T, m0, layer+1); END;
+				r := r.next;
+			END;
+			m0 := m0.next;
+		END;
+	END;
+END Mark;
+
+PROCEDURE Hierarchy*(VAR T: Tree);
+VAR m, m0, clist: Mod; r: Ref;
+BEGIN
+	(* calculate layers *)
+	T.maxlayer := 0;
+	m := T.list;
+	WHILE m # NIL DO
+		IF m.fname[0] # 0X THEN Mark(T, m, 1) END;
+		m := m.next;
+	END;
+	(* process *)
+	clist := NIL;
+	LOOP
+		m := T.list; m0 := NIL;
+		WHILE (m # NIL) & (m.ref # 0) DO m0 := m; m := m.next END;
+		IF m = NIL THEN
+			IF T.list # NIL THEN
+				Texts.WriteString(W, "inconsistant import hierarchy"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf);
+			ELSE
+				EXIT
+			END;
+		ELSE (* m is a module to be compiled *)
+			(* remove m *)
+			IF T.list = m THEN (* first in list *) T.list := m.next;
+			ELSE m0.next := m.next;
+			END;
+			(* put in compile list *)
+			m.next := clist; clist := m;
+			r := m.impl; WHILE r # NIL DO DEC(r.mod.ref); r := r.next END; (* decrement references *)
+		END;
+	END;
+	T.list := clist;
+END Hierarchy;
+
+PROCEDURE Append(VAR list: Display.Frame; f: Display.Frame);
+BEGIN
+	IF list = NIL THEN
+		list := f; f.slink := NIL;
+	ELSE
+		f.slink := list; list := f;
+	END;
+END Append;
+
+PROCEDURE InsertHierarchy*;
+VAR S: Attributes.Scanner; m: Mod; T: Tree; list: Display.Frame; F: Icons.Icon; x, y, layer: INTEGER; obj: Objects.Object;
+	A: Objects.AttrMsg;
+BEGIN
+	T.list := NIL;
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	WHILE S.class = Attributes.Name DO
+		AddModule(T, S.s);
+		Attributes.Scan(S);
+	END;
+	Hierarchy(T);
+	IF T.list # NIL THEN
+		layer := 1; x := 0; y := 0; list := NIL;
+		WHILE layer <= T.maxlayer DO
+			m := T.list;
+			WHILE m # NIL DO
+				IF (m.fname[0] # 0X) & (m.layer = layer) THEN
+					obj := Gadgets.FindPublicObj("Icons.Object");
+					NEW(F); Icons.MakeIcon(F, m.fname, Icons.ViewOf(obj(Gadgets.Frame))); F.X := x; F.Y := y;
+					A.id := Objects.set; A.name := "Cmd"; A.class := Objects.String;
+					A.s := "Desktops.OpenDoc '#Caption '"; A.res := -1;
+					F.handle(F, A);
+					Append(list, F); INC(x, F.W);
+				END;
+				m := m.next;
+			END;
+			INC(layer); INC(y, 60); x := 0;
+		END;
+		Gadgets.Integrate(list);
+	END;
+END InsertHierarchy;
+
+PROCEDURE Compile*;
+VAR S: Attributes.Scanner; T: Tree; m: Mod; s: ARRAY 64 OF CHAR; i, j, line: INTEGER; S1: Texts.Scanner;
+	beg, fbeg, fend, ftime: LONGINT; C: Oberon.CaretMsg; text, ftext: Texts.Text; par: Display.Frame; R: Texts.Reader;
+	
+	PROCEDURE WriteFileName(source: Texts.Text);
+	VAR S1: Texts.Scanner;
+	BEGIN
+		Texts.OpenScanner(S1, source, 0); Texts.Scan(S1);
+		WHILE ~S1.eot & ((S1.class # Texts.Name) OR (S1.s # "MODULE")) DO Texts.Scan(S1) END;
+		IF (S1.class = Texts.Name) & (S1.s = "MODULE") THEN
+			Texts.Scan(S1);
+			IF S1.class = Texts.Name THEN Texts.WriteString(W, " compiling "); Texts.WriteString(W, S1.s) END
+		END;
+		Texts.Append(Oberon.Log, W.buf);
+	END WriteFileName;
+	
+		PROCEDURE Locate(F: Display.Frame;  T: Texts.Text;  pos: LONGINT);
+		VAR M: Oberon.CaretMsg;  N: Oberon.ControlMsg;
+		BEGIN
+			IF pos < 0 THEN pos := 0
+			ELSIF pos > T.len THEN pos := T.len
+			END;
+            N.F := NIL; N.id := Oberon.neutralize; Display.Broadcast(N);
+            Oberon.FadeCursor(Oberon.Pointer);
+			M.id := Oberon.set; M.F := F; M.car := F; M.text := T; M.pos := pos; Display.Broadcast(M)
+		END Locate;
+		
+BEGIN
+	Texts.WriteString(W, "Builder.Compile ");
+	T.list := NIL; options := "";
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	IF (S.class = Attributes.Char) & (S.c = Oberon.OptionChar) THEN
+		Attributes.Scan(S); COPY(S.s, options);
+		Texts.WriteString(W, " \"); Texts.WriteString(W, options); 
+		Attributes.Scan(S);
+	END;
+	Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+	IF (S.class = Attributes.Char) & (S.c = "*") THEN
+		text := GetText(par);
+		IF text # NIL THEN
+			beg := Oberon.Log.len; RemoveErrors(text);
+			Texts.OpenReader(R, text, 0);
+			WriteFileName(text);
+			i := 0; WHILE (options[i] # 0X) & (options[i] # "f") DO INC(i) END;
+			IF options[i] = "f" THEN
+				OPM.breakpos := 0;
+				Oberon.GetSelection(ftext, fbeg, fend, ftime);
+				IF ftime >= 0 THEN
+					Texts.OpenScanner(S1, ftext, fbeg); Texts.Scan(S1); line := S1.line;
+					WHILE (S1.class # Texts.Int) & (S1.line = line) DO Texts.Scan(S1) END
+				ELSE S1.class := Texts.Inval
+				END;
+				IF S1.class = Texts.Int THEN
+					Compiler.Module(R, options, S1.i, Oberon.Log, error);
+					Locate(par, text, OPM.breakpos)
+				ELSE
+					Texts.WriteString(W, "  pc not selected"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf)
+				END;
+				RETURN
+			ELSE Compiler.Module(R, options, MAX(LONGINT), Oberon.Log, error);
+			END;
+		ELSE Texts.WriteString(W, " text not found"); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+		END
+	ELSE
+		error := FALSE;
+		WHILE ~S.eot & ~error & (S.class = Attributes.Name) DO
+			AddModule(T, S.s); Attributes.Scan(S);
+		END;
+		IF ~error THEN
+			Hierarchy(T);
+			tt := T; (* fool garbage collector *)
+			m := T.list;
+			WHILE (m # NIL) & ~error DO
+				IF m.fname[0] # 0X THEN
+					s := "Compiler.Compile "; i:=0; WHILE s[i] # 0X DO INC(i) END;
+					j := 0; WHILE m.fname[j] # 0X DO s[i] := m.fname[j]; INC(i); INC(j) END;
+					IF options # "" THEN
+						s[i] := Oberon.OptionChar; INC(i);
+						j := 0;
+						WHILE options[j] # 0X DO s[i] := options[j]; INC(i); INC(j); END;
+					END;
+					s[i] := " "; s[i+1] := "~"; s[i+2] := 0X;
+					Gadgets.Execute(s, NIL, NIL, NIL, NIL);
+					error := ~OPM.noerr;
+				END;
+				m := m.next;
+			END;
+		END
+	END;
+	tt.list := NIL
+END Compile;
+
+PROCEDURE Free*;
+VAR S: Attributes.Scanner; T: Tree;
+
+	PROCEDURE F(mod: Mod);
+	BEGIN
+		IF mod.next # NIL THEN F(mod.next) END;
+		IF (mod.fname[0] # 0X) & (mod.name[0] # 0X) THEN
+			Texts.WriteString(W, mod.name); Texts.WriteString(W, " unloading");
+			Modules.Free(mod.name, FALSE); 
+			IF Modules.res # 0 THEN Texts.WriteString(W, " failed") END;
+			Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END;
+	END F;
+	
+BEGIN
+	Texts.WriteString(W, "Builder.Free"); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+	T.list := NIL;
+	Attributes.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Attributes.Scan(S);
+	WHILE ~S.eot & (S.class = Attributes.Name) DO
+		AddModule(T, S.s); Attributes.Scan(S);
+	END;
+	
+	Hierarchy(T);
+	IF T.list # NIL THEN F(T.list) END
+END Free;
+
+BEGIN
+	COPY("Compiler.Compile ", compiler); options := "";
+	Texts.OpenWriter(W)
+END Builder.
+
+System.Free Builder ~
+
+Builder.Compile *
+Builder.InsertHierarchy Display3.Mod	Printer3.Mod 
+		Effects.Mod 	Attributes.Mod ~
+		Gadgets.Mod3 BasicGadgets.Mod3	TextFields.Mod3	Lists.Mod3
+		Proxies.Mod3	Icons.Mod3	Colors.Mod3
+		Panels0.Mod3	Panels.Mod3	Views.Mod3
+		PicturePanels.Mod3	Inspectors.Mod3	
+		Skeleton.Mod3	Folders.Mod3 ActionIcons.Mod3
+		Comp.GadgetsA.Mod3	Comp.GadgetsB.Mod3
+		Comp.StandardGadgets.Mod3	Comp.StandardGadgetsA.Mod3 ~
+		
+Builder.Compile /s Comp.GadgetsA.Mod3	Comp.GadgetsB.Mod3 ~
+		Comp.StandardGadgets.Mod3	Comp.StandardGadgetsA.Mod3
+		Display3.Mod3	Printer3.Mod3 
+		Effects.Mod3 	Attributes.Mod3
+		Gadgets.Mod3 BasicGadgets.Mod3	TextFields.Mod3	Lists.Mod3
+		Proxies.Mod3	Icons.Mod3	Colors.Mod3
+		Panels0.Mod3	Panels.Mod3	Views.Mod3 ~
+		
+Builder.Free Comp.GadgetsA.Mod3	Comp.GadgetsB.Mod3 
+		Comp.StandardGadgets.Mod3	Comp.StandardGadgetsA.Mod3
+		Display3.Mod3	Printer3.Mod3 
+		Effects.Mod3 	Attributes.Mod3
+		Gadgets.Mod3 BasicGadgets.Mod3	TextFields.Mod3	Lists.Mod3
+		Proxies.Mod3	Icons.Mod3	Colors.Mod3
+		Panels0.Mod3	Panels.Mod3	Views.Mod3 ~

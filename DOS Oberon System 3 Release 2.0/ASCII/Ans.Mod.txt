@@ -1,0 +1,462 @@
+MODULE Ans; (* Harry Peter *)
+	IMPORT Texts, Files, Oberon;
+
+	CONST NameLen* = 32; MnemoLen = 9; pdlen = 41;
+		OpTabLen = 271; InstrTabLen = 311;
+		(* die InstrTabLen ist viel groesser, als eigentlich benoetigt (ca. 180 Eintraege). Grund: Hash-Funktion
+			hat weniger Kollisionen *)
+
+		none* = 0; ident* = 1; number* = 2; string* = 3; parL* = 4; parR* = 5;
+		brL* = 6; brR* = 7; comma* = 8; at* = 9; plus* = 10; minus* = 11; ast* = 12;
+		slash* = 13; colon* = 14; reg* = 15; segReg* = 16; cntReg* = 18; debReg* = 19; tstReg* = 20;
+		TAB = 9X; CR = 0DX; SPC = 20X;
+
+	TYPE Name* = ARRAY NameLen OF CHAR;
+		Mnemo* = ARRAY MnemoLen OF CHAR;
+
+		Object* = POINTER TO Node;
+		FixPnt = POINTER TO FixRec;
+		FixPrc* = PROCEDURE (a, b, c: LONGINT);
+
+
+		(*object types: 0 = undefined, 1 = constant, 2 = rel adr (PC), 3 = stat adr (SB),
+				-1 = stat adr from symbol file, -2 = entry point*)
+
+		Node* = RECORD
+							typ*: INTEGER;
+							val*:  LONGINT;
+							name: Name;
+							left, right, next: Object;
+							first: FixPnt
+					   END;
+
+		 FixRec = RECORD
+							adr, len, pc0: LONGINT;
+							next: FixPnt
+						END;
+
+		Instr = RECORD
+						name: Mnemo;
+						ops: SHORTINT; (* Anz. Operanden [0, 1, 2] *)
+						class: INTEGER;
+						anz: SHORTINT; (* Anzahl der Eintraege in der OpCode-Tabelle *)
+						indx: INTEGER (* Index auf OpCode - Tabelle *)
+					END;
+
+		(* OpCode: type  1 Operand  ->  1=immediate, 2=accumulator, 3=reg, 4=mem, 5=segreg, 6= reg/mem
+											7=segreg3, 8=CL, 9=DX, 0A=ControlReg, 0B=DebugReg, OC=Konstante 1
+											0D=TestReg
+									2 Operands ->  wie 1 Operand, Ziel in Bits 4-7, Quelle in Bits 0-3
+						   cod   0 = X X X X X X X X			5 = X X X sreg2 X X X
+									1 = X X X X w  reg			  6 = X X X X X X s w
+									2 = X X X X X  reg			   7 = X X X X X X s X
+									3 = X X X X X X X w			8 = X X sreg3 X X X
+									4 = X X X X X X d w	*)
+		OpCode = RECORD
+							type: INTEGER;
+							op: INTEGER; (* Op-Code: 1 oder 2 Byte, falls nur 1 Byte -> niederwertiges *)
+							oplen: SHORTINT; (* 1 oder 2 *)
+							cod: SHORTINT;
+							modrm: SHORTINT;
+							TTT: SHORTINT
+						 END;
+
+	VAR W: Texts.Writer;
+			val*:   LONGINT;  (*val, sval, and name are results of GetSym*)
+			val1* : LONGINT; (* result of Get: if reg then val1 := predef[..].typ *)
+			regNr* : INTEGER; (* result of Get: if reg then regNr := Nr in Op386.text *)
+			sval*:  ARRAY 64 OF CHAR;
+			name*:  Name;
+			errs*:  BOOLEAN;
+			entno*: INTEGER;
+			entry*: ARRAY 40 OF LONGINT;
+
+			ch:    CHAR;
+			root:  Object;
+			in: Texts.Reader;
+			lasterr: LONGINT;
+			InstrTab: ARRAY InstrTabLen OF Instr;
+			OpTab:   ARRAY OpTabLen OF OpCode;
+			predef: ARRAY pdlen OF
+				RECORD name: ARRAY 4 OF CHAR;
+					typ, val: INTEGER (* typ: 8,10h,20h: Register; 1:SegReg2, 2:SegReg3, 3:CRx, 4:DRx, 5:TRx *)
+				END;
+			mat*: ARRAY 2,7,7 OF INTEGER; (* fuer die Codierung von class 1, 2 *)
+
+
+	PROCEDURE skipBlanks;
+	BEGIN
+		WHILE (ch = " ") OR (ch = TAB) DO Texts.Read(in, ch) END
+	END skipBlanks;
+
+	PROCEDURE getId(VAR name: Name);
+		VAR i: INTEGER;
+	BEGIN i := 0;
+		REPEAT
+			IF i < NameLen-1 THEN name[i] := ch; INC(i) END;
+			Texts.Read(in, ch)
+		UNTIL ~(("A" <= CAP(ch)) & (CAP(ch) <= "Z") OR ("0" <= ch) & (ch <= "9"));
+		name[i] := 0X
+	END getId;
+
+	PROCEDURE err*(n: INTEGER);
+		VAR pos: LONGINT;
+	BEGIN errs := TRUE; pos := Texts.Pos(in);
+		IF pos-lasterr > 12 THEN
+			lasterr := pos; Texts.WriteLn(W);
+			Texts.WriteString(W, "  pos"); Texts.WriteInt(W, pos, 6);
+			Texts.WriteString(W, "  err"); Texts.WriteInt(W, n, 4); Texts.Append(Oberon.Log, W.buf)
+		END
+	END err;
+
+	PROCEDURE insert*(VAR name: Name; VAR obj: Object);
+		VAR ob0, ob1: Object; d: INTEGER;
+	BEGIN ob0 := root; ob1 := ob0.right; d := 1;
+		LOOP
+			IF ob1 = NIL THEN (*insert undefined label*)
+				NEW(ob1); ob1.name := name; ob1.typ := 0;
+				ob1.left := NIL; ob1.right := NIL; ob1.first := NIL;
+				ob1.next := root.next; root.next := ob1;
+				IF d < 0 THEN ob0.left := ob1 ELSE ob0.right := ob1 END;
+				EXIT
+			ELSIF name < ob1.name THEN d := -1; ob0 := ob1; ob1 := ob1.left
+			ELSIF name > ob1.name THEN d :=  1; ob0 := ob1; ob1 := ob1.right
+			ELSE (*found, no insertion*) EXIT
+			END
+		END;
+		obj := ob1
+	END insert;
+
+	PROCEDURE Open*(source: Texts.Text);
+		VAR i: INTEGER; obj: Object; name: Name;
+	BEGIN errs := FALSE; lasterr := -12; entno := 1; ch := CR; i := 0;
+		NEW(root); root.left := NIL; root.right := NIL; root.next := NIL;
+		REPEAT COPY (predef[i].name, name); insert(name, obj);
+			obj.typ := predef[i].typ; obj.val := predef[i].val; INC(i)
+		UNTIL i = pdlen;
+		root.next := NIL; Texts.OpenReader(in, source, 0)
+	END Open;
+
+	PROCEDURE find*(VAR name: Name; VAR obj: Object);
+		VAR ob0: Object;
+	BEGIN ob0 := root.right;
+		WHILE (ob0 # NIL) & (ob0.name # name) DO
+			IF name < ob0.name THEN ob0 := ob0.left ELSE ob0 := ob0.right END
+		END;
+		obj := ob0
+	END find;
+
+	PROCEDURE EnterFixPnt*(obj: Object; adr, len, pc0: LONGINT);
+		VAR fix: FixPnt;
+	BEGIN NEW(fix); fix.adr := adr; fix.len := len; fix.pc0 := pc0;
+		fix.next := obj.first; obj.first := fix
+	END EnterFixPnt;
+
+	PROCEDURE GetLabel*(pc: LONGINT; VAR label: Object; fixup: FixPrc; VAR done: BOOLEAN);
+		VAR obj: Object; fix: FixPnt; name: Name;
+	BEGIN
+		LOOP
+			IF ch < CR THEN done := FALSE; EXIT END;
+			Texts.Read(in, ch);
+			IF (ch = " ") OR (ch = TAB) THEN
+				skipBlanks;
+				IF ch > CR THEN label := NIL; EXIT END
+			ELSIF ("A" <= CAP(ch)) & (CAP(ch) <= "Z") THEN
+				getId(name); insert(name, obj);
+				IF obj.typ = 0 THEN
+					fix := obj.first;
+					WHILE fix # NIL DO
+						fixup(fix.adr, fix.len, fix.pc0); fix := fix.next
+					END;
+					obj.typ := 2; obj.val := pc
+				ELSIF obj.typ = -2 THEN (*entry point*)
+					entry[obj.val] := pc; obj.typ := 2; obj.val := pc
+				ELSIF obj.typ # -1 THEN err(1) (*double def*)
+				END;
+				label := obj; EXIT
+			ELSIF ch > CR THEN
+				IF (ch # "*") & (ch # ";") THEN err(10) END;
+				WHILE (ch # CR) & (ch > 0X) DO Texts.Read(in, ch) END
+			END
+		END
+	END GetLabel;
+
+	PROCEDURE GetOp*(VAR inx, ops, class: INTEGER); (* inx: Index in InstrTab *)
+		VAR h, i, d: INTEGER;
+			k: LONGINT;
+			name: Name;
+	BEGIN skipBlanks; i := 0; k := 0;
+		REPEAT
+			IF i < MnemoLen-1 THEN name[i] := ch; k := 16*k+ORD(ch); INC(i) END;
+			Texts.Read(in, ch)
+		UNTIL ~(("A" <= CAP(ch)) & (CAP(ch) <= "Z"));
+		name[i] := 0X; h := SHORT(k MOD InstrTabLen); d := 1;
+		LOOP
+			IF InstrTab[h].name = name THEN
+				inx := h; ops := InstrTab[h].ops; class := InstrTab[h].class; EXIT
+			ELSIF InstrTab[h].name[0] = 0X THEN
+				err(12); ops := -1; EXIT
+			ELSE h := (h+d) MOD InstrTabLen; INC(d, 2)
+			END
+		END
+	END GetOp;
+
+	PROCEDURE Get*(VAR sym: INTEGER);
+		VAR u, d: LONGINT; L, R, M: INTEGER;
+	BEGIN skipBlanks;
+		CASE ch OF
+		  "A".."Z", "a".."z": getId(name); sym := ident
+		| "0".."9": val := 0; sym := number;
+			REPEAT d := ORD(ch)-30H;
+				IF (MAX(LONGINT) - d) DIV 10 < val THEN err(2); val := 0 END ;
+				val := val*10 + d; Texts.Read(in, ch)
+			UNTIL (ch < "0") OR ("9" < ch)
+		| "$" : Texts.Read(in, ch); val := 0; sym := number;
+			LOOP
+				IF ("0" <= ch) & (ch <= "9") THEN d := ORD(ch)-30H
+				ELSIF ("A" <= ch) & (ch <= "F") THEN d := ORD(ch)-37H
+				ELSE EXIT
+				END ;
+				u := val DIV 8000000H;
+				IF u = 1 THEN INC(val, 0F0000000H)
+				ELSIF u # 0 THEN err(2); val := 0
+				END ;
+				val := val*10H + d; Texts.Read(in, ch)
+			END
+		| 22X: sym := string; val := 0; (*string*)
+			LOOP Texts.Read(in, ch);
+				IF ch = 22X THEN Texts.Read(in, ch);  EXIT END ;
+				IF ch < " " THEN err(3); EXIT END ;
+				sval[val] := ch; INC(val)
+			END
+		| "(" : sym := parL; Texts.Read(in, ch)
+		| ")" : sym := parR; Texts.Read(in, ch)
+		| "[" : sym := brL; Texts.Read(in, ch)
+		| "]" : sym := brR; Texts.Read(in, ch)
+		| "," : sym := comma; Texts.Read(in, ch)
+		| "@" : sym := at; Texts.Read(in, ch)
+		| "+" : sym := plus; Texts.Read(in, ch)
+		| "-" : sym := minus; Texts.Read(in, ch)
+		| "*" : sym := ast; Texts.Read(in, ch)
+		| "/" : sym := slash; Texts.Read(in, ch)
+		| ":" : sym := colon; Texts.Read(in, ch);
+		| "!", "#", "%", "&", "'", ".", ";", "<", "=", ">", "?", "\", "^", "_", "|", "~":
+			Texts.Read(in, ch); sym := 0
+		| 0X .. 17X: sym := 0
+		END;
+		IF sym = ident THEN L := 0; R := pdlen-1;
+			WHILE L < R DO
+				M := (L+R) DIV 2;
+				IF name > predef[M].name THEN L := M + 1 ELSE R := M END
+			END;
+			IF name = predef[L].name THEN
+				val1 := predef[L].typ; val := predef[L].val; regNr := L;
+				CASE val1 OF
+					1: sym := segReg
+				|  3: sym := cntReg
+				|  4: sym := debReg
+				|  5: sym := tstReg
+				|  8, 16, 32: sym := reg
+				END
+			END
+		END
+	END Get;
+
+	PROCEDURE EndLine*;
+	BEGIN
+		WHILE (ch # 0DX) & (ch # 0X) DO Texts.Read(in, ch) END
+	END EndLine;
+
+	PROCEDURE codBef*(h, mode: INTEGER; VAR op, oplen, cod, modrm, TTT: INTEGER): BOOLEAN;
+		VAR anz, i, j: INTEGER;
+	BEGIN i := InstrTab[h].indx; anz := InstrTab[h].anz; j := 0;
+		WHILE (j < anz) & (OpTab[i+j].type # mode) DO INC(j) END;
+		IF j = anz THEN (* not found *) err(60); RETURN FALSE
+		ELSE i := i + j; op := OpTab[i].op; oplen := LONG(OpTab[i].oplen); cod := LONG(OpTab[i].cod);
+			modrm := OpTab[i].modrm; TTT := LONG(OpTab[i].TTT); RETURN TRUE
+		END
+	END codBef;
+
+	PROCEDURE ReadSymFile*(VAR key: LONGINT);
+		CONST SymCode = 0FAX;
+		VAR ch: CHAR;
+				class, typcode: SHORTINT;
+				i: INTEGER;
+				adr: LONGINT;
+				obj: Object;
+				F:   Files.File;
+				S:   Files.Rider;
+				nm:  Name;
+
+		PROCEDURE skip(n: INTEGER);
+		BEGIN
+			REPEAT Files.Read(S, ch); DEC(n) UNTIL n = 0
+		END skip;
+
+		PROCEDURE SkipName;
+			VAR ch: CHAR;
+		BEGIN
+			REPEAT Files.Read(S, ch) UNTIL ch = 0X
+		END SkipName;
+
+		PROCEDURE ReadName;
+			VAR i: INTEGER; ch: CHAR;
+		BEGIN i := 0;
+			REPEAT Files.Read(S, ch); nm[i] := ch; INC(i) UNTIL ch = 0X
+		END ReadName;
+
+	BEGIN i := 0;
+		REPEAT INC(i) UNTIL name[i] = 0X;
+		name[i] := "."; name[i+1] := "S"; name[i+2] := "y";
+		name[i+3] := "m"; name[i+4] := 0X;
+		F := Files.Old(name);
+		IF F # NIL THEN
+			Files.Set(S, F, 0); Files.Read(S, ch);
+			IF ch = SymCode THEN
+				LOOP Files.Read(S, class);
+					IF S.eof THEN EXIT END ;
+					CASE class OF
+					  1: Files.Read(S, typcode);
+							 CASE typcode OF
+								  1..4: skip(1)
+							 | 5: skip(2)
+							 | 6, 7, 9, 10: skip(4)
+							 | 8: skip(8)
+							 | 11:
+							 END ;
+							 SkipName
+					| 2, 3: skip(2); SkipName
+					| 4: skip(1); Files.ReadBytes(S, adr, 4); ReadName;
+							 insert(nm, obj); obj.typ := -1; obj.val := adr
+					| 5: skip(1); Files.Read(S, ch); ReadName;
+							 insert(nm, obj); obj.typ := -2; obj.val := ORD(ch); INC(entno)
+					| 6: skip(2); SkipName
+					| 7: skip(4); SkipName
+					| 8, 9, 20: skip(2)
+					| 10: skip(12)
+					| 11, 12: skip(8)
+					| 13, 16:
+					| 14, 15: skip(3); SkipName
+					| 17: skip(5); SkipName
+					| 18, 19: skip(4)
+					| 21: skip(3)
+					| 22: Files.ReadBytes(S, key, 4); SkipName
+					END
+				END
+			ELSE err(14)
+			END
+		ELSE err(15)
+		END
+	END ReadSymFile;
+
+	PROCEDURE CheckLabels*;
+		VAR obj, obj1, obj2: Object;
+	BEGIN obj1 := root.next; obj := NIL; (* invert list *)
+		WHILE obj1 # NIL DO
+			obj2 := obj1.next; obj1.next := obj; obj := obj1; obj1 := obj2
+		END;
+		WHILE obj # NIL DO
+			IF obj.typ <= 0 THEN
+				errs := TRUE; Texts.WriteLn(W); Texts.WriteString(W, obj.name);
+				Texts.WriteString(W, " undefined"); Texts.Append(Oberon.Log, W.buf)
+			END;
+			obj := obj.next
+		END
+	END CheckLabels;
+
+	PROCEDURE Close*;
+	BEGIN root.right := NIL; root.next := NIL;
+	END Close;
+
+	PROCEDURE ReadCodes;
+		VAR cls, d, h, i, n, oprds, x, z : INTEGER;
+			k : LONGINT;
+			opcd: Mnemo;
+			F: Files.File;
+			R: Files.Rider;
+
+		PROCEDURE Blanks;
+		BEGIN
+			WHILE (ch = " ") OR (ch = TAB) DO Files.Read(R, ch) END
+		END Blanks;
+
+		PROCEDURE ReadHex(VAR n: INTEGER);
+			VAR val: LONGINT;
+		BEGIN Blanks;
+			val := 0;
+			LOOP
+				IF ch <= " " THEN EXIT
+				ELSIF ch <= "9" THEN val := val*10H + (ORD(ch)-30H)
+				ELSE val := val*10H + (ORD(ch)-37H)
+				END;
+				Files.Read(R, ch)
+			END ;
+			n := SHORT(val)
+		END ReadHex;
+
+		PROCEDURE SkipComm;
+		BEGIN
+			WHILE ch # CR DO Files.Read(R, ch) END;
+			Files.Read(R, ch)
+		END SkipComm;
+
+	BEGIN i := 0; z := 0; (* z: Index in die OpTab - Liste *)
+		REPEAT InstrTab[i].name[0] := 0X; INC(i) UNTIL i = InstrTabLen;
+		F := Files.Old("Op386.Text"); Files.Set(R, F, 0);
+		REPEAT Files.Read(R, ch) UNTIL ch = ";";
+		REPEAT
+			Blanks;
+			IF ch = ";" THEN SkipComm
+			ELSE i := 0; k := 0; 
+				WHILE ch > " " DO
+					opcd[i] := ch; INC(i); k := 16*k+ORD(ch); Files.Read(R, ch);
+				END;
+				opcd[i] := 0X; (* Mnemonic in opcd *)
+				ReadHex(n); (* Anzahl verschiedener Opcodes fuer dieses Mnemonic *)
+				ReadHex(oprds); (* Anzahl Operanden fuer diese Mnemonic *)
+				ReadHex(cls); (* class *)
+				x := 0;
+				WHILE x < n DO
+					ReadHex(OpTab[z].op); (* OpCode *)
+					ReadHex(OpTab[z].type);
+					ReadHex(i); OpTab[z].oplen := SHORT(i); (* Op-Laenge *)
+					ReadHex(i); OpTab[z].cod := SHORT(i);
+					ReadHex(i); OpTab[z].modrm := SHORT(i);
+					ReadHex(i); OpTab[z].TTT := SHORT(i);
+					SkipComm; INC(z); INC(x)
+				END; 
+				h := SHORT(k MOD InstrTabLen); d := 1;
+				LOOP
+					IF InstrTab[h].name[0] = 0X THEN (* frei *)
+						InstrTab[h].name := opcd; InstrTab[h].ops := SHORT(oprds); InstrTab[h].class := cls;
+						InstrTab[h].anz := SHORT(n); InstrTab[h].indx := z-n; EXIT
+					ELSE h := (h+d) MOD InstrTabLen; INC(d, 2)
+					END
+				END;
+			END
+		UNTIL ch = "$";
+		SkipComm; h := 0;
+		REPEAT
+			i := 0;
+			WHILE ch > " " DO
+				predef[h].name[i] := ch; INC(i); Files.Read(R, ch)
+			END;
+			predef[h].name[i] := 0X;
+			ReadHex(predef[h].typ); ReadHex(predef[h].val); INC(h); SkipComm;
+		UNTIL ch = "&";
+		SkipComm; i := 0; ReadHex(n); SkipComm; h := 0;
+		WHILE h < n DO i := 0;
+			REPEAT d := 0;
+				WHILE d < 7 DO ReadHex(mat[h, i, d]); INC(d) END;
+				SkipComm;
+				INC(i);
+			UNTIL i = 7;
+			INC(h)
+		END;
+		WHILE ~R.eof DO Files.Read(R, ch) END;
+	END ReadCodes;
+
+BEGIN
+	Texts.OpenWriter(W);
+	ReadCodes
+END Ans.

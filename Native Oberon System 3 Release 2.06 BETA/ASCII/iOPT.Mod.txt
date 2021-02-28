@@ -1,0 +1,1028 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE iOPT;	(* NW, RC 6.3.89 / 18.6.93 / prk 4.6.96  *)
+
+(*
+	OPT - Oberon Portable Symbol Table (front end)
+----------------------------------------------------------------------------	
+	Documentation on this module:
+		ETH diss. nr 10650, 1994; R. Crelier "Separate Compilation and Module Extension"
+		can be found at "http://www-cs.inf.ethz.ch/Dissertations.html"
+		
+---------------------------------------------------------------------------		
+	Created by R. Crelier (6.3.89)
+	
+	Updates / Changes:
+		11.8.95 (jm) 
+			option /S results in error 153 when SYSTEM IS imported.
+			
+		11.9.95 (tk)
+			Change CheckMark for disallowing read-only constants, types and procedures
+			
+		20.12.95 (prk / reali@inf.ethz.ch)
+			Ported for PC-Native Oberon
+			Transitory changes done 
+			The old compiler doesn't allow to export string constants.
+			For this reason the constants HdPtrName, HdProcName, HdTProcName aren't exported now.
+			Every occurence of these constants in any other module is replaced with a local constant.
+			This is done in the modules: OPL.
+			
+		9.1.96 (prk / reali@inf.ethz.ch)
+			Integrating SYSTEM.CLI, SYSTEM.STI, SYSTEM.PORTOUT, SYSTEM.PORTIN		(* New Functions *)
+			
+		5.2.96 (prk / reali@inf.ethz.ch)
+			Integrating the iASM assembler module 	(* iASM *)
+			Creating a new node type: inline. conval.ext contains the value. The first byte is the length
+			
+		29.02.96 (dVdW)
+			Export globals for Scope
+		
+		27.4.96 (prk / reali@inf.ethz.ch)
+			Intel common release (Native + Linux + Windows)
+		
+		4.6.96 (prk / reali@inf.ethz.ch)
+			Merging Active Compiler
+			
+---------------------------------------------------------------------------			
+			
+*)
+
+
+	IMPORT	OPS := iOPS, OPM := iOPM;
+
+
+	CONST
+		MaxConstLen* = OPS.MaxStrLen;
+
+		HdPtrName* = "@ptr";
+		HdProcName* = "@proc";
+		HdTProcName* = "@tproc";
+
+
+	TYPE
+		Const* = POINTER TO ConstDesc;
+		Object* = POINTER TO ObjDesc;
+		Struct* = POINTER TO StrDesc;
+		Node* = POINTER TO NodeDesc;
+		ConstExt* = POINTER TO OPS.String;
+
+		ConstDesc* = RECORD
+			ext*: ConstExt;	(* string *)
+			intval*: LONGINT;	(* constant value or adr, proc par size, text position or least case label *)
+			intval2*: LONGINT;	(* string length, proc var size or larger case label *)
+			setval*: SET;	(* constant value, procedure body present or "ELSE" present in case *)
+			realval*: LONGREAL	(* real or longreal constant value *)
+		END ;
+
+		ObjDesc* = RECORD
+
+			left*, right*, link*, scope*: Object;
+
+			name*: OPS.Name;
+			leaf*: BOOLEAN;
+			mode*, mnolev*: SHORTINT;	(* mnolev < 0 -> mno = -mnolev *)
+			vis*: SHORTINT;	(* 0: internal; 1: external; 2: externalR *)
+			typ*: Struct;
+			conval*: Const;
+			adr*, linkadr*: LONGINT
+		END ;
+
+		StrDesc* = RECORD
+			form*, comp*, mno*, extlev*: SHORTINT;
+			ref*, sysflag*: INTEGER;
+			n*, size*, tdadr*, offset*, txtpos*: LONGINT;
+			BaseTyp*: Struct;
+			link*, strobj*: Object
+		END ;
+		
+		NodeDesc* = RECORD
+			left*, right*, link*: Node;
+			class*, subcl*: SHORTINT;
+			readonly*: BOOLEAN;
+			typ*: Struct;
+			obj*: Object;
+			conval*: Const
+		END ;
+
+(* Objects:
+
+    mode  | adr   conval  link     scope    leaf
+    ---------------------------------------------
+    Undef |                                        Not used
+    Var   | adr           next              regopt Glob or loc var or proc value parameter
+    VarPar| vadr          next              regopt Procedure var parameter
+    Con   |       val                              Constant
+    Fld   | off           next                     Record field
+    Typ   |                                        Named type
+    LProc |       sizes   firstpar scope    leaf   Local procedure
+    XProc | pno   sizes   firstpar scope    leaf   External procedure
+    SProc | fno   sizes                            Standard procedure
+    CProc |       code    firstpar scope           Code procedure
+    IProc | pno   sizes            scope    leaf   Interrupt procedure
+    Mod   | key                    scope           Module
+    Head  | txtpos        owner    firstvar        Scope anchor
+    TProc | index sizes   firstpar scope    leaf   Bound procedure, index = 10000H*mthno+pno
+                                                    
+Structures:
+
+    form    comp  | n      BaseTyp   link     mno  tdadr  offset txtpos   sysflag
+    -----------------------------------------------------------------------------
+    Undef   Basic |
+    Byte    Basic |
+    Bool    Basic |
+    Char    Basic |
+    SInt    Basic |
+    Int     Basic |
+    LInt    Basic |
+    Real    Basic |
+    LReal   Basic |
+    Set     Basic |
+    String  Basic |
+    NilTyp  Basic |
+    NoTyp   Basic |
+    Pointer Basic |        PBaseTyp           mno                txtpos   sysflag
+    ProcTyp Basic |        ResTyp    params   mno                txtpos   sysflag
+    Comp    Array | nofel  ElemTyp            mno                txtpos   sysflag
+    Comp    DynArr| dim    ElemTyp            mno         lenoff txtpos   sysflag
+    Comp    Record| nofmth RBaseTyp  fields   mno  tdadr         txtpos   sysflag
+
+Nodes:
+
+design   = Nvar|Nvarpar|Nfield|Nderef|Nindex|Nguard|Neguard|Ntype|Nproc.
+expr     = design|Nconst|Nupto|Nmop|Ndop|Ncall.
+nextexpr = NIL|expr.
+ifstat   = NIL|Nif.
+casestat = Ncaselse.
+sglcase  = NIL|Ncasedo.
+stat     = NIL|Ninittd|Nenter|Nassign|Ncall|Nifelse|Ncase|Nwhile|Nrepeat|
+           Nloop|Nexit|Nreturn|Nwith|Ntrap|Nassembler.
+
+
+              class     subcl     obj      left      right     link      
+              ---------------------------------------------------------
+
+design        Nvar                var                          nextexpr
+              Nvarpar             varpar                       nextexpr
+              Nfield              field    design              nextexpr
+              Nderef                       design              nextexpr
+              Nindex                       design    expr      nextexpr
+              Nguard                       design              nextexpr (typ = guard type)
+              Neguard                      design              nextexpr (typ = guard type)
+              Ntype               type                         nextexpr
+              Nproc     normal    proc                         nextexpr
+                        super     proc                         nextexpr
+
+
+expr          design
+              Nconst              const                                 (val = node^.conval)
+              Nupto                        expr      expr      nextexpr 
+              Nmop      not                expr                nextexpr
+                        minus              expr                nextexpr
+                        is        tsttype  expr                nextexpr
+                        conv               expr                nextexpr
+                        abs                expr                nextexpr
+                        cap                expr                nextexpr
+                        odd                expr                nextexpr
+                        adr                expr                nextexpr SYSTEM.ADR
+                        cc                 Nconst              nextexpr SYSTEM.CC
+                        val                expr                nextexpr SYSTEM.VAL
+              Ndop      times              expr      expr      nextexpr
+                        slash              expr      expr      nextexpr
+                        div                expr      expr      nextexpr
+                        mod                expr      expr      nextexpr
+                        and                expr      expr      nextexpr
+                        plus               expr      expr      nextexpr
+                        minus              expr      expr      nextexpr
+                        or                 expr      expr      nextexpr
+                        eql                expr      expr      nextexpr
+                        neq                expr      expr      nextexpr
+                        lss                expr      expr      nextexpr
+                        leq                expr      expr      nextexpr
+                        grt                expr      expr      nextexpr
+                        geq                expr      expr      nextexpr
+                        in                 expr      expr      nextexpr
+                        ash                expr      expr      nextexpr
+                        msk                expr      Nconst    nextexpr
+                        len                design    Nconst    nextexpr
+                        bit                expr      expr      nextexpr SYSTEM.BIT
+                        lsh                expr      expr      nextexpr SYSTEM.LSH
+                        rot                expr      expr      nextexpr SYSTEM.ROT
+              Ncall               fpar     design    nextexpr  nextexpr
+
+nextexpr      NIL
+              expr
+
+ifstat        NIL
+              Nif                          expr      stat      ifstat
+
+casestat      Ncaselse                     sglcase   stat            (minmax = node^.conval)
+
+sglcase       NIL
+              Ncasedo                      Nconst    stat      sglcase
+
+stat          NIL
+              Ninittd                                          stat     (of node^.typ)
+              Nenter              proc     stat      stat      stat     (proc=NIL for mod)
+              Nassign   assign             design    expr      stat
+                        newfn              design              stat
+                        incfn              design    expr      stat
+                        decfn              design    expr      stat
+                        inclfn             design    expr      stat
+                        exclfn             design    expr      stat
+                        copyfn             design    expr      stat
+                        getfn              design    expr      stat     SYSTEM.GET
+                        putfn              expr      expr      stat     SYSTEM.PUT
+                        getrfn             design    Nconst    stat     SYSTEM.GETREG
+                        putrfn             Nconst    expr      stat     SYSTEM.PUTREG
+                        sysnewfn           design    expr      stat     SYSTEM.NEW
+                        movefn             expr      expr      stat     SYSTEM.MOVE
+                                                                        (right^.link = 3rd par)
+                        cli                                    stat     SYSTEM.CLI
+                        sti                                    stat     SYSTEM.STI
+                        pinfn              design    expr      stat     SYSTEM.GET
+                        poutfn             expr      expr      stat     SYSTEM.PUT
+              Ncall               fpar     design    nextexpr  stat
+              Nifelse                      ifstat    stat      stat
+              Ncase                        expr      casestat  stat
+              Nwhile                       expr      stat      stat
+              Nrepeat                      stat      expr      stat
+              Nloop                        stat                stat 
+              Nexit                                            stat 
+              Nreturn             proc     nextexpr            stat     (proc = NIL for mod)
+              Nwith                        ifstat    stat      stat
+              Ntrap                                  expr      stat
+              Nassembler                   Ncode     Nfixup    stat
+*)
+
+	CONST
+		maxImps = 31;	(* must be < 128 *)
+
+	VAR
+		topScope*: Object;
+		globals*: Object;	(* dVdW *)
+		undftyp*, bytetyp*, booltyp*, chartyp*, sinttyp*, inttyp*, linttyp*,
+		realtyp*, lrltyp*, settyp*, stringtyp*, niltyp*, notyp*, sysptrtyp*: Struct;
+
+		nofGmod*: SHORTINT;	(*nof imports*)
+		GlbMod*:  ARRAY maxImps OF Object;	(* GlbMod[i]^.mode = exported module number *)
+		SYSimported*: BOOLEAN;
+		
+	CONST
+		(* object modes *)
+		Var = 1; VarPar = 2; Con = 3; Fld = 4; Typ = 5; LProc = 6; XProc = 7;
+		SProc = 8; CProc = 9; IProc = 10; Mod = 11; Head = 12; TProc = 13;
+
+		(* structure forms *)
+		Undef = 0; Byte = 1; Bool = 2; Char = 3; SInt = 4; Int = 5; LInt = 6;
+		Real = 7; LReal = 8; Set = 9; String = 10; NilTyp = 11; NoTyp = 12;
+		Pointer = 13; ProcTyp = 14; Comp = 15;
+		
+		(* composite structure forms *)
+		Basic = 1; Array = 2; DynArr = 3; Record = 4;
+
+		(*function number*)
+		assign = 0;
+		haltfn = 0; newfn = 1; absfn = 2; capfn = 3; ordfn = 4;
+		entierfn = 5; oddfn = 6; minfn = 7; maxfn = 8; chrfn = 9;
+		shortfn = 10; longfn = 11; sizefn = 12; incfn = 13; decfn = 14;
+		inclfn = 15; exclfn = 16; lenfn = 17; copyfn = 18; ashfn = 19; assertfn = 32;
+
+		(*SYSTEM function number*)
+		adrfn = 20; ccfn = 21; lshfn = 22; rotfn = 23;
+		getfn = 24; putfn = 25; getrfn = 26; putrfn = 27;
+		bitfn = 28; valfn = 29; sysnewfn = 30; movefn = 31;
+		stifn = 33; clifn = 34; poutfn = 35; pinfn = 36;
+		
+		(* module visibility of objects *)
+		internal = 0; external = 1; externalR = 2;
+
+		firstStr = 16;
+
+		maxStruct = 255;	(* must be < 256 *)
+		maxUndPtr = 64;
+		NotYetExp = 0;
+		
+	VAR
+		universe, syslink: Object;
+		strno, udpinx: INTEGER;
+		nofExp: SHORTINT;
+		undPtr: ARRAY maxUndPtr OF Struct;
+
+	PROCEDURE Init*;
+	BEGIN topScope := universe; strno := 0; udpinx := 0; nofGmod := 0; SYSimported := FALSE
+	END Init;
+
+	PROCEDURE Close*;
+		VAR i: INTEGER;
+	BEGIN i := 0;
+		WHILE i < maxImps DO GlbMod[i] := NIL; INC(i) END	(* garbage collection *)
+	END Close;
+
+	PROCEDURE err(n: INTEGER);
+	BEGIN OPM.err(n)
+	END err;
+	
+	PROCEDURE NewConst*(): Const;
+		VAR const: Const;
+	BEGIN NEW(const); (*const^.ext := NIL;*) RETURN const
+	END NewConst;
+	
+	PROCEDURE NewObj*(): Object;
+		VAR obj: Object;
+	BEGIN NEW(obj); (*obj^.left := NIL; obj^.right := NIL; obj^.link := NIL; obj^.scope := NIL; *)
+		(*obj^.typ := NIL; obj^.conval := NIL;*) RETURN obj
+	END NewObj;
+	
+	PROCEDURE NewStr*(form, comp: SHORTINT): Struct;
+		VAR typ: Struct;
+	BEGIN NEW(typ); (*typ^.link := NIL; typ^.strobj := NIL;*)
+		typ^.form := form; typ^.comp := comp;
+		(*typ^.mno := 0; typ^.ref := 0; typ^.sysflag := 0; typ^.extlev := 0; typ^.n := 0;*)
+		typ^.tdadr := OPM.TDAdrUndef; typ^.offset := OPM.TDAdrUndef;
+		typ^.txtpos := OPM.errpos; typ^.size := -1; typ^.BaseTyp := undftyp; RETURN typ
+	END NewStr;
+	
+	PROCEDURE NewNode*(class: SHORTINT): Node;
+		VAR node: Node;
+	BEGIN
+		NEW(node); node^.class := class; (*node^.left := NIL; node^.right := NIL; node^.link := NIL;*)
+		(*node^.typ := NIL; node^.obj := NIL; node^.conval := NIL;*)
+		RETURN node
+	END NewNode;
+	
+	PROCEDURE NewExt*(): ConstExt;
+		VAR ext: ConstExt;
+	BEGIN NEW(ext); RETURN ext
+	END NewExt;
+
+	PROCEDURE FindImport*(mod: Object; VAR res: Object);
+		VAR obj: Object;
+	BEGIN obj := mod^.scope;
+		LOOP
+			IF obj = NIL THEN EXIT END ;
+			IF OPS.name < obj^.name THEN obj := obj^.left
+			ELSIF OPS.name > obj^.name THEN obj := obj^.right
+			ELSE (*found*)
+				IF (obj^.mode = Typ) & (obj^.vis = internal) THEN obj := NIL END ;
+				EXIT
+			END
+		END ;
+		res := obj
+	END FindImport;
+
+	PROCEDURE FindInScope*(name: OPS.Name; scope: Object; VAR res: Object);
+		VAR obj, head: Object;
+	BEGIN head := scope;
+		LOOP obj := head^.right;
+			LOOP
+				IF obj = NIL THEN EXIT END ;
+				IF name < obj^.name THEN obj := obj^.left
+				ELSIF name > obj^.name THEN obj := obj^.right
+				ELSE (*found*) EXIT
+				END
+			END ;
+			IF obj # NIL THEN EXIT END ;
+			head := head^.left;
+			IF head = NIL THEN EXIT END
+		END ;
+		res := obj
+	END FindInScope;
+
+	PROCEDURE Find*(VAR res: Object);
+	BEGIN
+		FindInScope (OPS.name, topScope, res)
+	END Find;
+
+	PROCEDURE FindField*(name: OPS.Name; typ: Struct; VAR res: Object);
+		VAR obj: Object;
+	BEGIN 
+		WHILE typ # NIL DO obj := typ^.link;
+			WHILE obj # NIL DO
+				IF name < obj^.name THEN obj := obj^.left
+				ELSIF name > obj^.name THEN obj := obj^.right
+				ELSE (*found*) res := obj; RETURN
+				END
+			END ;
+			typ := typ^.BaseTyp
+		END ;
+		res := NIL
+	END FindField;
+
+	PROCEDURE Insert*(name: OPS.Name; VAR obj: Object);
+		VAR ob0, ob1: Object; left: BOOLEAN;
+	BEGIN ob0 := topScope; ob1 := ob0^.right; left := FALSE;
+		LOOP
+			IF ob1 # NIL THEN
+				IF name < ob1^.name THEN ob0 := ob1; ob1 := ob0^.left; left := TRUE
+				ELSIF name > ob1^.name THEN ob0 := ob1; ob1 := ob0^.right; left := FALSE
+				ELSE (*double def*) err(1); ob0 := ob1; ob1 := ob0^.right
+				END
+			ELSE (*insert*) ob1 := NewObj(); ob1^.leaf := TRUE;
+				IF left THEN ob0^.left := ob1 ELSE ob0^.right := ob1 END ;
+				ob1^.left := NIL; ob1^.right := NIL; COPY(name, ob1^.name);
+				ob1^.mnolev := topScope^.mnolev; EXIT
+			END
+		END ;
+		obj := ob1
+	END Insert;
+
+	PROCEDURE OpenScope*(level: SHORTINT; owner: Object);
+		VAR head: Object;
+	BEGIN head := NewObj();
+		head^.mode := Head; head^.mnolev := level; head^.link := owner;
+		IF owner # NIL THEN owner^.scope := head END ;
+		head^.left := topScope; head^.right := NIL; head^.scope := NIL; topScope := head
+	END OpenScope;
+
+	PROCEDURE CloseScope*;
+	BEGIN topScope := topScope^.left
+	END CloseScope;
+
+	PROCEDURE InsertImport(obj, root: Object; VAR old: Object);
+		VAR ob0, ob1: Object; left: BOOLEAN;
+	BEGIN ob0 := root; ob1 := ob0^.right; left := FALSE;
+		LOOP
+			IF ob1 # NIL THEN
+				IF obj^.name < ob1^.name THEN ob0 := ob1; ob1 := ob1^.left; left := TRUE
+				ELSIF obj^.name > ob1^.name THEN ob0 := ob1; ob1 := ob1^.right; left := FALSE
+				ELSE old := ob1; EXIT
+				END
+			ELSE ob1 := obj;
+				IF left THEN ob0^.left := ob1 ELSE ob0^.right := ob1 END ;
+				ob1^.left := NIL; ob1^.right := NIL; ob1^.mnolev := root^.mnolev; old := NIL; EXIT
+			END
+		END
+	END InsertImport;
+
+	PROCEDURE ReadId(VAR name: ARRAY OF CHAR; VAR len: LONGINT);
+		VAR i: INTEGER; ch: CHAR;
+	BEGIN i := 0;
+		REPEAT
+			OPM.SymRCh(ch); name[i] := ch; INC(i)
+		UNTIL ch = 0X;
+		len := i
+	END ReadId;
+
+	PROCEDURE WriteId(VAR name: ARRAY OF CHAR);
+		VAR i: INTEGER; ch: CHAR;
+	BEGIN i := 0;
+		REPEAT ch := name[i]; OPM.SymWCh(ch); INC(i)
+		UNTIL ch = 0X
+	END WriteId;
+	
+	PROCEDURE Import*(VAR aliasName, impName, selfName: OPS.Name);
+		VAR i, m, s, class: INTEGER;
+				k, len: LONGINT; rval: REAL;
+				ch: CHAR; done: BOOLEAN;
+				nofLmod, strno, parlev, fldlev: INTEGER;
+				obj, head, old: Object;
+				typ: Struct;
+				ext: ConstExt;
+				mname: OPS.Name;
+				LocMod:  ARRAY maxImps + 1 OF Object;
+				struct:  ARRAY maxStruct OF Struct;
+				param, lastpar, fldlist, lastfld: ARRAY 6 OF Object;
+				tag: CHAR;
+
+		PROCEDURE reverseList(p: Object; mnolev: SHORTINT);
+			VAR q, r: Object;
+		BEGIN q := NIL;
+			WHILE p # NIL DO p^.mnolev := mnolev;
+				r := p^.link; p^.link := q; q := p; p := r
+			END
+		END reverseList;
+				
+	BEGIN nofLmod := 0; strno := firstStr;
+		parlev := -1; fldlev := -1;
+		IF impName = "SYSTEM" THEN SYSimported := TRUE;
+			Insert(aliasName, obj); obj^.mode := Mod; obj^.mnolev := 0; obj^.scope := syslink;
+			obj^.adr := 0; obj^.typ := notyp
+		ELSE OPM.OldSym(impName, FALSE, done);
+			IF done THEN
+				struct[Undef] := undftyp; struct[Byte] := bytetyp;
+				struct[Bool] := booltyp;  struct[Char] := chartyp;
+				struct[SInt] := sinttyp;  struct[Int] := inttyp;
+				struct[LInt] := linttyp;  struct[Real] := realtyp;
+				struct[LReal] := lrltyp;  struct[Set] := settyp;
+				struct[String] := stringtyp; struct[NilTyp] := niltyp;
+				struct[NoTyp] := notyp;
+				struct[Pointer] := sysptrtyp;
+
+				NEW(head); (*for bound procedures*)
+				LOOP (*read next item from symbol file*)
+					OPM.SymRTag(class);
+					IF OPM.eofSF() THEN EXIT END ;
+					IF (class < 8) OR (class = 23) OR (class = 25) THEN (*object*)
+						obj := NewObj(); m := 0;
+						OPM.SymRTag(s); obj^.typ := struct[s];
+						CASE class OF
+						   1:
+								obj^.mode := Con; obj^.conval := NewConst();
+								CASE obj^.typ^.form OF
+								  Byte, Char:
+										OPM.SymRCh(ch); obj^.conval^.intval := ORD(ch)
+								| SInt, Bool:
+										OPM.SymRCh(ch); i := ORD(ch);
+										IF i > OPM.MaxSInt THEN i := i + 2*OPM.MinSInt END ;
+										obj^.conval^.intval := i
+								| Int:
+										OPM.SymRInt(obj^.conval^.intval)
+								| LInt:
+										OPM.SymRLInt(obj^.conval^.intval)
+								| Set:
+										OPM.SymRSet(obj^.conval^.setval)
+								| Real:
+										OPM.SymRReal(rval); obj^.conval^.realval := rval;
+										obj^.conval^.intval := OPM.ConstNotAlloc
+								| LReal:
+										OPM.SymRLReal(obj^.conval^.realval);
+										obj^.conval^.intval := OPM.ConstNotAlloc
+								| String:
+										obj^.conval^.ext := NewExt();
+										ReadId(obj^.conval^.ext^, obj^.conval^.intval2);
+										obj^.conval^.intval := OPM.ConstNotAlloc
+								| NilTyp:
+										obj^.conval^.intval := OPM.nilval
+								END
+						| 2, 3:
+								obj^.mode := Typ; OPM.SymRTag(m);
+
+								IF obj^.typ^.strobj = NIL THEN obj^.typ^.strobj := obj END ;
+								IF class = 2 THEN obj^.vis := external ELSE obj^.vis := internal END
+						| 4, 23:
+								obj^.mode := Var;
+								IF OPM.ExpVarAdr THEN OPM.SymRLInt(obj^.adr)
+								ELSE OPM.SymRTag(s); obj^.adr := s
+								END ;
+								IF class = 23 THEN obj^.vis := externalR ELSE obj^.vis := external END
+						| 5, 6, 7, 25:
+								obj^.conval := NewConst();
+								IF class = 5 THEN obj^.mode := IProc; OPM.SymRTag(s); obj^.adr := s
+								ELSIF class = 6 THEN obj^.mode := XProc; OPM.SymRTag(s); obj^.adr := s
+								ELSIF class = 7 THEN  obj^.mode := CProc; ext := NewExt(); obj^.conval^.ext := ext;
+									OPM.SymRCh(ch); s := ORD(ch); ext^[0] := ch; i := 1; obj^.adr := 0;
+									WHILE i <= s DO OPM.SymRCh(ext^[i]); INC(i) END
+								ELSE obj^.mode := TProc; obj^.vis := external; OPM.SymRTag(s); typ := struct[s];
+									OPM.SymRTag(i); OPM.SymRTag(s); obj^.adr := 10000H*i + s;
+
+								END ;
+								obj^.linkadr := OPM.LANotAlloc;	(* link adr *)
+								obj^.conval^.intval := -1;
+								reverseList(lastpar[parlev], LocMod[0]^.mnolev);
+								obj^.link := param[parlev]^.right; DEC(parlev)
+						ELSE err (151); EXIT
+						END ;
+
+						ReadId(obj^.name, len);
+						IF class = 25 THEN
+							head^.right := typ^.link; head^.mnolev := -typ^.mno;
+							InsertImport(obj, head, old); typ^.link := head^.right
+						ELSE InsertImport(obj, LocMod[m], old)
+						END ;
+
+						IF (old # NIL) & (obj^.mode = Typ) THEN struct[s] := old^.typ END
+
+					ELSIF class < 13 THEN (*structure*)
+
+						typ := NewStr(Undef, Basic); OPM.SymRTag(s); typ^.BaseTyp := struct[s];
+						OPM.SymRTag(s); typ^.mno := -LocMod[s]^.mnolev;
+						CASE class OF
+						  8:
+								typ^.form := Pointer; typ^.size := OPM.PointerSize; typ^.n := 0
+						| 9:
+								typ^.form := ProcTyp; typ^.size := OPM.ProcSize; 
+								reverseList(lastpar[parlev], -typ^.mno);
+								typ^.link := param[parlev]^.right; DEC(parlev)
+						| 10:
+								typ^.form := Comp; typ^.comp := Array; OPM.SymRLInt(typ^.size);
+								typ^.n := typ^.size DIV typ^.BaseTyp^.size
+						| 11:
+								typ^.form := Comp; typ^.comp := DynArr;
+								OPM.SymRLInt(typ^.size); OPM.SymRInt(typ^.offset);
+								IF typ^.BaseTyp^.comp = DynArr THEN typ^.n := typ^.BaseTyp^.n + 1
+								ELSE typ^.n := 0
+								END
+						| 12, 28:
+								typ^.form := Comp; typ^.comp := Record;
+								OPM.SymRLInt(typ^.size); typ^.n := 0;
+								reverseList(lastfld[fldlev], -typ^.mno); typ^.link := fldlist[fldlev]^.right; DEC(fldlev);
+								IF typ^.BaseTyp = notyp THEN typ^.BaseTyp := NIL; typ^.extlev := 0
+								ELSE typ^.extlev := typ^.BaseTyp^.extlev + 1
+								END ;
+								OPM.SymRInt(typ^.tdadr);
+
+						END ;
+						struct[strno] := typ; INC(strno)
+					ELSIF class = 13 THEN (*parameter list start*)
+						obj := NewObj(); obj^.mode := Head; obj^.right := NIL;
+						IF parlev < 5 THEN INC(parlev); param[parlev] := obj; lastpar[parlev] := NIL
+						ELSE err(229)
+						END
+					ELSIF class < 16 THEN (*parameter*)
+						obj := NewObj();
+						IF class = 14 THEN obj^.mode := Var ELSE obj^.mode := VarPar END ;
+						OPM.SymRTag(s); obj^.typ := struct[s];
+						IF OPM.ExpParAdr THEN OPM.SymRLInt(obj^.adr) END ;
+						ReadId(obj^.name, len);
+						obj^.link := lastpar[parlev]; lastpar[parlev] := obj;
+						IF param[parlev]^.right = NIL THEN param[parlev]^.right := obj END
+					ELSIF class = 16 THEN (*start field list*)
+						obj := NewObj(); obj^.mode := Head; obj^.right := NIL;
+						IF fldlev < 5 THEN INC(fldlev); fldlist[fldlev] := obj; lastfld[fldlev] := NIL
+						ELSE err(229)
+						END
+					ELSIF (class = 17) OR (class = 24) THEN (*field*)
+						obj := NewObj(); obj^.mode := Fld; OPM.SymRTag(s);
+						obj^.typ := struct[s]; OPM.SymRLInt(obj^.adr);
+						ReadId(obj^.name, len);
+						obj^.link := lastfld[fldlev]; lastfld[fldlev] := obj;
+						InsertImport(obj, fldlist[fldlev], old);
+						IF class = 24 THEN obj^.vis := externalR ELSE obj^.vis := external END
+					ELSIF (class = 18) OR (class = 19) THEN (*hidden pointer or proc*)
+						obj := NewObj(); obj^.mode := Fld; OPM.SymRLInt(obj^.adr);
+						IF class = 18 THEN obj^.name := HdPtrName
+						ELSE obj^.name := HdProcName
+						END ;
+						obj^.typ := notyp; obj^.vis := internal;
+						obj^.link := lastfld[fldlev]; lastfld[fldlev] := obj;
+						IF fldlist[fldlev]^.right = NIL THEN
+							fldlist[fldlev]^.right := obj
+						END
+					ELSIF class = 20 THEN (*fixup pointer typ*)
+						OPM.SymRTag(s); typ := struct[s]; OPM.SymRTag(s);
+						IF typ^.BaseTyp = undftyp THEN typ^.BaseTyp := struct[s] END
+					ELSIF class = 21 THEN (*sysflag*)
+						OPM.SymRTag(s); typ := struct[s]; OPM.SymRTag(s); typ^.sysflag := s
+					ELSIF class = 22 THEN (*module anchor*)
+						OPM.SymRLInt(k); ReadId(mname, len);
+						IF mname = selfName THEN err(154) END ;
+						i := 0;
+						WHILE (i < nofGmod) & (mname # GlbMod[i]^.name) DO
+							INC(i)
+						END ;
+						IF i < nofGmod THEN (*module already present*)
+							IF k # GlbMod[i]^.adr THEN err(150) END ;
+							obj := GlbMod[i]
+						ELSE obj := NewObj();
+							IF nofGmod < maxImps THEN GlbMod[nofGmod] := obj; INC(nofGmod)
+							ELSE err(227)
+							END ;
+							obj^.mode := NotYetExp; COPY(mname, obj^.name);
+							obj^.adr := k; obj^.mnolev := -nofGmod; obj^.right := NIL
+						END ;
+						IF nofLmod < maxImps + 1 THEN LocMod[nofLmod] := obj; INC(nofLmod)
+						ELSE err(227)
+						END
+					ELSIF class = 26 THEN (*nof methods*)
+						OPM.SymRTag(s); typ := struct[s]; OPM.SymRTag(s); typ^.n := s
+					ELSIF class = 27 THEN (*hidden method*)
+						obj := NewObj(); obj^.mode := TProc; obj^.name := HdTProcName; obj^.typ := undftyp;
+						OPM.SymRTag(s); typ := struct[s]; obj^.mnolev := -typ^.mno;
+						OPM.SymRTag(i); OPM.SymRTag(s); obj^.adr := 10000H*i + s;
+						obj^.linkadr := OPM.LANotAlloc; obj^.vis := internal;
+						obj^.link := NewObj(); obj^.link^.typ := typ; old := typ^.link;
+						IF old = NIL THEN typ^.link := obj
+						ELSE WHILE old^.left # NIL DO old := old^.left END ;
+							old^.left := obj
+						END
+					ELSE err (151); EXIT
+					END
+				END (*LOOP*) ;
+				Insert(aliasName, obj);
+				obj^.mode := Mod; obj^.scope := LocMod[0]^.right;
+				obj^.mnolev  := LocMod[0]^.mnolev; obj^.typ := notyp;
+				OPM.CloseOldSym
+			END
+		END
+	END Import;
+
+
+	PROCEDURE^ OutStr(typ: Struct);
+
+	PROCEDURE^ OutObjs(obj: Object);
+
+	PROCEDURE ^OutFlds(fld: Object; adr: LONGINT; visible: BOOLEAN);
+
+	PROCEDURE OutPars(par: Object);
+	BEGIN
+		OPM.SymWTag(13);
+		WHILE par # NIL DO
+			OutStr(par^.typ);
+			IF par^.mode = Var THEN OPM.SymWTag(14) ELSE OPM.SymWTag(15) END ;
+			OPM.SymWTag(par^.typ^.ref);
+			IF OPM.ExpParAdr THEN OPM.SymWLInt(par^.adr) END ;
+			WriteId(par^.name); par := par^.link
+		END
+	END OutPars;
+
+	PROCEDURE OutHdFld(typ: Struct; fld: Object; adr: LONGINT);
+		VAR i, n: LONGINT; btyp: Struct;
+	BEGIN
+		IF typ^.comp = Record THEN OutFlds(typ^.link, adr, FALSE)
+		ELSIF typ^.comp = Array THEN btyp := typ^.BaseTyp; n := typ^.n;
+			WHILE btyp^.comp = Array DO n := btyp^.n * n; btyp := btyp^.BaseTyp END ;
+			IF (btyp^.form = Pointer) OR (btyp^.comp = Record) THEN i := 0;
+				WHILE i < n DO OutHdFld(btyp, fld, adr); INC(adr, btyp^.size); INC(i) END
+			END
+		ELSIF OPM.ExpHdPtrFld & ((typ^.form = Pointer) & (typ^.sysflag = 0) OR (fld^.name = HdPtrName)) THEN
+			OPM.SymWTag(18); OPM.SymWLInt(adr)
+		ELSIF OPM.ExpHdProcFld & ((typ^.form = ProcTyp) & (typ^.sysflag = 0) OR (fld^.name = HdProcName)) THEN
+			OPM.SymWTag(19); OPM.SymWLInt(adr)
+		END
+	END OutHdFld;
+
+	PROCEDURE OutFlds(fld: Object; adr: LONGINT; visible: BOOLEAN);
+	BEGIN
+		IF visible THEN OPM.SymWTag(16) END ;
+		WHILE (fld # NIL) & (fld^.mode = Fld) DO
+			IF (fld^.vis # internal) & visible THEN
+				OutStr(fld^.typ);
+				IF fld^.vis = external THEN OPM.SymWTag(17) ELSE OPM.SymWTag(24) END ;
+				OPM.SymWTag(fld^.typ^.ref); OPM.SymWLInt(fld^.adr); WriteId(fld^.name)
+			ELSE OutHdFld(fld^.typ, fld, fld^.adr + adr)
+			END ;
+			fld := fld^.link
+		END
+	END OutFlds;
+
+	PROCEDURE OutStr(typ: Struct);
+		VAR m, em, r: INTEGER; btyp: Struct; mod: Object; name: ARRAY 8 OF CHAR;
+	BEGIN
+		IF typ^.ref < 0 THEN OPM.Mark(234, typ^.txtpos)
+		ELSIF typ^.ref = 0 THEN
+			typ^.ref := -1;
+			m := typ^.mno; btyp := typ^.BaseTyp;
+			IF m > 0 THEN mod := GlbMod[m-1]; em := mod^.mode;
+				IF em = NotYetExp THEN
+					mod^.mode := nofExp; m := nofExp; INC(nofExp);
+					OPM.SymWTag(22); OPM.SymWLInt(mod^.adr); WriteId(mod^.name)
+				ELSE m := em
+				END
+			END ;
+			CASE typ^.form OF
+			  Undef .. NoTyp:
+			| Pointer:
+					OPM.SymWTag(8);
+					IF btyp^.ref > 0 THEN OPM.SymWTag(btyp^.ref)
+					ELSE OPM.SymWTag(Undef);
+						IF udpinx < maxUndPtr THEN undPtr[udpinx] := typ; INC(udpinx) ELSE err(224) END
+					END ;
+					OPM.SymWTag(m)
+			| ProcTyp:
+					OutStr(btyp); OutPars(typ^.link); OPM.SymWTag(9);
+					OPM.SymWTag(btyp^.ref); OPM.SymWTag(m)
+			| Comp:
+					IF typ^.comp = Array THEN
+						OutStr(btyp); OPM.SymWTag(10); OPM.SymWTag(btyp^.ref);
+						OPM.SymWTag(m); OPM.SymWLInt(typ^.size)
+					ELSIF typ^.comp = DynArr THEN
+						OutStr(btyp); OPM.SymWTag(11); OPM.SymWTag(btyp^.ref); OPM.SymWTag(m);
+						OPM.SymWLInt(typ^.size); OPM.SymWInt(typ^.offset)
+					ELSE (* typ^.comp = Record *)
+						IF btyp = NIL THEN r := NoTyp
+						ELSE OutStr(btyp); r := btyp^.ref
+						END ;
+						OutFlds(typ^.link, 0, TRUE);
+
+						OPM.SymWTag(12); OPM.SymWTag(r); OPM.SymWTag(m);
+						OPM.SymWLInt(typ^.size);
+						OPM.SymWInt(typ^.tdadr)
+
+					END
+			END ;
+			IF typ^.sysflag # 0 THEN OPM.SymWTag(21); OPM.SymWTag(strno); OPM.SymWTag(typ^.sysflag) END ;
+			IF (typ^.comp = Record) & (typ^.n > 0) THEN
+				OPM.SymWTag(26); OPM.SymWTag(strno); OPM.SymWTag(SHORT(typ^.n))
+			END ;
+			IF typ^.strobj # NIL THEN
+				IF typ^.strobj^.vis # internal THEN OPM.SymWTag(2) ELSE OPM.SymWTag(3) END ;
+				OPM.SymWTag(strno); OPM.SymWTag(m); WriteId(typ^.strobj^.name)
+			END ;
+			typ^.ref := strno; INC(strno);
+			IF strno > maxStruct THEN err(228) END ;
+			IF typ^.comp = Record THEN 
+
+				OutObjs(typ^.link)
+			END (*bound procedures*)
+		END
+	END OutStr;
+
+	PROCEDURE OutTyps(obj: Object);
+		VAR strobj: Object;
+	BEGIN
+		IF obj # NIL THEN
+			OutTyps(obj^.left); 
+			IF (obj^.vis # internal) & (obj^.mode = Typ) THEN
+				IF obj^.typ^.ref = 0 THEN OutStr(obj^.typ) END ;
+				strobj := obj^.typ^.strobj;
+				IF (strobj # obj) & (strobj # NIL) THEN
+					OPM.SymWTag(2); OPM.SymWTag(obj^.typ^.ref); OPM.SymWTag(0); WriteId(obj^.name)
+				END
+			END ;
+			OutTyps(obj^.right)
+		END
+	END OutTyps;
+
+	PROCEDURE OutObjs(obj: Object);
+		VAR f, m: INTEGER; rval: REAL; ext: ConstExt; typ: Struct; k: LONGINT;
+	BEGIN
+		IF obj # NIL THEN
+			OutObjs(obj^.left);
+			IF (obj^.vis # internal) OR (obj^.mode = TProc) THEN
+				IF obj^.mode = Var THEN
+					OutStr(obj^.typ);
+					IF obj^.vis = externalR THEN OPM.SymWTag(23) ELSE OPM.SymWTag(4) END ;
+					OPM.SymWTag(obj^.typ^.ref);
+					IF OPM.ExpVarAdr THEN OPM.SymWLInt(obj^.adr)
+					ELSE OPM.SymWTag(SHORT(obj^.adr))
+					END ;
+					WriteId(obj^.name)
+				ELSIF obj^.mode = Con THEN
+					OPM.SymWTag(1); f := obj^.typ^.form; OPM.SymWTag(f);
+					CASE f OF
+					   Byte, Char:
+							OPM.SymWCh(CHR(obj^.conval^.intval))
+					| Bool, SInt:
+							k := obj^.conval^.intval;
+							IF k < 0 THEN k := k - 2*OPM.MinSInt END ;
+							OPM.SymWCh(CHR(k))
+					| Int:
+							OPM.SymWInt(obj^.conval^.intval)
+					| LInt:
+							OPM.SymWLInt(obj^.conval^.intval)
+					| Set:
+							OPM.SymWSet(obj^.conval^.setval)
+					| Real:
+							rval := SHORT(obj^.conval^.realval); OPM.SymWReal(rval)
+					| LReal:
+							OPM.SymWLReal(obj^.conval^.realval)
+					| String:
+							WriteId(obj^.conval^.ext^)
+					| NilTyp:
+					ELSE err(127)
+					END ;
+					WriteId(obj^.name)
+				ELSIF obj^.mode = XProc THEN
+					OutStr(obj^.typ); OutPars(obj^.link); OPM.SymWTag(6);
+					OPM.SymWTag(obj^.typ^.ref); OPM.SymWTag(SHORT(obj^.adr)); WriteId(obj^.name)
+				ELSIF obj^.mode = IProc THEN
+					OutStr(obj^.typ); OutPars(obj^.link); OPM.SymWTag(5);
+					OPM.SymWTag(obj^.typ^.ref); OPM.SymWTag(SHORT(obj^.adr)); WriteId(obj^.name)
+
+				ELSIF obj^.mode = CProc THEN
+					OutStr(obj^.typ); OutPars(obj^.link); OPM.SymWTag(7);
+					OPM.SymWTag(obj^.typ^.ref); ext := obj^.conval^.ext;
+					m := ORD(ext^[0]); f := 1; OPM.SymWCh(CHR(m));
+					WHILE f <= m DO OPM.SymWCh(ext^[f]); INC(f) END ;
+					WriteId(obj^.name)
+
+				ELSIF obj^.mode = TProc THEN
+					typ := obj^.link^.typ; IF typ^.form = Pointer THEN typ := typ^.BaseTyp END ;
+					IF (typ^.BaseTyp # NIL) & (obj^.adr DIV 10000H < typ^.BaseTyp^.n) & (obj^.vis = internal) THEN
+						OPM.Mark(109, typ^.txtpos)
+						(* hidden and overriding, not detected in OPP because record exported indirectly or via aliasing *)
+					END ;
+					IF OPM.ExpHdTProc OR (obj^.vis # internal) THEN
+						IF obj^.vis # internal THEN OutStr(obj^.typ); OutPars(obj^.link);
+							OPM.SymWTag(25); OPM.SymWTag(obj^.typ^.ref)
+						ELSE OPM.SymWTag(27)
+						END ;
+						OPM.SymWTag(typ^.ref); OPM.SymWTag(SHORT(obj^.adr DIV 10000H));
+						OPM.SymWTag(SHORT(obj^.adr MOD 10000H));
+
+						IF obj^.vis # internal THEN WriteId(obj^.name) END
+					END
+				END
+			END ;
+			OutObjs(obj^.right)
+		END
+	END OutObjs;
+
+	PROCEDURE Export*(VAR modName: OPS.Name; VAR newSF: BOOLEAN; VAR key: LONGINT);
+		VAR i: INTEGER; done: BOOLEAN;
+			oldkey: LONGINT;
+			typ: Struct;
+	BEGIN
+		OPM.NewSym(modName, done);
+		IF done THEN strno := firstStr;
+			OPM.SymWTag(22); OPM.SymWLInt(key); WriteId(modName); nofExp := 1;
+			globals := topScope^.right;	(* dVdW *)
+			OutTyps(topScope^.right); OutObjs(topScope^.right); i := 0;
+			WHILE i < udpinx DO
+				typ := undPtr[i]; undPtr[i] := NIL(*garbage collection*); INC(i); OutStr(typ^.BaseTyp);
+				OPM.SymWTag(20); (*fixup*)
+				OPM.SymWTag(typ^.ref); OPM.SymWTag(typ^.BaseTyp^.ref)
+			END ;
+			IF OPM.noerr THEN
+				OPM.OldSym(modName, TRUE, done);
+				IF done THEN (*compare*)
+					IF OPM.EqualSym(oldkey) THEN OPM.DeleteNewSym; newSF := FALSE; key := oldkey
+					ELSIF newSF THEN OPM.RegisterNewSym(modName)
+					ELSE OPM.DeleteNewSym; err(155)
+					END
+				ELSE OPM.RegisterNewSym(modName); newSF := TRUE
+				END
+			ELSE OPM.DeleteNewSym; newSF := FALSE
+			END
+		ELSE newSF := FALSE
+		END
+	END Export;
+
+	PROCEDURE InitStruct(VAR typ: Struct; form: SHORTINT);
+	BEGIN typ := NewStr(form, Basic); typ^.ref := form; typ^.size := OPM.ByteSize;
+		typ^.tdadr := 0; typ^.offset := 0; typ^.strobj := NewObj()
+	END InitStruct;
+
+	PROCEDURE EnterBoolConst(name: OPS.Name; value: LONGINT);
+		VAR obj: Object;
+	BEGIN Insert(name, obj); obj^.conval := NewConst();
+		obj^.mode := Con; obj^.typ := booltyp; obj^.conval^.intval := value
+	END EnterBoolConst;
+
+	PROCEDURE EnterTyp(name: OPS.Name; form: SHORTINT; size: INTEGER; VAR res: Struct);
+		VAR obj: Object; typ: Struct;
+	BEGIN Insert(name, obj);
+		typ := NewStr(form, Basic); obj^.mode := Typ; obj^.typ := typ; obj^.vis := external;
+		typ^.strobj := obj; typ^.size := size; typ^.tdadr := 0; typ^.offset := 0; typ^.ref := form; res := typ
+	END EnterTyp;
+
+	PROCEDURE EnterProc(name: OPS.Name; num: INTEGER);
+		VAR obj: Object;
+	BEGIN Insert(name, obj);
+		obj^.mode := SProc; obj^.typ := notyp; obj^.adr := num
+	END EnterProc;
+
+BEGIN
+	topScope := NIL; OpenScope(0, NIL);  OPM.errpos := 0;
+	
+	InitStruct(undftyp, Undef); InitStruct(notyp, NoTyp);
+	InitStruct(stringtyp, String); InitStruct(niltyp, NilTyp);
+	undftyp^.BaseTyp := undftyp;
+
+	(*initialization of module SYSTEM*)
+	EnterTyp("BYTE", Byte, OPM.ByteSize, bytetyp);
+	EnterTyp("PTR", Pointer, OPM.PointerSize, sysptrtyp);
+	EnterProc("ADR", adrfn);
+	EnterProc("CC", ccfn);
+	EnterProc("LSH", lshfn);
+	EnterProc("ROT", rotfn);
+	EnterProc("GET", getfn);
+	EnterProc("PUT", putfn);
+	EnterProc("GETREG", getrfn);
+	EnterProc("PUTREG", putrfn);
+	EnterProc("BIT", bitfn);
+	EnterProc("VAL", valfn);
+	EnterProc("NEW", sysnewfn);
+	EnterProc("MOVE", movefn);
+	EnterProc("PORTOUT", poutfn);
+	EnterProc("PORTIN", pinfn);
+	EnterProc("STI", stifn);
+	EnterProc("CLI", clifn);
+	syslink := topScope^.right;
+	universe := topScope; topScope^.right := NIL;
+
+	EnterTyp("CHAR", Char, OPM.CharSize, chartyp);
+	EnterTyp("SET", Set, OPM.SetSize, settyp);
+	EnterTyp("REAL", Real, OPM.RealSize, realtyp);
+	EnterTyp("INTEGER", Int, OPM.IntSize, inttyp);
+	EnterTyp("LONGINT",  LInt, OPM.LIntSize, linttyp);
+	EnterTyp("LONGREAL", LReal, OPM.LRealSize, lrltyp);
+	EnterTyp("SHORTINT", SInt, OPM.SIntSize, sinttyp);
+	EnterTyp("BOOLEAN", Bool, OPM.BoolSize, booltyp);
+	EnterBoolConst("FALSE", 0);	(* 0 and 1 are compiler internal representation only *)
+	EnterBoolConst("TRUE",  1);
+	EnterProc("HALT", haltfn);
+	EnterProc("NEW", newfn);
+	EnterProc("ABS", absfn);
+	EnterProc("CAP", capfn);
+	EnterProc("ORD", ordfn);
+	EnterProc("ENTIER", entierfn);
+	EnterProc("ODD", oddfn);
+	EnterProc("MIN", minfn);
+	EnterProc("MAX", maxfn);
+	EnterProc("CHR", chrfn);
+	EnterProc("SHORT", shortfn);
+	EnterProc("LONG", longfn);
+	EnterProc("SIZE", sizefn);
+	EnterProc("INC", incfn);
+	EnterProc("DEC", decfn);
+	EnterProc("INCL", inclfn);
+	EnterProc("EXCL", exclfn);
+	EnterProc("LEN", lenfn);
+	EnterProc("COPY", copyfn);
+	EnterProc("ASH", ashfn);
+	EnterProc("ASSERT", assertfn);
+
+END iOPT.
+

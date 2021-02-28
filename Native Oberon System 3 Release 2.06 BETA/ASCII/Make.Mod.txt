@@ -1,0 +1,591 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Make;	(* jm *)
+
+IMPORT
+	Files, Display, OCS := iOPS, OPM := iOPM, Texts, Out, Oberon, TextDocs;
+	
+CONST
+	module = 63; ident = 38; semicolon = 39; import = 62; becomes = 34; comma = 19;
+
+TYPE
+	Name = ARRAY 64 OF CHAR;
+	
+	Module = POINTER TO ModuleDesc;
+	Ref = POINTER TO RefDesc;
+	RefDesc = RECORD
+		next: Ref;
+		mod: Module;
+	END;
+	
+	ModuleDesc = RECORD
+		next: Module;
+		name, filename, package, release, options: Name;
+		imports: Ref;
+		refs: INTEGER;
+		
+		order: Module;
+		dead, releasesource, specific, np: BOOLEAN;
+	END;
+	
+	Resource = POINTER TO ResourceDesc;
+	ResourceDesc = RECORD
+		next: Resource;
+		filename, base, package: Name;
+		specific: BOOLEAN;
+	END;
+	
+	Package = POINTER TO PackageDesc;
+	PackageDesc = RECORD
+		next: Package;
+		name: Name;
+	END;
+	
+VAR
+	sym: SHORTINT; (* << win *)
+	mod: Module;
+	order: Module;
+	res: Resource;
+	
+	prefix: ARRAY 3 OF ARRAY 64 OF CHAR;
+	W: Texts.Writer;
+	options: ARRAY 16 OF CHAR;
+	optionChar: CHAR;
+	curpackage, curpackageobj, currelease, cmpopt: Name;
+	packages: Package;
+	srcdir: ARRAY 64 OF CHAR;
+
+PROCEDURE Settings*;
+BEGIN
+	Out.String("Prefix 1 = "); Out.Char(22X); Out.String(prefix[0]); Out.Char(22X); Out.Ln;
+	Out.String("Prefix 2 = "); Out.Char(22X); Out.String(prefix[1]); Out.Char(22X); Out.Ln;
+	Out.String("Prefix 3 = "); Out.Char(22X); Out.String(prefix[2]); Out.Char(22X); Out.Ln;
+	Out.String("Compiler options = "); Out.Char(22X); Out.String(options); Out.Char(22X); Out.Ln;
+	Out.String("Options Char = "); Out.Char(22X); Out.Char(optionChar); Out.Char(22X); Out.Ln;
+END Settings;
+
+PROCEDURE SetPrefixes*;
+VAR S: Texts.Scanner;
+BEGIN
+	prefix[0] := ""; prefix[1] := ""; prefix[2] := "";
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(S);
+	IF S.class IN {Texts.Name, Texts.String} THEN
+		COPY(S.s, prefix[0]);
+		Texts.Scan(S);
+		IF S.class IN {Texts.Name, Texts.String} THEN
+			COPY(S.s, prefix[1]);
+			Texts.Scan(S);
+			IF S.class IN {Texts.Name, Texts.String} THEN
+				COPY(S.s, prefix[2]);
+			END
+		END
+	END
+END SetPrefixes;
+
+PROCEDURE SetCompileOptions*;
+VAR S: Texts.Scanner;
+BEGIN
+	options := "";
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(S);
+	IF S.class IN {Texts.Name, Texts.String} THEN
+		COPY(S.s, options);
+	END;
+END SetCompileOptions;
+
+PROCEDURE SetOptionChar*;
+VAR S: Texts.Scanner;
+BEGIN
+	optionChar := "\";
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(S);
+	IF S.class IN {Texts.String} THEN
+		optionChar := S.s[0];
+	END;
+END SetOptionChar;
+
+PROCEDURE FindMod(VAR name: ARRAY OF CHAR): Module;
+VAR m: Module;
+BEGIN
+	m := mod; WHILE (m # NIL) & (m.name # name) DO m := m.next END;
+	RETURN m
+END FindMod;
+
+PROCEDURE AddModule(name, filename: ARRAY OF CHAR; releasesource, specific: BOOLEAN);
+VAR m: Module;
+BEGIN
+	m := FindMod(name);
+	IF m = NIL THEN
+		NEW(m); COPY(name, m.name); COPY(filename, m.filename); COPY(curpackageobj, m.package);
+		COPY(currelease, m.release);
+		COPY(cmpopt, m.options);
+		m.refs := 0;
+		m.next := mod; mod := m;
+		m.releasesource := releasesource;
+		m.specific := specific
+	ELSIF m.filename = "" THEN COPY(filename, m.filename); m.releasesource := releasesource;
+		COPY(curpackageobj, m.package); COPY(currelease, m.release); COPY(cmpopt, m.options);
+		m.specific := specific
+	ELSE
+		Texts.WriteString(W, "WARNING: ");
+		Texts.WriteString(W, name); Texts.WriteString(W, " in ");  Texts.WriteString(W, filename);
+		Texts.WriteString(W, " already in list as "); Texts.WriteString(W, m.filename); Texts.WriteLn(W);
+	END
+END AddModule;
+
+PROCEDURE AddImport(VAR name, import: ARRAY OF CHAR);
+VAR m, i: Module; ref: Ref;
+BEGIN
+	m := FindMod(name); ASSERT(m # NIL);
+	i := FindMod(import);
+	IF i = NIL THEN AddModule(import, "", FALSE, FALSE); i := FindMod(import) END; (* insert in list *)
+	
+	NEW(ref);
+	ref.mod := i; ref.next := m.imports; m.imports := ref;
+	INC(i.refs)
+END AddImport;
+
+PROCEDURE Kill(m: Module);
+VAR r: Ref;
+BEGIN
+	m.dead := TRUE;
+	r := m.imports;
+	WHILE r # NIL DO
+		DEC(r.mod.refs);
+		r := r.next
+	END
+END Kill;
+
+PROCEDURE Sort;
+VAR m: Module; continue: BOOLEAN;
+BEGIN
+	order := NIL;
+	REPEAT
+		continue := FALSE;
+		m := mod;
+		WHILE m # NIL DO
+			IF ~m.dead THEN
+				IF m.refs = 0 THEN 
+					IF m.filename # "" THEN
+						m.order := order; order := m
+					ELSE
+						Texts.WriteString(W, "WARNING: Did you forget to include "); Texts.WriteString(W, m.name);
+						Texts.WriteString(W, " ?"); Texts.WriteLn(W);
+					END;
+					Kill(m)
+				ELSE continue := TRUE
+				END;
+			END;
+			m := m.next
+		END
+	UNTIL ~continue;
+END Sort;
+
+PROCEDURE AddResource(fname, base: ARRAY OF CHAR; specific: BOOLEAN);
+VAR r: Resource;
+BEGIN
+	NEW(r); COPY(fname, r.filename); r.specific := specific; COPY(base, r.base); COPY(curpackage, r.package);
+	r.next := res; res := r
+END AddResource;
+
+(* --- Parsing *)
+
+PROCEDURE MatchSym(s: INTEGER): BOOLEAN;
+BEGIN
+	IF s = sym THEN OCS.Get(sym); RETURN TRUE
+	ELSE RETURN FALSE END;
+END MatchSym;
+
+PROCEDURE NonPortable(name: ARRAY OF CHAR);
+VAR m: Module;
+BEGIN 
+	m := FindMod(name);
+	m.np := TRUE
+END NonPortable;
+
+PROCEDURE Import(VAR name: ARRAY OF CHAR);
+VAR import: ARRAY 32 OF CHAR;
+BEGIN
+	IF sym = ident THEN (* ident *)
+		COPY(OCS.name, import); OCS.Get(sym);
+		IF sym = becomes THEN (* := *)
+			OCS.Get(sym);
+			IF sym = ident THEN
+				COPY(OCS.name, import); OCS.Get(sym);
+			END;
+		END;
+		IF import # "SYSTEM" THEN AddImport(name, import) ELSE NonPortable(name) END
+	END
+END Import;
+
+PROCEDURE AddMod(T: Texts.Text; filename: ARRAY OF CHAR; release, specific: BOOLEAN);
+VAR R: Texts.Reader; name: ARRAY 64 OF CHAR;
+BEGIN
+	Texts.OpenReader(R, T, 0); OPM.Init(R, Oberon.Log);
+	OCS.Init; OCS.Get(sym);
+	IF MatchSym(module) THEN (* module *)
+		IF sym = ident THEN (* ident *)
+			COPY(OCS.name, name);
+			AddModule(name, filename, release, specific);
+			OCS.Get(sym);
+			IF MatchSym(semicolon) & MatchSym(import) THEN (* ; IMPORT *)
+				LOOP Import(name);
+					IF sym = semicolon THEN EXIT END; (* ; *)
+					IF sym # comma THEN EXIT ELSE OCS.Get(sym) END (* , *)
+				END
+			ELSE (* no import *)
+			END
+		END;
+	END
+END AddMod;
+
+(* ext returns the extension. If ext = "Mod" the base contains the mod name, else the complete filename *)
+PROCEDURE Strip(name: ARRAY OF CHAR; VAR base, ext: ARRAY OF CHAR);
+VAR i, j, e: INTEGER;
+BEGIN
+	i := 0; WHILE name[i] # 0X DO INC(i) END;
+	WHILE (i > 0) & (name[i] # ".") DO DEC(i) END;
+	IF name[i] = "." THEN (* has an extension *)
+		e := i + 1;
+		j := 0; WHILE name[e] # 0X DO ext[j] := name[e]; INC(j); INC(e) END;
+		ext[j] := 0X;
+		
+		IF ext = "Mod" THEN
+			DEC(i);
+			WHILE (i > 0) & (name[i-1] # ".") DO DEC(i) END;
+			j := 0;
+			REPEAT base[j] := name[i]; INC(i); INC(j); UNTIL name[i] = ".";
+			base[j] := 0X
+		ELSE COPY(name, base)
+		END
+	ELSE COPY(name, base)
+	END
+END Strip;
+
+PROCEDURE LocateModule(base: ARRAY OF CHAR; VAR fname: ARRAY OF CHAR);
+VAR i, j, k: INTEGER; F: Files.File;
+BEGIN
+	(* check with prefix *)
+	FOR k := 0 TO 2 DO
+		IF prefix[k] # "" THEN
+			COPY(prefix[k], fname);
+			i := 0; WHILE fname[i] # 0X DO INC(i) END;
+			fname[i] := "."; INC(i);
+			j := 0; WHILE base[j] # 0X DO fname[i] := base[j]; INC(i); INC(j) END;
+			fname[i] := "."; INC(i);
+			fname[i] := "M"; INC(i);
+			fname[i] := "o"; INC(i);
+			fname[i] := "d"; INC(i);
+			fname[i] := 0X;
+			
+			F := Files.Old(fname);
+			IF F # NIL THEN RETURN END
+		END;
+	END;
+		
+	(* check normal *)
+	i := 0; j := 0; WHILE base[j] # 0X DO fname[i] := base[j]; INC(i); INC(j) END;
+	fname[i] := "."; INC(i);
+	fname[i] := "M"; INC(i);
+	fname[i] := "o"; INC(i);
+	fname[i] := "d"; INC(i);
+	fname[i] := 0X;
+	
+	F := Files.Old(fname);
+	IF F # NIL THEN RETURN END;
+	fname[0] := 0X;
+END LocateModule;
+
+PROCEDURE LocateResource(VAR base: ARRAY OF CHAR; VAR fname: ARRAY OF CHAR; strip: BOOLEAN);
+VAR i, j, k: INTEGER; F: Files.File;
+BEGIN
+	(* check with prefix *)
+	FOR k := 0 TO 2 DO
+		IF prefix[k] # "" THEN
+			COPY(prefix[k], fname);
+			i := 0; WHILE fname[i] # 0X DO INC(i) END;
+			fname[i] := "."; INC(i);
+			j := 0; WHILE base[j] # 0X DO fname[i] := base[j]; INC(i); INC(j) END;
+			fname[i] := 0X;
+			
+			F := Files.Old(fname);
+			IF F # NIL THEN RETURN END
+		END
+	END;
+		
+	(* check normal *)
+	COPY(base, fname);
+	IF strip THEN 
+		i := 0; WHILE (base[i] # 0X) & (base[i] # ".") DO INC(i) END;
+		IF base[i] # 0X THEN INC(i);
+			j := 0; WHILE base[i] # 0X DO base[j] := base[i]; INC(i); INC(j) END;
+			base[j] := 0X
+		END
+	END;
+	F := Files.Old(fname);
+	IF F # NIL THEN RETURN END;
+	fname[0] := 0X;
+END LocateResource;
+
+PROCEDURE Analyze*;
+VAR S: Texts.Scanner; T: Texts.Text; m: Module; r: Resource;
+	base, fname, ext, tmp: ARRAY 64 OF CHAR; count: INTEGER; p: Package;
+BEGIN
+	curpackage := ""; curpackageobj := ""; NEW(packages);
+	mod := NIL; res := NIL;
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(S);
+	WHILE (S.class IN {Texts.Name, Texts.String}) OR ((S.class = Texts.Char) &
+		((S.c = "*") OR (S.c = "=") OR (S.c = "+") OR (S.c = "!") OR (S.c = "-") OR (S.c = "%") OR (S.c = "@"))) DO
+		IF S.class IN {Texts.Name, Texts.String} THEN
+			Strip(S.s, base, ext);
+			IF ext = "Mod" THEN
+				LocateModule(base, fname);
+				IF fname # "" THEN
+					m := mod;
+					WHILE (m # NIL) & (m.filename # fname) DO m := m.next END; (* check if file has been done before *)
+					IF m = NIL THEN
+						NEW(T); Texts.Open(T, fname);
+						AddMod(T, fname, S.nextCh = "*", fname # S.s)
+					END
+				ELSE
+					Texts.WriteString(W, "WARNING: Could not locate "); Texts.WriteString(W, S.s); Texts.WriteLn(W);
+				END
+			ELSIF ext = "Bak" THEN
+			ELSIF ext = "Sym" THEN
+			(* ELSIF ext = "Obj" THEN *)
+			ELSE
+				LocateResource(base, fname, S.nextCh = "-");
+				IF fname # "" THEN AddResource(fname, base, fname # S.s) END
+			END;
+			Texts.Scan(S)
+		ELSIF S.class = Texts.Char THEN
+			IF (S.c = "*") OR (S.c = "-") THEN Texts.Scan(S)
+			ELSIF S.c = "@" THEN
+				Texts.Scan(S);
+				ASSERT((S.class = Texts.Name) OR (S.class = Texts.String), 99);
+				COPY(S.s, curpackageobj);
+				p := packages;
+				WHILE (p # NIL) & (p.name # curpackageobj) DO p := p.next END;
+				IF p = NIL THEN
+					NEW(p); COPY(curpackageobj, p.name); p.next := packages; packages := p;
+					Texts.WriteString(W, "PACKAGE: "); Texts.WriteString(W, p.name); Texts.WriteLn(W);
+				END;
+				Texts.Scan(S);
+			ELSIF S.c = "+" THEN
+				Texts.Scan(S);
+				ASSERT((S.class = Texts.Name) OR (S.class = Texts.String), 99);
+				COPY(S.s, currelease);
+				Texts.Scan(S);
+			ELSIF S.c = "!" THEN
+				Texts.Scan(S);
+				ASSERT((S.class = Texts.Name) OR (S.class = Texts.String), 99);
+				COPY(S.s, srcdir);
+				Texts.Scan(S);
+			ELSIF S.c = "=" THEN
+				Texts.Scan(S);
+				ASSERT((S.class = Texts.Name) OR (S.class = Texts.String), 99);
+				COPY(S.s, curpackage);
+				p := packages;
+				WHILE (p # NIL) & (p.name # curpackage) DO p := p.next END;
+				IF p = NIL THEN
+					NEW(p); COPY(curpackage, p.name); p.next := packages; packages := p;
+					Texts.WriteString(W, "PACKAGE: "); Texts.WriteString(W, p.name); Texts.WriteLn(W);
+				END;
+				Texts.Scan(S);
+			ELSIF S.c = "%" THEN
+				Texts.Scan(S);
+				ASSERT((S.class = Texts.Name) OR (S.class = Texts.String), 99);
+				COPY(S.s, cmpopt);
+				Texts.Scan(S);
+			ELSE HALT(100)
+			END
+		ELSE HALT(100)
+		END
+	END;
+	Texts.WriteLn(W);
+	
+	Sort;
+	
+	(* THE COMPILE COMMAND *)
+	count := 0;
+	Texts.WriteLn(W);
+	Texts.WriteString(W, "{ Compile the whole system }"); Texts.WriteLn(W);
+	Texts.WriteString(W, "Compiler.Compile"); Texts.WriteLn(W); Texts.WriteString(W, "   ");
+	m := order;
+	WHILE m # NIL DO
+		IF m.specific THEN Texts.SetColor(W, 3) END;
+		IF m.np THEN Texts.SetColor(W, 1) END;
+		Texts.WriteString(W, m.filename);
+		
+		Texts.Write(W, optionChar); Texts.WriteString(W, options);
+		IF m.np THEN Texts.Write(W, "N"); END;
+		Texts.WriteString(W, m.options);
+		IF m.specific OR m.np THEN Texts.SetColor(W, 15) END;
+		
+		Texts.Write(W, " ");
+		INC(count);
+		IF count MOD 4 = 0 THEN Texts.WriteLn(W); Texts.WriteString(W, "   "); END;
+		m := m.order
+	END;
+	Texts.WriteLn(W); Texts.Write(W, "~"); Texts.WriteLn(W); Texts.WriteLn(W);
+	
+	(* RELEASING OF THE OBJECT & SYMBOL FILES *)
+		
+	p := packages;
+	WHILE p # NIL DO
+		count := 0;
+		Texts.WriteString(W, "{ Release Obj & Sym files of package ");
+		Texts.WriteString(W, p.name); Texts.WriteString(W, " }");
+		Texts.WriteLn(W);
+		Texts.WriteLn(W); Texts.WriteString(W, "System.CopyFiles"); Texts.WriteLn(W);
+		m := order;
+		WHILE m # NIL DO
+			IF m.package = p.name THEN
+				Texts.WriteString(W, "   "); Texts.WriteString(W, m.name); Texts.WriteString(W, ".Obj");
+				Texts.WriteString(W, " => "); Texts.WriteString(W, p.name);
+				Texts.WriteString(W, m.name); Texts.WriteString(W, ".Obj");
+				INC(count);
+				IF count MOD 2 = 0 THEN Texts.WriteLn(W) END;
+				(*
+				Texts.WriteString(W, "   "); Texts.WriteString(W, m.name); Texts.WriteString(W, ".Sym");
+				Texts.WriteString(W, " => "); Texts.WriteString(W, p.name);
+				Texts.WriteString(W, m.name); Texts.WriteString(W, ".Sym");
+				INC(count);
+				IF count MOD 2 = 0 THEN Texts.WriteLn(W) END
+				*)
+			END;
+			m := m.order
+		END;
+		Texts.WriteLn(W); Texts.Write(W, "~"); Texts.WriteLn(W); Texts.WriteLn(W);
+		p := p.next
+	END;
+	
+	(* RELEASING THE RESOURCES *)
+	Texts.WriteString(W, "{ Release the (re)sources of all packages }");
+	Texts.WriteLn(W);
+	count := 0;
+	Texts.WriteLn(W); Texts.WriteString(W, "System.CopyFiles"); Texts.WriteLn(W);
+	
+	(* release the modules *)
+	p := packages;
+	WHILE p # NIL DO
+		m := order;
+		WHILE m # NIL DO
+			IF (m.package = p.name) & m.releasesource THEN
+				Texts.WriteString(W, "   "); Texts.WriteString(W, m.filename);
+				Texts.WriteString(W, " => "); Texts.WriteString(W, m.release);
+				Texts.WriteString(W, m.name); Texts.WriteString(W, ".Mod");
+				INC(count);
+				IF count MOD 2 = 0 THEN Texts.WriteLn(W) END;
+			END;
+			m := m.order
+		END;
+		p := p.next;
+	END;
+	
+	p := packages;
+	WHILE p # NIL DO
+		r := res;
+		WHILE r # NIL DO
+			IF r.package = p.name THEN
+				IF r.specific THEN Texts.SetColor(W, 1) END;
+				Texts.WriteString(W, "   "); Texts.WriteString(W, r.filename);
+				Texts.WriteString(W, " => "); Texts.WriteString(W, p.name);
+				Texts.WriteString(W, r.base);
+				IF r.specific THEN Texts.SetColor(W, 15) END;
+				INC(count);
+				IF count MOD 2 = 0 THEN Texts.WriteLn(W) END
+			END;
+			r := r.next
+		END;
+		p := p.next
+	END;
+	Texts.WriteLn(W); Texts.Write(W, "~"); Texts.WriteLn(W); Texts.WriteLn(W);
+
+	(* THE ARCHIVING COMMAND *)
+	count := 0;
+	Texts.WriteString(W, "{ Archive all the sources }"); Texts.WriteLn(W);
+	Texts.WriteLn(W); Texts.WriteString(W, "Compress.Add Sources.Arc "); Texts.WriteLn(W); Texts.WriteString(W, "   ");
+	m := order;
+	WHILE m # NIL DO
+		Texts.WriteString(W, m.filename); Texts.Write(W, " ");
+		INC(count);
+		IF count MOD 5 = 0 THEN Texts.WriteLn(W); Texts.WriteString(W, "   "); END;
+		m := m.order
+	END;
+	Texts.WriteLn(W); Texts.Write(W, "~"); Texts.WriteLn(W); Texts.WriteLn(W);
+
+	(* THE RESOURCES ARCHIVING COMMAND *)
+	Texts.WriteString(W, "{ Archive all the misc files }"); Texts.WriteLn(W);
+	count := 0;
+	Texts.WriteLn(W); Texts.WriteString(W, "Compress.Add Misc.Arc "); Texts.WriteLn(W); Texts.WriteString(W, "   ");
+	r := res;
+	WHILE r # NIL DO
+		Texts.WriteString(W, r.filename); Texts.Write(W, " ");
+		INC(count);
+		IF count MOD 5 = 0 THEN Texts.WriteLn(W); Texts.WriteString(W, "   "); END;
+		r := r.next
+	END;
+	Texts.WriteLn(W); Texts.Write(W, "~"); Texts.WriteLn(W); Texts.WriteLn(W);
+	
+	IF srcdir # "" THEN (* backup the sources *)
+		Texts.WriteString(W, "{ Release all the developer sources }"); Texts.WriteLn(W);
+		count := 0;
+		Texts.WriteLn(W); Texts.WriteString(W, "System.CopyFiles "); Texts.WriteLn(W);
+		m := order;
+		WHILE m # NIL DO
+			Texts.WriteString(W, "   "); Texts.WriteString(W, m.filename); Texts.WriteString(W, " => ");
+			Texts.WriteString(W, srcdir);
+			Texts.WriteString(W, m.filename);
+			INC(count);
+			IF count MOD 2 = 0 THEN Texts.WriteLn(W) END;
+			m := m.order
+		END;
+		Texts.WriteLn(W); Texts.Write(W, "~"); Texts.WriteLn(W); Texts.WriteLn(W)
+	END;
+	
+	
+	Texts.WriteString(W, "{ Build the Watson definitions }"); Texts.WriteLn(W);
+	
+	count := 0;
+	Texts.WriteLn(W); Texts.WriteString(W, "Watson.MakeDefs "); Texts.WriteLn(W);
+	m := order;
+	WHILE m # NIL DO
+		Texts.WriteString(W, "   "); Texts.WriteString(W, m.filename);
+		INC(count);
+		IF count MOD 4 = 0 THEN Texts.WriteLn(W) END;
+		m := m.order
+	END;
+	Texts.WriteLn(W); Texts.Write(W, "~"); Texts.WriteLn(W); Texts.WriteLn(W);
+
+	Texts.WriteLn(W); Texts.WriteString(W, "System.DeleteFiles Definitions.Arc ~"); Texts.WriteLn(W);
+	Texts.WriteLn(W); Texts.WriteString(W, "Compress.Add Definitions.Arc "); Texts.WriteLn(W);
+	count := 0;
+	m := order;
+	WHILE m # NIL DO
+		Texts.WriteString(W, "   "); Texts.WriteString(W, m.name); Texts.WriteString(W, ".Def");
+		INC(count);
+		IF count MOD 4 = 0 THEN Texts.WriteLn(W) END;
+		m := m.order
+	END;
+	Texts.WriteLn(W); Texts.Write(W, "~"); Texts.WriteLn(W); Texts.WriteLn(W);
+
+	NEW(T); Texts.Open(T, ""); Texts.Append(T, W.buf);
+	TextDocs.ShowText(prefix[0], T, Display.Width DIV 8 * 3 + 20, 200);
+END Analyze;
+
+BEGIN Texts.OpenWriter(W); optionChar := "\"; options := "s"; srcdir := "";
+END Make.

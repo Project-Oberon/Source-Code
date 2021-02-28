@@ -1,0 +1,463 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE FDInstall;	(* pjm 19.03.96 *)
+
+IMPORT In, Out, Texts, Oberon, SYSTEM, Files, Diskette, MemFiles, MemDisk;
+
+CONST
+	BS = 512;
+	SS = 2048;
+	BPS = SS DIV BS;
+	BootFileName = "OBL.Bin";
+
+VAR
+	W: Texts.Writer;
+	verify, write: BOOLEAN;
+
+PROCEDURE -Equal4(adr0, adr1, len: LONGINT): BOOLEAN
+	059H,	(* POP ECX *)
+	05FH,	(* POP EDI *)
+	05EH,	(* POP ESI *)
+	0FCH,	(* CLD *)
+	0F3H, 0A7H,	(* REPE CMPSD *)
+	00FH, 094H, 0C0H;	(* SETE AL *)
+
+PROCEDURE PutSectors(start, num: INTEGER;  VAR buf: ARRAY OF SYSTEM.BYTE; ofs: LONGINT);
+CONST Size = 32;
+VAR
+	error: ARRAY 32 OF CHAR;
+	verbuf: ARRAY Size*BS OF CHAR;
+	n: INTEGER;
+BEGIN
+	Diskette.PutSectors(start, num, buf, ofs);
+	IF verify THEN
+		REPEAT
+			IF num > Size THEN n := Size ELSE n := num END;
+			Diskette.GetSectors(start, n, verbuf, 0);
+			IF ~Equal4(SYSTEM.ADR(buf[ofs]), SYSTEM.ADR(verbuf[0]), LONG(n)*BS DIV 4) THEN
+				error := "Verify error"; HALT(99)
+			END;
+			INC(start, n);  INC(ofs, LONG(n)*BS);  DEC(num, n)
+		UNTIL num = 0
+	END
+END PutSectors;
+
+(* ScanParams - Scan { env "=" strval {"+" strval} } ch, and add to tab *)
+
+PROCEDURE ScanParams(VAR s: Texts.Scanner;  VAR tab: ARRAY OF LONGINT;  size: INTEGER;  VAR i: INTEGER);
+VAR
+	error, name: ARRAY 32 OF CHAR;
+	val: ARRAY 80 OF CHAR;
+	i0, i1: LONGINT;
+	j, k: INTEGER;
+BEGIN
+	Texts.Scan(s);  i0 := SYSTEM.ADR(tab[i])+8;  i1 := i0;
+	WHILE s.class = Texts.Name DO
+		COPY(s.s, name);
+		Texts.Scan(s);	(* "=" *)
+		IF (s.class # Texts.Char) OR (s.c # "=") THEN error := "config: syntax error";  HALT(99) END;
+		Texts.Scan(s);	(* val *)
+		IF (s.class # Texts.Name) & (s.class # Texts.String) THEN error := "config: syntax error";  HALT(99) END;
+		COPY(s.s, val);
+		j := 0;  WHILE val[j] # 0X DO INC(j) END;	(* j = length of val *)
+		IF j >= 31 THEN error := "config: string too long; use +";  HALT(99) END;
+		Texts.Scan(s);	(* next name, or "+" *)
+		WHILE (s.class = Texts.Char) & (s.c = "+") DO
+			Texts.Scan(s);	(* val *)
+			IF (s.class # Texts.Name) & (s.class # Texts.String) THEN error := "config: syntax error";  HALT(99) END;
+			k := 0;  WHILE s.s[k] # 0X DO val[j] := s.s[k]; INC(j); INC(k) END;
+			val[j] := 0X;
+			IF k >= 31 THEN error := "config: string too long; use +";  HALT(99) END;
+			Texts.Scan(s)
+		END;
+		k := 0;  WHILE name[k] # 0X DO INC(k) END;	(* k = length of name *)
+		IF i1+k+j+3 >= SYSTEM.ADR(tab[size-1]) THEN error := "Table full";  HALT(99) END;
+		j := 0;  WHILE name[j] # 0X DO SYSTEM.PUT(i1, name[j]); INC(i1); INC(j) END;
+		SYSTEM.PUT(i1, 0X);  INC(i1);
+		j := 0;  WHILE val[j] # 0X DO SYSTEM.PUT(i1, val[j]); INC(i1); INC(j) END;
+		SYSTEM.PUT(i1, 0X);  INC(i1);
+	END;
+	IF i1 # i0 THEN	(* some env strings were added *)
+		SYSTEM.PUT(i1, 0X);  INC(i1);	(* end of env *)
+		WHILE (i1-i0) MOD 4 # 0 DO SYSTEM.PUT(i1, 0X);  INC(i1) END;
+		tab[i] := 8 (* patch *);  INC(i);  tab[i] := 8+(i1-i0);
+		INC(i, SHORT(1+(i1-i0) DIV 4))
+	END;
+		(* check syntax *)
+	IF s.class # Texts.Char THEN error := "syntax error"; HALT(99) END
+END ScanParams;
+
+PROCEDURE Copy(from, to: ARRAY OF CHAR);
+	VAR error: ARRAY 32 OF CHAR;
+		f: Files.File; g: MemFiles.File; Rf: Files.Rider; Rg: MemFiles.Rider; ch: CHAR;
+BEGIN
+	Texts.WriteString(W, from); Texts.WriteString(W, " => "); 
+	Texts.WriteString(W, to);  Texts.WriteString(W, " copying"); 
+	Texts.WriteLn(W);  Texts.Append(Oberon.Log, W.buf);
+	f := Files.Old(from);
+	IF (f = NIL) THEN
+		error := "File not found";  HALT(99)
+	END;
+	IF (MemDisk.Available()*SS-10*1024 < Files.Length(f)) THEN
+		error := "RAM disk full";  HALT(99)
+	END;
+	g := MemFiles.New(to);
+	Files.Set(Rf, f, 0); MemFiles.Set(Rg, g, 0); Files.Read(Rf, ch);
+	WHILE ~Rf.eof DO MemFiles.Write(Rg, ch); Files.Read(Rf, ch) END;
+	MemFiles.Register(g)
+END Copy;
+
+PROCEDURE CopyFile(name: ARRAY OF CHAR; VAR S: Texts.Scanner);
+BEGIN Texts.Scan(S);
+	IF (S.class = Texts.Char) & (S.c = "=") THEN Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = ">") THEN Texts.Scan(S);
+			IF S.class = Texts.Name THEN
+				Copy(name, S.s);  Texts.Scan(S)
+			END
+		END
+	ELSE Copy(name, name)
+	END
+END CopyFile;
+
+PROCEDURE CreateBootFloppy*;	(* [flag] corename { env "=" strval } "\" [ size {file [=> file]} ] "~" *)
+CONST Size = 4*BS;
+VAR
+	error: ARRAY 32 OF CHAR;
+	tsize, rsize0, rsize1, i, j, dsize: INTEGER;
+	b: ARRAY Size OF CHAR;
+	f: Files.File;  r: Files.Rider;
+	tab: ARRAY Size DIV 4 OF LONGINT;
+	s: Texts.Scanner;
+	sum: LONGINT;
+	flag: LONGINT;
+BEGIN
+	Diskette.drive := 0;  i := 0;  MemDisk.Init(0);
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);  Texts.Scan(s);
+	IF s.class = Texts.Int THEN flag := s.i;  Texts.Scan(s)
+	ELSE flag := 0
+	END;
+	IF s.class # Texts.Name THEN error := "corename expected"; HALT(99) END;
+	f := Files.Old(BootFileName);  Files.Set(r, f, 0);
+	IF (f # NIL) & (Files.Length(f) <= Size) THEN
+		Files.ReadBytes(r, b, Files.Length(f));
+		IF r.res # 0 THEN error := "Read error";  HALT(99) END;
+			(* get parameters from boot loader *)
+		SYSTEM.GET(SYSTEM.ADR(b[0EH]), rsize0);  tsize := ORD(b[10H]);
+		IF (rsize0-tsize)*BS # Files.Length(f) THEN error := "OBL inconsistent";  HALT(99) END;
+		tsize := tsize*BS DIV 4;
+			(* write the core image *)
+		Texts.WriteString(W, "Writing inner core");  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		f := Files.Old(s.s);  Files.Set(r, f, 0);	(* open core file *)
+		IF f = NIL THEN error := "core file not found"; HALT(99) END;
+		rsize1 := rsize0;  sum := 0;
+		LOOP
+			Files.ReadBytes(r, b, Size);
+			IF r.res = Size THEN EXIT END;
+			j := SHORT(Size - r.res);  WHILE j MOD BS # 0 DO b[j] := 0X; INC(j) END;
+			PutSectors(rsize1, j DIV BS, b, 0);  INC(rsize1, j DIV BS);
+			REPEAT DEC(j); sum := (sum + ORD(b[j])) MOD 100H UNTIL j = 0
+		END;
+		sum := (-sum) MOD 100H;
+		IF rsize1 = rsize0 THEN error := "empty core file"; HALT(99) END;
+		ScanParams(s, tab, tsize, i);
+		IF s.c # Oberon.OptionChar THEN error := "\ expected"; HALT(99) END;
+		Texts.Scan(s);
+		IF s.class = Texts.Int THEN	(* disk files specified *)
+			MemFiles.Init(SHORT(s.i));  Texts.Scan(s);
+			WHILE s.class = Texts.Name DO CopyFile(s.s, s) END;
+			dsize := SHORT(MemDisk.Used());
+			Texts.WriteString(W, "Writing ");
+			Texts.WriteInt(W, dsize DIV (SS DIV 1024), 1);  Texts.WriteString(W, "k ramdisk contents");
+			Texts.WriteLn(W);  Texts.Append(Oberon.Log, W.buf);
+			PutSectors(rsize1, dsize*BPS, MemDisk.disk^, 0);
+			MemDisk.Init(0)
+		END;
+		IF s.c # "~" THEN error := "~ expected"; HALT(99) END;
+			(* set parameters in boot loader for 1.44Mb floppy *)
+		f := Files.Old(BootFileName);  Files.Set(r, f, 0);
+		Files.ReadBytes(r, b, Files.Length(f));
+		IF r.res # 0 THEN error := "Read error";  HALT(99) END;
+		SYSTEM.PUT(SYSTEM.ADR(b[13H]), SYSTEM.VAL(INTEGER, rsize1+dsize*BPS));	(* total sectors *)
+		SYSTEM.PUT(SYSTEM.ADR(b[18H]), SYSTEM.VAL(INTEGER, 18));	(* sectors/track *)
+		SYSTEM.PUT(SYSTEM.ADR(b[1AH]), SYSTEM.VAL(INTEGER, 2));	(* heads *)
+		SYSTEM.PUT(SYSTEM.ADR(b[1CH]), SYSTEM.VAL(LONGINT, 1));	(* next sector *)
+		SYSTEM.PUT(SYSTEM.ADR(b[24H]), 0X);	(* drive 0 *)
+		SYSTEM.PUT(SYSTEM.ADR(b[0EH]), rsize1);	(* new reserved size *)
+		b[10] := CHR(flag);
+			(* write the boot loader to disk *)
+		Texts.WriteString(W, "Writing boot loader");  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		PutSectors(0, SHORT(Files.Length(f) DIV BS), b, 0);
+			(* finish the table *)
+		tab[i] := 7 (* frag. kernel *);  INC(i);  tab[i] := 28;  INC(i);
+		tab[i] := 1000H;  INC(i);  tab[i] := 1 + ASH(sum, 16);  INC(i);
+		tab[i] := 1000H;  INC(i);  tab[i] := rsize0;  INC(i);
+		tab[i] := rsize1-rsize0;  INC(i);
+		IF i >= tsize-1 THEN error := "Table overflow"; HALT(99) END;
+		WHILE i # tsize DO tab[i] := -1; INC(i) END;
+		tsize := tsize*4 DIV BS;	(* number of blocks in table *)
+		PutSectors(rsize0-tsize, tsize, tab, 0);
+		Texts.WriteString(W, "done");  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf)
+	END
+END CreateBootFloppy;
+
+PROCEDURE FileToFloppy*;	(* name *)
+CONST Size = 32*BS;
+VAR f: Files.File;  r: Files.Rider;  buf: ARRAY Size OF CHAR;  s: Texts.Scanner;  pos, num: INTEGER;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);  Texts.Scan(s);
+	IF s.class = Texts.Name THEN
+		f := Files.Old(s.s);
+		IF f # NIL THEN
+			Files.Set(r, f, 0);  pos := 0;
+			LOOP
+				Files.ReadBytes(r, buf, Size);
+				num := SHORT((Size-r.res+BS-1) DIV BS);
+				IF num = 0 THEN EXIT END;
+				PutSectors(pos, num, buf, 0);
+				INC(pos, num)
+			END
+		END
+	END
+END FileToFloppy;
+
+PROCEDURE CreateInstallFloppy*;	(* { label file [=> file]} ~ *)
+CONST
+	BufSize = BS*16;
+	N = 16384;
+	End = 0C0X;  Esc = 0DBX;  EscEnd = 0DCX;  EscEsc = 0DDX;
+TYPE
+	List = POINTER TO Rec;
+	Rec = RECORD
+		next: List;  f: Files.File;
+		src, dst: ARRAY 32 OF CHAR
+	END;
+VAR
+	notfound: ARRAY 32 OF CHAR;
+	label: ARRAY 32 OF CHAR;
+	s: Texts.Scanner;
+	ok: BOOLEAN;
+	ch: CHAR;
+	bytesin, bytesout, stuffed: LONGINT;
+	list, n: List;
+	r: Files.Rider;
+	out: ARRAY BufSize OF CHAR;
+	outpos, outblock: INTEGER;
+	table: ARRAY N OF CHAR;	(* hash table for compression *)
+	hash, bit, byte: LONGINT;
+
+	PROCEDURE Insert(n: List);
+	VAR error, duplicate: ARRAY 32 OF CHAR;  p: List;  
+	BEGIN
+		p := list;
+		WHILE (p.next # NIL) & (p.next.dst < n.dst) DO p := p.next END;
+		IF p.next # NIL THEN
+			IF p.next.dst = n.dst THEN COPY(n.dst, duplicate); error := "Duplicate file"; HALT(99) END;	(* duplicate *)
+			n.next := p.next;  p.next := n
+		ELSE
+			n.next := NIL;  p.next := n
+		END
+	END Insert;
+	
+	PROCEDURE Open;
+	VAR i: LONGINT;
+	BEGIN
+			(* check if boot disk & init buffer *)
+		Diskette.GetSectors(0, 1, out, 0);
+		i := 0;  SYSTEM.GET(SYSTEM.ADR(out[510]), SYSTEM.VAL(INTEGER, i));
+		out[0] := "x"; out[1] := "x"; out[2] := "x";  out[9] := 0X;
+		IF (i = 0AA55H) & (out = "xxxOBERON") THEN	(* valid boot block *)
+			outblock := 0;
+			SYSTEM.GET(SYSTEM.ADR(out[13H]), outblock)	(* total sectors *)
+		ELSE HALT(99)
+		END;
+		outpos := 0;  bytesin := 0;  bytesout := 0;  stuffed := 0;
+			(* init compression *)
+		i := 0; REPEAT table[i] := 0X; INC(i) UNTIL i = N;
+		hash := 0; bit := 0; byte := 0
+	END Open;
+	
+	PROCEDURE Put0(ch: CHAR);	(* write character to output *)
+	BEGIN
+		IF outpos = BufSize THEN
+			IF write THEN PutSectors(outblock, BufSize DIV BS, out, 0) END;
+			INC(outblock, BufSize DIV BS);  outpos := 0
+		END;
+		out[outpos] := ch;  INC(outpos);  INC(bytesout)
+	END Put0;
+
+	PROCEDURE Put(ch: CHAR);	(* write character to output with compression *)
+	BEGIN
+		IF table[hash] = ch THEN	(* 0 bit for correct prediction *)
+			INC(bit); IF bit = 8 THEN Put0(CHR(byte)); byte := 0; bit := 0 END
+		ELSE	(* Incorrect prediction -> 1'xxxx'xxxx bits where x = ch[0..7] *)
+			table[hash] := ch; INC(byte, ASH(1, bit)); INC(bit);
+			IF bit = 8 THEN Put0(CHR(byte)); Put0(ch);  byte := 0; bit := 0
+			ELSE Put0(CHR(byte+ASH(ORD(ch), bit) MOD 256)); byte := ASH(ORD(ch), bit) DIV 256
+			END
+		END;
+		hash := (16*hash+ORD(ch)) MOD N	(* hash value *)
+	END Put;
+	
+	PROCEDURE Write(ch: CHAR);	(* write character to output, with SLIP byte stuffing & compression *)
+	BEGIN
+		INC(bytesin);
+		IF ch = End THEN Put(Esc);  Put(EscEnd);  INC(stuffed)
+		ELSIF ch = Esc THEN Put(Esc);  Put(EscEsc);  INC(stuffed)
+		ELSE Put(ch)
+		END
+	END Write;
+
+	PROCEDURE WriteEOF;
+	BEGIN
+		Put(End)
+	END WriteEOF;
+	
+	PROCEDURE Close;
+	BEGIN
+			(* close compression *)
+		IF bit # 0 THEN Put0(CHR(byte)) END;	(* write last byte *)
+			(* close buffer *)
+		IF outpos # 0 THEN
+			IF write THEN PutSectors(outblock, (outpos+BS-1) DIV BS, out, 0) END;
+			INC(outblock, (outpos+BS-1) DIV BS);  outpos := 0
+		END
+	END Close;
+	
+	PROCEDURE WriteString(s: ARRAY OF CHAR);
+	VAR i: LONGINT;
+	BEGIN
+		i := 0;  WHILE s[i] # 0X DO Write(s[i]); INC(i) END;
+		Write(0X)
+	END WriteString;
+	
+BEGIN
+	ASSERT((BufSize MOD BS = 0) & (BufSize <= MAX(INTEGER)));
+	NEW(list);  list.next := NIL;
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);  Texts.Scan(s);
+	IF s.class = Texts.Name THEN
+		COPY(s.s, label);  Texts.Scan(s);  ok := TRUE;
+		WHILE (s.class = Texts.Name) & ok DO
+			NEW(n);  COPY(s.s, n.src);
+			Texts.Scan(s);
+			IF (s.class = Texts.Char) & (s.c = "=") THEN
+				Texts.Scan(s);
+				IF (s.class = Texts.Char) & (s.c = ">") THEN
+					Texts.Scan(s);
+					IF s.class = Texts.Name THEN
+						COPY(s.s, n.dst);  Texts.Scan(s)
+					ELSE ok := FALSE
+					END
+				ELSE ok := FALSE
+				END
+			ELSE n.dst := n.src
+			END;
+			IF ok THEN
+				n.f := Files.Old(n.src);
+				IF n.f = NIL THEN
+					COPY(n.src, notfound);  HALT(99)
+				END;
+				Insert(n)
+			END
+		END;
+		IF ~ok THEN list.next := NIL END
+	END;
+	IF list.next # NIL THEN
+		Open;  WriteString(label);
+		n := list.next;
+		WHILE n # NIL DO
+			Texts.WriteString(W, n.src);  Texts.WriteString(W, " => ");
+			Texts.WriteString(W, n.dst);  Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+			WriteString(n.dst);
+			Files.Set(r, n.f, 0);  Files.Read(r, ch);
+			WHILE ~r.eof DO Write(ch);  Files.Read(r, ch) END;
+			WriteEOF;
+			n.f := NIL;  n := n.next
+		END;
+		Write(0X);  Close;
+		Texts.WriteInt(W, bytesin DIV 1024, 1);  Texts.WriteString(W, "k in, ");
+		Texts.WriteInt(W, bytesout DIV 1024, 1);  Texts.WriteString(W, "k out, ");
+		Texts.WriteInt(W, stuffed DIV 1024, 1);  Texts.WriteString(W, "k stuffed, ");
+		Texts.WriteInt(W, 100-(bytesout*100 DIV bytesin), 1);  Texts.WriteString(W, "% saved, ");
+		Texts.WriteInt(W, outblock, 1);  Texts.WriteString(W, " blocks");
+		Texts.WriteLn(W);  Texts.Append(Oberon.Log, W.buf)
+	END;
+	list := NIL
+END CreateInstallFloppy;
+
+PROCEDURE Verify*;
+VAR s: ARRAY 10 OF CHAR;
+BEGIN
+	In.Open;  In.String(s);
+	IF ~In.Done THEN
+	ELSIF s = "on" THEN
+		verify := TRUE;
+		Out.String("verify on");  Out.Ln
+	ELSIF s = "off" THEN
+		verify := FALSE;
+		Out.String("verify off");  Out.Ln
+	END
+END Verify;
+
+PROCEDURE Write*;
+VAR s: ARRAY 10 OF CHAR;
+BEGIN
+	In.Open;  In.String(s);
+	IF ~In.Done THEN
+	ELSIF s = "on" THEN
+		write := TRUE;
+		Out.String("write on");  Out.Ln
+	ELSIF s = "off" THEN
+		write := FALSE;
+		Out.String("write off");  Out.Ln
+	END
+END Write;
+
+BEGIN
+	Texts.OpenWriter(W);  verify := TRUE;  write := TRUE
+END FDInstall.
+
+FDInstall.CreateBootFloppy Native0.Bin
+	MouseType="6"  MouseRate="100"  TracePort="1"  TraceBPS="19200"
+	Video="38,0F001001"
+	/ 100
+	Oberon10.Scn.Fnt System.Tool 
+ ~
+FDInstall.CreateBootFloppy 1 Native.Bin
+	MouseType="6"  MouseRate="100"  TracePort="1"  TraceBPS="19200"
+	Video="02054F02,0F001001"  Display="S3C805"
+	/ ~
+FDInstall.CreateInstallFloppy LABEL
+	{file [=> file]} ~
+~
+
+Backup.ReadFiles OBL.BIN OBL.ASM ~	System.RenameFiles OBL.BIN => OBL.Bin OBL.ASM => OBL.Asm ~
+
+FDInstall.Write off
+FDInstall.CreateBootFloppy 1 Core0.Bin
+	MouseType="6"  Buttons="2"  Init="b81200cd10bb003fb80110cd10"
+	Testing="it was a dark and stormy "+"night...  Suddenly a shot "+"rang out"
+	\ 550
+	Objects.obj VGA.Display.obj=>Display.obj V24.obj Input.obj Viewers.obj
+	Fonts.obj Reals.obj Texts.obj Oberon.obj MenuViewers.obj TextFrames.obj
+	System.obj NativeIntro.obj In.obj Diskette.obj 
+	Backup.obj Oberon10.Scn.Fnt Courier10.Scn.Fnt OBL.Bin Out.obj 
+	Empty.Display.obj ATDisk.obj ATFileDir.obj ATFiles.obj Install.obj 
+	Trace.Display.obj MemDisk.obj MemFileDir.obj MemFiles.obj 
+	FDInstall.obj ET.obj Core.Bin=>Native.Bootfile
+	Install.Oberon.Text=>Oberon.Text Install.Tool 
+~ 

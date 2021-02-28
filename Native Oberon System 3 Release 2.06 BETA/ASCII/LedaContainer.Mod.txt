@@ -1,0 +1,643 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaContainer;	(* uh, Fri, 10-Dec-1993 *)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaFrames, LedaBox, 
+		Files, Display, Objects, Oberon;
+		
+CONST
+	DefW = 3 * LedaBase.CM;	DefH = 4 * LedaBase.MM;
+	ModName = "LedaContainer";
+	ContName = "container";	ContCh = 03X;	(* CTRL-C *)
+	FormName = "formula";	FormCh = 016X;	(* CTRL_V *)
+	
+	(*--- dialog ---*)
+	Unit = "unit";	Screen = "screen";	Printer = "printer";
+	On = "on";	Off = "off";	Yes = "yes";	No = "no";
+	PrtUnit = 3048;	(* LedaBase.Point * 72 DIV 300 *)
+
+
+TYPE
+	(*--- container control ---*)
+	Cont* =  POINTER TO ContDsc;
+	ContDsc* = RECORD
+		(LedaBase.PieceCtrlDsc)
+		W*, H*, dY*: LONGINT;	(* width, height and vertical offset of control in document units *)
+		w*, h*: INTEGER;	(* width and height of control in screen units *)
+		C*: Display.Frame;	(* content frame *)
+		env*: LedaBase.Control;	(* environment of container control *)
+		trailer*: Display.Frame;	(* document trailer *)
+		msg*: BOOLEAN;	(* to indicate missed broadcast messages *)
+		protected*: BOOLEAN;	(* if set no input is received *)
+		autoDY*: BOOLEAN;	(* vertical offset determined automatically *)
+		lib*: Objects.Library	(* private library to bind content frame *)
+	END;
+	
+		(*--- remarks:
+			- a container control notes its environment; changes of the environment
+				are reported by a LedaBase.CtrlMsg [EnvironmentId]
+			- if a container control is in an evironment then it calls
+				the document trailer to reveive broadcast messages
+			- if a container control receives broadcast messages it is part
+				of the display space and may be edited in place
+			- if a container control missed some broadcast messages
+				it has to send a control message to the content [to update content]
+		---*)
+		
+	(*--- formula ---*)
+	FocusExcpt = POINTER TO FocusExcptDsc;
+	FocusExcptDsc = RECORD
+		(LedaSys.ExcptDsc)
+		F: Display.Frame
+	END;
+
+	
+VAR
+	(*--- container control ---*)
+	contDoOp: LedaBase.CtrlProc;		(* control handle *)
+	
+	clipF: Display.Frame;	(* clipping frame [used in messages sent to content] *)
+	markCount: INTEGER;	(* used for highlight/unhighlight selection mark in ContPassMsg *)
+	
+(*--- utilities ---*)
+	
+	PROCEDURE InArea(pX, pY, X, Y, W, H: INTEGER): BOOLEAN;
+	BEGIN
+		RETURN (X <= pX) & (pX < X + W) & (Y <= pY) & (pY < Y + H)
+	END InArea;
+	
+	PROCEDURE ClipFrame(X, Y, W, H, clipX, clipY, clipW, clipH: INTEGER): Display.Frame;
+	BEGIN
+		IF (X + W <= clipX) OR (X >= clipX + clipW) THEN W := 0
+		ELSE
+			IF X < clipX THEN DEC(W, clipX-X); X := clipX END;
+			IF X + W > clipX + clipW THEN DEC(W, X + W - clipX - clipW) END
+		END;
+		IF (Y + H <= clipY) OR (Y >= clipY + clipH) THEN H := 0
+		ELSE
+			IF Y < clipY THEN DEC(H, clipY - Y); Y := clipY END;
+			IF Y + H > clipY + clipH THEN DEC(H, Y + H - clipY - clipH) END
+		END;
+		clipF.X := X; clipF.Y := Y; clipF.W := W; clipF.H := H;
+		RETURN clipF
+	END ClipFrame;
+	
+	PROCEDURE SizeFrame(G: Display.Frame; W, H: INTEGER);
+	(* sets the size of the frame G to the values W and H *)
+		VAR M: Display.ModifyMsg;
+	BEGIN
+		IF (W # G.W) OR (H # G.H) THEN
+			M.id := Display.extend; M.res := -1; M.F := G; Objects.Stamp(M);
+			M.dW := G.W-W; M.dH := G.H-H; M.W := W; M.H := H;
+			M.X := G.X; M.Y := G.Y; M.dX := 0; M.dY := 0;
+			clipF.X := G.X; clipF.Y := G.Y; clipF.W := G.W; clipF.H := G.H;
+			M.dlink := clipF; M.mode := Display.state;
+			G.handle(G, M)
+		END
+	END SizeFrame;
+	
+	PROCEDURE CopyFrame*(F: Display.Frame; id: INTEGER): Display.Frame;
+		VAR M: Objects.CopyMsg;
+	BEGIN
+		M.id := id; M.obj := NIL;
+		IF F # NIL THEN Objects.Stamp(M); F.handle(F, M) END;
+		IF M.obj = NIL THEN RETURN NIL ELSE RETURN M.obj(Display.Frame) END
+	END CopyFrame;
+	
+	PROCEDURE BindFrame*(F: Display.Frame; put: BOOLEAN; VAR L: Objects.Library);
+	(* binds the frame F to a new library; returns new library in L *)
+		VAR M: Objects.BindMsg;
+	BEGIN
+		NEW(L); Objects.OpenLibrary(L);
+		IF put THEN L.PutObj(L, 0, F) END;	(* put frame to library *)
+		Objects.Stamp(M); M.lib := L; F.handle(F, M)	(* bind *)
+	END BindFrame;
+	
+	PROCEDURE NeutralizeFrame*(F: Display.Frame);
+		VAR M: Oberon.ControlMsg;	m: Display.SelectMsg;
+	BEGIN
+		m.id := Display.reset; m.res := -1; m.obj := NIL; m.sel := NIL; Objects.Stamp(m);
+		m.x := 0; m.y := 0; m.F := F; m.dlink := NIL; F.handle(F, m);	(* selection of frame F *)
+		M.id := Oberon.neutralize; M.x := 0; M.y := 0; M.F := NIL; M.dlink := NIL;
+		M.res := -1; Objects.Stamp(M); F.handle(F, M)	(* selection of descenders of F *)
+	END NeutralizeFrame;
+	
+	PROCEDURE DsrOfFrame(F: Display.Frame): LONGINT;
+		VAR B: Objects.AttrMsg;
+	BEGIN
+		B.dlink := NIL; B.i := 0; Objects.Stamp(B);
+		B.id := Objects.get; B.name := "LineupHY"; B.res := -1; 
+		F.handle(F, B); RETURN - B.i
+	END DsrOfFrame;
+	
+	PROCEDURE ResetDocSel(F: LedaFrames.Frame);
+		VAR M: LedaFrames.FrameMsg;
+	BEGIN
+		M.id := LedaFrames.ResetSelectionId; M.box := NIL;
+		IF F = NIL THEN Display.Broadcast(M)	(* resets all document selections *)
+		ELSE F.handle(F, M)	(* resets the document selection of frame F *)
+		END
+	END ResetDocSel;
+	
+	PROCEDURE NewLn(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR);
+	BEGIN
+		a.typ := LedaBox.NewLn; a.stat := TRUE; a.i := 0;
+		IF s # "" THEN COPY(s, a.s) ELSE a.s := "" END
+	END NewLn;
+	
+	PROCEDURE StrAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Str; COPY(s, a.s); a.stat := stat; a.i := 0;
+	END StrAt;
+	
+	PROCEDURE IntAt(VAR a: LedaBox.ParaDsc; i: LONGINT; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Int; a.i := i; a.stat := stat; a.s := ""
+	END IntAt;
+	
+	PROCEDURE EnumAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; i: LONGINT);
+	BEGIN
+		a.typ := LedaBox.Enum; COPY(s, a.s); a.i := i
+	END EnumAt;
+
+	
+(*--- container control ---*)
+
+	(*---
+		- a container control is a unique control; every control displays a content frame for its own
+	---*)
+	
+	PROCEDURE NotifyChange*(text: LedaCtrl.Text; beg, len: LONGINT);
+		VAR m: LedaCtrl.TextMsg;
+	BEGIN
+		IF text.owner # NIL THEN
+			m.id := LedaCtrl.TextUpdId; m.text := text; m.beg := beg; m.len := len;
+			text.owner.do.handle(text.owner, m)
+		END
+	END NotifyChange;
+	
+	PROCEDURE SetSize*(cont: Cont; newW, newH: LONGINT);
+	(* sets the size of the content; newW and newH specifies the new content size *)
+	(* newW/newH <= 0: set width/height to effective content width/height *)
+		VAR gW, gH: LONGINT;
+	BEGIN
+		IF cont.C = NIL THEN
+			cont.W := DefW; cont.w := SHORT(cont.W DIV LedaSys.scnUnit);
+			cont.H := DefH; cont.h := SHORT(cont.H DIV LedaSys.scnUnit)
+		ELSE
+			gW := cont.C.W * LedaSys.scnUnit; gH := cont.C.H * LedaSys.scnUnit;	(* effective size *)
+			IF (newW < 0) OR (newW >= gW) THEN cont.W := gW ELSE cont.W := newW END;
+			IF (newH < 0) OR (newH >= gH) THEN cont.H := gH ELSE cont.H := newH END;
+			cont.w := SHORT(cont.W DIV LedaSys.scnUnit);
+			cont.h := SHORT(cont.H DIV LedaSys.scnUnit);
+			SizeFrame(cont.C, cont.w, cont.h)
+		END
+	END SetSize;
+
+	PROCEDURE DoInvSel(VAR M: Display.FrameMsg): BOOLEAN;
+	BEGIN
+		IF M IS Display.DisplayMsg THEN RETURN TRUE
+		ELSIF M IS Display.ModifyMsg THEN RETURN TRUE
+		ELSE RETURN FALSE
+		END
+	END DoInvSel;
+
+	PROCEDURE ContExtRef(cont: Cont; VAR x, y: INTEGER; VAR visible, inSel: BOOLEAN;
+												VAR text: LedaCtrl.Text; VAR beg: LONGINT);
+	(* gets the extern reference [absolute screen coordinates] *)
+	(* and the text the content frame is contained in *)
+		VAR tM: LedaCtrl.TextMsg;	bM: LedaBox.Msg;
+			owner: LedaBase.Box;	i: INTEGER;
+	BEGIN
+		tM.id := LedaCtrl.LocateId; tM.ctrl := cont; tM.text := NIL; tM.beg := 0; tM.len := 0;
+		cont.env.doOp(cont.env, tM);	(* get text cont ist contained in *)
+		text := tM.text; beg := tM.beg;
+		IF (LedaFrames.editF = NIL) OR (text = NIL) OR (text.owner = NIL) THEN visible := FALSE
+		ELSE owner := text.owner;
+			bM.id := LedaBox.LocateId; bM.op := 6; bM.text := text; bM.l0 := beg; bM.b := FALSE;
+			bM.l1 := -1; bM.l2 := -1; owner.do.handle(owner, bM); 	(* locate external refernce *)
+			IF (bM.l1 = -1) OR (bM.l2 = -1) THEN visible := FALSE
+			ELSE	(* l1, l2: external reference of line [eX, eY]; l3, l4: distances in line [X, bH] *)
+				inSel := bM.b;
+				LedaFrames.DocToFrm(LedaFrames.editF, bM.l1, bM.l2, x, y);
+				LedaFrames.DocToFrmLen(LedaFrames.editF, bM.l3, i); INC(x, i);
+				LedaFrames.DocToFrmLen(LedaFrames.editF, -bM.l4, i); INC(y, i);	(* base line *)
+				INC(y, SHORT(cont.dY DIV LedaSys.scnUnit));	(* vertical offset *)
+				visible := LedaFrames.Inside(LedaFrames.editF, x, y, x + cont.w - 1, y + cont.h - 1)
+			END
+		END
+	END ContExtRef;
+	
+	(*--- remark:
+		- caching of external reference of a container control only for a single
+			broadcast message possible [same stamp of message]
+		- global caching not possible: container control can become part of
+			unpoured text without notice
+	---*)
+	
+	PROCEDURE ContPassMsg(cont: Cont; VAR M: Display.FrameMsg);
+		VAR C: Display.Frame;	text: LedaCtrl.Text;	beg: LONGINT;
+			gX, gY: INTEGER;	visible, inSel, inv: BOOLEAN;
+	BEGIN	(* M.dlink is set in the trailer handle *)
+		IF (cont.C # NIL) & (cont.trailer # NIL) THEN
+			ContExtRef(cont, gX, gY, visible, inSel, text, beg);
+			M.x := gX; M.y := gY;
+			IF visible THEN C := cont.C;
+				IF M IS Display.ModifyMsg THEN
+					WITH M: Display.ModifyMsg DO
+						IF M.F = C THEN
+							M.mode := Display.state; DEC(M.x, C.X); DEC(M.y, C.Y);
+							C.handle(C, M);
+							IF cont.autoDY THEN cont.dY := DsrOfFrame(C) * LedaSys.scnUnit END;
+							SetSize(cont, -1, -1); NotifyChange(text, beg, 1);
+							C := NIL
+						END
+					END
+				ELSIF M IS Oberon.InputMsg THEN
+					IF cont.protected THEN C := NIL	(* do not pass message *)
+					ELSE
+						WITH M: Oberon.InputMsg DO
+							IF M.id = Oberon.track THEN
+								IF InArea(M.X, M.Y, M.x, M.y, cont.w, cont.h) THEN
+									IF inSel THEN inSel := FALSE; ResetDocSel(LedaFrames.editF) END
+								ELSE C := NIL	(* do not pass message *)
+								END
+							END
+						END
+					END
+				END;
+				IF C # NIL THEN
+					inv := inSel & DoInvSel(M);
+					IF inv THEN INC(markCount) END;
+					IF inv & (markCount = 0) THEN	(* unhighlight selection of cont *)
+						Display.ReplPattern(LedaSys.inv, LedaSys.scrPat[LedaSys.Grey2], gX, gY, cont.w, cont.h, Display.invert)
+					END;
+					DEC(M.x, C.X); DEC(M.y, C.Y); C.handle(C, M);	(* pass message *)
+					(* note --> passing message to content frame can cause nested broadcasts *)
+					IF inv & (markCount = 0) THEN	(* highlight selection of cont *)
+						Display.ReplPattern(LedaSys.inv, LedaSys.scrPat[LedaSys.Grey2], gX, gY, cont.w, cont.h, Display.invert)
+					END;
+					IF inv THEN DEC(markCount) END;
+				END
+			ELSE cont.msg := TRUE
+			END
+		END
+	END ContPassMsg;
+	
+	PROCEDURE ContValidate(cont: Cont);
+	(* validetes the content frame cont.C *)
+		VAR M: Display.ControlMsg;
+	BEGIN
+		IF cont.C # NIL THEN
+			M.id := Display.restore; M.F := NIL; M.dlink := NIL; M.res := -1;
+			M.x := 0; M.y := 0; cont.C.handle(cont.C, M)
+		END;
+		cont.msg := FALSE
+	END ContValidate;
+	
+	PROCEDURE ContChangeMsgList(cont: Cont; op: INTEGER);
+	(* adds or removes container control cont to the message list of the document *)
+	(* according the parameter op [LedaFrames.AddCtrlId/LedaFrames.RemCtrlId] *)
+		VAR M: LedaFrames.FrameMsg;
+	BEGIN
+		IF cont.trailer # NIL THEN
+			M.id := op; M.ctrl := cont; cont.trailer.handle(cont.trailer, M);
+			IF op = LedaFrames.AddCtrlId THEN ContValidate(cont) END
+		END;
+		IF op = LedaFrames.RemCtrlId THEN cont.trailer := NIL; cont.msg := TRUE END
+	END ContChangeMsgList;
+	
+	PROCEDURE ContChangeEnv(cont: Cont; env: LedaBase.Control);
+	(* change the environment of cont to control env *)
+	BEGIN
+		IF cont.env # NIL THEN ContChangeMsgList(cont, LedaFrames.RemCtrlId) END;
+		cont.env := env;		(* set new environment *)
+		IF cont.env # NIL THEN ContChangeMsgList(cont, LedaFrames.AddCtrlId) END
+	END ContChangeEnv;
+	
+	PROCEDURE Height*(ctrl: LedaBase.PieceCtrl; VAR H, bH: LONGINT);
+		VAR cont: Cont;	dsr, asr: LONGINT;
+	BEGIN
+		cont := ctrl(Cont);
+		H := cont.H DIV LedaSys.scnUnit;
+		dsr := 0; asr := 0;
+		IF cont.dY < 0 THEN
+			dsr := ABS(cont.dY) DIV LedaSys.scnUnit;
+			IF H > dsr THEN asr := H - dsr END
+		ELSE
+			IF cont.dY > 0 THEN asr := cont.dY DIV LedaSys.scnUnit END;
+			INC(asr, H)
+		END;
+		H := (dsr + asr) * LedaSys.scnUnit;
+		bH := - (dsr * LedaSys.scnUnit)
+	END Height;
+	
+	PROCEDURE Width*(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR cont: Cont;	gW, gH: LONGINT;
+	BEGIN
+		cont := ctrl(Cont);
+		IF I # NIL THEN	(* check/adjust width *)
+			gW := LedaSys.Min(cont.w * LedaSys.scnUnit, I.width);
+			gH := LedaSys.Min(cont.h * LedaSys.scnUnit, I.height);
+			IF (gW # cont.W) OR (gH # cont.H) THEN SetSize(cont, gW, gH) END;
+			I.bigHgt := I.bigHgt OR (cont.H > 9 * I.lsp DIV 10)
+		END;
+		W := cont.W; w := cont.w
+	END Width;
+	
+	PROCEDURE Draw*(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+		VAR cont: Cont;	dy, clipX, clipY, clipW, clipH: INTEGER;	C: Display.Frame;	M: Display.DisplayMsg;
+	BEGIN
+		cont :=  ctrl(Cont); markCount := -1;	(* reset count *)
+		IF (cont.trailer = NIL) & (cont.env # NIL) & (LedaFrames.outF # NIL) THEN
+			cont.trailer := LedaFrames.outF.trailer;
+			ContChangeMsgList(cont, LedaFrames.AddCtrlId)	(* add to message list *)
+		ELSIF cont.msg THEN ContValidate(cont)
+		END;	
+		dy := SHORT(cont.dY DIV LedaSys.scnUnit);
+		IF cont.C # NIL THEN
+			C := cont.C; M.id := Display.display; M.res := -1; Objects.Stamp(M);
+			M.F := cont.C; M.x := x - C.X; M.y := y + dy - C.Y;
+			Display.GetClip(clipX, clipY, clipW, clipH);	(* get actual clipping *)
+			M.dlink := ClipFrame(x, y+dy, cont.w, cont.h, clipX, clipY, clipW, clipH);
+			Display.ResetClip; C.handle(C, M);	(* contents fades marks [cursor/pointer] *)
+				(* if clipping is not reset the cursor/pointer is not fade on screen *)
+				(* and next drawing makes cursor disappear *)
+			Display.SetClip(clipX, clipY, clipW, clipH)	(* resetore clipping *)
+		ELSE
+			Display.ReplPattern(LedaSys.fg, LedaSys.scrPat[LedaSys.Grey3], x, y+dy, cont.w, cont.h, mode)
+		END;
+		INC(x, cont.w)
+	END Draw;
+	
+	PROCEDURE ContPrint(cont: Cont; x, y, mode: INTEGER; P: LedaSys.PrtPort);
+		VAR dy: INTEGER;	C: Display.Frame;	M: Display.PrintMsg;
+	BEGIN
+		IF cont.C = NIL THEN RETURN END;	(*###*)
+		IF cont.msg THEN ContValidate(cont) END;
+		dy := SHORT(cont.dY DIV P.unit); C := cont.C;
+		M.id := Display.view; M.res := -1; Objects.Stamp(M);
+		M.x := x; M.y := y + dy; M.dlink := NIL; M.pageno := 999;
+		C.dlink := NIL; (*!!!*) C.handle(C, M);
+		P.out.col := MAX(INTEGER)	(* force resetting of colors *)
+	END ContPrint;
+	
+	PROCEDURE New*(C: Display.Frame; dY: LONGINT; copy: BOOLEAN): Cont;
+		VAR nCont: Cont;
+	BEGIN
+		NEW(nCont); LedaBase.InitControl(nCont, contDoOp);
+		nCont.width := Width; nCont.height :=Height; nCont.draw := Draw;
+		IF copy THEN nCont.C := CopyFrame(C, Objects.deep) ELSE nCont.C := C END;
+		nCont.dY := dY; nCont.env := NIL; nCont.trailer := NIL;
+		nCont.msg := FALSE; nCont.protected := FALSE; nCont.autoDY := FALSE; nCont.lib := NIL;
+		SetSize(nCont, -1, -1);
+		RETURN nCont
+	END New;
+	
+	PROCEDURE Copy*(cont: Cont): Cont;
+		VAR nCont: Cont;
+	BEGIN
+		nCont := New(CopyFrame(cont.C, Objects.deep), cont.dY, FALSE);
+		nCont.doOp := cont.doOp;
+		nCont.protected := cont.protected; nCont.autoDY := cont.autoDY; 
+		IF nCont.C # NIL THEN BindFrame(nCont.C, FALSE, nCont.lib) END;
+		RETURN nCont
+	END Copy;
+	
+	PROCEDURE ContSetOffset(cont: Cont; dY: LONGINT);
+		CONST D = 15 * LedaBase.MM;
+	BEGIN
+		IF dY < - D THEN cont.dY := - D
+		ELSIF dY > D THEN cont.dY := D
+		ELSE cont.dY := dY
+		END
+	END ContSetOffset;
+	
+	PROCEDURE ContCheck(cont: Cont);
+	BEGIN
+		ContSetOffset(cont, cont.dY);
+		SetSize(cont, -1, -1)
+	END ContCheck;
+	
+	PROCEDURE SetAttr*(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* handles the attribute message with id's LedaBox.SetValue, LedaBox.SetStyle, LedaBox.NewStyle *)
+		VAR cont: Cont;	dY: LONGINT;	n: INTEGER;	valid, protected: BOOLEAN;
+	BEGIN
+		IF (M.name # ContName) OR (M.id # LedaBox.SetValue) THEN ctrl := NIL; RETURN END;	(*###*)
+		IF (ctrl = NIL) OR ~(ctrl IS Cont) THEN ctrl := NIL; RETURN END;	(*###*)
+		cont := ctrl(Cont); ctrl := NIL;
+		valid := FALSE;
+		LOOP	(* one pass; validate message *)
+			IF cont.autoDY THEN n := 0; dY := cont.dY
+			ELSE
+				IF (M.a[0].typ = LedaBox.Int) & (M.a[1].typ = LedaBox.Str) THEN
+					dY := M.a[0].i;
+					IF M.a[1].s = Printer THEN dY := dY * PrtUnit
+					ELSIF M.a[1].s = Screen THEN dY := dY * LedaSys.scnUnit
+					ELSIF M.a[1].s = Unit THEN dY := dY * LedaBox.attrUnit
+					ELSE EXIT	(*###*)
+					END
+				ELSE EXIT	(*###*)
+				END; n := 2
+			END;
+			IF (M.a[n].typ = LedaBox.Str) & ((M.a[n].s = Yes) OR (M.a[n].s = No)) THEN
+				protected := M.a[n].s = No
+			ELSE EXIT	(*###*)
+			END;
+			valid := TRUE; EXIT
+		END;
+		IF valid THEN
+			cont.protected := protected;
+			IF cont.dY # dY THEN ContSetOffset(cont, dY); ctrl := cont END
+		END
+	END SetAttr;
+	
+	PROCEDURE GetAttr*(cont: Cont; VAR M: LedaBox.AttributeMsg);
+		CONST Dyn = FALSE;	Stat = TRUE;
+		VAR v: LONGINT;	i, n: INTEGER;
+	BEGIN
+		IF M.id = LedaBox.GetValue THEN
+			M.name := ContName;
+			IF  cont.autoDY THEN n := 0
+			ELSE
+					IF cont.dY = 0 THEN v := 0; i := 0
+					ELSIF cont.dY MOD PrtUnit = 0 THEN i := 2; v := cont.dY DIV PrtUnit
+					ELSIF cont.dY MOD LedaSys.scnUnit = 0 THEN i := 1; v := cont.dY DIV LedaSys.scnUnit
+					ELSE i := 0; v := cont.dY DIV LedaBox.attrUnit
+					END;
+					StrAt(M.a[3], Unit, Stat); StrAt(M.a[4], Screen, Stat); StrAt(M.a[5], Printer, Stat);
+				NewLn(M.a[0], "offset"); IntAt(M.a[1], v, Dyn); EnumAt(M.a[2], "-|-|-", i); n:= 6
+			END;
+				IF cont.protected THEN i := 1 ELSE i := 0 END;
+				StrAt(M.a[n+2], Yes, Stat); StrAt(M.a[n+3], No, Stat);
+			NewLn(M.a[n], "edit"); EnumAt(M.a[n+1], "-|-", i); INC(n, 4);
+			M.nbr := n
+		END
+	END GetAttr;
+	
+	PROCEDURE Store*(VAR r: LedaBase.Rider; cont: Cont);
+		VAR pos, len, fixup: LONGINT;
+	BEGIN
+		LedaBase.StoreVal(r, cont.dY);
+		LedaBase.StoreJump(r, fixup);
+		IF cont.autoDY THEN LedaBase.Store(r, "a") END;
+		IF cont.protected THEN LedaBase.Store(r, "p") END;
+		IF cont.C = NIL THEN LedaBase.Store(r, 01CX)
+		ELSE
+			pos := LedaBase.RiderPos(r);
+			BindFrame(cont.C, TRUE, cont.lib);
+			Objects.StoreLibrary(cont.lib, Files.Base(r), pos, len);	(* tag written = 1 byte *)
+			LedaBase.SetRider(r, pos + len)
+		END;
+		(* cont.env: may not be stored because of mutual dependcy of controls cont <-> cont.env *)
+		(* cont.trailer: not the same on load time [new allocated] *)
+		LedaBase.FixupJump(r, fixup)
+	END Store;
+	
+	PROCEDURE Load*(VAR r: LedaBase.Rider; cont: Cont);
+		VAR pos, len, ret, jmp, dY: LONGINT;	obj: Objects.Object;	ch, tag: CHAR;
+	BEGIN
+		LedaBase.LoadVal(r, cont.dY);
+		LedaBase.LoadJump(r, ret, jmp);
+		LedaBase.Load(r, tag);
+		IF tag = "a" THEN cont.autoDY := TRUE; LedaBase.Load(r, tag) END;
+		IF tag = "p" THEN cont.protected := TRUE; LedaBase.Load(r, tag) END;
+		IF tag # 01CX THEN 
+			pos := LedaBase.RiderPos(r);
+			NEW(cont.lib); Objects.OpenLibrary(cont.lib);
+			Objects.LoadLibrary(cont.lib, Files.Base(r), pos, len);	(* tag = 1 byte *)
+			cont.lib.GetObj(cont.lib, 0, obj);
+			IF obj # NIL THEN cont.C := obj(Display.Frame) END;
+			LedaBase.SetRider(r, pos + len)
+		END;
+		IF LedaBase.RiderPos(r) # jmp THEN LedaBase.SetRider(r, jmp);
+			LedaSys.OutT(" - ", 0); LedaSys.OutT(ModName, 0);
+			LedaSys.OutT(".Load: incorrect number of bytes read", 1)
+		END;
+		SetSize(cont, -1, -1)
+	END Load;
+	
+	PROCEDURE DoOp*(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for container control; unique reference *)
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN
+			WITH m: LedaBase.PrintMsg DO
+				IF m.id = 0 THEN	(* return print specification *)
+					m.id := 2; m.W := ctrl(Cont).W; m.sepKind := m.ch
+				ELSIF m.id = 2 THEN	(* print line *)
+					IF (m.p # NIL) & (m.p IS LedaSys.PrtPort) THEN
+						ContPrint(ctrl(Cont), m.x, m.y, m.mode, m.p(LedaSys.PrtPort))
+					END
+				END
+			END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.EnvironmentId:  ContChangeEnv(ctrl(Cont), m.ctrl)
+				| LedaBase.CopyId:  m.ctrl := Copy(ctrl(Cont))	(* deep copy *)
+				| LedaBase.RegisterId:  LedaBase.PutToList(ctrl, m.ctrlId)
+				| LedaBase.StoreId:  Store(m.r, ctrl(Cont))
+				| LedaBase.LoadId:  m.ctrl := New(NIL, 0, FALSE); Load(m.r, m.ctrl(Cont))
+				| LedaBase.StoreModCmd:  LedaBase.StoreStr(m.r, ModName); LedaBase.StoreStr(m.r, "DC")
+				| LedaBase.CheckId:  ContCheck(ctrl(Cont))
+				| LedaBase.ReplaceId:	(* no replacement possible *)
+				| LedaBase.UpdateId:	(* no updates possible *)
+				| LedaBase.InvertSepId:	INCL(m.s, LedaBase.InvertSepId);
+						Display.ReplPattern(LedaSys.inv, LedaSys.scrPat[LedaSys.Grey2], m.x, m.y, ctrl(Cont).w, m.ctrlId, Display.invert)
+				ELSE
+				END
+			END
+		ELSIF m IS LedaBox.AttributeMsg THEN GetAttr(ctrl(Cont), m(LedaBox.AttributeMsg))
+		ELSIF m IS LedaBox.Msg THEN
+			WITH m: LedaBox.Msg DO
+				IF (m.id = LedaBox.BoxId) & (m.op = 4) THEN	(* remove notification [m.caller is removed from document tree] *)
+					IF m.text = LedaCtrl.bc.text THEN ContChangeMsgList(ctrl(Cont), LedaFrames.RemCtrlId) END
+				END
+			END
+		ELSIF m IS Display.FrameMsg THEN ContPassMsg(ctrl(Cont), m)
+		END
+	END DoOp;
+
+	PROCEDURE DAMH*;
+	(** deposits the attribute message handler for the gadget control *)
+	(** is called if an attribute is changed or set *)
+	BEGIN LedaBox.SetAttrHandle(SetAttr)
+	END DAMH;
+
+	PROCEDURE DC*;
+	(** deposits a empty control in LedaBase *)
+	(** is used during loading of container control *)
+	BEGIN LedaBase.depositedCtrl := New(NIL, 0, FALSE)
+	END DC;
+	
+	PROCEDURE Create*;
+		VAR cont: Cont;	F: Display.Frame;	mod, cmd: LedaSys.String;
+	BEGIN
+		Objects.NewObj := NIL;
+		LedaBox.ParPopStr(mod); LedaBox.ParPopStr(cmd);
+		IF (mod # "") & (cmd # "") THEN LedaSys.Execute(mod, cmd) END;	(* create frame *)
+		IF (Objects.NewObj # NIL) & (Objects.NewObj IS Display.Frame) THEN
+			F := Objects.NewObj(Display.Frame);
+			cont := New(F, 0, FALSE);
+			IF F # NIL THEN BindFrame(F, FALSE, cont.lib) END;
+			LedaBase.depositedCtrl := cont
+		END
+	END Create;
+	
+(*--- formulas ---*)
+	
+	PROCEDURE FocusExcptProc(ex: LedaSys.Excpt);
+		VAR M: Oberon.CaretMsg;	F: Display.Frame;
+	BEGIN
+		IF ex IS FocusExcpt THEN
+			F := ex(FocusExcpt).F; ex(FocusExcpt).F := NIL;
+			IF F # NIL THEN
+				M.id := Oberon.set; M.F := F;
+				M.car := F; M.text := NIL; M.pos := 0;
+				Display.Broadcast(M)	(* set caret in new formula F *)
+			END
+		END;
+		ex.remove := TRUE
+	END FocusExcptProc;
+	
+	PROCEDURE NewFormula*;
+		VAR cont: Cont;	F: Display.Frame;	ex: FocusExcpt;
+	BEGIN
+		Objects.NewObj := NIL; LedaSys.Execute("FormulaLine", "New");
+		IF (Objects.NewObj # NIL) & (Objects.NewObj IS Display.Frame) THEN
+			F := Objects.NewObj(Display.Frame);
+			cont := New(F, 0, FALSE);
+			cont.autoDY := TRUE; cont.dY := DsrOfFrame(F) * LedaSys.scnUnit;
+			IF F # NIL THEN BindFrame(F, FALSE, cont.lib) END;
+			NEW(ex); ex.remove := FALSE; ex.handle := FocusExcptProc; ex.F := F;
+			LedaSys.InstallExcpt(ex);	(* will set focus in formula F *)
+			LedaBase.depositedCtrl := cont
+		END
+	END NewFormula;
+	
+	
+BEGIN
+	(*--- container control ---*)
+	contDoOp := DoOp;
+	LedaCtrl.DefChCtrl(ContCh, ContName, FALSE, FALSE, NIL, NIL, ModName, "Create");	(* register for key input *)
+	LedaBox.DefineAttrName(ContName, ModName, "DAMH");		(* register for attribute handling *)
+	
+	(*--- formulas ---*)
+	LedaCtrl.DefChCtrl(FormCh, FormName, FALSE, FALSE, NIL, NIL, ModName, "NewFormula");	(* register for key input *)
+	
+	NEW(clipF);
+	markCount := -1
+	
+END LedaContainer.

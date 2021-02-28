@@ -1,0 +1,1480 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaCtrl; 	(* uh, Tue, 23-Nov-1993 *)
+
+	IMPORT LedaSys, LedaBase, Display;
+	
+CONST
+	NotDef = -1;	ModName = "LedaCtrl";
+	
+	(*--- tags [text and list control] ---*)
+	EmptyTag = 0FAX;	Entry0Tag = 0FBX;	Entry1Tag = 0FDX;
+	Entry2Tag = 0FEX;	ExistTag = 0FCX;
+	
+	(*--- id's for LedaBase.CtrlMsg ---*)
+	FileId = 4;	(* defined in LedaBase *)
+	
+	(*--- text control ---*)
+	AsciiBufRange = 504;	(* to fit in 512 Bytes *)
+	TextErr = "error in text";
+	(*- values for id field in TextMsg -*)
+		TextUpdId* = 0;	TextInsId* = 1;	TextDelId* = 2;	(* text changes *)
+		FlowChkId* = 3;	FlowInsId* = 4;	FlowDelId* = 5;	(* text flow *)
+		FlowPourId* = 6;	FlowAvailId* = 7;	FlowEndId* = 8;	(* text flow *)
+		DrawTextId* = 9;	SelectedTextId* = 10;	ExecuteId* = 11;	(* special*)
+		LocateId* = -1;	(* sent to text base only: locate given control ctrl and return text, beg and len *)
+	(*- special values for pos parameter in TextOwner -*)
+		ThisText* = -1;	NextText*= -2;	PrevText* = -3;
+	(*- values for id parameter in TextLen -*)
+		AvailThisLen* = 1;	AvailSuccLen* = 2;	UnpouredLen* = 3;
+	(*- values for op parameter in TextBasics -*)
+		GetId* = 1;	SetId* = 2;
+	(*- values for op parameter in TextFlow and for ctrlId field in LedaBase.CtrlMsg -*)
+		PourAll* = 1;	PourThis* = 2;	DetachThis* = 3;
+	
+	(*--- formatting ---*)
+	NoSep* = LedaBase.Null;	GapSep* = LedaBase.Space;	TabSep* = LedaBase.Tab;
+	EndSep*= LedaBase.LEnd;	SoftSep* = LedaBase.Hyphen;	BreakSep* = LedaBase.Break;
+	(* other separators:  LedaChar.RedIns [inset control] *)
+	LenUnlimited* = 35640000;	(* 9.9 m *)
+	CompFactor = 2;	(* factor for compression: GapSep is smaller about 1/CompFact *)
+	
+	(*--- special keys ---*)
+	P = 23;	(* linear hashing *)
+
+	(*--- predefined control kinds ---*)		
+	ListId = 7;	TextId = 8;
+		(* predefined controls in LedaBase:  id's 1..3 [not used: 5]  *)
+		(* predefined controls in LedaCtrl: id's 7..8 [not used: 6] *)
+		(* predefined controls in LedaChar: id's 4, 9..15 [not used: 20..31] *)
+		(* predefined controls in LedaBox: id's 15 [not used: 16..19] *)
+	
+TYPE
+	Sequence* = POINTER TO SequenceDsc;
+	SequenceDsc* = RECORD
+		next*: Sequence;
+		ctrl*: LedaBase.Control
+	END;
+		
+	(*--- list control ---*)
+	List* = POINTER TO ListDsc;
+	ListDsc* = RECORD
+		(LedaBase.ControlDsc)
+		seq*: Sequence
+	END;
+					
+	(*--- text control ---*)
+	AsciiBuf = POINTER TO AsciiBufDsc;
+	AsciiBufDsc = RECORD
+		next: AsciiBuf;
+		c: ARRAY AsciiBufRange OF CHAR
+	END;
+	TextBase = POINTER TO TextBaseDsc;
+	
+	Text* = POINTER TO TextDsc;
+	TextDsc* = RECORD
+		beg*, len*: LONGINT;	(* read only; beg + len -> first character of next text *)
+		owner*: LedaBase.Box;	(* read only; relation to owner is not stored; owner establish it at load time *) 
+		next*, prev*: Text;	(* read only; linear list [not a ring] of stream *)
+		frm*: LedaBase.FormatDsc;	(* end format of text *)
+		base: TextBase;
+	END;
+	
+	TextMsg* = RECORD (LedaBase.Msg) id*: INTEGER; text*: Text; beg*, len*: LONGINT; ctrl*: LedaBase.PieceCtrl END;
+		(* sent to a text owner or to the textbase *)
+	CheckProc* = PROCEDURE (ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	
+	Piece = POINTER TO PieceDsc;
+	PieceDsc = RECORD
+		next, prev: Piece;
+		buf: AsciiBuf;	(* buffer for ascii codes *)
+		ind: LONGINT;	(* index in buffer *)
+		len: LONGINT;	(* number of characters *)
+		ctrl: LedaBase.PieceCtrl;	(* additional data [style, flowing box, ...] *)
+		stamp: INTEGER
+	END;
+	
+	TextBaseDsc = RECORD
+		(LedaBase.ControlDsc)
+		len: LONGINT;	(* total length of text *)
+		first: Text;	(* first part of text; texts linear listed [not in a ring] *)
+		head: Piece;	(* piece list of text *)
+		ctrl: ARRAY 4 OF LedaBase.Control	(* to hold basic information [format, character styles] *)
+	END;
+	
+	Buffer* = RECORD
+		(LedaBase.Buffer)
+		head, tail: Piece
+	END;
+	
+	Writer* = RECORD
+		(Buffer)
+		copy*: BOOLEAN;	(* copy control while writing *)
+		buf: AsciiBuf;	(* buffer for written ascii codes *)
+		ind: LONGINT;	(* index in buffer *)
+	END;
+	
+	Reader* = RECORD
+		eot*: BOOLEAN;
+		txBase: TextBase;
+		p: Piece;
+		org: LONGINT;	(* origin of piece p [text position] *)
+		ind: LONGINT;	(* relative index in piece p *)
+		buf: AsciiBuf;
+		bufInd: LONGINT	(* index in buffer *)
+	END;
+	
+	(*--- formatting ---*)
+	Formatter* = RECORD
+		(Reader)
+		(*- building lines [format horizontal] -*)
+		len*: INTEGER;	(* number of characters; F.len = NotDef -> empty unit *)
+		X*, W*, H*, bH*: LONGINT;	(* size *)
+		x*, w*: INTEGER;	(* screen width of unit *)
+		sep*, ch*: CHAR;		(* kind, ch, ctrl -> current separator *)
+		ctrl*: LedaBase.PieceCtrl;
+		calc*: BOOLEAN;	(* control will calculate width using next unit *)
+		bigHgt*: BOOLEAN;	(* hint for big line height [illustrations] *)
+		newFrm*: BOOLEAN;	(* new format: field var specifies a format variation *)
+		var*: LedaBase.FormatDsc
+	END;
+	
+	Block* = POINTER TO BlockDsc;
+	BlockDsc* = RECORD
+		next*: Block;
+		Y*, W*, H*, bH*: LONGINT;	(* size *)
+		len*: INTEGER;	(* number of characters *)
+		w*: INTEGER;	(* screen width of all units including separators *)
+		gaps*: INTEGER;	(* width of a gap *)
+		mode*, sepKind*: CHAR		(* format mode, last separator *)
+	END;	(* size 28 bytes [to fit in 32 bytes] *)
+	
+	(*--- special keys ---*)
+	ChCtrlSpec = RECORD
+		ch: CHAR;
+		name: LedaSys.Name;		(* identification *)
+		findPrev, findList: BOOLEAN;	(* for search in text *)
+		enum: CheckProc;	(* for search in text *)
+		defCtrl: LedaBase.PieceCtrl;
+		mod, cmd: LedaSys.String	(* command that creates control *)
+	END;
+
+VAR
+	notedText*: Text;	(* to pass a text *)
+	(*--- text broadcast ---*)
+	bc*: RECORD
+		stamp*: INTEGER;	(* bc fields are valid if bc.stamp = LedaBase.CurStamp() *)
+		text*: Text;
+		pos*: LONGINT;
+		stop*: BOOLEAN
+	END;
+	(*--- text reading ---*)
+	read: RECORD	(* information about last reading in ReadChar; used in TextGet *)
+		p: Piece;
+		txBase: TextBase
+	END;
+	(*--- list control ---*)
+	listDoOp: LedaBase.CtrlProc;	(* control handle for list control *)
+	(*--- text control ---*)
+	textDoOp: LedaBase.CtrlProc;	(* control handle for text *)
+	delBuf: Buffer;	(* last recently deleted text *)
+	updBase: TextBase;	(* used in TextUpdate and TextMark *)
+	(*--- formatting ---*)
+	fI: LedaBase.FormatInfo;	(* used in FormatBlock *)
+	defVar: LedaBase.FormatDsc;
+	(*--- special keys ---*)
+	cs: ARRAY P OF ChCtrlSpec;	(* hash table used in GetChCtrl and DefChCtrl *)
+
+
+	PROCEDURE *DefHeight(ctrl: LedaBase.PieceCtrl; VAR H, bH: LONGINT);
+	BEGIN
+		H := 10 * LedaSys.scnUnit; bH := 0	(* default height *)
+	END DefHeight;
+	
+(*--- list control ---*)
+
+(*---
+	- list control is a predefined control with instance data [sequence = list of controls]
+	- storing and loading with LedaBase.StoreCtrl/LedaBase.LoadCtrl
+---*)
+	
+	PROCEDURE NewList*(seq: Sequence): List;
+		VAR list: List;
+	BEGIN
+		NEW(list); LedaBase.InitControl(list, listDoOp);
+		list.seq := seq; RETURN list
+	END NewList;
+	
+	PROCEDURE PutList(list: List; VAR refId: INTEGER);
+	(* calls for all controls in list:  ctrl.doOp(PutList, ctrl, r) *)
+		VAR seq: Sequence;	cM: LedaBase.CtrlMsg;
+	BEGIN
+		seq := list.seq;
+		WHILE seq # NIL DO
+			cM.id := LedaBase.RegisterId; seq.ctrl.doOp(seq.ctrl, cM); seq := seq.next
+		END;
+		LedaBase.PutToList(list, refId)
+	END PutList;
+	
+	PROCEDURE StoreList(VAR r: LedaBase.Rider; list: List);
+		VAR seq: Sequence;
+	BEGIN
+		seq := list.seq;
+		WHILE seq # NIL DO
+			LedaBase.Store(r, Entry1Tag);
+			LedaBase.StoreCtrl(r, seq.ctrl);
+			seq := seq.next
+		END;
+		LedaBase.Store(r, Entry2Tag)
+	END StoreList;
+	
+	PROCEDURE LoadList(VAR r: LedaBase.Rider): List;
+		VAR seq, s: Sequence;	ctrl: LedaBase.Control;	ch: CHAR;
+	BEGIN
+		seq := NIL; LedaBase.Load(r, ch);
+		WHILE ch = Entry1Tag DO
+			IF seq = NIL THEN NEW(s); seq := s ELSE NEW(s.next); s := s.next END;
+			s.next := NIL; LedaBase.LoadCtrl(r, ctrl); s.ctrl := ctrl;
+			LedaBase.Load(r, ch)
+		END;
+		IF ch # Entry2Tag THEN LedaSys.Halt("loading list") END;	(*###*)
+		RETURN NewList(seq)
+	END LoadList;
+	
+	PROCEDURE *ListDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for list control [=predefined control] *)
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF  LedaBase.RegisterId:  PutList(ctrl(List), m.ctrlId)
+				| LedaBase.StoreId:  StoreList(m.r, ctrl(List))
+				| LedaBase.LoadId:  m.ctrl := LoadList(m.r)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("list control error")
+				| FileId:  ctrl.kindId := ListId
+				ELSE  (* LedaBase.CopyId/LedaBase.CheckId/LedaBase.ReplaceId/LedaBase.UpdateId/LedaBase.InvertSepId *)
+				END
+			END
+		END
+	END ListDoOp;
+	
+(*--- text control ---*)
+
+(*---
+	- text control is a predefined control with instance data
+	- a text consists of pairs character/control wheras 
+		the control can specifies a style[character, format], a flowing box or ...
+	- a text can be shared of several boxes
+	- TextBase -> descrips all the text
+		- possibility to attach basic information [procedure TextBasics]
+		- agreement: default styles have index 0
+	- Text -> descrips a part of the text
+		read only fields: beg, len, next, prev	[managed by LedaCtrl]
+	- text is added to a text as a buffer [insert/append];
+	- text can be written to a writer; the writer's buffer
+		may only be enlarge with WriteText	
+	- text can be read with a reader
+	- exported text fields beg and len are read only
+---*)
+	
+	PROCEDURE CopyCtrl(ctrl: LedaBase.PieceCtrl): LedaBase.PieceCtrl;
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		cM.id := LedaBase.CopyId; cM.ctrl := NIL; ctrl.doOp(ctrl, cM);
+		IF cM.ctrl = NIL THEN LedaSys.Halt("copy error") END;	(*###*)
+		RETURN cM.ctrl(LedaBase.PieceCtrl)
+	END CopyCtrl;
+	
+	PROCEDURE SameCtrl(ctrl0, ctrl1: LedaBase.PieceCtrl): BOOLEAN;
+	(* asks ctrl1 if he is identical to ctrl0 [ctrl0 # ctrl1] *)
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		cM.id := LedaBase.ReplaceId; cM.ctrl := ctrl0; cM.ch := "I"; cM.ctrlId := 0;
+		ctrl1.doOp(ctrl1, cM);	(* ask ctrl1 if he is identical to ctrl0 *)
+		RETURN cM.ctrlId = 1
+	END SameCtrl;
+	
+	PROCEDURE ReplaceCtrl(ctrl, replCtrl: LedaBase.PieceCtrl; kind: CHAR; VAR newCtrl: LedaBase.PieceCtrl): BOOLEAN;
+	(* asks control ctrl to replace itself by control replCtrl *)
+	(* newCtrl is set to replaced control if function result is true or to original control otherwise *)
+	(* kind: kind of replacement: "X" -> exchange / "=" -> replace by equal control [same typ and name] *)
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		cM.id := LedaBase.ReplaceId; cM.ctrl := replCtrl; 
+		cM.ch := kind; cM.ctrlId := 0;
+		ctrl.doOp(ctrl, cM);
+		IF (cM.ctrlId = 1) & (cM.ctrl # NIL) & (cM.ctrl IS LedaBase.PieceCtrl) THEN
+			newCtrl := cM.ctrl(LedaBase.PieceCtrl); RETURN TRUE
+		ELSE newCtrl := ctrl; RETURN FALSE
+		END
+	END ReplaceCtrl;
+	
+	(*- pieces -*)
+
+	PROCEDURE NewPiece(buf: AsciiBuf; ind, len: LONGINT; ctrl: LedaBase.PieceCtrl): Piece;
+		VAR p: Piece;
+	BEGIN
+		IF buf # NIL THEN
+			WHILE ind >= AsciiBufRange DO buf := buf.next; DEC(ind, AsciiBufRange) END
+		END;
+		NEW(p); p.next := NIL; p.prev := NIL; p.buf := buf;
+		p.ind := ind; p.len := len; p.ctrl := ctrl; p.stamp := LedaBase.DefStamp();
+		RETURN p
+	END NewPiece;
+	
+	PROCEDURE FindPiece(pos: LONGINT; begP: Piece; begOrg: LONGINT; VAR p: Piece; VAR pOrg: LONGINT);
+	(* find piece containing position pos; start search at piece begP with origin begOrg *)
+	(* set p to piece found and pOrg to the according origin *)
+		VAR d: LONGINT;
+	BEGIN
+		d := pos - begOrg;
+		IF pos >= begOrg THEN
+			WHILE d >= begP.len DO DEC(d, begP.len); begP := begP.next END
+		ELSE
+			WHILE d < 0 DO begP := begP.prev; INC(d, begP.len) END
+		END;
+		p := begP; pOrg := pos - d
+	END FindPiece;
+	
+	PROCEDURE SplitPiece(at: LONGINT; VAR pLt, pRt: Piece);
+	(* split piece pLt at piece relative pos at; *)
+	(* out: pLt -> piece to left of split / pRt -> piece to right of split *)
+	BEGIN
+		IF at = 0 THEN pRt := pLt; pLt := pLt.prev
+		ELSIF at = pLt.len THEN pRt := pLt.next
+		ELSE
+			pRt := NewPiece(pLt.buf, pLt.ind + at, pLt.len - at, CopyCtrl(pLt.ctrl));
+			pLt.len := at;
+			pRt.prev := pLt; pRt.next := pLt.next;
+			pLt.next := pRt; pRt.next.prev := pRt
+		END
+	END SplitPiece;
+	
+	PROCEDURE Successors(bufLt: AsciiBuf; nextInd: LONGINT; bufRt: AsciiBuf; ind: LONGINT): BOOLEAN;
+	(* tests if bufLt is followed immediatly by bufRt *)
+	BEGIN
+		WHILE (nextInd >= AsciiBufRange) & (bufLt # NIL) DO bufLt := bufLt.next; DEC(nextInd, AsciiBufRange) END;
+		RETURN (bufLt = bufRt) & (nextInd = ind)
+	END Successors;
+	 
+	PROCEDURE MergePieces(p: Piece; VAR bufP: Piece);
+	(* if merge is possible bufP is merged into p and bufP is advanced to next piece *)
+	BEGIN
+		IF (p.ctrl = bufP.ctrl) & Successors(p.buf, p.ind + p.len, bufP.buf, bufP.ind) THEN
+			INC(p.len, bufP.len); bufP := bufP.next		(* merge pieces *)
+		END
+	END MergePieces;
+	
+	(*- text base -*)
+
+	PROCEDURE NewTextBase(text: Text): TextBase;
+		VAR txBase: TextBase;	i: INTEGER;
+	BEGIN	(* takes no care about listet texts *)
+		NEW(txBase); LedaBase.InitControl(txBase, textDoOp);
+		txBase.len := 0;
+		txBase.first := text;
+		txBase.head := NewPiece(NIL, MAX(LONGINT), MAX(LONGINT), NIL);
+			txBase.head.next := txBase.head; txBase.head.prev := txBase.head;	(* txBase.head initialized *)
+		i := 0; WHILE i < LEN(txBase.ctrl) DO txBase.ctrl[i] := NIL; INC(i) END;
+		RETURN txBase	(* txBase initialized *)
+	END NewTextBase;
+
+	PROCEDURE PutTextBase(txBase: TextBase; VAR refId: INTEGER);
+	(* calls for all used controls:  ctrl.doOp(PutList, ctrl, r) *)
+		VAR p: Piece;	cM: LedaBase.CtrlMsg;	i: INTEGER;
+	BEGIN
+		i := 0; LedaBase.NewStamp;
+		WHILE (i < LEN(txBase.ctrl)) & (txBase.ctrl[i] # NIL) DO
+			IF LedaBase.Unstamped(txBase.ctrl[i].stamp) THEN
+				cM.id := LedaBase.RegisterId; txBase.ctrl[i].doOp(txBase.ctrl[i], cM);
+				txBase.ctrl[i].stamp := LedaBase.CurStamp()
+			END;
+			INC(i)
+		END;
+		p := txBase.head.next;
+		WHILE p # txBase.head DO
+			IF LedaBase.Unstamped(p.ctrl.stamp) THEN
+				cM.id := LedaBase.RegisterId; p.ctrl.doOp(p.ctrl, cM);
+				p.ctrl.stamp := LedaBase.CurStamp()
+			END;
+			p := p.next
+		END;
+		LedaBase.PutToList(txBase, refId)
+	END PutTextBase;
+	
+	(*--- file format of a text [basic format, text parts, control list, run list, ascii codes]:
+		{ Entry0Tag CtrlRef | EmptyTag }  { Entry1Tag beg end lt rt gap lsp adj }  { Entry2Tag runLen CtrlRef }
+		ExistTag  nbrOfChars  AsciiCodes
+	---*)
+	
+	PROCEDURE StoreTextBase(VAR r: LedaBase.Rider; txBase: TextBase);
+		VAR p, q: Piece;	text: Text;	buf: AsciiBuf;	i, len, runLen: LONGINT;
+	BEGIN
+		(*- store basic infos -*)
+		i := 0;
+		WHILE i < LEN(txBase.ctrl) DO
+			IF txBase.ctrl[i] = NIL THEN LedaBase.Store(r, EmptyTag)
+			ELSE LedaBase.Store(r, Entry0Tag); LedaBase.StoreCtrl(r, txBase.ctrl[i])
+			END;
+			INC(i)
+		END;
+		(*- store text parts -*)
+		text := txBase.first;
+		WHILE text # NIL DO
+			LedaBase.Store(r, Entry1Tag);
+			LedaBase.StoreVal(r, text.beg); LedaBase.StoreVal(r, text.len);
+			LedaBase.StoreVal(r, text.frm.lt); LedaBase.StoreVal(r, text.frm.rt);
+			LedaBase.StoreVal(r, text.frm.gap); LedaBase.StoreVal(r, text.frm.lsp);
+			LedaBase.Store(r, text.frm.adj);
+			(* box and its instance data are stored in document tree *)
+			text := text.next
+		END;
+		(*- store run list -*)
+		p := txBase.head.next;
+		WHILE p # txBase.head DO
+			runLen := p.len; q := p.next;
+			WHILE (q # txBase.head) & ((p.ctrl = q.ctrl) OR SameCtrl(p.ctrl, q.ctrl)) DO	(* enlarge run *)
+				INC(runLen, q.len); q := q.next
+			END;
+			LedaBase.Store(r, Entry2Tag);
+			LedaBase.StoreVal(r, runLen);
+			LedaBase.StoreCtrl(r, p.ctrl);
+			p := q
+		END;
+		(*- store ascii codes -*)
+		LedaBase.Store(r, ExistTag);
+		LedaBase.StoreVal(r, txBase.len);	(* number of characters *)
+		p := txBase.head.next; runLen := 0;
+		WHILE p # txBase.head DO
+			i := p.ind; len := p.len; buf := p.buf;
+			WHILE len > 0 DO
+				LedaBase.Store(r, buf.c[i]); INC(runLen); INC(i); DEC(len);
+				IF i >= AsciiBufRange THEN i := 0; buf := buf.next END
+			END;
+			p := p.next
+		END;
+		IF runLen # txBase.len THEN LedaSys.Halt("text length error") END
+	END StoreTextBase;
+	
+	PROCEDURE LoadTextBase(VAR r: LedaBase.Rider): TextBase;
+		VAR txBase: TextBase;	text, prevT: Text;	p: Piece;	ctrl: LedaBase.Control;
+			buf, firstB: AsciiBuf;	l: LONGINT;	i: INTEGER;	ch: CHAR;	m: LedaBase.CtrlMsg;
+	BEGIN
+		txBase := NewTextBase(NIL);
+		(*- load basic infos -*)
+		LedaBase.Load(r, ch); i := 0;
+		WHILE (ch = Entry0Tag) OR (ch = EmptyTag) DO
+			IF ch = Entry0Tag THEN LedaBase.LoadCtrl(r, txBase.ctrl[i]) END;
+			LedaBase.Load(r, ch); INC(i)
+		END;
+		(*- load text parts -*)
+		WHILE ch = Entry1Tag DO
+			NEW(text);
+			LedaBase.LoadVal(r, text.beg); LedaBase.LoadVal(r, text.len);
+			LedaBase.LoadVal(r, text.frm.lt); LedaBase.LoadVal(r, text.frm.rt);
+			LedaBase.LoadVal(r, text.frm.gap); LedaBase.LoadVal(r, text.frm.lsp);
+			LedaBase.Load(r, text.frm.adj);
+			(* box and its instance data are stored in document tree *)
+			text.owner := NIL; text.base := txBase; text.next := NIL; text.prev := NIL;
+			IF txBase.first = NIL THEN txBase.first := text ELSE prevT.next := text; text.prev := prevT END;
+			prevT := text;
+			LedaBase.Load(r, ch)
+		END;
+		(*- load run list -*)
+		WHILE ch = Entry2Tag DO
+			p := NewPiece(NIL, MAX(LONGINT), MAX(LONGINT), NIL);
+			LedaBase.LoadVal(r, p.len); LedaBase.LoadCtrl(r, ctrl); p.ctrl := ctrl(LedaBase.PieceCtrl);
+			p.next := txBase.head; txBase.head.prev.next := p;
+			p.prev := txBase.head.prev; txBase.head.prev := p;
+			LedaBase.Load(r, ch)
+		END;
+		(*- load ascii codes -*)
+		IF ch # ExistTag THEN LedaSys.Halt("loading text") END;	(*###*)
+		LedaBase.LoadVal(r, l); txBase.len := l; firstB := NIL;
+		WHILE l > 0 DO
+			IF firstB = NIL THEN NEW(firstB); buf := firstB ELSE NEW(buf.next); buf := buf.next END;
+			buf.next := NIL; i := 0;
+			WHILE (l > 0) & (i < AsciiBufRange) DO LedaBase.Load(r, buf.c[i]); INC(i); DEC(l) END
+		END;
+		(*- combine pieces with ascii buf -*)
+		p := txBase.head.next; buf := firstB; l := 0;	(* l -> index in buffer *)
+		m.id := LedaBase.EnvironmentId; m.ctrl := txBase;
+		WHILE p # txBase.head DO
+			p.buf := buf; p.ind := l; INC(l, p.len);
+			WHILE l >= AsciiBufRange DO buf := buf.next; DEC(l, AsciiBufRange) END;
+			p.ctrl.doOp(p.ctrl, m);	(* report environment *)
+			p := p.next
+		END;
+		RETURN txBase
+	END LoadTextBase;
+(*---	
+PROCEDURE ShowPieces(p: Piece; str: LedaSys.Name);
+	VAR q: Piece;
+BEGIN
+	LedaSys.OutT(str, 1);
+	q := p;
+	LOOP
+		LedaSys.OutT("---------------------", 1);
+		LedaSys.OutT("buf = ", 0);
+		IF q.buf # NIL THEN LedaSys.OutI(SYSTEM.ADR(q.buf^), 1)
+		ELSE LedaSys.OutT("NIL", 1)
+		END;
+		LedaSys.OutT("ind = ", 0); LedaSys.OutI(q.ind, 1);
+		LedaSys.OutT("len = ", 0); LedaSys.OutI(q.len, 1);
+		LedaSys.OutT("ctrl = ", 0); 
+		IF q.ctrl # NIL THEN LedaSys.OutI(SYSTEM.ADR(q.ctrl^), 1)
+		ELSE LedaSys.OutT("NIL", 1)
+		END;
+		q := q.next;
+		IF (q = NIL) OR (q = p) THEN EXIT END
+	END
+END ShowPieces;
+---*)	
+	(*- buffers -*)
+	
+	PROCEDURE ResetBuffer(VAR B: Buffer);
+	BEGIN
+		B.head.next := NIL; B.head.prev := NIL; B.len := 0; B.tail := B.head;
+		IF (B IS Writer) & (B(Writer).ind > AsciiBufRange - 4) THEN
+			(* cut insertion buffer that previous unsed parts can be collected *)
+			WITH B: Writer DO
+				NEW(B.buf); B.buf.next := NIL; B.ind := 0	(* new ascii buffer *)
+			END
+		END
+	END ResetBuffer;
+	
+	PROCEDURE InitBuffer*(VAR B: Buffer);
+	BEGIN
+		B.len := 0; B.head := NewPiece(NIL, MAX(LONGINT), MAX(LONGINT), NIL); B.tail := B.head
+	END InitBuffer;
+	
+	PROCEDURE CopyBuffer*(VAR SB, DB: Buffer);
+		VAR s, d, n: Piece;
+	BEGIN
+		s := SB.head; d := DB.tail;
+		WHILE s # SB.tail DO s := s.next;
+			n := NewPiece(s.buf, s.ind, s.len, CopyCtrl(s.ctrl));
+			n.next := NIL; n.prev := d; d.next := n; d := n
+		END;
+		DB.tail := d; INC(DB.len, SB.len)
+	END CopyBuffer;
+	
+	PROCEDURE SaveText*(text: Text; beg, len: LONGINT; VAR B: Buffer);
+		VAR p, begP, endP, newP: Piece;	txBase: TextBase;	org, delta, end: LONGINT;
+	BEGIN
+		IF len <= 0 THEN RETURN END;	(*###*)
+		IF beg < text.beg THEN LedaSys.Halt(TextErr) END;	(*###*)
+		txBase := text.base;
+		IF (text.next = NIL) & (len > text.len) THEN len := txBase.len - beg END;
+		end := beg + len; IF end > txBase.len THEN end := txBase.len; len := txBase.len - beg END;
+		FindPiece(beg, txBase.head.next, 0, p, org);
+		delta := beg - org;
+		begP := NewPiece(p.buf, p.ind + delta, p.len - delta, CopyCtrl(p.ctrl)); endP := begP;
+		WHILE org + p.len  < end DO
+			INC(org, p.len); p := p.next;
+			newP := NewPiece(p.buf, p.ind, p.len, CopyCtrl(p.ctrl));
+			endP.next := newP; newP.prev := endP; endP := newP
+		END;
+		endP.next := NIL; DEC(endP.len, org + p.len - end);
+		B.tail.next := begP; begP.prev := B.tail; B.tail := endP;
+		INC(B.len, end - beg)
+	END SaveText;
+	
+	PROCEDURE GetCorresp*(ctrl: LedaBase.PieceCtrl; text: Text; VAR crsp: LedaBase.PieceCtrl);
+	(** gets in crsp a corresponding control for control ctrl if a substitute is found in text text or nil *)
+		VAR s: Sequence;	q: Piece;	txBase: TextBase;	repl, new: LedaBase.PieceCtrl;
+	BEGIN
+		crsp := NIL; txBase := text.base;
+		LedaBase.NewStamp;
+		IF (txBase.ctrl[0] # NIL) & (txBase.ctrl[0] IS List) THEN s := txBase.ctrl[0](List). seq ELSE s := NIL END;
+		q := txBase.head.next;
+		LOOP
+			IF s # NIL THEN repl := s.ctrl(LedaBase.PieceCtrl); s := s.next
+			ELSIF q # txBase.head THEN repl := q.ctrl; q := q.next
+			ELSE EXIT	(*###*)
+			END;	(* repl -> possible substitute control from text text *)
+			IF LedaBase.Unstamped(repl.stamp) THEN
+				repl.stamp := LedaBase.CurStamp();
+				IF ReplaceCtrl(ctrl, repl, "=", new) THEN crsp := new; EXIT END	(*###*)
+			END
+		END
+	END GetCorresp;
+	
+	PROCEDURE ReplaceCorresp*(VAR B: Buffer; text: Text);
+	(** replaces controls in buffer B if a substitute is found in text text *)
+		VAR p: Piece;	crsp: LedaBase.PieceCtrl;
+	BEGIN
+		p := B.head;
+		WHILE p # B.tail DO
+			p := p.next;
+			GetCorresp(p.ctrl, text, crsp);
+			IF crsp # NIL THEN p.ctrl := crsp END
+		END
+	END ReplaceCorresp;
+	
+	(*- texts -*)
+	
+	PROCEDURE TextMsgTo(text: Text; id: INTEGER; beg: LONGINT; len: LONGINT);
+		VAR txMsg: TextMsg;
+	BEGIN
+		IF text.owner # NIL THEN
+			txMsg.text := text; txMsg.beg := beg;  txMsg.len := len;
+			txMsg.id := id; text.owner.do.handle(text.owner, txMsg)
+		END
+	END TextMsgTo;
+	
+	PROCEDURE ReportEnvironment(p: Piece; envCtrl: LedaBase.Control);
+		VAR m: LedaBase.CtrlMsg;
+	BEGIN
+		m.id := LedaBase.EnvironmentId; m.ctrl := envCtrl;
+		WHILE p # NIL DO
+			p.ctrl.doOp(p.ctrl, m); p := p.next
+		END
+	END ReportEnvironment;
+	
+	PROCEDURE NewText*(owner: LedaBase.Box; refText: Text): Text;
+	(** creates a new text; owner: box owing text; refText: reference text *)
+	(** refText = NIL: new text belongs to an new textbase *)
+	(** refText # NIL: adds new text to same textbase as refText; *)
+	(**						the new text follows refText *)
+		VAR text, h: Text;
+	BEGIN
+		NEW(text); text.next := NIL;
+		text.owner := owner; text.len := 0; LedaBase.InitFormat(text.frm);
+		IF refText = NIL THEN
+			text.base := NewTextBase(text); text.prev := NIL; text.beg := 0
+		ELSE
+			text.base := refText.base;
+			h := text.base.first; WHILE h.next # NIL DO h := h.next END;
+			h.next := text; text.prev := h; text.beg := h.beg + h.len
+		END;
+		RETURN text
+	END NewText;
+
+	PROCEDURE TextStore*(VAR r: LedaBase.Rider; text: Text);
+		VAR refId: INTEGER;	h: Text;
+	BEGIN
+		PutTextBase(text.base, refId);
+		LedaBase.StoreI(r, refId);	(* reference number of text.base *)
+		refId := 1; h := text.base.first; WHILE h # text DO INC(refId); h := h.next END;
+		LedaBase.StoreI(r, refId);	(* reference number of text *)
+	END TextStore;
+	
+	PROCEDURE TextLoad*(VAR r: LedaBase.Rider; owner: LedaBase.Box; VAR text: Text);
+		VAR ctrl: LedaBase.Control;	refId, txtId, i: INTEGER;
+	BEGIN
+		LedaBase.LoadI(r, refId); LedaBase.LoadI(r, txtId);
+		(* reference number:  refId _> text.base / i -> text *)
+		LedaBase.GetFromList(ctrl, refId);
+		text := ctrl(TextBase).first;
+		i := 1; WHILE i < txtId DO text := text.next; INC(i) END;
+		text.owner := owner
+	END TextLoad;
+	
+	PROCEDURE TextInsert*(text: Text; pos: LONGINT; VAR B: Buffer);
+		VAR pLt, pRt, begB, endB: Piece;	org, len: LONGINT;
+			txBase: TextBase;	h: Text;
+	BEGIN
+		IF (pos < text.beg) OR (text.beg + text.len < pos) THEN LedaSys.Halt(TextErr) END;	(*###*)
+		txBase := text.base;
+		ReportEnvironment(B.head.next, txBase);
+		IF pos > txBase.len THEN pos := txBase.len END;
+		FindPiece(pos, txBase.head.next, 0, pLt, org);
+		SplitPiece(pos - org, pLt, pRt);
+		begB := B.head.next;
+		IF begB # NIL THEN
+			MergePieces(pLt, begB)	(* if merge is successful begB may be set to NIL [if B consist of one piece] *)
+		END;
+		IF begB # NIL THEN
+			endB := B.tail;	(* insert remaining pieces of B to T *)
+			begB.prev := pLt; pLt.next := begB; endB.next := pRt; pRt.prev := endB
+		END;
+		len := B.len; INC(txBase.len, len); INC(text.len, len);
+		h := text.next; WHILE h # NIL DO INC(h.beg, len); h := h.next END;	(* adjust following texts *) 
+		ResetBuffer(B);
+		TextMsgTo(text, TextInsId, pos, len)
+	END TextInsert;
+	
+	PROCEDURE TextAppend*(text: Text; VAR B: Buffer);
+		VAR begB, endB, lastP: Piece;	pos, len: LONGINT;	txBase: TextBase;
+	BEGIN
+		IF text.next # NIL THEN LedaSys.Halt(TextErr) END;	(*###*)
+		txBase := text.base; pos := txBase.len;
+		ReportEnvironment(B.head.next, txBase);
+		begB := B.head.next; lastP := txBase.head.prev;
+		IF begB # NIL THEN
+			MergePieces(lastP , begB)	(* if merge is successful begB may be set to NIL [if B consist of one piece] *)
+		END;
+		IF begB # NIL THEN
+			endB := B.tail; begB.prev := lastP; lastP.next := begB; 	(* insert remaining pieces of B to T *)
+			endB.next := txBase.head; txBase.head.prev := endB
+		END;
+		len := B.len; INC(txBase.len, len); INC(text.len, len);
+		ResetBuffer(B);
+		TextMsgTo(text, TextInsId, pos, len)
+	END TextAppend;
+	
+	PROCEDURE InsDelBuf*(foc: LedaBase.Box; P: LedaSys.Port);
+		VAR box: LedaBase.Box;	eX, eY: LONGINT;	sM: LedaBase.BoxMsg;
+	BEGIN	(* port P has to be already noted in LedaBox *)
+		IF delBuf.len > 0 THEN
+			box := foc; eX := box.X; eY := box.Y;
+			WHILE box.anc # NIL DO box := box.anc; INC(eX, box.X); INC(eY, box.Y) END;
+			sM.id := LedaBase.DocRemSelId; box.do.handle(box, sM);	(* remove any selection in document *)
+			foc.do(LedaBase.BoxHandler).mark(foc, eX, eY, P, LedaBase.FocMark, LedaBase.Off);	(* unhighlite focus *)
+			IF P # NIL THEN INCL(P.state, LedaSys.FocFlag) END;
+			foc.do(LedaBase.BoxHandler).insert(foc, eX, eY, P, delBuf)
+		END
+	END InsDelBuf;
+
+	PROCEDURE TextDelete*(text: Text; beg, len: LONGINT);
+		VAR bLt, bRt, eLt, eRt: Piece;	org, end, l: LONGINT;
+			txBase: TextBase;	h: Text;
+	BEGIN
+		IF len <= 0 THEN RETURN END;	(*###*)
+		IF (beg < text.beg) OR (beg >= text.beg + text.len) THEN LedaSys.Halt(TextErr) END;	(*###*)
+		txBase := text.base; end := beg + len;
+		IF end > text.beg + text.len THEN
+			IF text.next = NIL THEN	(* delete all text *)
+				end := txBase.len; len := end - beg; l := text.beg + text.len - beg
+			ELSE end := text.beg + text.len; len := end - beg; l := len
+			END
+		ELSE l := len
+		END;
+		FindPiece(beg, txBase.head.next, 0, bLt, org); SplitPiece(beg - org, bLt, bRt);
+		FindPiece(end, txBase.head.next, 0, eLt, org); SplitPiece(end - org, eLt, eRt);
+		bLt.next := eRt; eRt.prev := bLt;	(* remove pieces to delete from text *)
+		delBuf.head.next := bRt; bRt.prev := delBuf.head;	(* and put them to delBuf *)
+		delBuf.tail := eLt; delBuf.tail.next := NIL;
+		delBuf.len := len; LedaBase.Recall := InsDelBuf;
+		ReportEnvironment(delBuf.head.next, NIL);
+		DEC(txBase.len, len); DEC(text.len, l); h := text.next;
+		WHILE h # NIL DO DEC(h.beg, len); h := h.next END;	(* adjust following texts *)
+		IF (text.len = 0) & (text.prev # NIL) & (text.next = NIL)THEN
+			TextMsgTo(text, FlowEndId, text.beg, text.len)
+		ELSE TextMsgTo(text, TextDelId, beg, l)
+		END
+	END TextDelete;
+
+(*---- old:		
+	PROCEDURE TextDelete*(text: Text; beg, len: LONGINT);
+		VAR bLt, bRt, eLt, eRt: Piece;	org, end: LONGINT;
+			txBase: TextBase;	h: Text;
+	BEGIN
+		IF len <= 0 THEN RETURN END;	(*###*)
+		IF beg < text.beg THEN LedaSys.Halt(TextErr) END;	(*###*)
+		txBase := text.base;
+		IF (text.next = NIL) & (len > text.len) THEN len := txBase.len - beg END;
+		end := beg + len; IF end > txBase.len THEN end := txBase.len; len := txBase.len - beg END;
+		FindPiece(beg, txBase.head.next, 0, bLt, org); SplitPiece(beg - org, bLt, bRt);
+		FindPiece(end, txBase.head.next, 0, eLt, org); SplitPiece(end - org, eLt, eRt);
+		bLt.next := eRt; eRt.prev := bLt;	(* remove pieces to delete from text *)
+		delBuf.head.next := bRt; bRt.prev := delBuf.head;	(* and put them to delBuf *)
+		delBuf.tail := eLt; delBuf.tail.next := NIL;
+		delBuf.len := len; LedaBase.Recall := InsDelBuf;
+		ReportEnvironment(delBuf.head.next, NIL);
+		DEC(txBase.len, len); DEC(text.len, len); h := text.next;
+		WHILE h # NIL DO DEC(h.beg, len); h := h.next END;	(* adjust following texts *)
+		IF (text.len = 0) & (text.prev # NIL) & (text.next = NIL)THEN
+			TextMsgTo(text, FlowEndId, text.beg, text.len)
+		ELSE TextMsgTo(text, TextDelId, beg, len)
+		END
+	END TextDelete;
+---*)	
+	PROCEDURE TextChange*(text: Text; beg, len: LONGINT; ctrl: LedaBase.PieceCtrl);
+	(** changes the control of the text given by text, beg and len to control ctrl *)
+		VAR bLt, bRt, eLt, eRt: Piece;	txBase: TextBase;	repl: LedaBase.PieceCtrl;	end, org: LONGINT;
+	BEGIN
+		IF len <= 0 THEN RETURN END;	(*###*)
+		txBase := text.base; end := beg + len;
+		IF (beg < text.beg) OR (text.beg + text.len < end) THEN LedaSys.Halt(TextErr) END;	(*###*)
+		IF end > txBase.len THEN end := txBase.len; len := txBase.len - beg END;
+		FindPiece(beg, txBase.head.next, 0, bLt, org); SplitPiece(beg - org, bLt, bRt);
+		FindPiece(end, txBase.head.next, 0, eLt, org); SplitPiece(end - org, eLt, eRt);
+		WHILE bRt # eRt DO
+			IF ReplaceCtrl(bRt.ctrl, ctrl, "X", repl) THEN bRt.ctrl := repl END;
+			IF (bLt.ctrl = bRt.ctrl) & Successors(bLt.buf, bLt.ind + bLt.len, bRt.buf, bRt.ind) THEN
+				INC(bLt.len, bRt.len);
+				bLt.next := bRt.next; bRt := bRt.next; bRt.prev := bLt	(* remove piece bRt and advance bRt *)
+			ELSE bLt := bLt.next; bRt := bRt.next
+			END
+		END;
+		IF (bLt.ctrl = bRt.ctrl) & Successors(bLt.buf, bLt.ind + bLt.len, bRt.buf, bRt.ind) THEN
+			INC(bLt.len, bRt.len); 
+			bLt.next := bRt.next; bRt := bRt.next; bRt.prev := bLt	(* remove piece bRt and advance bRt *)
+		END;
+		TextMsgTo(text, TextUpdId, beg, len)
+	END TextChange;
+	
+	PROCEDURE TextLocate*(text: Text; pos: LONGINT): Text;
+	(** locates and returns the text containing the position pos int the text stream *)
+	(** defined by the text base of the text text *)
+		VAR t: Text;
+	BEGIN
+		IF pos < 0 THEN t := text.base.first
+		ELSE
+			IF pos >= text.beg THEN t := text ELSE t := text.base.first END;
+			LOOP
+				IF t = NIL THEN EXIT	(*###*)
+				ELSIF (t.beg <= pos) & (pos < t.beg + t.len) THEN EXIT	(*###*)
+				ELSIF t.next = NIL THEN EXIT	(*###*)
+				ELSE t := t.next
+				END
+			END
+		END;
+		RETURN t
+	END TextLocate;
+	
+	PROCEDURE TextSearch*(isTyp: CheckProc; text: Text; VAR beg, len: LONGINT; VAR ctrl: LedaBase.PieceCtrl);
+	(** begins at position beg in the text text the search for a control accepted by the check procedure isTyp *)
+	(** the search direction is determined by beg:  beg >= 0: next control / beg < 0: previous control *)
+	(** returned: ctrl -> found control or nil / beg -> position of found control / len -> number of characters *)
+		VAR p: Piece;	txBase: TextBase;	pOrg, pLen: LONGINT;	goNext, stop: BOOLEAN;
+	BEGIN
+		txBase := text.base; goNext := beg >= 0; stop := FALSE;
+		ctrl := NIL; beg := ABS(beg); len := 0;
+		FindPiece(beg, txBase.head.next, 0, p, pOrg);
+		IF ~ goNext THEN p := p.prev; pLen := -p.len
+		ELSIF pOrg < beg THEN pLen := p.len; p := p.next
+		ELSE pLen := 0
+		END;
+		WHILE (ctrl = NIL) & (p # txBase.head) & ~ stop DO
+			INC(pOrg, pLen);	(* adjust origin of new piece [only if it is not the head piece!] *)
+			IF isTyp(p.ctrl, stop) THEN ctrl := p.ctrl; beg := pOrg; len := p.len END;
+			IF goNext THEN pLen := p.len; p := p.next ELSE p := p.prev; pLen := -p.len END
+		END
+	END TextSearch;
+	
+	PROCEDURE TextBasics*(text: Text; op, ind: INTEGER; VAR ctrl: LedaBase.Control);
+	(** to mangage the basic information of the text base given by text text *)
+	(** op: SetId or GetId; ind: index of information [default styles index 0] *)
+		VAR txBase: TextBase;
+	BEGIN
+		txBase := text.base;
+		IF op = GetId THEN ctrl := txBase.ctrl[ind]
+		ELSIF op = SetId THEN txBase.ctrl[ind] := ctrl
+		END
+	END TextBasics;
+	
+	PROCEDURE TextBuildSeq*(text: Text; enum: CheckProc; VAR seq: Sequence);
+	(** passes all controls [predefined controls in list and controls in pieces] *)
+	(** and builds a sequence seq with all controls selected by enumerator enum *)
+	(** enum = NIL:  selects all predefined controls in list *)
+		VAR s, cur: Sequence;	txBase: TextBase;	ctrl: LedaBase.PieceCtrl;	p: Piece;	stop: BOOLEAN;
+	BEGIN
+		txBase := text.base;
+		seq := NIL; stop := FALSE; LedaBase.NewStamp;
+		IF (txBase.ctrl[0] # NIL) & (txBase.ctrl[0] IS List) THEN s := txBase.ctrl[0](List).seq ELSE s := NIL END;
+		p := txBase.head; IF enum # NIL THEN p := p.next END;	(* to select all predefined controls *)
+		LOOP
+			IF s # NIL THEN ctrl := s.ctrl(LedaBase.PieceCtrl); s := s.next	(* predefined control *)
+			ELSIF p # txBase.head THEN ctrl := p.ctrl; p := p.next	(* control in use *)
+			ELSE EXIT	(*###*)
+			END;
+			IF (enum = NIL) OR (LedaBase.Unstamped(ctrl.stamp) & enum(ctrl, stop)) THEN
+				IF seq = NIL THEN NEW(seq); cur := seq ELSE NEW(cur.next); cur := cur.next END;
+				cur.next := NIL; cur.ctrl := ctrl; cur.ctrl.stamp := LedaBase.CurStamp()
+			END;
+			IF stop THEN EXIT END;	(*###*)
+		END
+	END TextBuildSeq;
+	
+	PROCEDURE TextLen*(id: INTEGER; text: Text; VAR len: LONGINT);
+	(** id = AvailThisLen:  len set to available text length for text text *)
+	(** id = AvailSuccLen:   len set to available text length for successor of text text *)
+	(** id = UnpouredLen:  len set to length of unpoured text *)
+		VAR txBase: TextBase;	t: Text;
+	BEGIN
+		txBase := text.base;
+		IF id = AvailThisLen THEN len := txBase.len - text.beg
+		ELSIF id = AvailSuccLen THEN len := txBase.len - (text.beg + text.len)
+		ELSIF id = UnpouredLen THEN
+			t := text; WHILE t.next # NIL DO t := t.next END;
+			len := txBase.len - (t.beg + t.len) 
+		ELSE LedaSys.Halt(TextErr)			
+		END
+	END TextLen;
+	
+	PROCEDURE NotifyNoText(text: Text);
+	BEGIN
+		IF text # NIL THEN
+			NotifyNoText(text.next);
+			TextMsgTo(text, FlowEndId, text.beg, 0)
+		END
+	END NotifyNoText;
+	
+	PROCEDURE FlowMsgTo(text: Text; id: INTEGER; beg: LONGINT; VAR len: LONGINT; VAR res: INTEGER);
+		VAR txMsg: TextMsg;
+	BEGIN
+		txMsg.id := id; txMsg.len := len; 
+		IF text.owner # NIL THEN
+			txMsg.text := text; txMsg.beg := beg;
+			text.owner.do.handle(text.owner, txMsg)
+		END;
+		res := txMsg.id; len := txMsg.len
+	END FlowMsgTo;
+
+	PROCEDURE PourText(text: Text);
+	(** pours all the text stream beginning with text text at position text.beg *)
+		VAR txBase: TextBase;	h: Text;	len: LONGINT;	res: INTEGER;
+	BEGIN
+		txBase := text.base;
+		LOOP	(* text # NIL; text.beg valid *)
+			len := 0;
+			FlowMsgTo(text, FlowPourId, text.beg, len, res);	(* formatted text length returned in len *)
+			text.len := len; INC(len, text.beg);
+			IF len >= txBase.len THEN	(* end of text stream *)
+				text.len := txBase.len - text.beg;	(* adjust length of last text *)
+				h := text.next; WHILE h # NIL DO h.beg := txBase.len; h.len := 0; h := h.next END;
+				NotifyNoText(text.next); EXIT	(*###*)
+			ELSIF text.next = NIL THEN		(* there is unpoured text *)
+				TextMsgTo(text, FlowAvailId, len, txBase.len - len); EXIT	(*###*)
+			ELSE
+				text := text.next;
+				text.beg := len
+			END
+		END
+	END PourText;
+	
+	PROCEDURE TextCheckPred*(text: Text; VAR len: LONGINT; VAR cancelOp: BOOLEAN);
+	(** calls predecessor to check its text length; returns in len any difference in length *)
+	(** cancelOp -> if true cancel operation [already processed] *)
+		VAR txBase: TextBase;	prev, h: Text;	res: INTEGER;
+	BEGIN	(* text.prev # NIL *)
+		cancelOp := FALSE; len := 0;
+		txBase := text.base; prev := text.prev; len := 0;
+		FlowMsgTo(prev, FlowChkId, prev.beg + prev.len, len, res);
+		IF len = prev.len THEN len := 0		(* no change *)
+		ELSIF prev.beg + len >= txBase.len THEN	(* end of text stream *)
+			prev.len := txBase.len - prev.beg;	(* adjust length of last text *)
+			h := text; WHILE h # NIL DO h.beg := txBase.len; h.len := 0; h := h.next END;
+			NotifyNoText(text); len := 0; cancelOp := TRUE
+		ELSIF len < prev.len THEN		(* prev.len decreases -> text.len increases *)
+			DEC(len, prev.len); INC(prev.len, len); INC(text.beg, len); DEC(text.len, len)
+		ELSE		(* prev.len increases -> text.len decreases *)
+			DEC(len, prev.len); INC(prev.len, len); INC(text.beg, len); DEC(text.len, len);
+			IF text.len < 0 THEN PourText(text); len := 0; cancelOp := TRUE END
+		END
+	END TextCheckPred;
+
+	PROCEDURE TextChangeFlow*(text: Text; len: LONGINT);
+	(** changes the text flow: sets the length of text text to len *)
+	(** causes pouring of successors as needed *)
+		VAR txBase: TextBase;	next: Text;	id, res: INTEGER;
+	BEGIN
+		txBase := text.base;
+		LOOP
+			next := text.next;
+			IF next = NIL THEN
+				text.len := len; INC(len, text.beg);
+				IF len >= txBase.len THEN text.len := txBase.len - text.beg
+				ELSE TextMsgTo(text, FlowAvailId, len, txBase.len - len)
+				END;
+				EXIT	(*###*)
+			ELSIF  text.beg + len >= txBase.len THEN		(* end of text stream *)
+				text.len := txBase.len - text.beg;				(* adjust length of last text *)
+				WHILE next # NIL DO next.beg := txBase.len; next.len := 0; next := next.next END;
+				NotifyNoText(text.next); EXIT	(*###*)
+			ELSIF len < text.len THEN			(* text.len decreases -> next.len increases *)
+				len :=  text.len - len; DEC(text.len, len);
+				DEC(next.beg, len); INC(next.len, len); id := FlowInsId
+			ELSIF len > text.len THEN			(* text.len increases -> next.len decreases *)
+				DEC(len, text.len); INC(text.len, len);
+				INC(next.beg, len); DEC(next.len, len);
+				IF next.len >= 0 THEN id := FlowDelId ELSE PourText(next); EXIT END		(*###*)
+			ELSE len := 0; id := FlowInsId		(* len = text.len -> next.len unchanged; format change  *)
+			END;
+			FlowMsgTo(next, id, next.beg, len, res);
+			IF (len = next.len) & (res # FlowPourId) THEN EXIT END;		(*###*)
+			text := next
+		END
+	END TextChangeFlow;
+	
+	PROCEDURE TextUpdateFlow*(op: INTEGER; text: Text);
+	(** updates the text flow according operation op *)
+	(** op = PourAll -> pours all the text stream *)
+	(** op = PourThis -> pours the text stream beginning with text text *)
+	(** op = DetachThis -> detaches the text text from its text base and pours text stream as needed *)
+		VAR txBase: TextBase;	prev: Text;
+	BEGIN
+		IF text.base = NIL THEN RETURN END;	(*###*)	(* detached text *)
+		IF op = PourAll THEN PourText(text.base.first)
+		ELSIF op = PourThis THEN PourText(text)
+		ELSIF op = DetachThis THEN
+			IF text.len > 0 THEN TextChangeFlow(text, 0) END;
+			prev := text.prev;
+			IF prev = NIL THEN 
+				txBase := text.base; txBase.first := text.next;
+				IF txBase.first # NIL THEN txBase.first.prev := NIL END
+			ELSE
+				prev.next := text.next;
+				IF text.next # NIL THEN text.next.prev := prev END
+			END;
+			text.next := NIL; text.prev := NIL;	(* text.base -> leave reference  could still be used [pass focus] *)
+			text.beg := MAX(LONGINT) - 1; text.len := 0	(* text detached from its base *)
+		END
+	END TextUpdateFlow;
+
+	PROCEDURE TextUpdate*(text: Text; updCtrl: LedaBase.Control);
+	(** broadcasts the changed/updated control updCtrl in the text stream beginning with text text *)
+	(** a called control can cause a local or global formatting of the text stream by setting the ctrlId field *)
+	(** a called control can prevent to be called again by setting it's stamp field to LedaBase.CurStamp() *)
+		VAR p: Piece;	org: LONGINT;	m: LedaBase.CtrlMsg;
+	BEGIN
+		IF updBase # NIL THEN LedaSys.Halt("updBase # NIL") END;
+		updBase := text.base; LedaBase.NewStamp;
+		FindPiece(text.beg, updBase.head.next, 0, p, org);
+		LOOP		(* org < text.beg + text.len *)
+			IF p = updBase.head THEN EXIT END;	(*###*)
+			IF LedaBase.Unstamped(p.stamp) THEN
+				m.id := LedaBase.UpdateId; m.ctrl := updCtrl; m.ctrlId := MAX(INTEGER);
+				p.ctrl.doOp(p.ctrl, m);
+				IF text = NIL THEN	(* no formatting needed *)
+				ELSIF m.ctrlId = PourThis THEN
+					IF org + p.len <= text.beg + text.len THEN TextMsgTo(text, TextUpdId, org, p.len)
+					ELSE PourText(text); EXIT	(*###*)
+					END
+				ELSIF m.ctrlId = PourAll THEN PourText(text); EXIT	(*###*)
+				END
+			END;
+			INC(org, p.len); p := p.next;
+			WHILE (text # NIL) & (org >= text.beg + text.len) DO text := text.next END;
+		END;
+		updBase := NIL
+	END TextUpdate;
+
+	PROCEDURE TextMark*(text: Text; beg, len: LONGINT);
+	(** to mark the formatted text stretch specified by text, beg and len *)
+	(** prevents multiple text updates by local formatting *)
+		VAR p: Piece;	org: LONGINT;
+	BEGIN
+		IF updBase # text.base THEN RETURN END;	(*###*)
+		IF (beg < 0) OR (len <= 0) THEN RETURN END;	(*###*)
+		FindPiece(beg, updBase.head.next, 0, p, org);
+		IF org < beg THEN INC(len, beg - org) END;
+		WHILE (p # updBase.head) & (len >= p.len) DO
+			p.stamp := LedaBase.CurStamp(); DEC(len, p.len); p := p.next
+		END;
+	END TextMark;
+	
+	PROCEDURE TextBroadcast*(text: Text; this: BOOLEAN; VAR m: LedaBase.Msg);
+	(** broadcasts the message m in the text stream beginning with text text *)
+	(** this = true: broadcast inside text only / this = false: broadcast to end of stream *)
+	(** a called control can prevent to be called again by setting it's stamp field to LedaBase.CurStamp() *)
+		VAR txBase: TextBase;	p: Piece;	org: LONGINT;	i: INTEGER;
+	BEGIN
+		txBase := text.base; LedaBase.NewStamp;
+		IF text.prev = NIL THEN
+			bc.stop := FALSE; i := 0;
+			REPEAT
+				IF (txBase.ctrl[i] # NIL) & LedaBase.Unstamped(txBase.ctrl[i].stamp) THEN
+					bc.stamp := LedaBase.CurStamp(); bc.text := NIL; bc.pos := -1;
+					txBase.ctrl[i].doOp(txBase.ctrl[i], m)
+				END;
+				INC(i)
+			UNTIL (i = 4) OR bc.stop
+		END;
+		FindPiece(text.beg, txBase.head.next, 0, p, org);
+		LOOP		(* org < text.beg + text.len *)
+			IF p = txBase.head THEN EXIT END;	(*###*)
+			IF LedaBase.Unstamped(p.ctrl.stamp) THEN
+				bc.stamp := LedaBase.CurStamp(); bc.stop := FALSE; bc.text := text; bc.pos := org;
+				p.ctrl.doOp(p.ctrl, m);
+				IF bc.stop THEN EXIT END	(*###*)
+			END;
+			INC(org, p.len); p := p.next;
+			IF (this & (org > text.beg + text.len)) OR (p = NIL) THEN EXIT END;	(*###*)	(* p = NIL -> due to changes in piece structure *)
+			WHILE (text # NIL) & (org >= text.beg + text.len) DO text := text.next END
+		END;
+		bc.stamp := LedaBase.DefStamp(); bc.stop := FALSE; bc.text := NIL; bc.pos := 0
+	END TextBroadcast;
+	
+	PROCEDURE TextGet*(ctrl: LedaBase.PieceCtrl; VAR text: Text; VAR pos: LONGINT);
+	(** gets the text text and the beginning position pos of the last recently read control ctrl *)
+		VAR p: Piece;
+	BEGIN
+		IF (read.p # NIL) & (read.p.ctrl = ctrl) THEN
+			pos := 0; p := read.txBase.head.next; text := read.txBase.first;
+			WHILE p # read.p DO
+				INC(pos, p.len); p := p.next;
+				IF (text.beg + text.len <= pos) & (text.next # NIL) THEN text := text.next END;
+			END
+		ELSE text := NIL; pos := -1
+		END
+	END TextGet;
+
+	(*- readers -*)
+	
+	(*--- condition "reader at end of text":  R.p = R.txBase.head  ---*)
+	
+	PROCEDURE InitReader*(VAR R: Reader; text: Text);
+	BEGIN
+		
+		R.eot := FALSE; R.txBase := text.base;
+		R.p := R.txBase.head.next; R.org := 0; R.ind := 0;	(* set to first piece *)
+		R.buf := R.p.buf; R.bufInd := R.p.ind
+	END InitReader;
+
+	PROCEDURE SetReader*(VAR R: Reader; pos: LONGINT);
+	BEGIN
+		R.eot := FALSE;
+		IF (pos <= 0) OR (pos >= R.txBase.len) THEN
+			IF pos <= 0 THEN R.p := R.txBase.head.next; R.org := 0
+			ELSE R.p := R.txBase.head; R.org := R.txBase.len
+			END;
+			R.ind := 0; R.buf := R.p.buf; R.bufInd := R.p.ind
+		ELSE
+			FindPiece(pos, R.p, R.org, R.p, R.org); R.ind := pos - R.org;
+			R.buf := R.p.buf; R.bufInd := R.p.ind + R.ind;
+			WHILE R.bufInd >= AsciiBufRange DO DEC(R.bufInd, AsciiBufRange); R.buf := R.buf.next END
+		END
+	END SetReader;
+	
+	PROCEDURE ReadChar*(VAR R: Reader; VAR ch: CHAR; VAR ctrl: LedaBase.PieceCtrl);
+	BEGIN
+		IF R.p # read.p THEN read.p := R.p; read.txBase := R.txBase END;	(* set last reading info *)
+		R.eot := R.p = R.txBase.head;
+		IF R.eot THEN ch := 0X; ctrl := NIL; read.p := NIL; read.txBase := NIL
+		ELSE
+			ch := R.buf.c[R.bufInd]; ctrl := R.p.ctrl;	(* get next character *)
+			INC(R.ind);
+			IF R.ind = R.p.len THEN	(* advance to next piece *)
+				R.p := R.p.next; INC(R.org, R.ind); R.ind := 0;
+				R.buf := R.p.buf; R.bufInd := R.p.ind	(* + R.ind [= 0] *)
+			ELSE
+				INC(R.bufInd); IF R.bufInd >= AsciiBufRange THEN R.buf := R.buf.next; R.bufInd := 0 END
+			END;
+		END
+	END ReadChar;
+	
+	PROCEDURE ReaderPos*(VAR R: Reader): LONGINT;
+	BEGIN
+		RETURN R.org + R.ind
+	END ReaderPos;
+	
+	(*- writers -*)
+	
+	PROCEDURE InitWriter*(VAR W: Writer);
+	BEGIN
+		InitBuffer(W);
+		NEW(W.buf); W.copy := FALSE; W.buf.next := NIL; W.ind := 0;	(* init ascii buffer *)
+	END InitWriter;
+	
+	PROCEDURE WriteChar*(VAR W: Writer; ch: CHAR; ctrl: LedaBase.PieceCtrl);
+	(** appends the pair ch/control to the writer W *)
+	BEGIN
+		IF W.copy THEN ctrl := CopyCtrl(ctrl) END;
+		IF W.tail.ctrl # ctrl THEN	(* create new piece *)
+			W.tail.next := NewPiece(W.buf, W.ind, 0, ctrl);
+			W.tail.next.prev := W.tail; W.tail := W.tail.next
+		END;
+		W.buf.c[W.ind] := ch; INC(W.ind); 
+		IF W.ind >= AsciiBufRange THEN	(* enlarge ascii buffer *)
+			NEW(W.buf.next); W.buf := W.buf.next; W.buf.next := NIL; W.ind := 0
+		END; 
+		INC(W.tail.len);	(* piece length *)
+		INC(W.len)	(* buffer length *)
+	END WriteChar;
+
+	(*- text control -*)
+	
+	PROCEDURE TextLocCtrl(ctrl: LedaBase.PieceCtrl; txBase: TextBase; VAR text: Text; VAR beg, len: LONGINT);
+	(* locates the first occurance of control ctrl *)
+		VAR p: Piece;	org: LONGINT;
+	BEGIN
+		org := 0; p := txBase.head.next;
+		WHILE (p # txBase.head) & (p.ctrl # ctrl) DO INC(org, p.len); p := p.next END;
+		IF p = txBase.head THEN text := NIL; beg := 0; len := 0
+		ELSE beg := org; len := p.len; text := TextLocate(txBase.first, beg)
+		END
+	END TextLocCtrl; 
+	
+	PROCEDURE *TextDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for text control [=predefined control] *)
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF  LedaBase.RegisterId:  PutTextBase(ctrl(TextBase), m.ctrlId)
+				| LedaBase.StoreId:  StoreTextBase(m.r, ctrl(TextBase))
+				| LedaBase.LoadId:  m.ctrl := LoadTextBase(m.r)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("text control error")
+				| FileId:  ctrl.kindId := TextId
+				ELSE  (* LedaBase.CopyId/LedaBase.CheckId/LedaBase.ReplaceId/LedaBase.UpdateId/LedaBase.InvertSepId *)
+				END
+			END
+		ELSIF m IS TextMsg THEN
+			WITH m: TextMsg DO
+				IF m.id = LocateId THEN TextLocCtrl(m.ctrl, ctrl(TextBase), m.text, m.beg, m.len) END
+			END
+		END
+	END TextDoOp;
+
+(*--- formatting ---*)
+
+(*---
+	- text can be formatted as a continous sequence of lines
+	- a line consists of units; units are terminated by separators
+	- there are no predefined separators; a pair "ch/ctrl" defines
+		if it is a separator; every separator has a width
+	- there are the following separator kinds: 
+		EndSep, GapSep, TabSep, InsetSep and NoSep
+	- a separator belongs to the unit that it is terminating;
+		the width of the last separator of a line is not regarded
+		but the separator still belongs to that line;
+		exception: LedaBase.SoftSep, LedaBase.Divis
+	- the width of a TabSep can depend on the following text;
+		therefore its returned width is only an approximation
+	- conditions for a procedure formatting units:
+		pre_conditions:
+		_ ReaderPos(F) specifies the begin of the unit
+		_ F.X, F.x:  coordinate relative to line of leading separator [document/screen]
+		_ F.sep, F.ch, F.ctrl: leading separator
+		post_conditions:
+		_ returns exact width of previous separator in prevW and prevw
+		_ F.sep, F.ch, F.ctrl:  next separator
+		_ F.len:  length of unit [number of characters] including next spearator
+		_ formatter set for next unit
+		_ F.W, F.H, F.bH, F.w: size of unit
+---*)
+
+	PROCEDURE SetFntH(H1, bH1, H2, bH2: LONGINT; VAR H, bH: LONGINT);
+	(** enlarges the height data to the maximum of input data *)
+	BEGIN
+		IF bH1 < bH2 THEN bH := bH1 ELSE bH := bH2 END;	(* bH1, bH2, bH are negative *)
+		IF H1 + bH1 > H2 + bH2 THEN H := H1 + bH1 ELSE H := H2 + bH2 END;	(* ascender part *)
+		DEC(H, bH)	(* add descender part *)
+	END SetFntH;
+
+	PROCEDURE FormatUnit(VAR F: Formatter; W: LONGINT; I: LedaBase.FormatInfo;
+												VAR prevW: LONGINT; VAR prevw: INTEGER);
+	(* build unit with formatter F according the rules *)
+		VAR ctrl, last: LedaBase.PieceCtrl;	chW, fH, bH: LONGINT;
+			chw, w: INTEGER;	ch, sepKind, sep: CHAR;
+	BEGIN
+		I.newFrm := FALSE; I.bigHgt := FALSE;
+		F.len := 0; F.W := 0; F.H := 0; F.bH := 0; F.w := 0;
+		w := SHORT(W DIV LedaSys.scnUnit);
+		prevW := 0; prevw := 0; sep := NoSep;
+		IF F.ctrl # NIL THEN
+			I.uX := F.X; I.ux := F.x; I.uW := -1;
+			F.ctrl.width(F.ctrl, F.ch, I, prevW, prevw, sep)	(* format and return width *)
+		END;
+		I.uX := -1; I.uW := -1; sepKind := NoSep; last := NIL;
+		LOOP
+			ReadChar(F, ch, ctrl);
+			IF F.eot THEN ch := 0X; ctrl := NIL; sepKind := NoSep; EXIT END;	(*###*)
+			INC(F.len);	(* enlarge unit *)
+			ctrl.width(ctrl, ch, I, chW, chw, sepKind);		(* get width *)
+			IF (sepKind = NoSep) OR (sepKind = BreakSep) THEN
+				DEC(W, chW); DEC(w, chw);
+				IF (W < 0) OR (w < 0) THEN	(* special case -> fromatting up to a given width *)
+					SetReader(F, ReaderPos(F) - 1); DEC(F.len);
+					ch := 0X; ctrl := NIL; sepKind := NoSep; EXIT	(*###*)
+				ELSIF F.W = 0 THEN sepKind := NoSep	(* because unit is empty *)
+				END;
+				INC(F.W, chW); INC(F.w, chw);	(* enlarge size *)
+			END;
+			IF last # ctrl THEN      	(* check for height *)
+				last := ctrl; ctrl.height(ctrl, fH, bH);
+				SetFntH(F.H, F.bH, fH, bH, F.H, F.bH);
+			END;
+			IF sepKind # NoSep THEN EXIT END	(*###*)
+		END;
+		IF sep = "^" THEN	(* call separator before unit *)
+			F.calc := TRUE; I.uX := F.X; I.ux := F.x; I.uW := F.W;  I.uw := F.w;
+			F.ctrl.width(F.ctrl, F.ch, I, prevW, prevw, sep)	(* format and return width *)
+		END;
+		IF sepKind # BreakSep THEN
+			F.ch := ch; F.ctrl := ctrl; F.sep := sepKind	(* separater terminating unit *)
+		ELSE F.ch := 0X; F.ctrl := NIL; F.sep := NoSep	(* ch/ctrl belongs to formatted unit *)
+		END	
+	END FormatUnit;
+	
+	PROCEDURE FormatBlock*(VAR F: Formatter; bD: Block; W, H, lsp: LONGINT; mode: CHAR);
+	(** format the block bD using formatter F, length W and maximum height H *)
+	(** precondition:  formatter F specifies a formatted unit with its separator [also empty unit] *)
+	(**		unit may not specify a new format or a hint for big line *)
+	(** postcondition:  bD specifies built block and formatter F specifies next unit with its separator [also empty unit]; *)
+	(**		bD.W is in document units: screen width bD.w may be wider as bD.W but samller as W  *)
+		VAR ctrl: LedaBase.PieceCtrl;	sepW, addW, chW: LONGINT;	w, gaps, sepw, addw, chw: INTEGER;
+	BEGIN
+		(*- init -*)
+		bD.len := 0; bD.W := 0; bD.H := 0; bD.bH := 0; bD.w := 0; bD.gaps := 0; bD.sepKind := NoSep;
+		F.calc := FALSE; F.newFrm := FALSE; F.bigHgt := FALSE;
+		fI.width := W; fI.height := H; fI.lsp := lsp; fI.uX := -1; fI.uW := -1; fI.var := defVar;	(* prepare format information *)
+		gaps := 0; w := SHORT(W DIV LedaSys.scnUnit);
+		(*- format -*)
+		IF F.len = NotDef THEN
+			F.X := 0; F.x := 0; F.sep := NoSep; F.ch := 0X; F.ctrl := NIL;	(* no leading separator *)
+			FormatUnit(F, LenUnlimited, fI, sepW, sepw)
+		END;
+		IF (F.W > W) OR (F.w > w) THEN	(* error case: unit specified by F is to wide *)
+			F.X := 0; F.x := 0; F.sep := NoSep; F.ch := 0X; F.ctrl := NIL;
+			SetReader(F, ReaderPos(F) - F.len); FormatUnit(F, W, fI, sepW, sepw);
+			bD.len := F.len; bD.sepKind := F.sep;	(* F.sep = NoSep *)
+			bD.W := F.W; bD.w := F.w; bD.H := F.H; bD.bH := F.bH; F.bigHgt := fI.bigHgt;
+			IF fI.newFrm THEN F.newFrm := TRUE; F.var := fI.var END;
+			F.len := NotDef; IF mode = "a" THEN mode := "l" END	(* left adjust *)
+		ELSE
+			sepW := 0; sepw := 0; addW := 0; addw := 0;
+			LOOP	(* F.sep, F.ch, F.ctrl -> separator after unit F *)
+				(*- add unit to block -*)
+				INC(bD.len, F.len); INC(bD.W, sepW + F.W); INC(bD.w, sepw + F.w);
+				SetFntH(bD.H, bD.bH, F.H, F.bH, bD.H, bD.bH); F.bigHgt := F.bigHgt OR fI.bigHgt;
+				IF fI.newFrm THEN F.newFrm := TRUE; F.var := fI.var END;
+				IF F.eot OR (F.sep = EndSep) THEN
+					IF ~ F.eot OR (F.len > 0) OR (bD.sepKind # SoftSep) THEN 	(* ~ (F.eot & F.len=0 & bD.sepKind=SoftSep) *)
+						bD.sepKind := F.sep
+					END;
+					F.len := NotDef;	(* unit of F is added to bD *)
+					IF (mode = "a") & (bD.W < W) & (bD.w < w) THEN mode := "l" END; EXIT	(*###*)
+				END;
+				(*- format next unit -*)
+				bD.sepKind := F.sep; ctrl := F.ctrl;	(* separator before new unit *)
+				F.X := bD.W; F.x := bD.w;
+				FormatUnit(F, LenUnlimited, fI, sepW, sepw);
+				(*- process new unit -*)
+				IF bD.sepKind = GapSep THEN INC(gaps);	(* separator before unit F *)
+					IF mode = "a" THEN INC(addW, sepW DIV CompFactor); INC(addw, sepw - 1)  END
+				ELSIF (bD.sepKind = TabSep) & (mode = "a") & (gaps > 0) THEN addW := 0; addw := 0; mode := "x"
+				END;
+				IF (bD.W + sepW + F.W > W + addW) OR (bD.w + sepw + F.w > w + addw) THEN
+					IF fI.newFrm OR fI.bigHgt THEN SetReader(F, ReaderPos(F) - F.len); F.len := NotDef END;
+					EXIT	(*###*)
+				END
+			END;	(* LOOP *)
+			(*- terminate -*)
+			IF bD.sepKind = GapSep THEN DEC(gaps)
+			ELSIF bD.sepKind = SoftSep THEN
+				ctrl.width(ctrl, LedaBase.Divis, NIL, chW, chw, bD.sepKind);
+				bD.sepKind := NoSep; INC(bD.W, chW); INC(bD.w, chw)
+			END;
+			IF F.calc THEN mode := "x" END
+		END;
+		bD.gaps := gaps; bD.mode := mode;
+		IF (mode = "a") OR (mode = "c") OR (mode = "r") THEN bD.W := W END
+	END FormatBlock;
+	
+	PROCEDURE InitFormatter*(VAR F: Formatter; text: Text; pos: LONGINT);
+	BEGIN
+		F.len := NotDef;
+		F.sep := NoSep; F.ch := 0X; F.ctrl := NIL;
+		F.calc := FALSE; F.newFrm := FALSE;
+		InitReader(F, text); SetReader(F, pos)
+	END InitFormatter;
+	
+(*--- special keys ---*)
+
+	(*---
+		- every special key has an unique character code
+		- the specification of a special key is set by DefChCtrl; it defines:
+			- identification name
+			- enumeration procedure and booleans findPrev and findList [for search in text]
+			- default control
+			- module and command to create an according control
+		- the control for a special key is returned by GetChCtrl;
+			GetChCtrl determines the control for a special key as follows:
+			- search in text according enum, findPrev and findList  [enum = NIL: no search]
+			- default control
+			- create control by calling mod.cmd
+			note: a found control or the defualt control will be copied
+		- the character code of a special key can be asked by GetChCode with its
+			identification name
+		---*)
+	
+	PROCEDURE GetChCode*(name: LedaSys.Name; VAR ch: CHAR);
+	(* returns the character code for the special key with identification name name *)
+		VAR i: INTEGER;
+	BEGIN
+		i := 0; ch := 0X;
+		WHILE (i < P) & (ch = 0X) DO
+			IF (cs[i].ch # 0X) & (cs[i].name = name) THEN ch := cs[i].ch ELSE INC(i) END
+		END
+	END GetChCode;
+	
+	PROCEDURE GetChCtrl*(text: Text; pos: LONGINT; ch: CHAR; VAR ctrl: LedaBase.PieceCtrl);
+	(** returns for special character ch in text text at position pos the according control ctrl *)
+		VAR seq: Sequence;	m: LedaBase.CtrlMsg;	len: LONGINT;	i: INTEGER;
+	BEGIN
+		ctrl := NIL;
+		i := ORD(ch) MOD P;	(* hash code *)
+		WHILE (cs[i].ch # ch) & (cs[i].ch # 0X) DO i := (i + 1) MOD P END;	(* linear hashing *)
+		IF cs[i].ch # ch THEN RETURN END;	(*###*)
+		IF cs[i].findPrev & (cs[i].enum # NIL) THEN
+			pos := -pos;	(* pos negative -> search for previous control *)
+			TextSearch(cs[i].enum, text, pos, len, ctrl)
+		END;
+		IF (ctrl = NIL) & cs[i].findList & (cs[i].enum # NIL) THEN
+			TextBuildSeq(text, cs[i].enum, seq);
+			IF seq # NIL THEN ctrl := seq.ctrl(LedaBase.PieceCtrl) END	(*###*)
+		END;
+		IF (ctrl = NIL) & (cs[i].defCtrl # NIL) THEN ctrl := cs[i].defCtrl END;
+		IF ctrl # NIL THEN	(* copy found control *)
+			m.ctrl := NIL; m.id := LedaBase.CopyId; ctrl.doOp(ctrl, m)
+		ELSE m.ctrl := LedaBase.CreateControl(cs[i].mod, cs[i].cmd)
+		END;
+		IF (m.ctrl # NIL) & (m.ctrl IS LedaBase.PieceCtrl) THEN ctrl := m.ctrl(LedaBase.PieceCtrl) ELSE ctrl := NIL END
+	END GetChCtrl;
+	
+	PROCEDURE DefChCtrl*(ch: CHAR; name: LedaSys.Name; prev, list: BOOLEAN; enum: CheckProc;
+											   defCtrl: LedaBase.PieceCtrl; mod, cmd: LedaSys.String);
+	(** defines the special character ch and the according specification *)
+	(** that is needed in GetChCtrl to return the apropriate control to this character code *)
+		VAR i: INTEGER;
+	BEGIN
+		i := ORD(ch) MOD P;	(* hash code *)
+		WHILE (cs[i].ch # 0X) & (cs[i].ch # ch) DO i := (i + 1) MOD P END;	(* linear hashing *)
+		IF cs[i].ch = ch THEN
+			LedaSys.OutT(" - overwriting character definition [", 0); LedaSys.OutI(ORD(ch), 0); LedaSys.OutC("]", 1)
+		END;
+		cs[i].ch := ch; cs[i].name := name;
+		cs[i].findPrev := prev; cs[i].findList := list;
+		cs[i].enum := enum; cs[i].defCtrl := defCtrl;
+		cs[i].mod := mod; cs[i].cmd := cmd
+	END DefChCtrl;
+	
+	PROCEDURE InitChCtrls;
+		VAR i: INTEGER;
+	BEGIN
+		i := 0; WHILE i < P DO cs[i].ch := 0X; cs[i].name := ""; INC(i) END
+	END InitChCtrls;
+	
+	PROCEDURE Reset*;
+	(** reset all caches *)
+	BEGIN
+		bc.stamp := LedaBase.DefStamp(); bc.stop := FALSE; bc.text := NIL; bc.pos := 0;
+		read.p := NIL; read.txBase := NIL;
+		updBase := NIL; notedText := NIL
+	END Reset;
+	
+
+BEGIN
+	(*--- text broadcast ---*)
+	bc.stamp := LedaBase.DefStamp(); bc.stop := FALSE; bc.text := NIL; bc.pos := 0;
+	(*--- text reading ---*)
+	read.p := NIL; read.txBase := NIL;
+	(*--- formatting ---*)
+	LedaBase.InitFormat(defVar);
+	NEW(fI); fI.newFrm := FALSE; fI.var := defVar;
+	(*--- list control ---*)
+	listDoOp := ListDoOp;
+	LedaBase.RPC(NewList(NIL), ListId);	(* register type *)
+	(*--- text control ---*)
+	textDoOp := TextDoOp;	(* textDoOp -> used by NewTextBase and LoadTextBase *)
+	LedaBase.RPC(NewTextBase(NIL), TextId);	(* register type *)
+	InitBuffer(delBuf);
+	updBase := NIL;
+	notedText := NIL;
+	(*--- special keys ---*)
+	InitChCtrls
+END LedaCtrl.

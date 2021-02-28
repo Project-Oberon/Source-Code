@@ -1,0 +1,320 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaRules;	(* uh, Thu, 16-Sep-1993 *)
+
+(* pjm 28.06.96 changed to Oberon font *)
+
+	(*--- remarks:
+		_ provides typographic support
+		_ implements the basic typographic rules
+		_ allows to customize the rules
+		_ name convention of controls: a name starts usually with small letter			
+	---*)
+	
+	IMPORT LedaBase, LedaCtrl, LedaIO, LedaChar, LedaSys;
+	
+CONST
+	(*--- character styles ---*)
+	Style0 = "normal";	Style1 = "highlight";	Style2 = "title";
+	Style3 = "maintitle";	Style4 = "special";	Style5 = "figure";
+	DefFntName = "Oberon";
+	NormFace = " ";	ItalicFace = "i";	BoldFace = "b";	CapFace = "t";
+	
+	(*--- format styles ---
+	Line0 = "normal";	Line1 = "inset";	Line2 = "title";	Line3 = "break";
+	*)
+	
+	(*--- tabulator styles ---*)
+	Tab0 = "column";	Tab1 = "left";	Tab2 = "table";
+	
+	(*--- inset styles ---*)
+	Ins0 = "marginal";	Ins1 = "indent";
+	
+	
+VAR
+	fSize, fHeight: ARRAY 32 OF SHORTINT;	(* to ge correct font size/height [pixel] *)
+	
+	PROCEDURE FontSize*(W: LONGINT): LONGINT;
+	(** font size and font height [screen pixels] differ *)
+		VAR w: INTEGER;
+	BEGIN
+		w := SHORT(W DIV LedaBase.MM);	(* width in mm *)
+		IF w > 150 THEN RETURN fSize[w DIV 10]
+		ELSIF w > 120 THEN RETURN fSize[w DIV 10]
+		ELSIF w >  75 THEN RETURN fSize[12]
+		ELSIF w > 55 THEN RETURN fSize[10]
+		ELSE RETURN fSize[w DIV 10]
+		END
+	END FontSize;
+	
+	PROCEDURE LineSpace*(W: LONGINT): LONGINT;
+	(** use a multiple of LedaSys.scnUnit to avoid rounding effects in the line placing *)
+		VAR s, lsp: LONGINT;
+	BEGIN	(* font size 16 -> font height 18 pixel *)
+		s := FontSize(W);
+		IF s > 16 THEN lsp := fHeight[s] + 4 ELSE lsp := fHeight[s] + 3 END;
+		RETURN lsp * LedaSys.scnUnit
+	END LineSpace;
+	
+	PROCEDURE TypeArea*(boxW, boxH: LONGINT; VAR X, Y, W, H: LONGINT);
+	BEGIN
+		X := boxW DIV 6; Y := boxH DIV 8; W := X * 4; H := Y * 6
+	END TypeArea;
+	
+	PROCEDURE FirstBaseLine*(fB: LedaBase.FormBase; styles: LedaCtrl.List; VAR asr: LONGINT);
+	(* sets the ascender asr for the first base line *)
+		VAR fName: LedaSys.String;	seq: LedaCtrl.Sequence;	style: LedaBase.Style;
+			ctrl: LedaBase.Control;	lsp: LONGINT;	height, minY: INTEGER;
+	BEGIN
+		lsp := fB.data.lsp; asr := 3 * lsp DIV 4;	(* default value *)
+		IF (styles # NIL) & (styles.seq # NIL) THEN
+			seq := styles.seq; style := NIL; 
+			WHILE seq # NIL DO
+				ctrl := seq.ctrl;
+				IF (ctrl # NIL) & (ctrl IS LedaBase.Style) & (ctrl(LedaBase.Style).name = Style0) THEN
+					style := ctrl(LedaBase.Style); seq := NIL
+				ELSE seq := seq.next
+				END
+			END;
+			IF style = NIL THEN
+				ctrl := styles.seq.ctrl;
+				IF (ctrl # NIL) & (ctrl IS LedaBase.Style) THEN style := ctrl(LedaBase.Style) END
+			END;
+			IF style # NIL THEN
+				LedaBase.FntInfo(style.font, 5, fName, minY);	(* max font descender [minY < 0] *)
+				LedaBase.FntInfo(style.font, 2, fName, height);	(* font height *)
+				IF (height*LedaSys.scnUnit <= 4*lsp DIV 3) & (minY < 0) THEN	(* 1 1/3 lsp *)
+					asr := lsp + (minY - 1) * LedaSys.scnUnit
+				END
+			END
+		END
+	END FirstBaseLine;
+	
+(*--- character styles ---*)
+	
+	PROCEDURE NewChar(styleName, fntName: LedaSys.Name; size: SHORTINT; face: CHAR): LedaCtrl.Sequence;
+	(* returns a new character style; size > 0: exact font size / size < 0: maximum font size *)
+		VAR font: LedaBase.Font;	seq: LedaCtrl.Sequence;	tries: INTEGER;
+	BEGIN
+		seq := NIL; font := NIL;
+		IF size < 0 THEN
+			size := ABS(size); tries := 4;
+			LOOP
+				IF LedaBase.ExistFont(fntName, size, face) THEN
+					font := LedaBase.GetFont(fntName, size, face); EXIT
+				ELSE
+					DEC(tries); DEC(size);
+					IF tries = 0 THEN EXIT END
+				END
+			END
+		ELSE font := LedaBase.GetFont(fntName, size, face)
+		END;
+		IF font # NIL THEN
+			NEW(seq); seq.next := NIL;
+			seq.ctrl := LedaBase.NewStyle(styleName, font, LedaSys.fg, 0)
+		END;
+		RETURN seq
+	END NewChar;
+	
+	PROCEDURE DefCharSeq(fntFam: LedaSys.Name; W: LONGINT): LedaCtrl.Sequence;
+	(* returns a default sequence of character styles using font family fntFam *)
+		VAR fName: LedaSys.Name;	seq, cur: LedaCtrl.Sequence;	size, s: SHORTINT;
+	BEGIN
+		IF fntFam = "" THEN fName := DefFntName ELSE LedaSys.CopyStr(fntFam, fName) END;
+		size := SHORT(SHORT(FontSize(W)));
+		seq := NewChar(Style0, fName, size, NormFace);
+		cur := NewChar(Style1, fName, size, ItalicFace);
+		IF cur # NIL THEN seq.next := cur END;
+		cur.next := NewChar(Style2, fName, size, BoldFace);
+		IF cur.next # NIL THEN cur := cur.next END;
+		cur.next := NewChar(Style3, fName, -(size+4), BoldFace);
+		IF cur.next # NIL THEN cur := cur.next END;
+		cur.next := NewChar(Style4, fName, -size, CapFace);
+		IF cur.next # NIL THEN cur := cur.next END;
+		s := size DIV 4; s := (size - s + 1) DIV 2; s := fSize[s * 2];
+		cur.next := NewChar(Style5, fName, s, ItalicFace);
+		RETURN seq
+	END DefCharSeq;
+	
+(*--- format styles ---
+
+	PROCEDURE SizeToPixel(size: LONGINT): LONGINT;
+		VAR pix: LONGINT;
+	BEGIN
+		(* font size of Ceres font refers to 1/72 inch *)
+		pix := size * LedaBase.Point + LedaBase.Point DIV 2;
+		pix := pix DIV LedaSys.scnUnit; RETURN pix - 1
+	END SizeToPixel;
+
+	PROCEDURE NewLine(name: LedaSys.Name; lsp, gap, lt, rt: LONGINT; adj: CHAR): LedaCtrl.Sequence;
+		VAR seq: LedaCtrl.Sequence;	fCtrl: LedaChar.Format;
+	BEGIN
+		fCtrl := LedaChar.NewFormat(name);
+		fCtrl.var.lsp := lsp; fCtrl.var.gap := gap; fCtrl.var.lt := lt; fCtrl.var.rt := rt; LedaBase.CheckFormat(fCtrl.var);
+		NEW(seq); seq.next := NIL; seq.ctrl := fCtrl;
+		RETURN seq
+	END NewLine;
+
+	PROCEDURE DefFormatSeq(W: LONGINT): LedaCtrl.Sequence;
+	(** returns a default sequence of format styles *)
+		VAR seq, cur: LedaCtrl.Sequence;	inset: LONGINT;
+	BEGIN
+		seq  := NewLine(Line0, 0, 1, 0, 0, 0X);	(* default settings *)
+		IF W > 0 THEN
+			inset := SizeToPixel(FontSize(W)) * LedaSys.scnUnit;
+			seq.next := NewLine(Line1, -1, 0, inset, inset, 0X);	(* inset *)
+			cur := seq.next; cur.next := NewLine(Line2, -1, 2, -1, -1, 0X);	(* title *)
+			cur := cur.next; cur.next := NewLine(Line3, -1, 100H, 0, 0, 0X)	(* break *)
+		END;
+		RETURN seq
+	END DefFormatSeq;
+*)	
+(*--- tabulator styles ---*)
+
+	PROCEDURE NewTab(name: LedaSys.Name; W: LONGINT; div: INTEGER): LedaCtrl.Sequence;
+		VAR tab: LedaChar.Tabulator;	td: LedaChar.TabData;
+			seq: LedaCtrl.Sequence;	pos, dX: LONGINT;	i: INTEGER;
+	BEGIN
+		td.name := name;
+		IF (W > 0) & (div > 1) THEN
+			dX := W DIV div; i := 0; pos := dX;
+			WHILE pos < W DO
+				td.pos[i] := pos; td.typ[i] := "L"; INC(pos, dX); INC(i)
+			END;
+			td.pos[i] := -1
+		ELSIF div = 1 THEN
+			td.pos[0] := -2; td.typ[0] := "C";	(* column middle *)
+			td.pos[1] := -3; td.typ[1] := "R";	(* column right *)
+			td.pos[2] := -1
+		ELSE
+			td.pos[0] := 6 * LedaBase.MM; td.typ[0] := "L";
+			td.pos[1] := 12 * LedaBase.MM; td.typ[1] := "L";
+			td.pos[2] := 18 * LedaBase.MM; td.typ[2] := "L";
+			td.pos[3] := 24 * LedaBase.MM; td.typ[3] := "L";
+			td.pos[5] := -1
+		END;
+		tab := LedaChar.NewTabulator(NIL);
+		LedaChar.TabulatorData(1, tab, td);	(* set tabulator data *)
+		NEW(seq); seq.next := NIL; seq.ctrl := tab;
+		RETURN seq
+	END NewTab;
+	
+	PROCEDURE DefTabSeq(W: LONGINT): LedaCtrl.Sequence;
+	(** returns a default tabulator sequence of tabulator styles *)
+		VAR seq, cur: LedaCtrl.Sequence;
+	BEGIN
+		seq := NewTab(Tab0, 0, 1);
+		seq.next := NewTab(Tab1, 0, 0);
+		IF W > 0 THEN
+			cur := seq.next; cur.next := NewTab(Tab2, W, 4)
+		END;
+		RETURN seq
+	END DefTabSeq;
+	
+(*--- inset styles ---*)
+
+	PROCEDURE NewIns(name: LedaSys.Name; W: LONGINT): LedaCtrl.Sequence;
+		VAR ins: LedaChar.Inset;	id: LedaChar.InsData;	seq: LedaCtrl.Sequence;
+	BEGIN
+		NEW(seq); seq.next := NIL;
+		id.name := name; id.margin := W;
+		ins := LedaChar.NewInset(NIL);
+		LedaChar.InsetData(1, ins, id);	(* set inset data *)
+		NEW(seq); seq.next := NIL; seq.ctrl := ins;
+		RETURN seq
+	END NewIns;
+	
+	PROCEDURE DefInsSeq(W, margW: LONGINT): LedaCtrl.Sequence;
+	(** returns a default inset sequence of inset styles *)
+		VAR seq: LedaCtrl.Sequence;
+	BEGIN
+		IF margW <= 0 THEN margW := W DIV 4 END;
+		seq := NewIns(Ins1, FontSize(W) * LedaSys.scnUnit);	(* normal inset *)
+		seq.next := NewIns(Ins0, margW);		(* marginal inset *)
+		RETURN seq
+	END DefInsSeq;
+	
+(*--- default list ---*)
+
+	PROCEDURE AddSequence(VAR seq0: LedaCtrl.Sequence;  seq1: LedaCtrl.Sequence);
+	(* adds sequence seq1 to seq0 *)
+		VAR s: LedaCtrl.Sequence;
+	BEGIN
+		IF seq0 = NIL THEN
+			IF seq1 # NIL THEN seq0 := seq1 END
+		ELSIF seq1 # NIL THEN
+			s := seq0; WHILE s.next # NIL DO s := s.next END;
+			s.next := seq1
+		END
+	END AddSequence; 
+	
+	PROCEDURE DefStyleSeq*(fntFam: LedaSys.Name; colW, margW: LONGINT): LedaCtrl.Sequence;
+	(** returns a default sequence of character, format and tabulator styles *)
+	(** colW: width of text column; margW: width [inset] for marginal mode *)
+	(** marginal: true if marginal mode is on *)
+		VAR seq: LedaCtrl.Sequence;
+	BEGIN
+		seq := DefCharSeq(fntFam, colW);
+		AddSequence(seq, DefTabSeq(colW));
+		AddSequence(seq, DefInsSeq(colW, margW));
+		RETURN seq
+	END DefStyleSeq;
+	
+	PROCEDURE DefStyleList*(fntFam: LedaSys.Name; fB: LedaBase.FormBase; boxW: LONGINT): LedaCtrl.List;
+	(** returns a list control specifying the default sequence of character, format and *)
+	(** tabulator styles; boxW specifies the width of the box *)
+		VAR seq: LedaCtrl.Sequence;	colW, margW: LONGINT;
+	BEGIN
+		IF fB.data.cols = "m" THEN margW := fB.data.colDX; colW := boxW - margW
+		ELSE margW := fB.data.width DIV 4; colW := boxW DIV (ORD(fB.data.cols) - ORD("0"))
+		END;
+		seq := DefStyleSeq(fntFam, colW, margW);
+		RETURN LedaCtrl.NewList(seq)
+	END DefStyleList;
+	
+		
+BEGIN
+	fSize[0] := 8;	fHeight[0] := 9;
+	fSize[1] := 8;	fHeight[1] := 9;
+	fSize[2] := 8;	fHeight[2] := 9;
+	fSize[3] := 8;	fHeight[3] := 9;
+	fSize[4] := 8;	fHeight[4] := 9;
+	fSize[5] := 8;	fHeight[5] := 9;
+	fSize[6] := 8;	fHeight[6] := 9;
+	fSize[7] := 8;	fHeight[7] := 9;
+	fSize[8] := 8;	fHeight[8] := 9;
+	fSize[9] := 9;	fHeight[9] := 10;
+	fSize[10] := 10;	fHeight[10] := 12;
+	fSize[11] := 11;	fHeight[11] := 13;
+	fSize[12] := 12;	fHeight[12] := 14;
+	fSize[13] := 12;	fHeight[13] := 14;
+	fSize[14] := 14;	fHeight[14] := 16;
+	fSize[15] := 14;	fHeight[15] := 16;
+	fSize[16] := 16;	fHeight[16] := 19;
+	fSize[17] := 16;	fHeight[17] := 19;
+	fSize[18] := 16;	fHeight[18] := 19;
+	fSize[19] := 20;	fHeight[19] := 23;
+	fSize[20] := 20;	fHeight[20] := 23;
+	fSize[21] := 20;	fHeight[21] := 23;
+	fSize[22] := 20;	fHeight[22] := 23;
+	fSize[23] := 24;	fHeight[23] := 28;
+	fSize[24] := 24;	fHeight[24] := 28;
+	fSize[25] := 24;	fHeight[25] := 28;
+	fSize[26] := 24;	fHeight[26] := 28;
+	fSize[27] := 24;	fHeight[27] := 28;
+	fSize[28] := 24;	fHeight[28] := 28;
+	fSize[29] := 24;	fHeight[29] := 28;
+	fSize[30] := 24;	fHeight[30] := 28;
+	fSize[31] := 24;	fHeight[31] := 28;
+END LedaRules.

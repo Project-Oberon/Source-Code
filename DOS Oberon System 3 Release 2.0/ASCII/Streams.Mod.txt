@@ -1,0 +1,147 @@
+MODULE (PROTECTED) Streams; (*JG 23.5.96*)
+  IMPORT Reals, Objects, Display, Fonts;
+
+  TYPE
+    Stream* = POINTER TO StreamDesc;
+    StreamDesc = RECORD
+      left, right, X, Y: INTEGER
+    END;
+
+  VAR f: Fonts.Font; right*, DH, titleH: INTEGER;
+
+  PROCEDURE Reset* (s: Stream);
+  BEGIN {UNPROTECTED}
+    Display.ReplConst(14, s.left, 0, s.right - s.left, DH - titleH, Display.replace);
+    s.X := s.left; s.Y := DH - titleH - f.height 
+  END Reset;
+
+  PROCEDURE WriteCh (s: Stream; ch: CHAR);
+    VAR obj: Objects.Object;
+  BEGIN 
+    f.GetObj(f, ORD(ch), obj);
+    WITH obj: Fonts.Char DO
+      IF s.X + obj.x + obj.w <= s.right - 1 THEN
+        Display.CopyPattern(15, obj.pat, s.X + obj.x, s.Y + obj.y, Display.paint)
+      END;
+      s.X := s.X + obj.dx
+    END
+  END WriteCh;
+
+  PROCEDURE Write* (s: Stream; ch: CHAR);
+  BEGIN {UNPROTECTED}
+    IF s.Y < 0 THEN Reset(s) END;
+    WriteCh(s, ch)
+  END Write;
+
+  PROCEDURE WriteLn* (s: Stream);
+  BEGIN {UNPROTECTED}
+    IF s.Y < 0 THEN Reset(s) END;
+    s.Y := s.Y - f.height; s.X := s.left
+  END WriteLn;
+
+  PROCEDURE WriteString* (s: Stream; str: ARRAY OF CHAR);
+    VAR i: INTEGER;
+  BEGIN {UNPROTECTED}
+    IF s.Y < 0 THEN Reset(s) END;
+    i := 0;
+    WHILE str[i] # 0X DO WriteCh(s, str[i]); INC(i) END
+  END WriteString;
+
+  PROCEDURE WriteInt* (s: Stream; n: LONGINT);
+    VAR i: INTEGER; dig: ARRAY 16 OF CHAR;
+  BEGIN {UNPROTECTED}
+    IF s.Y < 0 THEN Reset(s) END;
+    IF n < 0 THEN WriteCh(s, "-"); n := -n END;
+    i := 0;
+    REPEAT dig[i] := CHR(n MOD 10 + ORD("0")); n := n DIV 10; INC(i) UNTIL n = 0;
+    REPEAT WriteCh(s, dig[i-1]); DEC(i) UNTIL i = 0
+  END WriteInt;
+
+	PROCEDURE WriteHex* (s: Stream; x: LONGINT);
+	VAR i: INTEGER; y: LONGINT;
+			a: ARRAY 10 OF CHAR;
+	BEGIN {UNPROTECTED} 
+		IF s.Y < 0 THEN Reset(s) END;
+		i := 0; WriteCh(s, " ");
+		REPEAT y := x MOD 10H;
+			IF y < 10 THEN a[i] := CHR(y + 30H) ELSE a[i] := CHR(y + 37H) END;
+			x := x DIV 10H; INC(i)
+		UNTIL i = 8;
+		REPEAT DEC(i); WriteCh(s, a[i]) UNTIL i = 0
+	END WriteHex;
+
+  PROCEDURE WriteReal* (s: Stream; x: REAL; n, f: LONGINT);
+    (* BM 1993.4.22. Do not simplify rounding ! / JG formatting adjusted *)
+    VAR e, h, i: LONGINT; r, y: LONGREAL; z: REAL; sgn: CHAR; d: ARRAY 8 OF CHAR;
+  BEGIN {UNPROTECTED}
+    IF s.Y < 0 THEN Reset(s) END;
+    e := Reals.Expo(x);
+    IF e = 255 THEN
+      WHILE n > 8 DO Write(s, " "); DEC(n) END;
+      WriteString(s, "     NaN")
+    ELSE DEC(n, 2);
+      IF f < 0 THEN f := 0 END;
+      IF n < f + 2 THEN n := f + 2 END;
+      DEC(n, f);
+      IF (e # 0) & (x < 0) THEN sgn := "-"; x:= - x ELSE sgn := " " END;
+      IF e = 0 THEN h := 0; INC(e) (* no denormals *)
+      ELSE
+        e := (e - 127) * 301 DIV 1000; (* ln(2)/ln(10) = 0.301029996 *)
+        IF e < 38 THEN z := SHORT(Reals.Ten(e+1));
+          IF x >= z THEN y := LONG(x)/LONG(z); INC(e) ELSE y := x * Reals.Ten(-e) END
+        ELSE y := x * Reals.Ten(-38)
+        END;
+        INC(e); i := -(e+f);
+        IF i <= 0 THEN r := 5 * Reals.Ten(i) ELSE r := 0 END;
+        IF y >= 10 THEN y := y * Reals.Ten(-1) + r; INC(e)
+        ELSE y := y + r;
+          IF y >= 10 THEN y := y * Reals.Ten(-1); INC(e) END
+        END;
+        y := y * Reals.Ten(7); h := ENTIER(y)
+      END;
+      i := 7;
+      WHILE i >= 0 DO d[i] := CHR(h MOD 10 + ORD("0")); h := h DIV 10; DEC(i) END;
+      IF n <= e THEN n := e + 1 END;
+      IF e > 0 THEN WHILE n > e DO Write(s, " "); DEC(n) END;
+        Write(s, sgn); e := 0;
+        WHILE n > 0 DO DEC(n);
+          IF e < 8 THEN Write(s, d[e]); INC(e) ELSE Write(s, "0") END
+        END;
+        Write(s, ".")
+      ELSE
+        WHILE n > 1 DO Write(s, " "); DEC(n) END;
+        Write(s, sgn); Write(s, "0"); Write(s, ".");
+        WHILE (0 < f) & (e < 0) DO Write(s, "0"); DEC(f); INC(e) END
+      END;
+      WHILE f > 0 DO DEC(f);
+        IF e < 8 THEN Write(s, d[e]); INC(e) ELSE Write(s, "0") END
+      END
+    END
+  END WriteReal;
+
+  PROCEDURE New* (name: ARRAY OF CHAR; width: INTEGER): Stream;
+    VAR s: Stream;
+  BEGIN {UNPROTECTED}
+    IF right - width >= 0 THEN NEW(s);
+      s.left := right - width + 3; s.right := right;
+      Display.ReplConst(0, s.left - 3, 0, 1, DH, Display.replace);
+      Display.ReplConst(14, s.left - 2, 0, 1, DH, Display.replace);
+      Display.ReplConst(12, s.left - 1, 0, 1, DH, Display.replace);
+      Display.ReplConst(13, s.left, DH - titleH, s.right - s.left, titleH, Display.replace);
+      s.X := s.left; s.Y := DH - f.height;
+      WriteString(s, name); Reset(s);
+      right := right - width;
+      RETURN s
+    ELSE RETURN NIL
+    END
+  END New;
+
+  PROCEDURE Init*;
+  BEGIN {UNPROTECTED}
+    DH := Display.Height; right := Display.Width; f := Fonts.Default; titleH := f.height + 6
+  END Init;
+
+END Streams.
+
+
+

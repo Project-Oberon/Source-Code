@@ -1,0 +1,625 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE IP;	(* 01.02.96 mg / 01.02.96 pm *)
+
+IMPORT
+	SYSTEM, Oberon, Input, Texts, NetBase, EtherNet;
+	
+CONST
+	echorp = 0; unreach* = 3; sourceq = 4; echorq* = 8; timexc = 11;
+	parm = 12; timrq = 13; timrp = 14; maskrq* = 17; maskrp = 18;
+		
+	UDP* = 17; TCP* = 6; ICMP = 1; EGP = 8;
+
+	ipid = 0800H; ipver = 4;
+
+	TTL = 32; MinHLen* = 20;
+
+	PLen = 8; IcmpHLen = 8; DataLength = 56;
+
+	MaxQSize = 30;	MaxService = 18;
+
+	IpAdrLen* = 4;
+
+	(* ARP/RARP *)
+	
+	hw = 1; arpid = 0806H; rarpid = 08035H;
+
+	request = 1; reply = 2; requestr = 3; replyr = 4;
+
+	free = 0; pending = 1; resolved = 2;
+	
+	arpqsize = 10; timo = 600; rsend = 1; mretry = 4;
+	
+	arplen = 28;
+	
+TYPE
+	IpAdr* = ARRAY IpAdrLen OF SYSTEM.BYTE;
+
+	Arp* =POINTER TO ArpDesc;
+
+	ArpDesc* =RECORD
+		hwtype*: INTEGER;
+		prtype*: INTEGER;
+		hwlen*: SHORTINT;
+		prlen*: SHORTINT;
+		op*: INTEGER;
+		sha*: EtherNet.Adr;
+		spa*: IpAdr;
+		tha*: EtherNet.Adr;
+		tpa*: IpAdr
+	END;
+
+	Entry = POINTER TO EntryDesc;
+	
+	EntryDesc = RECORD
+		state: INTEGER;
+		att, ttl: INTEGER;
+		queue: NetBase.Queue;
+		hwa: EtherNet.Adr;
+		pra: IpAdr;
+		next: Entry
+	END;
+
+	Header* = POINTER TO HeaderDesc;
+
+	HeaderDesc* = RECORD
+		verlen*, tos*: SHORTINT;
+		len*, id*, frag*: INTEGER;
+		ttl*, proto*: SHORTINT;
+		chksum*: INTEGER;
+		src*, dst*: IpAdr;
+		optionOrData*: SYSTEM.BYTE
+	END;
+				
+	IcmpHd* = POINTER TO IcmpHdDesc;
+	
+	IcmpHdDesc* = RECORD
+		type*, code*: SHORTINT;
+		chksum*: INTEGER;
+		data*: ARRAY 1 OF SYSTEM.BYTE
+	END;
+	
+	Echo = POINTER TO EchoDesc;
+	
+	EchoDesc* = RECORD
+		id*, seq*: INTEGER;
+		optdata*: ARRAY DataLength OF SYSTEM.BYTE
+	END;
+	
+	Param* = POINTER TO ParamDesc;
+	
+	ParamDesc* = RECORD
+		ptr*, uusd1*: SHORTINT;
+		uusd2*: INTEGER;
+		data*: ARRAY MinHLen + PLen OF SYSTEM.BYTE
+	END;
+	
+	Mask* = POINTER TO MaskDesc;
+
+	MaskDesc* = RECORD
+		id*, seq*: INTEGER;
+		mask*: IpAdr
+	END;
+
+	General* = POINTER TO GeneralDesc;
+	
+	GeneralDesc* = RECORD
+		uusd*: LONGINT;
+		data*: ARRAY MinHLen + PLen OF SYSTEM.BYTE
+	END;
+	
+	demuxProc* = PROCEDURE(item: NetBase.Item);
+
+VAR
+	(* icmp counters *)
+	erq*, erp*, dur*, srq*, tmx*, prm*: LONGINT;
+	
+	ipdemux: Oberon.Task;
+	ipq: NetBase.Queue;
+
+	ippackid: LONGINT;
+
+	(* Broadcast addresses: all'1s/all'0(BSD broadcast)/net broadcast/subnet broadcast *)
+	ipall*, ipany*, netbcast*, subbcast*: IpAdr;
+
+	netmask, submask: SET;	(* masks for broadcast check (Broadcast) *)
+
+	ipadr*, subnet*, gway*: IpAdr;	(* IP adresses: host address/subnet mask/gateway address *)
+
+	arprc, arpsd, iprc, ipsd, icmprc, icmpsd: LONGINT;
+
+	i: INTEGER;
+
+	dmy: BOOLEAN;
+
+	(* ARP *)
+
+	cache: Entry;
+	demux: ARRAY MaxService OF demuxProc;
+	timer: Oberon.Task;
+	last, lact: LONGINT;
+
+	W: Texts.Writer;
+
+PROCEDURE ASSERT*(cond: BOOLEAN; trap: INTEGER);
+BEGIN IF ~cond THEN HALT(112) END
+END ASSERT;
+
+PROCEDURE IllegalClass (ipadr: IpAdr): BOOLEAN;
+VAR
+	set: SET;
+	num: SHORTINT;
+BEGIN num := SYSTEM.VAL(SHORTINT, ipadr[0]);
+	set := SYSTEM.VAL(SET, LONG(LONG(num)));
+	RETURN (set * {4..7} = {5..7}) OR (set * {4..7} = {4..7})
+END IllegalClass;
+
+PROCEDURE ClassA (ipadr: IpAdr): BOOLEAN;
+VAR
+	set: SET;
+	num: SHORTINT;
+BEGIN num := SYSTEM.VAL(SHORTINT, ipadr[0]);
+	set := SYSTEM.VAL(SET, LONG(LONG(num))); RETURN set * {7} = {}
+END ClassA;
+
+PROCEDURE ClassB (ipadr: IpAdr): BOOLEAN;
+VAR
+	set: SET;
+	num: SHORTINT;
+BEGIN num := SYSTEM.VAL(SHORTINT, ipadr[0]);
+	set := SYSTEM.VAL(SET, LONG(LONG(num))); RETURN set * {6,7} = {7}
+END ClassB;
+
+PROCEDURE ClassC (ipadr: IpAdr): BOOLEAN;
+VAR
+	set: SET;
+	num: SHORTINT;
+BEGIN num := SYSTEM.VAL(SHORTINT, ipadr[0]);
+	set := SYSTEM.VAL(SET, LONG(LONG(num))); RETURN set * {5..7} = {6,7}
+END ClassC;
+
+PROCEDURE Broadcast* (ipadr: IpAdr): BOOLEAN;
+VAR
+	dstmask, hostmask: SET;
+BEGIN dstmask := SYSTEM.VAL(SET, ipadr);
+	IF (dstmask # SYSTEM.VAL(SET, ipall)) & (dstmask # SYSTEM.VAL(SET, ipany)) THEN
+		IF dstmask * submask = submask THEN hostmask := dstmask * (-submask);
+			RETURN (hostmask = {}) OR (hostmask = -submask)
+		ELSIF dstmask * netmask = netmask THEN hostmask := dstmask * (-netmask);
+			RETURN (hostmask = {}) OR (hostmask = -netmask)
+		ELSE RETURN dstmask = {} (* BSD broadcast *)
+		END
+	ELSE RETURN TRUE
+	END
+END Broadcast;
+
+PROCEDURE HLen* (iph: Header): INTEGER;
+BEGIN RETURN SHORT(ASH(iph.verlen MOD 16, 2))
+END HLen;
+
+PROCEDURE VerLen* (iph: Header);
+VAR
+	set: SET;
+BEGIN set := SYSTEM.VAL(SET, ASH(ipver, 4)) + {0, 2};
+	iph.verlen := SHORT(SHORT(SYSTEM.VAL(LONGINT, set)))
+END VerLen;
+
+PROCEDURE NewEntry (VAR entry: Entry);
+BEGIN NEW(entry); NetBase.Reset(entry.queue);
+	entry.next := cache.next; cache.next := entry
+END NewEntry;
+
+PROCEDURE FindEntry (ipadr: IpAdr; VAR entry: Entry; VAR fnd: BOOLEAN);
+VAR
+	tentry: Entry;
+BEGIN tentry := NIL;
+	entry := cache.next;
+	WHILE (entry # cache) & ((entry.state = free) OR ~NetBase.Equal(ipadr, entry.pra, IpAdrLen)) DO
+		IF entry.state = free THEN tentry := entry END;
+		entry := entry.next
+	END;
+	fnd := entry # cache;
+	IF ~fnd THEN entry := tentry END
+END FindEntry;
+
+PROCEDURE SendArp (ipdst: IpAdr);
+VAR
+	arp: Arp;
+	etherh: EtherNet.Header;
+	item: NetBase.Item;
+BEGIN NetBase.NewItem(item);
+	arp := SYSTEM.VAL(Arp, item.data);
+	arp.hwtype := hw; NetBase.Host2Net(arp.hwtype);
+	arp.prtype := ipid; NetBase.Host2Net(arp.prtype);
+	arp.hwlen := EtherNet.AdrLen; arp.prlen := IpAdrLen;
+	arp.op := request; NetBase.Host2Net(arp.op);
+				
+	NetBase.Copy(EtherNet.ethadr, arp.sha, EtherNet.AdrLen);
+	NetBase.Copy(ipadr, arp.spa, IpAdrLen);
+	NetBase.Copy(EtherNet.anyadr, arp.tha, EtherNet.AdrLen);
+	NetBase.Copy(ipdst, arp.tpa, IpAdrLen);
+				
+	etherh := SYSTEM.VAL(EtherNet.Header, item.etherh);
+
+	NetBase.Copy(EtherNet.bethadr, etherh.dst, EtherNet.AdrLen);
+	etherh.type := arpid; NetBase.Host2Net(etherh.type);
+
+	item.len := arplen; arpsd := (arpsd + 1) MOD MAX(LONGINT);
+	NetBase.Output(item)
+END SendArp;
+
+PROCEDURE ^ IpReceive* (item: NetBase.Item);
+
+PROCEDURE ArpSend (ipdst: IpAdr; item: NetBase.Item);
+VAR
+	entry: Entry;
+	fnd: BOOLEAN;
+BEGIN	(* assumed: address is resolved *)
+	IF NetBase.Equal(ipadr, ipdst, IpAdrLen) THEN
+		IpReceive(item)
+	ELSIF Broadcast(ipdst) THEN
+		NetBase.Copy(EtherNet.bethadr, item.etherh.dst, EtherNet.AdrLen);
+		arpsd := (arpsd + 1) MOD MAX(LONGINT); NetBase.Output(item)
+	ELSE FindEntry(ipdst, entry, fnd);
+		IF fnd THEN
+			IF entry.state = resolved THEN
+				NetBase.Copy(entry.hwa, item.etherh.dst, EtherNet.AdrLen);
+				arpsd := (arpsd + 1) MOD MAX(LONGINT); NetBase.Output(item)
+			ELSIF entry.state = pending THEN
+				IF entry.queue.n < arpqsize THEN NetBase.PutItem(entry.queue, item)
+				ELSE NetBase.PutItem(NetBase.itq, item)
+				END
+			ELSE HALT(99)
+			END
+		ELSE
+			IF entry = NIL THEN NewEntry(entry) END;
+			NetBase.Copy(ipdst, entry.pra, IpAdrLen);
+			entry.state := pending; entry.att := 1; entry.ttl := rsend;
+			NetBase.PutItem(entry.queue, item); SendArp(ipdst)
+		END
+	END
+END ArpSend;
+
+PROCEDURE NetMatch* (adr: IpAdr): BOOLEAN;
+VAR
+	srcmask, dstmask: SET;
+BEGIN srcmask := SYSTEM.VAL(SET, ipadr) * submask;
+	dstmask := SYSTEM.VAL(SET, adr) * submask;
+	RETURN srcmask = dstmask
+END NetMatch;
+
+PROCEDURE IpChkSum* (iph: Header; len: INTEGER): LONGINT;
+BEGIN RETURN NetBase.ChkSum(iph^, HLen(iph), 0)
+END IpChkSum;
+
+PROCEDURE IpSend* (item: NetBase.Item; proto: SHORTINT);
+VAR
+	iph: Header;
+BEGIN
+	item.etherh.type :=  ipid; NetBase.Host2Net(item.etherh.type);
+	
+	iph := SYSTEM.VAL(Header, item.data);
+	VerLen(iph); iph.tos := 0; iph.len := item.len;
+	iph.id := SHORT(ippackid); ippackid := (ippackid + 1) MOD MAX(INTEGER);
+	iph.frag := 0; iph.ttl := TTL; iph.proto := proto;
+	NetBase.Host2Net(iph.len); NetBase.Host2Net(iph.id); NetBase.Host2Net(iph.frag);
+
+	iph.chksum := 0; iph.chksum := SHORT(NetBase.ChkSum(iph^, HLen(iph), 0));
+	ipsd := (ipsd + 1) MOD MAX(LONGINT);
+
+	IF ~Broadcast(iph.dst) THEN
+		IF NetMatch(iph.dst) THEN ArpSend(iph.dst, item) ELSE ArpSend(gway, item) END
+	ELSE ArpSend(iph.dst, item)
+	END
+END IpSend;
+
+PROCEDURE IcmpChkSum* (icmph: IcmpHd; len: INTEGER): LONGINT;
+BEGIN RETURN NetBase.ChkSum(icmph^, len, 0)
+END IcmpChkSum;
+
+PROCEDURE IcmpSend* (ipsrc, ipdst: IpAdr; type, code: SHORTINT; val1, val2: INTEGER; data: ARRAY OF SYSTEM.BYTE);
+VAR
+	item: NetBase.Item;
+	iph: Header;
+	icmph: IcmpHd;
+	echo: Echo;
+	gnl: General;
+	prm: Param;
+	mask: Mask;
+	dlen, i: INTEGER;
+BEGIN NetBase.NewItem(item);
+	iph := SYSTEM.VAL(Header, item.data);
+	NetBase.Copy(ipsrc, iph.src, IpAdrLen); NetBase.Copy(ipdst, iph.dst, IpAdrLen);
+
+	icmph := SYSTEM.VAL(IcmpHd, SYSTEM.ADR(item.data.data[MinHLen]));
+	icmph.type := type; icmph.code := code;
+
+	CASE type OF
+	echorp, echorq:
+		echo := SYSTEM.VAL(Echo, SYSTEM.ADR(icmph.data[0]));
+		echo.id := val1; NetBase.Host2Net(echo.id);
+		echo.seq := val2; NetBase.Host2Net(echo.seq);
+		dlen := DataLength;
+		IF type = echorp THEN i := 0;
+			WHILE i < dlen DO echo.optdata[i] := data[i]; INC(i) END
+		ELSIF type = echorq THEN i := 0;
+			WHILE i < dlen DO echo.optdata[i] := SYSTEM.VAL(SYSTEM.BYTE, i); INC(i) END
+		ELSE HALT(99)
+		END
+	|unreach, timexc, sourceq:
+		gnl := SYSTEM.VAL(General, SYSTEM.ADR(icmph.data[0]));
+		gnl.uusd := 0; dlen := MinHLen + PLen;
+		NetBase.FastCopy(SYSTEM.ADR(item.data^), SYSTEM.ADR(gnl.data[0]), dlen)
+	|parm:
+		prm := SYSTEM.VAL(Param, SYSTEM.ADR(icmph.data[0]));
+		prm.ptr := SHORT(val1); prm.uusd1 := 0; prm.uusd2 := 0;
+		dlen := MinHLen + PLen;
+		NetBase.FastCopy(SYSTEM.ADR(item.data^), SYSTEM.ADR(prm.data[0]), dlen)
+	|maskrq:
+		mask := SYSTEM.VAL(Mask, SYSTEM.ADR(icmph.data[0]));
+		mask.id := 0; (* here has to come something *) mask.seq := 0; 
+		NetBase.Copy(ipany, mask.mask, IpAdrLen); dlen := IpAdrLen
+	ELSE NetBase.PutItem(NetBase.itq, item); RETURN
+	END;
+	dlen := dlen + IcmpHLen; icmph.chksum := 0;
+	icmph.chksum := SHORT(NetBase.ChkSum(icmph^, dlen, 0));
+	item.len := MinHLen + dlen; icmpsd := (icmpsd + 1) MOD MAX(LONGINT);
+	IpSend(item, ICMP)
+END IcmpSend;
+
+PROCEDURE IpReceive* (item: NetBase.Item);
+BEGIN
+	IF ipq.n < MaxQSize THEN NetBase.PutItem(ipq, item)
+	ELSE NetBase.PutItem(NetBase.itq, item)
+	END
+END IpReceive;
+
+PROCEDURE IcmpReceive (item: NetBase.Item);
+VAR
+	icmph: IcmpHd;
+	mask: Mask;
+	echo: Echo;
+	iph: Header;
+	ip: IpAdr;
+	chksum: INTEGER;
+BEGIN icmprc := (icmprc + 1) MOD MAX(LONGINT);
+	iph := SYSTEM.VAL(Header, item.data);
+	icmph := SYSTEM.VAL(IcmpHd, SYSTEM.ADR(item.data.data[MinHLen]));
+	chksum := icmph.chksum; icmph.chksum := 0;
+	IF SHORT(NetBase.ChkSum(icmph^, iph.len - MinHLen, 0)) = chksum THEN
+		IF icmph.type = echorq THEN erq := erq + 1;
+			echo := SYSTEM.VAL(Echo, SYSTEM.ADR(icmph.data[0]));
+			NetBase.Net2Host(echo.id); NetBase.Net2Host(echo.seq);		
+			IcmpSend(iph.dst, iph.src, echorp, 0, echo.id, echo.seq, echo.optdata)
+		ELSIF icmph.type = maskrp THEN
+			mask := SYSTEM.VAL(Mask, SYSTEM.ADR(icmph.data[0]));
+			NetBase.Copy(mask.mask, subnet, IpAdrLen);
+(*			NetBase.Copy(iph.src, gway2, IpAdrLen);	*)
+		ELSE
+			CASE icmph.type OF
+			echorp: erp := erp + 1
+			|unreach: dur := dur + 1
+			|sourceq: srq := srq + 1
+			|timexc: tmx := tmx + 1
+			|parm: prm := prm + 1
+			ELSE
+			END
+		END
+	END;
+	NetBase.PutItem(NetBase.itq, item)
+END IcmpReceive;
+
+PROCEDURE IpDemux*(me: Oberon.Task);
+VAR
+	iph: Header;
+	it: NetBase.Item;
+	chksum: INTEGER;
+	bcast: BOOLEAN;
+BEGIN
+	WHILE ipq.n > 0 DO NetBase.GetItem(ipq, it);
+		iph := SYSTEM.VAL(Header, it.data); iprc := (iprc + 1) MOD MAX(LONGINT);
+		IF iph.verlen DIV 16 = ipver THEN bcast := Broadcast(iph.dst);
+			IF bcast OR ~IllegalClass(iph.dst) THEN
+				chksum := iph.chksum; iph.chksum := 0;
+				IF SHORT(NetBase.ChkSum(iph^, HLen(iph), 0)) = chksum THEN
+					ASSERT(HLen(iph) = MinHLen, 50);
+					NetBase.Net2Host(iph.len); NetBase.Net2Host(iph.id); NetBase.Net2Host(iph.frag); 
+					IF (iph.frag = 0) OR (iph.frag DIV 2000H = 2) THEN
+						IF NetBase.Equal(iph.dst, ipadr, IpAdrLen) OR bcast THEN
+							demux[iph.proto](it)
+						ELSE NetBase.PutItem(NetBase.itq, it)
+						END
+					ELSE NetBase.PutItem(NetBase.itq, it)
+					END
+				ELSE NetBase.PutItem(NetBase.itq, it)
+				END
+			ELSE NetBase.PutItem(NetBase.itq, it)
+			END
+		ELSE NetBase.PutItem(NetBase.itq, it)
+		END
+	END
+END IpDemux;
+
+PROCEDURE Dmy (item: NetBase.Item);
+VAR
+	iph: Header;
+BEGIN
+	iph := SYSTEM.VAL(Header, item.data);
+(*	EN.Copy(iph.src, iph.dst, IpAdrLen);
+	IcmpSend(item, unreach, 2, 0)	*)
+	NetBase.PutItem(NetBase.itq, item)
+END Dmy;
+
+(* ARP *)
+
+PROCEDURE ArpReceive (item: NetBase.Item);
+VAR
+	arp: Arp;
+	entry: Entry;
+	it: NetBase.Item;
+	prtype, hwtype: INTEGER;
+	fnd: BOOLEAN;
+BEGIN arprc := (arprc + 1) MOD MAX(LONGINT);
+	arp := SYSTEM.VAL(Arp, item.data);
+	hwtype := arp.hwtype; NetBase.Net2Host(hwtype);
+	prtype := arp.prtype; NetBase.Net2Host(prtype);
+	IF (hwtype = hw) & (prtype = ipid) THEN
+		FindEntry(arp.spa, entry, fnd);
+		IF fnd THEN NetBase.Copy(arp.sha, entry.hwa, EtherNet.AdrLen);
+			entry.state := resolved; entry.ttl := timo;
+			WHILE entry.queue.n > 0 DO
+				NetBase.GetItem(entry.queue, it);
+				NetBase.Copy(entry.hwa, it.etherh.dst, EtherNet.AdrLen);
+				NetBase.Output(it)
+			END
+		END;
+		IF NetBase.Equal(ipadr, arp.tpa, IpAdrLen) THEN
+			IF ~fnd THEN
+				IF entry = NIL THEN NewEntry(entry) END;
+				NetBase.Copy(arp.spa, entry.pra, IpAdrLen);
+				NetBase.Copy(arp.sha, entry.hwa, EtherNet.AdrLen);
+				entry.state := resolved; entry.ttl := timo
+			END;
+			NetBase.Net2Host(arp.op);
+			IF arp.op = request THEN
+				arp.op := reply; NetBase.Host2Net(arp.op);
+				NetBase.Copy(arp.spa, arp.tpa, IpAdrLen);
+				NetBase.Copy(arp.sha, arp.tha, EtherNet.AdrLen);
+				NetBase.Copy(ipadr, arp.spa, IpAdrLen);
+				NetBase.Copy(EtherNet.ethadr, arp.sha, EtherNet.AdrLen);
+				
+				NetBase.Copy(arp.tha, item.etherh.dst, EtherNet.AdrLen);
+				item.len := arplen; NetBase.Output(item)
+			ELSE NetBase.PutItem(NetBase.itq, item)
+			END
+		ELSE NetBase.PutItem(NetBase.itq, item)
+		END
+	ELSE NetBase.PutItem(NetBase.itq, item)
+	END
+END ArpReceive;
+
+PROCEDURE Timer*(me: Oberon.Task);
+VAR
+	cur: Entry;
+	item: NetBase.Item;
+	now, delay: LONGINT;
+BEGIN
+	IF Input.Time() - lact > Input.TimeUnit*3 THEN now := Input.Time();
+		delay := (now - last) DIV Input.TimeUnit; last := now;
+		cur := cache.next;
+		WHILE cur # cache DO
+			IF cur.state # free THEN
+				cur.ttl := SHORT(cur.ttl - delay);
+				IF cur.ttl <= 0 THEN
+					IF (cur.state # resolved) & (cur.att < mretry) THEN
+						INC(cur.att); cur.ttl := rsend; SendArp(cur.pra)
+					ELSE cur.state := free;
+						WHILE cur.queue.n > 0 DO
+							NetBase.GetItem(cur.queue, item); NetBase.PutItem(NetBase.itq, item)
+						END
+					END
+				END
+			END;
+			cur := cur.next
+		END;
+		lact := Input.Time()
+	END
+END Timer;
+
+PROCEDURE InstallDemux* (proc: demuxProc; service: INTEGER);
+BEGIN demux[service] := proc
+END InstallDemux;
+
+PROCEDURE RemoveDemux* (service: INTEGER);
+BEGIN demux[service] := Dmy
+END RemoveDemux;
+
+PROCEDURE StartTimer*;
+BEGIN NetBase.arprec := ArpReceive;
+	arprc := 0; arpsd := 0; cache.next := cache;
+	last := Input.Time(); lact := last;
+	timer.safe := TRUE; timer.time := 0;
+	timer.handle := Timer; Oberon.Install(timer)
+END StartTimer;
+
+PROCEDURE StopTimer*;
+VAR
+	cur: Entry;
+	item: NetBase.Item;
+BEGIN Oberon.Remove(timer);
+	cur := cache.next;
+	WHILE cur # cache DO cur.state := free;
+		WHILE cur.queue.n > 0 DO
+			NetBase.GetItem(cur.queue, item); NetBase.PutItem(NetBase.itq, item)
+		END;
+		cur := cur.next
+	END
+END StopTimer;
+
+PROCEDURE StartIp*;
+BEGIN (*EN.rarprec := RarpReceive; *)
+	NetBase.Reset(ipq); NetBase.iprec := IpReceive;
+	iprc := 0; ipsd := 0; icmprc := 0; icmpsd := 0;
+	erq := 0; erp := 0; dur := 0; srq := 0; tmx := 0; prm := 0;
+	ipdemux.safe := TRUE; ipdemux.time := 0;
+	ipdemux.handle := IpDemux; Oberon.Install(ipdemux)
+END StartIp;
+
+PROCEDURE StopIp*;
+VAR
+	item: NetBase.Item;
+BEGIN Oberon.Remove(ipdemux);
+	WHILE ipq.n > 0 DO NetBase.GetItem(ipq, item);
+		NetBase.PutItem(NetBase.itq, item)
+	END
+END StopIp;
+
+PROCEDURE SetDirectedBRC*;
+VAR
+	bcast: IpAdr;
+	hostmask, bcastmask: SET;
+BEGIN
+	IF ClassA(ipadr) THEN netmask := {0..7}
+	ELSIF ClassB(ipadr) THEN netmask := {0..15}
+	ELSIF ClassC(ipadr) THEN netmask := {0..23}
+	ELSE netmask := {0..31}
+	END;
+	hostmask := SYSTEM.VAL(SET, ipadr); bcastmask := hostmask + (-netmask);
+	NetBase.Copy(SYSTEM.VAL(IpAdr, bcastmask), netbcast, IpAdrLen);
+	submask := SYSTEM.VAL(SET, subnet); bcastmask := hostmask + (-submask);
+	NetBase.Copy(SYSTEM.VAL(IpAdr, bcastmask), subbcast, IpAdrLen)
+END SetDirectedBRC;
+
+BEGIN
+	ipall[0] := 0FFX; ipall[1] := 0FFX; ipall[2] := 0FFX; ipall[3] := 0FFX;
+	ipany[0] := 0X; ipany[1] := 0X; ipany[2] := 0X; ipany[3] := 0X;
+	NetBase.Copy(ipany, ipadr, IpAdrLen); NetBase.Copy(ipany, subnet, IpAdrLen);
+	NetBase.Copy(ipany, gway, IpAdrLen);
+	NetBase.Copy(ipany, netbcast, IpAdrLen); NetBase.Copy(ipany, subbcast, IpAdrLen);
+	netmask := {}; submask := {};
+
+	NetBase.Reset(ipq); NEW(cache); cache.next := cache;
+
+	i := 0; WHILE i < MaxService DO demux[i] := Dmy; INC(i) END;
+
+	InstallDemux(IcmpReceive, ICMP);
+
+	NEW(timer); NEW(ipdemux);
+
+	arprc := 0; arpsd := 0; iprc := 0; ipsd := 0; icmprc := 0; icmpsd := 0;
+	erq := 0; erp := 0; dur := 0; srq := 0; tmx := 0; prm := 0;
+
+	Texts.OpenWriter(W)
+END IP.

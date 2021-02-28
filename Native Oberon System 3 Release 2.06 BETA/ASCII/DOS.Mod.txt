@@ -1,0 +1,256 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE DOS; (* pmuller 1994-08-31, harry 1996-02-09 *)
+
+(* pjm 27.02.96 - port to Native Oberon *)
+(* pjm 28.03.96 - CopyFrom speeded up *)
+
+  IMPORT SYSTEM, Files, DosDisk, Oberon, Texts;
+
+  TYPE
+    DOSScanner = RECORD(Texts.Scanner) d: ARRAY 64 OF CHAR END;
+      
+  VAR W: Texts.Writer;
+    
+  (* ------------- Toolbox of file system ---------------*)
+
+  PROCEDURE ScanDosName(VAR S: DOSScanner);
+  VAR i : INTEGER;
+  BEGIN
+    S.class := Texts.Inval; 
+    IF S.nextCh = "~" THEN S.c := "~"; S.class := Texts.Inval END;
+    WHILE ~S.eot & ((S.nextCh = " ") OR (S.nextCh = 0DX) OR (S.nextCh = 9X)) DO Texts.Read(S,S.nextCh) END;
+    IF S.nextCh = "^" THEN S.c := "^"; S.class := Texts.Char
+    ELSE
+      i := 0;
+      IF ~S.eot & (S.nextCh # "~") THEN
+        S.d[i] := S.nextCh; INC(i); Texts.Read(S,S.nextCh);  
+        WHILE ~S.eot & (S.nextCh # " ") & (S.nextCh # "=") 
+          & (S.nextCh # 0DX) & (S.nextCh # "~") & (S.nextCh # 9X) DO 
+          S.d[i] := S.nextCh; INC(i); Texts.Read(S,S.nextCh); 
+        END
+      END;
+      S.d[i] := 0X;
+      IF i # 0 THEN S.class := Texts.Name END
+    END
+  END ScanDosName;
+  
+  PROCEDURE CopyTo*;
+  (* Exports a file to DOS. Creates a new DOS file without header *)
+  VAR S: DOSScanner;
+      name: ARRAY 32 OF CHAR;
+      f: Files.File; err, len: LONGINT; Rf: Files.Rider; ch: CHAR;
+      buf: DosDisk.Cluster; (* POINTER TO ARRAY 4096 OF CHAR; *)
+      g: DosDisk.tFile;  T: Texts.Text;
+      CSize, j, CCount, n, beg, end, time: LONGINT;
+      Entry: DosDisk.tDirectoryEntry;
+  BEGIN
+    DosDisk.Reset;
+    Texts.WriteString(W, "DOS.CopyTo"); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+    Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+    IF (S.class = Texts.Char) & (S.c = "^") THEN
+    	Oberon.GetSelection(T, beg, end, time);
+    	IF time >= 0 THEN
+    		Texts.OpenScanner(S, T, beg); Texts.Scan(S)
+    	ELSE
+    		RETURN
+    	END
+    END;
+    beg := 1;
+    REPEAT IF beg = 1 THEN beg := 0 ELSE Texts.Scan(S) END;
+      IF S.class = Texts.Name THEN COPY(S.s, name);  
+        Texts.Scan(S);
+        IF (S.class = Texts.Char) & (S.c = "=") THEN Texts.Scan(S);
+          IF (S.class = Texts.Char) & (S.c = ">") THEN ScanDosName(S);
+            IF S.class = Texts.Name THEN
+              Texts.WriteString(W, name); Texts.WriteString(W, " => "); 
+              Texts.WriteString(W, S.d);
+              Texts.WriteString(W, " exporting"); 
+              Texts.Append(Oberon.Log, W.buf);
+              f := Files.Old(name);
+              IF f # NIL THEN
+              	err := DosDisk.Create(FALSE, S.d, g, Entry);
+              	Entry.FileSize := Files.Length(f);
+              	IF err = 0 THEN
+              		CSize := DosDisk.GetClusterSize(); 
+              		SYSTEM.NEW(buf, CSize*DosDisk.cSectorSize);
+              		CCount :=((Entry.FileSize+(DosDisk.cSectorSize*CSize))-1) DIV (DosDisk.cSectorSize*CSize);
+              		err := DosDisk.AllocateClusterList(CCount, Entry.Start);
+              		IF (err = 0) THEN err := DosDisk.PutDirectoryEntry(Entry) END;
+              		IF (err = 0) THEN
+                  		Files.Set(Rf, f, 0); Files.Read(Rf, ch);
+                  		g.FirstCluster := Entry.Start;
+                  		j := 0;
+                  		WHILE (j < CCount) DO
+                  			IF (j # (CCount-1)) THEN
+                  				n := CSize*DosDisk.cSectorSize
+                  			ELSE
+                  				n := Entry.FileSize MOD (CSize*DosDisk.cSectorSize);
+                  				IF (n = 0) THEN n := CSize*DosDisk.cSectorSize END
+                  			END;
+                  			len := 0;
+                  			WHILE ~Rf.eof & (len # n) DO buf[len] := ch; INC(len); Files.Read(Rf, ch) END;
+                  			WHILE (len # CSize*DosDisk.cSectorSize) DO buf[len] := 0X; INC(len) END;
+                  			err := DosDisk.PutCluster(g.FirstCluster, j, buf);
+                  			IF (err # 0) THEN
+                  				Texts.WriteString(W, " put cluster error ");  Texts.WriteInt(W, err, 1)
+                  			END;
+                  			INC(j)
+                  		END;
+                  		DosDisk.Close(TRUE, g)
+                  	ELSE Texts.WriteString(W, " no dir entry created ");  Texts.WriteInt(W, err, 1)
+                  	END
+                ELSE Texts.WriteString(W, " error ");  Texts.WriteInt(W, err, 1)
+                END;
+              ELSE Texts.WriteString(W, " failed")
+              END;
+              Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+            END
+          END
+        END
+      END
+    UNTIL (S.class = Texts.Char) & (S.c = "~");
+    DosDisk.Reset
+  END CopyTo;
+  
+  PROCEDURE CopyFrom*;
+  CONST BufSizeB = 32768;	(* max is size of DosDisk.Cluster^ *)
+  VAR S: DOSScanner;
+      name: ARRAY 48 OF CHAR;
+      err, len, i, beg, end, time: LONGINT; g: Files.File; Rg: Files.Rider; res: INTEGER;
+      f: DosDisk.tFile;
+      buf: DosDisk.Cluster;
+      (*first: BOOLEAN;*)  T: Texts.Text;
+      CSize, j, CCount, CSizeB, NC, BufSizeC: LONGINT;
+  BEGIN
+    DosDisk.Reset;
+    Texts.WriteString(W, "DOS.CopyFrom"); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+    Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); ScanDosName(S);
+    IF (S.class = Texts.Char) & (S.c = "^") THEN
+    	Oberon.GetSelection(T, beg, end, time);
+    	IF time >= 0 THEN
+    		Texts.OpenScanner(S, T, beg); ScanDosName(S)
+    	ELSE
+    		RETURN
+    	END
+    END;
+    beg := 1;  SYSTEM.NEW(buf, BufSizeB);
+    REPEAT
+      IF beg = 1 THEN beg := 0 ELSE ScanDosName(S) END;
+      IF S.class = Texts.Name THEN COPY(S.d, name);  
+        Texts.Scan(S);
+        IF (S.class = Texts.Char) & (S.c = "=") THEN Texts.Scan(S);
+          IF (S.class = Texts.Char) & (S.c = ">") THEN Texts.Scan(S);
+            IF S.class = Texts.Name THEN
+              Texts.WriteString(W, name); Texts.WriteString(W, " => "); Texts.WriteString(W, S.s);
+              Texts.WriteString(W, " importing"); Texts.Append(Oberon.Log, W.buf);
+              err := DosDisk.Open(name, f);
+              IF err = 0 THEN g := Files.New(S.s);
+                Files.Set(Rg, g, 0);  (*first := TRUE;*)
+		CSize := DosDisk.GetClusterSize();
+		CSizeB := CSize*DosDisk.cSectorSize;
+		IF BufSizeB MOD CSizeB # 0 THEN HALT(99) END;
+		BufSizeC := BufSizeB DIV CSizeB;
+		(*SYSTEM.NEW(buf, BufSizeB);*)
+		CCount := ((f.Size+CSizeB)-1) DIV CSizeB;
+		j := 0;
+		WHILE (j < CCount) DO
+			NC := BufSizeC;
+			IF j + NC > CCount THEN (* at end *)
+				NC := CCount MOD BufSizeC
+			END;
+			err := DosDisk.GetClusters(f.FirstCluster, j, NC, buf^);
+			IF err = 0 THEN
+				IF j + NC < CCount THEN
+					len := BufSizeB
+				ELSE (* at end *)
+					len := f.Size MOD BufSizeB;
+					IF len = 0 THEN len := BufSizeB END
+				END;
+				Files.WriteBytes(Rg, buf^, len)
+			ELSE
+				Texts.WriteString(W, " cluster rd error ");  Texts.WriteInt(W, err, 1)
+			END;
+			INC(j, NC)
+(*
+			err := DosDisk.GetCluster(f.FirstCluster, j, buf);
+			IF (err = 0) THEN
+				IF (j # (CCount-1)) THEN
+					len := CSize*DosDisk.cSectorSize
+				ELSE
+					len := f.Size MOD (CSize*DosDisk.cSectorSize);
+					IF (len = 0) THEN len := CSize*DosDisk.cSectorSize END
+				END;
+                  		IF first THEN
+                    				first := FALSE;
+                    				IF (buf[0] = "o") & (buf[1] = "B") & (len >= 34) THEN
+                    					FOR i := 0 TO len-34-1 DO buf[i] := buf[i+34] END;
+                    					DEC(len, 34)
+                    				END
+                  		END;
+                  		Files.WriteBytes(Rg, buf^, len)
+			ELSE
+                   		Texts.WriteString(W, " cluster rd error ");  Texts.WriteInt(W, err, 1)
+			END;
+			INC(j)
+ *)
+		END;
+                (*Files.Delete(S.s, res);*) Files.Register(g);
+		DosDisk.Close(FALSE, f)
+              ELSE Texts.WriteString(W, " error ");  Texts.WriteInt(W, err, 1)
+              END;
+              Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+            END
+          END
+        END
+      END
+    UNTIL (S.class = Texts.Inval) OR (S.nextCh = "~");
+	buf := NIL;
+    DosDisk.Reset
+  END CopyFrom;
+
+PROCEDURE Dir*;
+  VAR S: DOSScanner;  beg, end, time: LONGINT;  T: Texts.Text;
+  BEGIN
+    DosDisk.Reset;
+    Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); 
+    ScanDosName(S);
+    IF (S.class = Texts.Char) & (S.c = "^") THEN
+    	Oberon.GetSelection(T, beg, end, time);
+    	IF time >= 0 THEN
+    		Texts.OpenScanner(S, T, beg); ScanDosName(S)
+    	ELSE
+    		RETURN
+    	END
+    END;
+    IF S.class = Texts.Name THEN
+        (*Texts.WriteString(W, "DOS.Dir "); Texts.WriteString(W, S.d); Texts.WriteLn(W);
+        Texts.Append(Oberon.Log, W.buf);*)
+        DosDisk.Dir(S.d)
+	END;
+	DosDisk.Reset
+  END Dir;
+ 
+BEGIN 
+  Texts.OpenWriter(W)
+END DOS.
+
+DOS.Dir ^ a: c:/tmp
+DOS.CopyTo => ~
+DOS.CopyFrom => ~
+
+System.Free DOS DosDisk ~
+
+System.DeleteFiles t ~
+DOS.CopyFrom a:/t => t ~

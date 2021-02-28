@@ -1,0 +1,121 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE DiskSpace;	(* pmuller 22.06.95 *)
+
+IMPORT SYSTEM, Texts, Oberon, Disk, In, Kernel, Files;
+
+CONST
+	LogName = "DiskSpace.Log";
+	
+VAR
+	W: Texts.Writer;
+	task: Oberon.Task;
+	prev, threshold: LONGINT;
+
+PROCEDURE WriteInt(VAR r: Files.Rider; x, n: LONGINT);
+VAR i: INTEGER; x0: LONGINT;
+	a: ARRAY 14 OF CHAR;
+BEGIN i := 0;
+	IF x < 0 THEN
+		IF x = MIN(LONGINT) THEN
+			a := " -2147483648";  i := 0;
+			WHILE a[i] # 0X DO Files.Write(r, a[i]); INC(i) END;
+			RETURN
+		ELSE DEC(n); x0 := -x
+		END
+	ELSE x0 := x
+	END;
+	REPEAT
+		a[i] := CHR(x0 MOD 10 + 30H); x0 := x0 DIV 10; INC(i)
+	UNTIL x0 = 0;
+	WHILE n > i DO Files.Write(r, " "); DEC(n) END;
+	IF x < 0 THEN Files.Write(r, "-") END;
+	REPEAT DEC(i); Files.Write(r, a[i]) UNTIL i = 0
+END WriteInt;
+
+PROCEDURE WriteDate(VAR r: Files.Rider; t, d: LONGINT);
+	PROCEDURE WritePair(ch: CHAR; x: LONGINT);
+	BEGIN
+		Files.Write(r, ch);
+		Files.Write(r, CHR(x DIV 10 + 30H)); Files.Write(r, CHR(x MOD 10 + 30H))
+	END WritePair;
+BEGIN
+	WritePair(" ", d MOD 32); WritePair(".", d DIV 32 MOD 16); WritePair(".", d DIV 512 MOD 128);
+	WritePair(" ", t DIV 4096 MOD 32); WritePair(":", t DIV 64 MOD 64);
+	(* WritePair(":", t MOD 64) *)
+END WriteDate;
+	
+PROCEDURE UpdateLog(on: BOOLEAN);
+VAR t, d: LONGINT;  f: Files.File;  log: Files.Rider;
+BEGIN
+	f := Files.Old(LogName);
+	IF f = NIL THEN f := Files.New(LogName); Files.Register(f) END;
+	Files.Set(log, f, Files.Length(f));
+	Oberon.GetClock(t, d); WriteDate(log, t, d);
+	Files.Write(log, " ");  Files.Write(log, "o");
+	IF on THEN Files.Write(log, "n")
+	ELSE Files.Write(log, "f");  Files.Write(log, "f")
+	END;
+	Files.Write(log, " ");
+	WriteInt(log, Disk.Available()*Disk.SectorSize DIV 1024, 1);
+	Files.Write(log, 0DX);
+	Files.Close(f)
+END UpdateLog;
+	
+PROCEDURE Stop*;
+BEGIN
+	IF task # NIL THEN
+		UpdateLog(FALSE);
+		Oberon.Remove(task);  task := NIL
+	END
+END Stop;
+
+PROCEDURE Handler(t: Oberon.Task);
+VAR s: LONGINT;
+BEGIN
+	s := Disk.Available();
+	IF ABS(s - prev) > threshold THEN
+		IF s < 2*threshold THEN threshold := 1 END;	(* so little space, warn often! *)
+		prev := s;
+		Texts.WriteInt(W, s*Disk.SectorSize DIV 1024, 1);
+		Texts.WriteString(W, "k disk space free");  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf)
+	END
+END Handler;
+
+PROCEDURE Start*;
+BEGIN
+	IF task = NIL THEN
+		UpdateLog(TRUE);
+		NEW(task);  task.time := -1;  task.safe := FALSE;  task.handle := Handler;
+		Oberon.Install(task)
+	END
+END Start;
+
+PROCEDURE SetColor*;
+VAR i: INTEGER;
+BEGIN
+	In.Open;  In.Int(i);
+	IF In.Done THEN Texts.SetColor(W, SHORT(i)) END
+END SetColor;
+
+BEGIN
+	task := NIL;  threshold := 100;  prev := -threshold;
+	Texts.OpenWriter(W);  Texts.SetColor(W, 3);
+	Kernel.InstallTermHandler(Stop)
+END DiskSpace.
+
+DiskSpace.Start
+DiskSpace.Stop
+DiskSpace.SetColor ^

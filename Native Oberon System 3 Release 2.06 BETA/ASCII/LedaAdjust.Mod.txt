@@ -1,0 +1,1088 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaAdjust;	(* uh, Wed, 1-Dec-1993 *)
+
+	IMPORT LedaBase, LedaCtrl, LedaChar, LedaBox, LedaIO, LedaRuler, LedaSys;
+	
+CONST
+	Char = "character";
+	Format = "format";
+	Tab = "tabulator";
+	Inset = "inset";
+	Line = "line";
+	PgNbr = "pagenumber";
+	Filler = "filler";
+	Wrap = "wrap";
+	
+	(*--- format control ---*)
+	Anon = "anonymous";	MinUnit = LedaBase.MM DIV 2;
+	
+	(*--- font faces ---*)
+	NormFace = " ";	ItalicFace = "i";	BoldFace = "b";	CapFace = "t";	MedFace = "m";
+	
+	(*--- vertical offsets ---*)
+	SubOff = -25;	SuperOff = 15;
+	
+	(*--- dialog ---*)
+	Normal = "normal";	Italic = "italic";	Bold = "bold";	Capital = "capital";	Medium = "medium";
+	Sub = "sub";	Super = "super";
+	Stat = TRUE;	Dyn = FALSE;
+	UnAff = "unaffected";	Default = "default";	No = "no";	Yes = "yes";
+	Wide = "wide";	Dense = "dense";	Lines = "lines";
+	ToGrid = "togrid";	Half = "half";	Third = "third";	Quarter = "quarter";
+	Left = "left";	Center = "center";	Right = "right";	Adjust = "adjust";
+	Column = "column";	Unit = "unit";	Screen = "screen";	Printer = "printer";
+	Color = "color";
+	Marginal = "marginal";
+	
+	
+(*--- utilities ---*)
+
+	PROCEDURE NewLn(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR);
+	BEGIN
+		a.typ := LedaBox.NewLn; a.stat := TRUE; a.i := 0;
+		IF s # "" THEN LedaSys.CopyStr(s, a.s) ELSE a.s := "" END
+	END NewLn;
+	
+	PROCEDURE StrAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Str; LedaSys.CopyStr(s, a.s); a.stat := stat; a.i := 0;
+	END StrAt;
+	
+	PROCEDURE IntAt(VAR a: LedaBox.ParaDsc; i: LONGINT; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Int; a.i := i; a.stat := stat; a.s := ""
+	END IntAt;
+	
+	PROCEDURE EnumAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; i: LONGINT);
+	BEGIN
+		a.typ := LedaBox.Enum; LedaSys.CopyStr(s, a.s); a.i := i
+	END EnumAt;
+	
+(*--- style control ---*)
+	
+	PROCEDURE *StyleEnumAll(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN
+		RETURN (ctrl # NIL) & (ctrl IS LedaBase.Style) & (ctrl(LedaBase.Style).name # Anon)
+	END StyleEnumAll;
+	
+	PROCEDURE ValidateStyle(VAR s: LedaBase.StyleDsc; VAR a: LedaBox.Attributes): BOOLEAN;
+	(* scans the attributes a and sets the attributes of character style s to it *)
+		VAR name: LedaSys.Name;	size: SHORTINT;	face: CHAR;
+	BEGIN
+		IF a[0].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)	(* style name *)
+		LedaSys.CopyStr(a[0].s, s.name);
+		IF a[1].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)	(* font family name *)
+		LedaSys.CopyStr(a[1].s, name);
+		IF a[2].typ # LedaBox.Int THEN RETURN FALSE END;	(*###*)	(* font size *)
+		size := SHORT(SHORT(a[2].i));
+		IF a[3].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)	(* font face *)
+		IF a[3].s = Normal THEN face := NormFace
+		ELSIF a[3].s = Italic THEN face := ItalicFace
+		ELSIF a[3].s = Bold THEN face := BoldFace
+		ELSIF a[3].s = Capital THEN face := CapFace
+		ELSIF a[3].s = Medium THEN face := MedFace
+		ELSE RETURN FALSE		(*###*)
+		END;
+		IF a[4].typ = LedaBox.Str THEN			(* vertical offset *)
+			IF a[4].s = Normal THEN s.voff := 0
+			ELSIF a[4].s = Sub THEN s.voff := SubOff
+			ELSIF a[4].s = Super THEN s.voff := SuperOff
+			ELSE RETURN FALSE		(*###*)
+			END
+		ELSIF a[4].typ = LedaBox.Int THEN s.voff := SHORT(a[4].i)
+		ELSE RETURN FALSE		(*###*)
+		END;
+		IF a[5].typ # LedaBox.Int THEN RETURN FALSE END;	(*###*)
+		s.clr := SHORT(a[5].i);
+		s.font := LedaBase.GetFont(name, size, face);
+		RETURN TRUE
+	END ValidateStyle;
+
+	PROCEDURE StyleGet(s: LedaBase.Style; VAR M: LedaBox.AttributeMsg);
+	(* gets the attributes of style control s in the attribute message M *)
+		VAR f: LedaBase.Font;	i: INTEGER;
+	BEGIN
+		M.name := Char; M.nbr := 21; f := s.font;
+		NewLn(M.a[0], "name"); StrAt(M.a[1], s.name, Dyn);	(* style name *)
+		NewLn(M.a[2], "font"); StrAt(M.a[3], f.name, Dyn);	(* font family name *)
+		NewLn(M.a[4], "size"); IntAt(M.a[5], f.size, Dyn);	(* font size *)
+			StrAt(M.a[8], Normal, Stat); StrAt(M.a[9], Italic, Stat);
+			StrAt(M.a[10], Bold, Stat); StrAt(M.a[11], Medium, Stat); StrAt(M.a[12], Capital, Stat);
+			i := 0; IF f.face = ItalicFace THEN i := 1 ELSIF f.face = BoldFace THEN i := 2 
+			ELSIF f.face = MedFace THEN i := 3 ELSIF f.face = CapFace THEN i := 4 END;
+		NewLn(M.a[6], "face"); EnumAt(M.a[7], "-|-|-|-|-", i);	(* font face *)
+			StrAt(M.a[15], Normal, Stat); StrAt(M.a[16], Sub, Stat);
+			StrAt(M.a[17], Super, Stat); IntAt(M.a[18], s.voff, Dyn);
+			IF s.voff = 0 THEN i := 0 ELSIF s.voff = SubOff THEN i := 1 ELSIF s.voff = SuperOff THEN i := 2 ELSE i := 3 END;
+		NewLn(M.a[13], "offset"); EnumAt(M.a[14], "-|-|-|-", i);	(* vertical offset *)
+		NewLn(M.a[19], "color"); IntAt(M.a[20], s.clr, Dyn); M.a[20].s := Color	(* color *)
+	END StyleGet;
+
+	PROCEDURE ChangeStyle(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* changes the style control according the attributes specified in the attribute message M *)
+	(* out: ctrl = NIL -> no change / ctrl # NIL -> new or changed control *)
+		VAR s: LedaBase.StyleDsc;	style: LedaBase.Style;
+	BEGIN	(* M.name = CharStyle *)
+		IF (ctrl # NIL) & (ctrl IS LedaBase.Style) THEN style := ctrl(LedaBase.Style) ELSE style := NIL END;
+		ctrl := NIL;
+		IF (M.nbr = 6) & ValidateStyle(s, M.a) THEN
+			IF (style # NIL) & (style.name = Anon) THEN	(* change or name anonymous style *)
+				(* style may specify multiple characters -> allocate new style *)
+				ctrl := LedaBase.NewStyle(s.name, s.font, s.clr, s.voff); M.id := LedaBox.NewStyle
+			ELSIF (style # NIL) & (style.name # Anon) & (s.name = Anon) THEN
+				ctrl := LedaBase.NewStyle(s.name, s.font, s.clr, s.voff); M.id := LedaBox.NewStyle
+			ELSIF M.id = LedaBox.NewStyle THEN
+				ctrl := LedaBase.NewStyle(s.name, s.font, s.clr, s.voff)
+			ELSIF (M.id = LedaBox.SetStyle) & (style # NIL) THEN
+				style.name := s.name;
+				IF (s.font # style.font) OR (s.voff # style.voff) OR (s.clr # style.clr) THEN	(* changed *)
+					ctrl := style; style.font := s.font; style.voff := s.voff; style.clr := s.clr;
+					LedaBase.CheckControl(style)
+				END
+			END
+		END
+	END ChangeStyle;
+		
+(*--- format control ---*)
+
+	PROCEDURE *FormatEnumAll(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN
+		RETURN (ctrl # NIL) & (ctrl IS LedaChar.Format) & (ctrl(LedaChar.Format).name # Anon)
+	END FormatEnumAll;
+	
+	(*---
+		- gap field of FormatDsc contains gap and wrap settings
+		- lowest byte: gap kind: 0=no/1=grid/2...254=fractional part/255=special value
+		- second byte: wrap: 0=no/1=yes/2..255=lines
+		- upper 2 bytes: gap value [document units DIV 1000]
+	---*)
+
+	PROCEDURE ValidateFormat(VAR name: LedaSys.Name; VAR var: LedaBase.FormatDsc; VAR a: LedaBox.Attributes): BOOLEAN;
+	(* scans the attributes a and sets name and var to it *)
+		VAR gap: LONGINT;	i: INTEGER;
+	BEGIN
+		IF a[0].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)	(* style name *)
+		LedaSys.CopyStr(a[0].s, name);
+		LedaBase.InitFormat(var);	(* default settings *)
+		IF a[1].typ = LedaBox.Int THEN var.lt := a[1].i * LedaBox.attrUnit END;	(* left *)
+		IF a[2].typ = LedaBox.Int THEN var.rt := a[2].i * LedaBox.attrUnit END;	(* right *)
+		IF a[3].typ = LedaBox.Str THEN		(* line space *)
+			IF a[3].s = Default THEN var.lsp := 0
+			ELSIF a[3].s = Wide THEN var.lsp := 1
+			ELSIF a[3].s = Dense THEN var.lsp := 2
+			END
+		ELSIF a[3].typ = LedaBox.Int THEN var.lsp := a[3].i * LedaSys.scnUnit
+		END;
+		IF a[4].typ = LedaBox.Str THEN		(* gap/extra space *)
+			IF a[4].s = ToGrid THEN var.gap := 1 + 100H * (var.gap DIV 100H)
+			ELSIF a[4].s = Half THEN var.gap := 2 + 100H * (var.gap DIV 100H)
+			ELSIF a[4].s = Third THEN var.gap := 3 + 100H * (var.gap DIV 100H)
+			ELSIF a[4].s = Quarter THEN var.gap := 4 + 100H * (var.gap DIV 100H)
+			END
+		ELSIF a[4].typ = LedaBox.Int THEN
+			var.gap := 0FFH + 100H * ((var.gap DIV 100H) MOD 100H) + 10000H * (a[4].i * LedaSys.scnUnit DIV 1000)
+		END;
+		IF a[5].typ = LedaBox.Str THEN		(* wrap *)
+			gap := (var.gap MOD 100H);
+			IF a[5].s = Yes THEN var.gap := gap + 100H + 10000H * (var.gap DIV 10000H)
+			ELSIF (a[5].s = Lines) & (a[6].typ = LedaBox.Int) THEN
+				var.gap := gap + 100H * (a[6].i MOD 100H) + 10000H * (var.gap DIV 10000H)
+			END	
+		END;
+		IF a[6].typ = LedaBox.Int THEN i := 7 ELSE i := 6 END;
+		IF a[i].typ = LedaBox.Str THEN		(* mode *)
+			IF a[i].s = Default THEN var.adj := "d"
+			ELSIF a[i].s = Adjust THEN var.adj := "a"
+			ELSIF a[i].s = Left THEN var.adj := "l"
+			ELSIF a[i].s = Center THEN var.adj := "c"
+			ELSIF a[i].s = Right THEN var.adj := "r"
+			END
+		END;
+		RETURN TRUE
+	END ValidateFormat;
+	
+	PROCEDURE GetFormat(f: LedaChar.Format; VAR M: LedaBox.AttributeMsg);
+	(* gets the attributes of format control f in the attribute message M *)
+		VAR v: LONGINT;	i, j: INTEGER;
+	BEGIN
+		M.name := Format; M.nbr := 39;
+		(*- style name -*)
+		NewLn(M.a[0], "name"); StrAt(M.a[1], f.name, Dyn);
+		(*- left margin -*)
+			IF f.var.lt < 0 THEN i := 0; v := 45 ELSE i := 1; v := f.var.lt DIV LedaBox.attrUnit END;
+			StrAt(M.a[4], UnAff, Stat); IntAt(M.a[5], v, Dyn);
+		NewLn(M.a[2], "left"); EnumAt(M.a[3], "-|-", i);
+		(*- right margin -*)
+			IF f.var.rt < 0 THEN i := 0; v := 45 ELSE i := 1; v := f.var.rt DIV LedaBox.attrUnit END;
+			StrAt(M.a[8], UnAff, Stat); IntAt(M.a[9], v, Dyn);
+		NewLn(M.a[6], "right"); EnumAt(M.a[7], "-|-", i);
+		(*- line space -*)
+			StrAt(M.a[12], UnAff, Stat); StrAt(M.a[13], Default, Stat);
+			StrAt(M.a[14], Wide, Stat); StrAt(M.a[15], Dense, Stat);
+			IF f.var.lsp > LedaSys.scnUnit THEN i := SHORT(f.var.lsp DIV LedaSys.scnUnit) ELSE i := 18 END;
+			IntAt(M.a[16], i, Dyn);
+			IF f.var.lsp > 2 THEN i := 4 ELSE i := SHORT(f.var.lsp) + 1 END;
+		NewLn(M.a[10], "lines"); EnumAt(M.a[11], "-|-|-|-|-", i);
+		(*- gap / extra space -*)
+			StrAt(M.a[19], No, Stat); StrAt(M.a[20], ToGrid, Stat);
+			StrAt(M.a[21], Half, Stat); StrAt(M.a[22], Third, Stat); StrAt(M.a[23], Quarter, Stat);
+			i := SHORT(f.var.gap MOD 100H);
+			IF i < 5 THEN j := 6 ELSE i := 5; j := SHORT(((f.var.gap DIV 10000H) * 1000) DIV LedaSys.scnUnit) END;
+			IntAt(M.a[24], j, Dyn);
+		NewLn(M.a[17], "gap"); EnumAt(M.a[18], "-|-|-|-|-|-", i);
+		(*- wrap column -*)
+			StrAt(M.a[27], No, Stat); StrAt(M.a[28], Yes, Stat); StrAt(M.a[29], Lines, Stat);
+			i := SHORT((f.var.gap DIV 100H) MOD 100H); IF i < 2 THEN j := 4 ELSE j := i; i := 2 END;
+			IntAt(M.a[30], j, Dyn);
+		NewLn(M.a[25], "wrap"); EnumAt(M.a[26], "-|-|--", i);
+		(*- format mode -*)
+			StrAt(M.a[33], UnAff, Stat); StrAt(M.a[34], Default, Stat); StrAt(M.a[35], Adjust, Stat);
+			StrAt(M.a[36], Left, Stat); StrAt(M.a[37], Center, Stat); StrAt(M.a[38], Right, Stat);
+			IF f.var.adj = "r" THEN i := 5 ELSIF f.var.adj = "c" THEN i := 4 ELSIF f.var.adj = "l" THEN i := 3
+				ELSIF f.var.adj = "a" THEN i := 2 ELSIF f.var.adj = "d" THEN i := 1 ELSE i := 0 END;
+		NewLn(M.a[31], "mode"); EnumAt(M.a[32], "-|-|-|-|-|-", i)
+	END GetFormat;
+	
+	PROCEDURE AdjustFormat(oF: LedaChar.Format; VAR name: LedaSys.Name; VAR var: LedaBase.FormatDsc;
+												  VAR ctrl: LedaBase.PieceCtrl; VAR id: INTEGER);
+	(* adjusts the the settings of old format control oF to name name and format var *)
+	(* returns in ctrl the new or changed control and changes the id if needed *)
+	BEGIN
+		ctrl := NIL;
+		IF (oF # NIL) & (oF.name = Anon) THEN	(* change or name anonymous style *)
+			(* oF may specify multiple LF's -> allocate new format control *)
+			LedaBase.CheckFormat(var); id := LedaBox.NewStyle;
+			ctrl := LedaChar.NewFormat(name); ctrl(LedaChar.Format).var := var; 
+		ELSIF (oF # NIL) & (oF.name # Anon) & (name = Anon) THEN
+			LedaBase.CheckFormat(var);
+			ctrl := LedaChar.NewFormat(name); ctrl(LedaChar.Format).var := var; 
+			id := LedaBox.NewStyle
+		ELSIF id = LedaBox.NewStyle THEN
+			LedaBase.CheckFormat(var);
+			ctrl := LedaChar.NewFormat(name); ctrl(LedaChar.Format).var := var
+		ELSIF (id = LedaBox.SetStyle) & (oF # NIL) THEN
+			oF.name := name;
+			IF (var.lsp # oF.var.lsp) OR (var.gap # oF.var.gap) OR (var.lt # oF.var.lt)
+						OR (var.rt # oF.var.rt) OR (var.adj # oF.var.adj) THEN	(* changed *)
+				ctrl := oF; oF.var := var; LedaBase.CheckControl(oF)
+			END
+		END
+	END AdjustFormat;
+	
+	PROCEDURE ChangeFormat(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* changes the format control according the attributes specified in the attribute message M *)
+	(* out: ctrl = NIL -> no change / ctrl # NIL -> new or changed control *)
+		VAR oF: LedaChar.Format;	var: LedaBase.FormatDsc;	name: LedaSys.Name;
+	BEGIN	(* M.name = Format *)
+		IF (ctrl # NIL) & (ctrl IS LedaChar.Format) THEN oF := ctrl(LedaChar.Format) ELSE oF := NIL END;
+		IF ((M.nbr = 7) OR (M.nbr = 8)) & ValidateFormat(name, var, M.a) THEN
+			AdjustFormat(oF, name, var, ctrl, M.id)
+		ELSE ctrl := NIL
+		END
+	END ChangeFormat;
+	
+	PROCEDURE FormatRuler(X, Y, W, colX, colW: LONGINT; f: LedaChar.Format;
+												VAR ctrl: LedaBase.PieceCtrl; VAR res: INTEGER);
+	(* shows a format ruler for editing; out: ctrl -> changed or new format control *)
+		VAR g: ARRAY 4 OF INTEGER;	nr: ARRAY 6 OF INTEGER;	pos: ARRAY 6 OF LONGINT;
+			lsp, lt, rt: LONGINT;	gap, gapVal, wrap: INTEGER;	var: LedaBase.FormatDsc;
+	BEGIN
+		LedaRuler.Define(f.name, FALSE, FALSE, -1, "WX");	(* left and right margin *)
+	(*- format mode: adjust/left/center/right/default -*)
+		LedaRuler.DefineGroup(TRUE, "efghd");
+		IF f.var.adj = "a" THEN g[0] := 0 ELSIF f.var.adj = "l" THEN g[0] := 1 ELSIF f.var.adj = "c" THEN g[0] := 2
+		ELSIF f.var.adj = "r" THEN g[0] := 3 ELSIF f.var.adj = "d" THEN g[0] := 4 ELSE g[0] := -1 END;
+	(*- line space: default/reduced/extended/special -*)
+		LedaRuler.DefineGroup(TRUE, "dbcs"); lsp := 18 * LedaSys.scnUnit;
+		IF f.var.lsp > 2 THEN g[1] := 3; lsp := f.var.lsp ELSIF f.var.lsp = 2 THEN g[1] := 1
+		ELSIF f.var.lsp = 1 THEN g[1] := 2 ELSIF f.var.lsp = 0 THEN g[1] := 0 ELSE g[1] := -1 END;
+	(*- gap: no/half/to grid/special -*)
+		LedaRuler.DefineGroup(FALSE, "ijks"); 
+		gap := SHORT(f.var.gap MOD 100H); gapVal := SHORT(6 * LedaSys.scnUnit DIV 1000);
+		IF gap > 2 THEN g[2] := 3; gapVal := SHORT(f.var.gap DIV 10000H)
+		ELSIF gap = 2 THEN g[2] := 1 ELSIF gap = 1 THEN g[2] := 2 ELSE g[2] := 0 END;
+	(*- wrap: no/yes/4 lines/special -*)
+		LedaRuler.DefineGroup(FALSE, "lmns");	(* wrap *)
+		wrap := SHORT((f.var.gap DIV 100H) MOD 100H);
+		IF wrap = 4 THEN g[3] := 2 ELSIF wrap = 1 THEN g[3] := 1; wrap := 4 
+		ELSIF wrap = 0 THEN g[3] := 0; wrap := 4 ELSE g[3] := 3 END;
+	(*- margins -*)
+		lt := X - colX; rt := lt + W;
+		nr[0] := 0; IF f.var.lt < 0 THEN pos[0] := lt ELSE pos[0] := f.var.lt END;
+		nr[1] := 1; IF f.var.rt < 0 THEN pos[1] := rt ELSE pos[1] := colW - f.var.rt END;
+		nr[2] := -2; pos[2] := lt; nr[3] := -2; pos[3] := rt;	(* margin marks *)
+		IF pos[0] # lt THEN nr[4] := -2; pos[4] := pos[0] ELSE nr[4] := -1; pos[4] := -1 END;
+		IF pos[1] # rt THEN nr[5] := -2; pos[5] := pos[1] ELSE nr[5] := -1; pos[5] := -1 END;
+	(*- display ruler -*)
+		LedaRuler.Track(colX, Y, colW, g, nr, pos);
+	(*- format mode -*)
+		IF g[0] = 0 THEN var.adj := "a" ELSIF g[0] = 1 THEN var.adj := "l" ELSIF g[0] = 2 THEN var.adj := "c"
+		ELSIF g[0] = 3 THEN var.adj := "r" ELSIF g[0] = 4 THEN var.adj := "d" ELSE var.adj := 0X END;
+	(*- line space -*)
+		IF g[1] = -1 THEN var.lsp := -1 ELSIF g[1] = 1 THEN var.lsp := 2 ELSIF g[1] = 2 THEN var.lsp := 1
+		ELSIF g[1] = 3 THEN var.lsp := lsp ELSE var.lsp := 0 END;
+	(*- gap -*)
+		IF g[2] = 3 THEN var.gap := 0FFH + 10000H * gapVal ELSIF g[2] = 2 THEN var.gap := 1
+		ELSIF g[2] = 1 THEN var.gap := 2 ELSE var.gap := 0 END;
+	(*- wrap -*)
+		IF g[3] = 3 THEN var.gap := var.gap + 100H * wrap ELSIF g[3] = 2 THEN var.gap := var.gap + 100H * 4
+		ELSIF g[3] = 1 THEN var.gap := var.gap + 100H ELSE (* no *) END;
+	(*- margins -*)
+		IF ABS(pos[0] - lt) > MinUnit THEN var.lt := pos[0] ELSE var.lt := -1 END;
+		IF ABS(pos[1] - rt) > MinUnit THEN var.rt := colW - pos[1] ELSE var.rt := -1 END;
+	(*- adjust settings -*)
+		res := LedaBox.SetStyle; AdjustFormat(f, f.name, var, ctrl, res)
+	END FormatRuler;
+
+(*--- tabulator control ---*)
+
+	PROCEDURE ValidateTab(VAR td: LedaChar.TabData; nbr: INTEGER; VAR a: LedaBox.Attributes): BOOLEAN;
+	(* scans the attributes a and sets the attributes of tab stops style t to it *)
+		VAR i, j: INTEGER;	pos: LONGINT;
+	BEGIN
+		IF a[0].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)	(* style name *)
+		LedaSys.CopyStr(a[0].s, td.name);
+		i := 0; j := 1;
+		WHILE (j < nbr) & (i < LedaChar.TabRange) DO
+			IF a[j].typ # LedaBox.Int THEN j := nbr
+			ELSE
+				pos := a[j].i; IF pos > 0 THEN pos := pos * LedaBox.attrUnit END;
+				td.pos[i] := pos; INC(j);
+				IF a[j].typ = LedaBox.Str THEN
+					IF a[j].s = Center THEN td.typ[i] := "C"
+					ELSIF a[j].s = Right THEN td.typ[i] := "R"
+					ELSE td.typ[i] := "L"
+					END;
+					INC(j)
+				ELSE td.typ[i] := "L"
+				END;
+				INC(i)
+			END
+		END;
+		WHILE i < LedaChar.TabRange DO td.pos[i] := -1; td.typ[i] := 0X; INC(i) END;
+		RETURN TRUE
+	END ValidateTab;
+	
+	PROCEDURE GetTab(tab: LedaChar.Tabulator; VAR M: LedaBox.AttributeMsg);
+	(* gets the attributes of tabulator control tab in the attribute message M *)
+		VAR td: LedaChar.TabData;	kind: LedaSys.Name;	pos: LONGINT;	i, j: INTEGER;	typ: CHAR;
+	BEGIN
+		M.name := Tab;
+		LedaChar.TabulatorData(-1, tab, td);	(* get tabulator data *)
+		NewLn(M.a[0], "name"); StrAt(M.a[1], td.name, Dyn);	(* style name *)
+		i := 0; j := 2;
+		WHILE (i < LedaChar.TabRange) & (td.pos[i] # -1) & (j + 3 < LedaBox.NumAttributes) DO
+			IF j = 2 THEN NewLn(M.a[j], "stops") ELSE NewLn(M.a[j], "") END; INC(j);
+			pos := td.pos[i]; IF pos > 0 THEN pos := pos DIV LedaBox.attrUnit END;
+			IntAt(M.a[j], pos, Dyn); INC(j);
+			typ := td.typ[i];
+			IF typ = "C" THEN kind := Center ELSIF typ = "R" THEN kind := Right ELSE kind := Left END;
+			StrAt(M.a[j], kind, Dyn); INC(j);
+			INC(i)
+		END;
+		M.nbr := j
+	END GetTab;
+	
+	PROCEDURE AdjustTab(tab: LedaChar.Tabulator; VAR ntd: LedaChar.TabData;
+									VAR ctrl: LedaBase.PieceCtrl; VAR id: INTEGER);
+	(* adjusts the the settings of tabulator control tab to tabulator data ntd *)
+	(* returns in ctrl the new or changed control and changes the id if needed *)
+		VAR td: LedaChar.TabData;	i: INTEGER;	changed: BOOLEAN;
+	BEGIN
+		ctrl := NIL;
+		IF tab # NIL THEN LedaChar.TabulatorData(-1, tab, td) END;	(* get original tabulator data *)
+		IF (tab # NIL) & (td.name = Anon) THEN 	(* change or name anonymous style *)
+			(* tab controls are unique -> one instance per character in text *)
+			i := 0; changed := FALSE; id :=  LedaBox.NewStyle;
+			WHILE ~ changed & (i < LedaChar.TabRange) DO
+				changed := (td.pos[i] # ntd.pos[i]) OR (td.typ[i] # ntd.typ[i]); INC(i)
+			END;
+			IF changed OR (td.name # ntd.name) THEN LedaChar.TabulatorData(1, tab, ntd) END;	(* set tabulator data *)
+			IF changed THEN ctrl := tab END
+		ELSIF (tab # NIL) & (td.name # Anon) & (ntd.name = Anon) THEN
+			tab := LedaChar.NewTabulator(NIL); id :=  LedaBox.NewStyle;
+			ctrl := tab; LedaChar.TabulatorData(1, tab, ntd)
+		ELSIF id = LedaBox.NewStyle THEN
+			tab := LedaChar.NewTabulator(NIL);
+			ctrl := tab; LedaChar.TabulatorData(1, tab, ntd)
+		ELSIF (id = LedaBox.SetStyle) & (tab # NIL) THEN
+			LedaChar.TabulatorData(-1, tab, td);	(* get original tabulator data *)
+			i := 0; changed := FALSE;
+			WHILE ~ changed & (i < LedaChar.TabRange) DO
+				changed := (td.pos[i] # ntd.pos[i]) OR (td.typ[i] # ntd.typ[i]); INC(i)
+			END;
+			IF changed OR (td.name # ntd.name) THEN LedaChar.TabulatorData(1, tab, ntd) END;	(* set tabulator data *)
+			IF changed THEN ctrl := tab END
+		END
+	END AdjustTab;
+
+	PROCEDURE ChangeTab(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* changes the tabulator control according the attributes specified in the attribute message M *)
+	(* out: ctrl = NIL -> no change / ctrl # NIL -> new or changed control *)
+		VAR td: LedaChar.TabData;	tab: LedaChar.Tabulator;
+	BEGIN
+		IF (ctrl # NIL) & (ctrl IS LedaChar.Tabulator) THEN tab := ctrl(LedaChar.Tabulator) ELSE tab := NIL END;
+		IF (M.nbr > 1) & ValidateTab(td, M.nbr, M.a) THEN AdjustTab(tab, td, ctrl, M.id)
+		ELSE ctrl := NIL
+		END
+	END ChangeTab;
+
+	PROCEDURE TabRuler(X, Y, W: LONGINT; tab: LedaChar.Tabulator;
+												VAR ctrl: LedaBase.PieceCtrl; VAR res: INTEGER);
+	(* shows a tabulator ruler for editing; out: ctrl -> changed or new control *)
+		CONST ColMiddle = -2;	ColRight = -3;
+		VAR td: LedaChar.TabData;	g: ARRAY 2 OF INTEGER;
+			nr: ARRAY LedaChar.TabRange OF INTEGER;	i: INTEGER;	colHalf: LONGINT;
+	BEGIN
+		colHalf := W DIV 2;	(* middle of column *)
+		LedaChar.TabulatorData(-1, tab, td);	(* get tabulator data *)
+		LedaRuler.Define(td.name, TRUE, TRUE, 0, "TUV");	(* stop patterns *)
+	(*- stops group -*)
+		LedaRuler.DefineGroup(FALSE, "opq"); g[0] := 0;
+	(*- new/change group -*)
+		LedaRuler.DefineGroup(FALSE, "SR"); g[1] := 0;
+	(*- stops -*)
+		i := 0;
+		WHILE (i < LedaChar.TabRange) & (td.pos[i] # -1) DO	(* td.pos is sorted *)
+			IF td.pos[i] = ColMiddle THEN td.pos[i] := colHalf ELSIF td.pos[i] = ColRight THEN td.pos[i] := W END;
+			IF td.typ[i] = "C" THEN nr[i] := 1 ELSIF td.typ[i] = "R" THEN nr[i] := 2 ELSE nr[i] := 0 END;
+			INC(i)
+		END;
+		IF i < LedaChar.TabRange THEN nr[i] := -2; td.pos[i] := colHalf; INC(i) END;	(* mark middle *)
+		WHILE i < LedaChar.TabRange DO nr[i] := -1; INC(i) END;
+	(*- display ruler -*)
+		LedaRuler.Track(X, Y, W, g, nr, td.pos);
+	(*- new/change group -*)
+		IF g[1] = 1 THEN res := LedaBox.NewStyle; td.name := Anon	(* new anonymous style *)
+		ELSE res := LedaBox.SetStyle
+		END;
+	(*- stops -*)
+		i := 0;
+		WHILE (i < LedaChar.TabRange) & (nr[i] # -1) DO	(* td.pos is sorted *)
+			IF ABS(td.pos[i] - colHalf) <= MinUnit THEN td.pos[i] := ColMiddle
+			ELSIF ABS(td.pos[i] - W) <= MinUnit THEN td.pos[i] := ColRight
+			END;
+			IF nr[i] = 1 THEN td.typ[i] := "C" ELSIF nr[i] = 2 THEN td.typ[i] := "R" ELSE td.typ[i] := "L" END;
+			INC(i)
+		END;
+		WHILE i < LedaChar.TabRange DO td.pos[i] := -1; td.typ[i] := 0X; INC(i) END;
+	(*- adjust settings -*)
+		AdjustTab(tab, td, ctrl, res)
+	END TabRuler;
+	
+(*--- inset control ---*)
+
+	PROCEDURE ValidateInset(VAR id: LedaChar.InsData; VAR a: LedaBox.Attributes): BOOLEAN;
+	(* scans the attributes a and sets the attributes of inset specification id to it *)
+	BEGIN
+		IF a[0].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)	(* style name *)
+		LedaSys.CopyStr(a[0].s, id.name);
+		IF a[1].typ # LedaBox.Int THEN RETURN FALSE END;	(*###*)	(* margin *)
+		id.margin := a[1].i * LedaBox.attrUnit;
+		RETURN TRUE
+	END ValidateInset;
+	
+	PROCEDURE GetInset(ins: LedaChar.Inset; VAR M: LedaBox.AttributeMsg);
+	(* gets the attributes of inset control i in the attribute message M *)
+		VAR id: LedaChar.InsData;
+	BEGIN
+		M.name := Inset; M.nbr := 4;
+		LedaChar.InsetData(-1, ins, id);	(* get inset data *)
+		NewLn(M.a[0], "name"); StrAt(M.a[1], id.name, Dyn);	(* inset name *)
+		NewLn(M.a[2], "margin"); IntAt(M.a[3], id.margin DIV LedaBox.attrUnit, Dyn);	(* margin *)
+	END GetInset;
+	
+	PROCEDURE AdjustInset(ins: LedaChar.Inset; VAR nid: LedaChar.InsData;
+									VAR ctrl: LedaBase.PieceCtrl; VAR iD: INTEGER);
+	(* adjusts the the settings of inset control ins to inset data nid *)
+		VAR id: LedaChar.InsData;
+	BEGIN
+		ctrl := NIL;
+		IF ins # NIL THEN LedaChar.InsetData(-1, ins, id) END;	(* get original inset data *)
+		IF (ins # NIL) & (id.name = Anon) THEN	(* change or name anonymous style *)
+			(* ins controls are unique -> one instance per character in text *)
+			IF (id.margin # nid.margin) OR (id.name # nid.name) THEN LedaChar.InsetData(1, ins, nid) END;	(* set data *)
+			IF id.margin # nid.margin THEN ctrl := ins END;
+			iD := LedaBox.NewStyle
+		ELSIF (ins # NIL) & (id.name # Anon) & (nid.name = Anon) THEN
+			ins := LedaChar.NewInset(NIL); LedaChar.InsetData(1, ins, nid);	(* set inset data *)
+			ctrl := ins; iD := LedaBox.NewStyle
+		ELSIF  iD = LedaBox.NewStyle THEN
+			ins := LedaChar.NewInset(NIL);
+			ctrl := ins; LedaChar.InsetData(1, ins, nid)	(* set inset data *)
+		ELSIF (iD = LedaBox.SetStyle) & (ins # NIL) THEN
+			IF (id.margin # nid.margin) OR (id.name # nid.name) THEN LedaChar.InsetData(1, ins, nid) END;	(* set data *)
+			IF id.margin # nid.margin THEN ctrl := ins END
+		END
+	END AdjustInset;
+
+	PROCEDURE ChangeInset(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* changes the inset control according the attributes specified in the attribute message M *)
+	(* out: ctrl = NIL -> no change / ctrl # NIL -> new or changed control *)
+		VAR id: LedaChar.InsData;	ins: LedaChar.Inset;
+	BEGIN
+		IF (ctrl # NIL) & (ctrl IS LedaChar.Inset) THEN ins := ctrl(LedaChar.Inset) ELSE ins := NIL END;
+		IF (M.nbr = 2) & ValidateInset(id, M.a) THEN AdjustInset(ins, id, ctrl, M.id)
+		ELSE ctrl := NIL
+		END
+	END ChangeInset;
+	
+	PROCEDURE InsetRuler(X, Y, W, colX, colW: LONGINT; ins: LedaChar.Inset;
+												VAR ctrl: LedaBase.PieceCtrl; ch: CHAR; VAR res: INTEGER);
+	(* shows a inset ruler for editing; out: ctrl -> changed or new control *)
+		CONST EnlIns = 05X;  (* CTRL - E [enlarge] *)
+		VAR id: LedaChar.InsData;	lt: LONGINT;	g: ARRAY 1 OF INTEGER;
+			nr: ARRAY 4 OF INTEGER;	pos: ARRAY 4 OF LONGINT;
+	BEGIN
+		LedaChar.InsetData(-1, ins, id);	(* get inset data *)
+		LedaRuler.Define(id.name, FALSE, FALSE, -1,  "WX");	(* left and right margin *)
+	(*- new/change group -*)
+		LedaRuler.DefineGroup(FALSE, "SR"); g[0] := 0;
+	(*- margin -*)
+		lt := X - colX; 
+		IF (ch = EnlIns) & (lt - id.margin >= 0) THEN
+			nr[0] := 0; pos[0] := lt - id.margin; nr[1] := 1; pos[1] := lt
+		ELSE nr[0] := 0; pos[0] := lt; nr[1] := 1; pos[1] := lt + id.margin
+		END;
+		nr[2] := -2; pos[2] := pos[0]; nr[3] := -2; pos[3] := pos[1];	(* margin marks *)
+	(*- display ruler -*)
+		LedaRuler.Track(colX, Y, colW, g, nr, pos);
+	(*- new/change group -*)
+		IF g[0] = 1 THEN res := LedaBox.NewStyle; id.name := Anon	(* new anonymous style *)
+		ELSE res := LedaBox.SetStyle
+		END;
+	(*- margin -*)
+		IF pos[1] > pos[0] THEN id.margin := pos[1] - pos[0] END;
+	(*- adjust settings -*)
+		AdjustInset(ins, id, ctrl, res)
+	END InsetRuler;
+
+(*--- line styles ---*)
+
+	PROCEDURE ValidateLine(VAR ld: LedaChar.LinDat; VAR a: LedaBox.Attributes): BOOLEAN;
+	(* scans the attributes a and sets the attributes of line control l to it *)
+	BEGIN
+		IF a[0].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)			(* style name *)
+		LedaSys.CopyStr(a[0].s, ld.name);
+		IF (a[1].typ = LedaBox.Str) & (a[1].s = Column) THEN ld.width := 0		(* width *)
+		ELSIF a[1].typ = LedaBox.Int THEN ld.width := a[1].i * LedaBox.attrUnit
+		ELSE RETURN FALSE	(*###*)
+		END;
+		IF (a[2].typ = LedaBox.Int) & (a[3].typ = LedaBox.Str) THEN ld.thick := a[2].i;	(* thickness *)
+			IF a[3].s = Printer THEN ld.thick := ld.thick * LedaChar.MinThick
+			ELSIF a[3].s = Screen THEN ld.thick := ld.thick * LedaSys.scnUnit
+			ELSIF a[3].s = Unit THEN ld.thick := ld.thick * LedaBox.attrUnit
+			ELSE RETURN FALSE	(*###*)
+			END
+		ELSE RETURN FALSE	(*###*)
+		END;
+		IF (a[4].typ = LedaBox.Int) & (a[5].typ = LedaBox.Str) THEN ld.dy := a[4].i;	(* offset *)
+			IF a[5].s = Printer THEN ld.dy := ld.dy * LedaChar.MinThick
+			ELSIF a[5].s = Screen THEN ld.dy := ld.dy * LedaSys.scnUnit
+			ELSIF a[5].s = Unit THEN ld.dy := ld.dy * LedaBox.attrUnit
+			ELSE RETURN FALSE	(*###*)
+			END
+		ELSE RETURN FALSE	(*###*)
+		END;
+		IF a[6].typ # LedaBox.Int THEN RETURN FALSE END;	(*###*)
+		ld.clr := SHORT(a[6].i);
+		RETURN TRUE
+	END ValidateLine;
+	
+	PROCEDURE GetLine(line: LedaChar.Line; VAR M: LedaBox.AttributeMsg);
+	(* gets the attributes of line control l in the attribute message M *)
+		VAR ld: LedaChar.LinDat;	v: LONGINT;	i: INTEGER;
+	BEGIN
+		M.name := Line; M.nbr := 20;
+		LedaChar.LineData(-1, line, ld);
+		NewLn(M.a[0], "name"); StrAt(M.a[1], ld.name, Dyn);
+			StrAt(M.a[4], Column, Stat);
+			IF ld.width > 0 THEN v := ld.width DIV LedaBox.attrUnit; i := 1
+			ELSE v := 100; i := 0
+			END;
+			IntAt(M.a[5], v, Dyn);
+		NewLn(M.a[2], "width"); EnumAt(M.a[3], "-|-", i);
+			IF ld.thick MOD LedaChar.MinThick = 0 THEN i := 2; v := ld.thick DIV LedaChar.MinThick
+			ELSIF ld.thick MOD LedaSys.scnUnit = 0 THEN i := 1; v := ld.thick DIV LedaSys.scnUnit
+			ELSE i := 0; v := ld.thick DIV LedaBox.attrUnit
+			END;
+			StrAt(M.a[9], Unit, Stat); StrAt(M.a[10], Screen, Stat); StrAt(M.a[11], Printer, Stat);
+		NewLn(M.a[6], "thickness"); IntAt(M.a[7], v, Dyn); EnumAt(M.a[8], "-|-|-", i);
+			IF ld.dy = 0 THEN v := 0; i := 0
+			ELSIF ld.dy MOD LedaChar.MinThick = 0 THEN i := 2; v := ld.dy DIV LedaChar.MinThick
+			ELSIF ld.dy MOD LedaSys.scnUnit = 0 THEN i := 1; v := ld.dy DIV LedaSys.scnUnit
+			ELSE i := 0; v := ld.dy DIV LedaBox.attrUnit
+			END;
+			StrAt(M.a[15], Unit, Stat); StrAt(M.a[16], Screen, Stat); StrAt(M.a[17], Printer, Stat);
+		NewLn(M.a[12], "offset"); IntAt(M.a[13], v, Dyn); EnumAt(M.a[14], "-|-|-", i);
+		NewLn(M.a[18], "color"); IntAt(M.a[19], ld.clr, Dyn); M.a[19].s := Color	(* color *)
+	END GetLine;
+	
+	PROCEDURE AdjustLine(line: LedaChar.Line; VAR ld: LedaChar.LinDat;
+									VAR ctrl: LedaBase.PieceCtrl; VAR id: INTEGER);
+	(* adjusts the the settings of line control line to line data ld *)
+	(* returns in ctrl the new or changed control and changes the id if needed *)
+		VAR od: LedaChar.LinDat;
+	BEGIN
+		ctrl := NIL;
+		IF line # NIL THEN LedaChar.LineData(-1, line, od) END;	(* gelt original line data *)
+		IF (line # NIL) & (od.name = Anon) THEN	(* change or name anonymous style *)
+			(* line controls are unique -> one instance per character in text *)
+			IF (od.width # ld.width) OR (od.thick # ld.thick)
+				OR (od.dy # ld.dy) OR (od.clr # ld.clr) OR (od.name # ld.name) THEN LedaChar.LineData(1, line, ld) END;
+			IF (od.width # ld.width) OR (od.thick # ld.thick) OR (od.dy # ld.dy) OR (od.clr # ld.clr) THEN ctrl := line END;
+			id := LedaBox.NewStyle
+		ELSIF (line # NIL) & (od.name # Anon) & (ld.name = Anon) THEN
+			line := LedaChar.NewLine(NIL); LedaChar.LineData(1, line, ld);	(* set line data *)
+			ctrl := line; id := LedaBox.NewStyle
+		ELSIF id = LedaBox.NewStyle THEN
+			line := LedaChar.NewLine(NIL);
+			ctrl := line; LedaChar.LineData(1, line, ld)	(* set line data *)
+		ELSIF (id = LedaBox.SetStyle) & (line # NIL) THEN
+			IF (od.width # ld.width) OR (od.thick # ld.thick)
+				OR (od.dy # ld.dy) OR (od.clr # ld.clr) OR (od.name # ld.name) THEN LedaChar.LineData(1, line, ld) END;
+			IF (od.width # ld.width) OR (od.thick # ld.thick) OR (od.dy # ld.dy) OR (od.clr # ld.clr) THEN ctrl := line END 
+		END
+	END AdjustLine;
+
+	PROCEDURE ChangeLine(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* changes the line control according the attributes specified in the attribute message M *)
+	(* out: ctrl = NIL -> no change / ctrl # NIL -> new or changed control *)
+		VAR ld: LedaChar.LinDat;	line: LedaChar.Line;
+	BEGIN	(* M.name = Line *)
+		IF (ctrl # NIL) & (ctrl IS LedaChar.Line) THEN line := ctrl(LedaChar.Line) ELSE line := NIL END;
+		IF (M.nbr = 7) & ValidateLine(ld, M.a) THEN AdjustLine(line, ld, ctrl, M.id)
+		ELSE ctrl := NIL
+		END
+	END ChangeLine;
+
+	PROCEDURE LineRuler(X, Y, W, colW, cX: LONGINT; line: LedaChar.Line; 
+												VAR ctrl: LedaBase.PieceCtrl; VAR res: INTEGER);
+	(* shows a line ruler for editing; out: ctrl -> changed or new control *)
+		VAR ld: LedaChar.LinDat;	thick, off1, off2, off3, fSize: LONGINT;
+			g: ARRAY 3 OF INTEGER;	nr: ARRAY 4 OF INTEGER;	pos: ARRAY 4 OF LONGINT;
+	BEGIN
+		LedaChar.LineData(-1, line, ld);	(* get line data *)
+		LedaRuler.Define(ld.name, FALSE, FALSE, -1,  "WX");	(* left and right margin *)
+	(*- thickness: 2 printer/1 screen/2 screen/special -*)
+		LedaRuler.DefineGroup(FALSE, "wxys"); thick := 4 * LedaSys.scnUnit;
+		IF ld.thick = 2 * LedaChar.MinThick THEN g[0] := 0
+		ELSIF ld.thick = LedaSys.scnUnit THEN g[0] := 1
+		ELSIF ld.thick = 2 * LedaSys.scnUnit THEN g[0] := 2
+		ELSE g[0] := 3; thick := ld.thick
+		END;
+	(*- offset: 0/sub/super/special -*)
+		LedaRuler.DefineGroup(FALSE, "tuvs"); off3 := 35 * LedaBase.MM DIV 10;
+		fSize := (colW DIV LedaBase.MM) DIV 10; IF fSize < 8 THEN fSize := 8 END;
+		off1 := ((fSize*LedaSys.scnUnit DIV 5) DIV LedaChar.MinThick) * LedaChar.MinThick;
+		off2 := ((fSize*LedaSys.scnUnit DIV 2) DIV LedaChar.MinThick) * LedaChar.MinThick;
+		IF ld.dy = 0 THEN g[1] := 0
+		ELSIF ABS(off1 + ld.dy) <= MinUnit THEN g[1] := 1; off1 := -ld.dy
+		ELSIF ABS(off2 - ld.dy) <= MinUnit THEN g[1] := 2; off2 := ld.dy
+		ELSE g[1] := 3; off3 := ld.dy
+		END;
+	(*- new/change group -*)
+		IF ld.name # Anon THEN LedaRuler.DefineGroup(FALSE, "SR"); g[2] := 0 ELSE g[2] := -1 END;
+	(*- width -*)
+		nr[0] := 0; pos[0] := cX; nr[1] := 1; pos[1] := cX + ld.width;
+		nr[2] := -2; pos[2] := cX; nr[3] := -2; pos[3] := cX + ld.width;	(* marks *)
+	(*- display ruler -*)
+		LedaRuler.Track(X, Y, W, g, nr, pos);
+	(*- thickness -*)
+		IF g[0] = 0 THEN ld.thick := 2 * LedaChar.MinThick ELSIF g[0] = 1 THEN ld.thick := LedaSys.scnUnit
+		ELSIF g[0] = 2 THEN ld.thick := 2 * LedaSys.scnUnit ELSE ld.thick := thick END;
+	(*- offset -*)
+		IF g[1] = 3 THEN ld.dy := off3 ELSIF g[1] = 2 THEN ld.dy := off2
+		ELSIF g[1] = 1 THEN ld.dy := -off1 ELSE ld.dy := 0 END;
+	(*- new/change -*)
+		IF g[2] = 1 THEN res := LedaBox.NewStyle; ld.name := Anon	(* no name *)
+		ELSE res := LedaBox.SetStyle
+		END;
+	(*- width -*)
+		IF pos[1] > pos[0] THEN ld.width := pos[1] - pos[0] END;
+	(*- adjust settings -*)
+		AdjustLine(line, ld, ctrl, res)
+	END LineRuler;			
+
+(*--- filler control ---*)
+
+	PROCEDURE GetFiller(fil: LedaChar.Filler; VAR M: LedaBox.AttributeMsg);
+	(* gets the attributes of filler control fil in the attribute message M *)
+	BEGIN
+		M.name := Filler; M.nbr := 3;
+		NewLn(M.a[0], "scale"); IntAt(M.a[1], fil.scale, Dyn); StrAt(M.a[2], " % ", Stat)
+	END GetFiller;
+	
+	PROCEDURE ChangeFiller(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* changes the filler control according the attributes specified in the attribute message M *)
+	(* out: ctrl = NIL -> no change / ctrl # NIL -> new or changed control *)
+		VAR fil: LedaChar.Filler;	scale: INTEGER;
+	BEGIN
+		IF (ctrl # NIL) & (ctrl IS LedaChar.Filler) THEN fil := ctrl(LedaChar.Filler) ELSE fil := NIL END;
+		ctrl := NIL;
+		IF (M.nbr >= 1) & (M.a[0].typ = LedaBox.Int) THEN
+			scale := SHORT(M.a[0].i);
+			IF fil = NIL THEN fil := LedaChar.NewFiller(NIL); fil.scale := scale; ctrl := fil
+			ELSIF fil.scale # scale THEN fil.scale := scale; LedaBase.CheckControl(fil); ctrl := fil
+			END
+		END
+	END ChangeFiller;		
+
+(*--- wrap control ---*)
+
+	PROCEDURE *WrapEnumAll(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN
+		RETURN (ctrl # NIL) & (ctrl IS LedaChar.Wrap) & (ctrl(LedaChar.Wrap).name # Anon)
+	END WrapEnumAll;
+
+	PROCEDURE GetWrap(wp: LedaChar.Wrap; VAR M: LedaBox.AttributeMsg);
+	(* gets the attributes of wrap control wp in the attribute message M *)
+		VAR v: LONGINT;	i: INTEGER;
+	BEGIN
+		M.name := Wrap; M.nbr := 7;
+		NewLn(M.a[0], "name"); StrAt(M.a[1], wp.name, Dyn);
+			IF wp.wrap = 1 THEN i := 0; v := 2 ELSE i := 1; v := wp.wrap END;
+			StrAt(M.a[4], "after", Stat); IntAt(M.a[5], v, Dyn); StrAt(M.a[6], "lines", Stat);
+		NewLn(M.a[2], "break"); EnumAt(M.a[3], "-|--", i);
+	END GetWrap;
+
+	PROCEDURE AdjustWrap(oW: LedaChar.Wrap; VAR name: LedaSys.Name; wrap: LONGINT;
+												VAR ctrl: LedaBase.PieceCtrl; VAR id: INTEGER);
+	(* adjusts the the settings of old wrap control oW to name name and format wrap *)
+	(* returns in ctrl the new or changed control and changes the id if needed *)
+	BEGIN
+		ctrl := NIL;
+		IF (oW # NIL) & (oW.name = Anon) THEN	(* change or name anonymous style *)
+			(* oW may specify multiple characters -> allocate new wrap control *)
+			ctrl := LedaChar.NewWrap(name); ctrl(LedaChar.Wrap).wrap := wrap;
+			LedaBase.CheckControl(ctrl); id := LedaBox.NewStyle
+		ELSIF (oW # NIL) & (oW.name # Anon) & (name = Anon) THEN
+			ctrl := LedaChar.NewWrap(name); ctrl(LedaChar.Wrap).wrap := wrap;
+			LedaBase.CheckControl(ctrl); id := LedaBox.NewStyle
+		ELSIF id = LedaBox.NewStyle THEN
+			ctrl := LedaChar.NewWrap(name); ctrl(LedaChar.Wrap).wrap := wrap;
+			LedaBase.CheckControl(ctrl)
+		ELSIF (id = LedaBox.SetStyle) & (oW # NIL) THEN
+			oW.name :=  name;
+			IF oW.wrap # wrap THEN ctrl := oW; oW.wrap := wrap; LedaBase.CheckControl(oW) END
+		END
+	END AdjustWrap;
+
+	PROCEDURE ChangeWrap(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* changes the wrap control according the attributes specified in the attribute message M *)
+	(* out: ctrl = NIL -> no change / ctrl # NIL -> new or changed control *)
+		VAR oW: LedaChar.Wrap;	name: LedaSys.Name;
+	BEGIN
+		IF (ctrl # NIL) & (ctrl IS LedaChar.Wrap) THEN oW := ctrl(LedaChar.Wrap) ELSE oW := NIL END;
+		ctrl := NIL;
+		IF (M.nbr >= 2) & (M.a[0].typ = LedaBox.Str) THEN
+			LedaSys.CopyStr(M.a[0].s, name);
+			IF M.a[1].typ = LedaBox.Int THEN AdjustWrap(oW, name, M.a[1].i, ctrl, M.id)
+			ELSIF (M.a[1].typ = LedaBox.Str) & (M.a[1].s = "after") THEN AdjustWrap(oW, name, 1, ctrl, M.id)
+			END
+		END
+	END ChangeWrap;	
+	
+(*--- attributes ---*)
+	
+	PROCEDURE GetValue*(text: LedaCtrl.Text; ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(** handles the attribute message with M.id = LedaBox.GetValue *)
+	(** in: ctrl -> selected control *)
+		VAR enum: LedaCtrl.CheckProc;	seq: LedaCtrl.Sequence;	ld: LedaChar.LinDat;
+	BEGIN	(* M.id = LedaBox.GetValue *)
+		IF ctrl = NIL THEN RETURN END;	(*###*)
+		IF ctrl IS LedaBase.Style THEN enum := StyleEnumAll; M.name := Char
+		ELSIF ctrl IS LedaChar.Format THEN enum := FormatEnumAll; M.name := Format
+		ELSIF ctrl IS LedaChar.Tabulator THEN enum := LedaChar.TabEnumAll; M.name := Tab
+		ELSIF ctrl IS LedaChar.Inset THEN enum := LedaChar.InsetEnumAll; M.name := Inset
+		ELSIF ctrl IS LedaChar.Line THEN enum := LedaChar.LineEnumAll; M.name := Line
+		ELSIF ctrl IS LedaChar.Filler THEN GetFiller(ctrl(LedaChar.Filler), M); RETURN	(*###*)
+		ELSIF ctrl IS LedaChar.Wrap THEN enum := WrapEnumAll; M.name := Wrap
+		ELSE enum := NIL
+		END;
+		IF enum = NIL THEN
+			LedaCtrl.notedText := text; ctrl.doOp(ctrl, M); LedaCtrl.notedText := NIL
+		ELSE
+			LedaCtrl.TextBuildSeq(text, enum, seq);	(* get control sequence *)
+			NewLn(M.a[0], ""); M.nbr := 1; LedaBox.EnumerateCtrls(seq, ctrl, M)
+		END
+	END GetValue;
+	
+	PROCEDURE GetStyle*(ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(** handles the attribute message with M.id = LedaBox.GetStyle *)
+	(** in: ctrl -> selected control *)
+	BEGIN	(* M.id = LedaBox.GetStyle *)
+		IF ctrl = NIL THEN RETURN END;	(*###*)
+		IF ctrl IS LedaBase.Style THEN StyleGet(ctrl(LedaBase.Style), M)
+		ELSIF ctrl IS LedaChar.Format THEN GetFormat(ctrl(LedaChar.Format), M)
+		ELSIF ctrl IS LedaChar.Tabulator THEN GetTab(ctrl(LedaChar.Tabulator), M)
+		ELSIF ctrl IS LedaChar.Inset THEN GetInset(ctrl(LedaChar.Inset), M)
+		ELSIF ctrl IS LedaChar.Line THEN GetLine(ctrl(LedaChar.Line), M)
+		ELSIF ctrl IS LedaChar.Filler THEN GetFiller(ctrl(LedaChar.Filler), M)
+		ELSIF ctrl IS LedaChar.Wrap THEN GetWrap(ctrl(LedaChar.Wrap), M)
+		ELSE LedaCtrl.notedText := NIL; ctrl.doOp(ctrl, M)
+		END
+	END GetStyle;
+	
+	PROCEDURE SetValue*(text: LedaCtrl.Text; VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(** handles the attribute message with M.id = LedaBox.SetValue *)
+	(** in: ctrl -> selected control *)
+	(** out: ctrl # NIL -> control specified by message M / ctrl = NIL -> invalid specification *)
+	(** note: M.id may change in this procedure *)
+		VAR enum: LedaCtrl.CheckProc;	seq: LedaCtrl.Sequence;	cnt: LedaBase.Control;
+			setHandle: LedaBox.AttrMsgProc;
+	BEGIN	(* M.id = LedaBox.SetValue *)
+		(* M.name: attribute name, control typ to search for *)
+		IF M.name = Char THEN enum := StyleEnumAll
+		ELSIF M.name = Format THEN
+			IF M.nbr = 1 THEN enum := FormatEnumAll
+			ELSE M.id := LedaBox.SetStyle; ChangeFormat(ctrl, M); RETURN	(*###*)
+			END
+		ELSIF M.name = Tab THEN enum := LedaChar.TabEnumAll
+		ELSIF M.name = Inset THEN enum := LedaChar.InsetEnumAll
+		ELSIF M.name = Line THEN
+			IF M.nbr = 1 THEN enum := LedaChar.LineEnumAll
+			ELSE M.id := LedaBox.SetStyle; ChangeLine(ctrl, M); RETURN	(*###*)
+			END
+		ELSIF M.name = Filler THEN ChangeFiller(ctrl, M); RETURN	(*###*)
+		ELSIF M.name = Wrap THEN
+			IF M.nbr = 1 THEN enum := WrapEnumAll
+			ELSE M.id := LedaBox.SetStyle; ChangeWrap(ctrl, M); RETURN	(*###*)
+			END
+		ELSE enum := NIL
+		END;
+		IF enum = NIL THEN
+			LedaBox.GetAttrHandle(M.name, setHandle);
+			IF setHandle = NIL THEN ctrl := NIL
+			ELSE LedaCtrl.notedText := text; setHandle(ctrl, M); LedaCtrl.notedText := NIL
+			END
+		ELSIF M.a[0].typ = LedaBox.Str THEN
+			LedaCtrl.TextBuildSeq(text, enum, seq);	(* get control sequence *)
+			LedaBox.GetNamedCtrl(seq, M.a[0].s, cnt);
+			IF (cnt # NIL) & (cnt IS LedaBase.PieceCtrl) THEN ctrl := cnt(LedaBase.PieceCtrl) ELSE ctrl := NIL END
+		ELSE ctrl := NIL
+		END
+	END SetValue;
+	
+	PROCEDURE SetStyle*(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(** handles the attribute message with M.id = LedaBox.SetStyle or LedaBox.NewStyle *)
+	(** in:  ctrl -> selected control *)
+	(** out: ctrl # NIL -> control specified by message M [new or changed] *)
+	(**		 ctrl = NIL -> no change or invalid specification *)
+	(** note: M.id may change in this procedure *)
+		VAR setHandler: LedaBox.AttrMsgProc;
+	BEGIN	(* M.id = LedaBox.SetStyle or LedaBox.NewStyle *)
+		IF M.name = Char THEN ChangeStyle(ctrl, M)
+		ELSIF M.name = Format THEN ChangeFormat(ctrl, M)
+		ELSIF M.name = Tab THEN ChangeTab(ctrl, M)
+		ELSIF M.name = Inset THEN ChangeInset(ctrl, M)
+		ELSIF M.name = Line THEN ChangeLine(ctrl, M)
+		ELSIF M.name = Filler THEN ChangeFiller(ctrl, M)
+		ELSIF M.name = Wrap THEN ChangeWrap(ctrl, M)
+		ELSE
+			LedaBox.GetAttrHandle(M.name, setHandler);
+			IF setHandler = NIL THEN ctrl := NIL
+			ELSE LedaCtrl.notedText := NIL; setHandler(ctrl, M)
+			END
+		END
+	END SetStyle;
+	
+	PROCEDURE ShowRuler*(X, Y, W, colX, colW, cX: LONGINT; text: LedaCtrl.Text;
+										VAR ctrl: LedaBase.PieceCtrl; ch: CHAR; VAR res: INTEGER);
+	(** shows a ruler displaying the attributes of control ctrl allowing to edit them *)
+	(** in:  X, Y, W -> coordinate [absolute] and size of current block *)
+	(** 	 colX, colW -> column size of block [coordinate is absolute] *)
+	(** 	 cX -> relative coordinate of control in block *)
+	(** 	 ctrl, ch -> selected control and character *)
+	(** out: res -> result code [LedaBox.SetStyle/LedaBox.NewStyle] *)
+	(**		ctrl -> control specified by ruler [new or changed] *)
+	BEGIN
+		IF ctrl = NIL THEN RETURN END;	(*###*)
+		res := -1;
+		IF ctrl IS LedaChar.Format THEN FormatRuler(X, Y, W, colX, colW, ctrl(LedaChar.Format), ctrl, res)
+		ELSIF ctrl IS LedaChar.Tabulator THEN TabRuler(X, Y, W, ctrl(LedaChar.Tabulator), ctrl, res)
+		ELSIF ctrl IS LedaChar.Inset THEN InsetRuler(X, Y, W, colX, colW, ctrl(LedaChar.Inset), ctrl, ch, res)
+		ELSIF ctrl IS LedaChar.Line THEN LineRuler(X, Y, W, colW, cX, ctrl(LedaChar.Line), ctrl, res)
+		END;
+	END ShowRuler;
+	
+(*--- format base ---*)
+
+	PROCEDURE NewSequence(ctrl: LedaBase.Control; next: LedaCtrl.Sequence): LedaCtrl.Sequence;
+		VAR seq: LedaCtrl.Sequence;
+	BEGIN
+		NEW(seq); seq.ctrl := ctrl; seq.next := next; RETURN seq
+	END NewSequence;
+	
+	PROCEDURE GetFormSeq(doc: LedaBase.Box; VAR seq: LedaCtrl.Sequence);
+		VAR ctrl: LedaBase.Control;	m: LedaBox.Msg;
+	BEGIN
+	(*- get format bases -*)
+		m.id := LedaBox.FormId; m.op := 1; m.ctrl := NIL;	(* get named, unstamped format bases; linked with link field *)
+		LedaBase.NewStamp; LedaBase.LockStamp(1);	(* set new stamp and lock it *)
+		LedaBox.Broadcast(doc, {}, m);
+		LedaBase.LockStamp(-1);	(* unlock stamp *)
+	(*- build sequence of format bases -*)
+		ctrl := m.ctrl; seq := NIL; 
+		WHILE m.ctrl # NIL DO
+			ctrl := m.ctrl; m.ctrl := ctrl.link; ctrl.link := NIL;
+			IF ctrl IS LedaBase.FormBase THEN seq := NewSequence(ctrl, seq) END
+		END
+	END GetFormSeq;
+
+	PROCEDURE LocateChar(chars: ARRAY OF CHAR; ch: CHAR; def: INTEGER; VAR i: INTEGER);
+	BEGIN
+		i := 0; WHILE (chars[i] # 0X) & (ch # chars[i]) DO INC(i) END;
+		IF chars[i] = 0X THEN i := def END
+	END LocateChar;
+
+	PROCEDURE FormValidate(VAR name: LedaSys.Name; VAR bd: LedaBase.BaseData; VAR a: LedaBox.Attributes): BOOLEAN;
+	(* scans the attributes a and sets the name name and the format base bd to it *)
+		VAR 
+	BEGIN
+		(*- style name -*)
+			IF a[0].typ # LedaBox.Str THEN RETURN FALSE END;	(*###*)
+			LedaSys.CopyStr(a[0].s, name);
+		(*- line space -*)
+			IF (a[1].typ = LedaBox.Str) & (a[1].s = Default) THEN bd.sLsp := "d"
+			ELSIF a[1].typ = LedaBox.Int THEN bd.sLsp := "o"; bd.lsp := a[1].i * LedaSys.scnUnit
+			ELSE RETURN FALSE	(*###*)
+			END;
+		(*- format mode -*)
+			IF (a[2].typ = LedaBox.Str) & LedaSys.EqualCh("dlcra", a[2].s[0]) THEN
+				bd.sAdj := a[2].s[0]; IF bd.sAdj = "d" THEN bd.adj := "a" ELSE bd.adj := bd.sAdj END
+			ELSE RETURN FALSE	(*###*)
+			END;
+		(*- columns -*)
+			IF a[3].typ = LedaBox.Str THEN
+				IF a[3].s = Default THEN bd.sCols := "d"; bd.cols := "1"
+				ELSIF a[3].s = Marginal THEN bd.sCols := "m"; bd.cols := "m"
+				ELSE RETURN FALSE	(*###*)
+				END
+			ELSIF a[3].typ = LedaBox.Int THEN bd.sCols := CHR(ORD("0") + a[3].i); bd.cols := bd.sCols
+			ELSE RETURN FALSE	(*###*)
+			END;
+		(*- column distance -*)
+			IF (a[4].typ = LedaBox.Str) & (a[4].s = Default) THEN bd.sDX := "d"
+			ELSIF a[4].typ = LedaBox.Int THEN bd.sDX := "o"; bd.colDX := a[4].i * LedaBox.attrUnit
+			ELSE RETURN FALSE	(*###*)
+			END;
+		RETURN TRUE
+	END FormValidate;
+	
+	PROCEDURE FormDuplicate(VAR fB: LedaBase.FormBase; VAR name: LedaSys.Name; VAR bd: LedaBase.BaseData);
+	(* duplicates the format base fB and adjusts settings to name and bd *)
+		VAR m: LedaBase.CtrlMsg;
+	BEGIN
+		m.id := LedaBase.DuplicateId; m.ctrl := NIL; fB.doOp(fB, m);	(* duplicate control [deep copy] *)
+		IF m.ctrl # NIL THEN
+			fB := m.ctrl(LedaBase.FormBase); fB.name := name;
+			fB.data := bd; LedaBase.CheckControl(fB)
+		ELSE fB := NIL
+		END
+	END FormDuplicate;
+	
+	PROCEDURE FormAdjust(VAR fB: LedaBase.FormBase; VAR name: LedaSys.Name; VAR bd: LedaBase.BaseData);
+	(* adjusts the settings of format base fB to name and bd *)
+	(* if format base does not change fB is set to NIL *)
+		VAR od: LedaBase.BaseData;
+	BEGIN
+		fB.name := name;	(* set name *)
+		od := fB.data;	(* save original settings *)
+		fB.data := bd; LedaBase.CheckControl(fB); bd := fB.data;	(* set new base data *)
+		IF (bd.lsp = od.lsp) & (bd.cols = od.cols)
+			& (bd.colDX = od.colDX) & (bd.adj = od.adj) THEN fB := NIL END	(* no change *)
+	END FormAdjust;
+	
+	PROCEDURE FormGetValue*(doc: LedaBase.Box; fB: LedaBase.FormBase; VAR M: LedaBox.AttributeMsg);
+	(** handles the attribute message with M.id = LedaBox.GetValue in document doc *)
+	(** adds an enumeration with available format bases to M; fB: selected control *)
+		VAR seq: LedaCtrl.Sequence;
+	BEGIN
+		GetFormSeq(doc, seq);
+		NewLn(M.a[M.nbr], "format"); INC(M.nbr);
+		LedaBox.EnumerateCtrls(seq, fB, M)
+	END FormGetValue;
+	
+	PROCEDURE FormGetStyle*(fB: LedaBase.FormBase; VAR M: LedaBox.AttributeMsg);
+	(** handles the attribute message with M.id = LedaBox.GetStyle *)
+	(** in: fB -> selected control *)
+		VAR bd: LedaBase.BaseData;	i: INTEGER;
+	BEGIN		(* M.id = LedaBox.GetStyle *)
+		M.name := Format; M.nbr := 24;
+		bd := fB.data;
+		(*- style name -*)
+			NewLn(M.a[0], "name"); StrAt(M.a[1], fB.name, Dyn);
+		(*- line space -*)
+			LocateChar("do", bd.sLsp, 0, i);
+			NewLn(M.a[2], "lines"); EnumAt(M.a[3], "-|-", i);	(* default/own *)
+			StrAt(M.a[4], Default, Stat); IntAt(M.a[5], bd.lsp DIV LedaSys.scnUnit, Dyn);
+		(*- format mode -*)
+			LocateChar("dlcra", bd.sAdj, 0, i);
+			NewLn(M.a[6], "format"); EnumAt(M.a[7], "-|-|-|-|-", i);	(* default/left/center/right/adjust *)
+			StrAt(M.a[8], Default, Stat); StrAt(M.a[9], Left, Stat); StrAt(M.a[10], Center, Stat);
+			StrAt(M.a[11], Right, Stat); StrAt(M.a[12], Adjust, Stat);
+		(*- columns -*)
+			LocateChar("d123m", bd.sCols, 0, i);
+			NewLn(M.a[13], "columns"); EnumAt(M.a[14], "-|-|-|-|-", i);	(* default/1/2/3/marginal *)
+			StrAt(M.a[15], Default, Stat); IntAt(M.a[16], 1, Stat); IntAt(M.a[17], 2, Stat);
+			IntAt(M.a[18], 3, Stat); StrAt(M.a[19], Marginal, Stat);
+		(*- column distance -*)
+			LocateChar("do", bd.sDX, 0, i);
+			NewLn(M.a[20], "distance"); EnumAt(M.a[21], "-|-", i);	(* default/own *)
+			StrAt(M.a[22], Default, Stat); IntAt(M.a[23], bd.colDX DIV LedaBox.attrUnit, Dyn);
+	END FormGetStyle;
+	
+	PROCEDURE FormSetValue*(doc: LedaBase.Box; VAR nbr: INTEGER; VAR fB: LedaBase.FormBase; VAR M: LedaBox.AttributeMsg);
+	(** handles the attribute message with M.id = LedaBox.SetValue in document doc *)
+	(** processes the format entry at nbr in the message M; advances index nbr *)
+	(** out: fB # NIL -> control specified by message M / fB = NIL -> invalid specification *)
+		VAR seq: LedaCtrl.Sequence;	ctrl: LedaBase.Control;
+	BEGIN
+		fB := NIL;
+		IF M.a[nbr].typ = LedaBox.Str THEN
+			GetFormSeq(doc, seq);
+			LedaBox.GetNamedCtrl(seq, M.a[nbr].s, ctrl); INC(nbr);
+			IF (ctrl # NIL) & (ctrl IS LedaBase.FormBase) THEN fB := ctrl(LedaBase.FormBase) END
+		END
+	END FormSetValue;
+	
+	PROCEDURE FormSetStyle*(VAR fB: LedaBase.FormBase; VAR M: LedaBox.AttributeMsg);
+	(** handles the attribute message with M.id = LedaBox.SetStyle or LedaBox.NewStyle *)
+	(** in:  fB -> selected control *)
+	(** out: fB # NIL -> control specified by message M [new or changed] *)
+	(**       fB = NIL -> no change or invalid specification *)
+	(** note: M.id may change in this procedure *)
+		VAR bd: LedaBase.BaseData;	name: LedaSys.Name;
+	BEGIN
+		IF (M.name # Format) OR (fB = NIL) THEN fB := NIL
+		ELSIF M.nbr = 5 THEN
+			bd.sW := "d"; bd.width := fB.data.width;
+			IF FormValidate(name, bd, M.a) THEN
+				IF fB.name = Anon THEN		(* change of anonymous style *)
+					FormAdjust(fB, name, bd); M.id := LedaBox.NewStyle
+				ELSIF (fB.name # Anon) & (name = Anon) THEN	(* change to anonymous style *)
+					FormDuplicate(fB, name, bd); M.id := LedaBox.NewStyle
+				ELSIF M.id = LedaBox.NewStyle THEN FormDuplicate(fB, name, bd)
+				ELSE FormAdjust(fB, name, bd)
+				END
+			ELSE fB := NIL
+			END
+		ELSE fB := NIL
+		END
+	END FormSetStyle;
+	
+	
+END LedaAdjust.

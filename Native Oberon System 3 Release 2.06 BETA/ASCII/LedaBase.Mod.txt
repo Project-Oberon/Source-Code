@@ -1,0 +1,1798 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaBase; 	(* uh, Fri, 29-Oct-1993 *)
+
+	IMPORT LedaSys, Files, Display, Fonts, Objects;
+
+(* pjm 28.06.96 changed to Oberon font *)
+
+(*---
+	special support for the Macintosh [search for MAC]:
+	- DrawChar:  get pattern before drawing to make use
+		of cache mechanism for string drawing
+	- LoadFnt:  allow the use of Ceres-Md3-Fonts to get
+		the same formatting as on Ceres; therefore the modul
+		MetricFonts and the Ceres-Md3-Fonts with extensions
+		".Metric" [instead of ".Md3.Fnt"] are needed too
+---*)
+	
+CONST
+	FileTag0 = 0F6X;	FileTag1 = 0EEX;
+	FileVer = 1X;	InvFileVer = 0FFX;
+	
+	NotDef = -1;	StampBeg = 1;
+	CtrlErr = "control error";	UnNamed = "unnamed";	Anon = "anonymous";
+
+	(*--- dimensions ---*)
+	MM* = 36000;	CM* = 360000;	Point* = 12700;	(* 1/72 inch *)
+	WA4* = 210 * MM;	HA4* = 296 * MM;	(* A4 paper size *)
+	
+	(*--- special characters [contained in text] ---*)
+	Space* = 20X;	Tab* = 09X;	LEnd* = 0DX;	Divis* = "_";
+	Hyphen* = 1FX;	Break* = 1EX;	Glue* = 1DX;	OldGlue = 13X;
+	Null* = 0X;
+		(* Hyphen: CTRL "-" / LEnd: RETURN *)
+		(* separators defined in LedaCtrl *)
+
+	(*--- communication of boxes ---*)
+	FocMark* = 1;	SelMark* = -1;	On* = 1;	Off* = -1;	(* kinds and modes for MarkProc *)
+	NotHandled* = -1;	Done* = 0;	NotDone* = 1;	DoHandle* = 2;	DoTrack* = 3;	(* result codes *)
+	
+	(*--- id's for CtrlMsg ---*)
+	CopyId* = 0;	RegisterId* = 1;	StoreId* = 2;	LoadId* = 3;	(* for all controls *)
+	FileId = 4;	DuplicateId* = 5;	CheckId* = 6;	ChangeId* = 7;	(* for all controls *)
+	ReplaceId* = 8;	UpdateId* = 9;	InvertSepId* = 10;	StoreModCmd* = 11;	(* for piece controls *)
+	EnvironmentId* = -1;	(* to report change of environment; m.ctrl: new environment *)
+	
+	(*--- id's for BoxMsg ---*)
+	DocRemSelId* = 1;	(* remove selection [for documents] *)
+	AdjustYId* = 2;	(* adjust y coordinate given in m.l1 and m.l2 for scrolling [upper/lower] *)
+	DocOriginId* = 3;	(* return origin [upper left] in m.l1 and m.l2 [for documents] *)
+	NameId* = 4;	(* return name in m.name and set m.b if ctrl is equal to m.ctrl *)
+	SizeId* = 5;	(* size change of a control [font, marginal]: m.l1: size change *)
+	TypeInstId* = 6;	(* to get box type instance in m.ctrl for specification m.name, m.s *)
+
+	(*--- name table ---*)
+	NewNT = 1;	DisposeNT = -1;
+	TabRange = 64;	NTTag = 0FFX;
+	
+	(*--- control table ---*)
+	CtrlRange = 32;	CtrlTabRange = CtrlRange * CtrlRange;
+	
+	(*--- font control ---*)
+	MtrScale = 3048;	ScnScale = 10973;	(* ScnScale := MtrScale * 3.6 *)
+	DefFamily = "Oberon";	Metric = ".Md3.Fnt";	ScnMetric = ".Scn.Fnt";
+	MetricTyp = Fonts.metric;	SpecialPat = -999;
+	
+	(*--- style control ---*)
+	DefColor = 0;	DefVoff = 0;
+	PourAll = 1;	PourThis = 2;	(* defined in LedaCtrl *)
+	
+	(*--- format base ---*)
+	ExtKey = 0EX;
+	
+	(*--- predefined control kinds ---*)
+	FontId = 1;	StyleId = 2;	FormBaseId = 3;
+		(* predefined controls in LedaBase:  id's 1..3 [not used: 5]  *)
+		(* predefined controls in LedaCtrl: id's 7..8 [not used: 6] *)
+		(* predefined controls in LedaChar: id's 4, 9..15 [not used: 20..31] *)
+		(* predefined controls in LedaBox: id's 15 [not used: 16..19] *)
+	
+	(*--- internaly used id's and tags ---*)
+	CtrlTag = 0FAX;	NewTag = 0FBX;	ExistTag = 0FCX;	EndTag = 0FFX;
+	MaxPredefId = 31;	PreDefCtrls = MaxPredefId + 1;	(* OldPredefId = 15; *)
+	
+
+TYPE
+	(*--- file handling ---*)
+	Rider* = RECORD
+		(Files.Rider)
+		f: Files.File;
+		state: CHAR	(* "n": new file / "o": old file *)
+	END;
+	
+	(*--- basic message ---*)
+	Msg* = Display.FrameMsg;
+	
+	(*--- control ---*)
+	Control* = POINTER TO ControlDsc;
+	CtrlProc* = PROCEDURE (ctrl: Control; VAR m: Msg);
+	ControlDsc* = RECORD
+		lib: Objects.Library;	(* points to control library for global accessible controls *)
+		fLink: Control;	(* file link; used for storing and loading *)
+		fId, fStamp: INTEGER;	(* file id and file stamp; used for storing *)
+		link*: Control;	(* dynamic link; temporary used [updates, messages] *)
+		kindId*: INTEGER;	(* temporary used [storing, loading, updates] *)
+		stamp*: INTEGER;
+		doOp*: CtrlProc	(* to control storing and loading *)
+	END;
+	CtrlMsg* = RECORD
+		(Msg)
+		id*: INTEGER;
+		r*: Rider;
+		ctrl*: Control;
+		ch*: CHAR;
+		ctrlId*: INTEGER;
+		s*: SET
+	END;
+	
+	PorcessProc* = PROCEDURE (ctrl: Control);
+	Library = POINTER TO LibDesc;
+	LibDesc = RECORD
+		(Objects.LibDesc)
+		ctrl: Control
+	END;
+	
+	(*--- format base control ---*)
+	FormatDsc* = RECORD
+		lt*, rt*: LONGINT;	(* inset of margins; -1=ignore *)
+		gap*: LONGINT;	(* gap and wrap settings *)
+		lsp*: LONGINT;	(* line space; -1=ignore; 0=default; 1=extended; 2=reduced *)
+		adj*: CHAR;	(* format mode; 0x=ignore; "a"=adjust; "l"=left; "c"=center; "r"=right; "d"=default *)
+	END;
+	(*---
+		- gap field contains gap and wrap settings
+		- lowest byte: gap kind: 0=no/1=grid/2...254=fractional part/255=special value
+		- second byte: wrap: 0=no/1=yes/2..255=lines
+		- upper 2 bytes: gap value [document units DIV 1000]
+	---*)
+	
+	BaseData* = RECORD
+		sW*, sLsp*, sAdj*, sCols*, sDX*: CHAR;	(* settings [default/.../own] *)
+		width*: LONGINT;	(* total column width [own]*)
+		lsp*: LONGINT;	(* line space [normal/extended/reduced/own] *)
+		adj*: CHAR;	(* format mode [adjust/left/center/right] *)
+		cols*: CHAR;	(* number of columns [1/2/3/m] *)
+		colDX*: LONGINT	(* space between columns [normal/own] *)
+	END;
+	
+	FormBase* = POINTER TO FormBaseDsc;
+	FormBaseDsc* = RECORD
+		(ControlDsc)
+		name*: LedaSys.Name;
+		def: FormBase;	(* reference to default format base *)
+		data*: BaseData
+	END;
+	
+	(*--- document world ---*)
+	Box* = POINTER TO BoxDsc;
+	
+	HandlerProc* = PROCEDURE (self: Box; VAR m: Msg);
+	BoxType* = POINTER TO BoxTypeDsc;
+	BoxTypeDsc* = RECORD
+		(ControlDsc)
+		handle*: HandlerProc;	(* handler for general messages *)
+		data*: Control	(* instance data of a box type *)
+	END;
+		(*---
+			- box types are externaly defined controls with a predefined data structure
+			- box types define the basic behaviour of a box class; therefore all instances
+				of the same class (type) have the same box type [do field of BoxDsc]
+			- to allow the handling of data within a document for a certain box type
+				there exists an instance of every box type in a document
+			- the procedure LedaBox.New creates new instances as needed in a document
+		---*)
+		
+	BoxDsc* = RECORD
+		do*: BoxType;
+		dsc*, next*, anc*, sel*: Box;
+		X*, Y*, W*, H*, bL*: LONGINT;
+		flags*: SET
+	END;
+		(*--- remarks:
+			_ box.anc = NIL -> box is root box [=document]
+			_ reserved fields in a root box:
+				-> root.sel  [first selected box]
+				-> root.bL  [time stamp of selection]
+				-> root.next  [focus box]
+		---*)
+	
+	(*--- basic definitions for controls flowing in a text ---*)
+	PieceCtrl* = POINTER TO PieceCtrlDsc;
+	
+	FormatInfo* = POINTER TO FormatInfoDsc;
+	FormatInfoDsc* = RECORD
+		width*, height*, lsp*: LONGINT;	(* [read] line width, maximum height, line space *)
+		uX*, uW*: LONGINT;	(* [read] unit values [document space] *)
+		ux*, uw*: INTEGER;	(* [read] unit values [screen space] *)
+		bigHgt*: BOOLEAN;	(* hint for big line height [illustration] *)
+		newFrm*: BOOLEAN;	(* true if var specifies a format variation *)
+		var*: FormatDsc	(* variation of format settings *)
+	END; 
+
+	WidthPiece* = PROCEDURE (ctrl: PieceCtrl; ch: CHAR; I: FormatInfo;
+														VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		(*--- size of a character or element:
+			- replace not defined characters by a question mark
+			- characters of width 0 must not be drawn
+			- I # NIL -> formatting of unit [block]; check width of pair ch/ctrl
+		---*)
+	HeightPiece* = PROCEDURE (ctrl: PieceCtrl; VAR H, bH: LONGINT);
+	DrawPiece* = PROCEDURE (ctrl: PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+												   VAR x: INTEGER; VAR sepKind: CHAR);
+		(*--- drawing (screen):
+			_ update x coordinate after drawing
+			_ y coordinate specifies baseline
+		---*)
+	PieceCtrlDsc* = RECORD
+		(ControlDsc)
+		draw*: DrawPiece;
+		width*: WidthPiece;
+		height*: HeightPiece
+	END;
+	
+	PrintMsg* = RECORD
+		(Msg)
+		id*: INTEGER;	(* 0: get specification / 2: print own *)
+		last*: BOOLEAN;		(* last character *)
+		ch*, sepKind*: CHAR;
+		W*: LONGINT;	(* width *)
+		(*- ch specification -*)
+		font*: Control;
+		dY*: LONGINT;	(* vertical offset *)
+		clr*: INTEGER;		(* color *)
+		(*- print own -*)
+		p*: LedaSys.Port;
+		mode*: INTEGER
+	END;	(* used for any output device *)
+		(*--- printing:
+			- messages received with id = 0 [to return specification] or id = 2 [to print pair ch/ctrl]
+			- message received with id = 0 --> decide what to do with character ch:
+				- print ch:  set  id = 1, sepKind, W, dY, clr, fName
+				- print own:  set  id = 2, sepKind, W	[printing done by control]
+				- do not print:  set id = 3, sepKind, W
+			- message received with id = 2 --> own printing of character ch
+				- valid fields:  ch, p, x, y, mode
+		---*)
+		
+	Buffer* = RECORD
+		len*: LONGINT
+	END;
+		
+	(*--- basic box type communication ---*)
+		(*--- remarks:
+			_ serves as communication base; therefore the definition 
+				has to be in a base module for the leda system
+			_ LedaBase is the first possible module for the definition
+			_ the communication defined here is not used
+				in the module itself
+		---*)
+	NewProc* = PROCEDURE(bT: BoxType; caller, ref: Box): Box;
+		(** ref = NIL: create default box;  ref # NIL: copy box ref *)
+	LoadProc* = PROCEDURE(VAR r: Rider; bT: BoxType; flags: SET; caller: Box): Box;
+		(** fileds X, Y, W, H of returned box not set [responsibility of caller] *)
+	StoreProc* = PROCEDURE(self: Box; VAR r: Rider);
+	DrawProc* = PROCEDURE (self: Box; eX, eY: LONGINT; P: LedaSys.Port);
+	MarkProc* = PROCEDURE (self: Box; eX, eY: LONGINT; P: LedaSys.Port; kind, mode: SHORTINT);
+		(** kind = FocMark or SelMark ; mode = On or Off  *)
+		(** P # NIL: show mark / P = NIL: change of mark state [get/loose] *)
+	MouseProc* = PROCEDURE (self: Box; eX, eY: LONGINT; P: LedaSys.Port; mX, mY: LONGINT; keys: SET; VAR res: INTEGER);
+	KeyProc* = PROCEDURE (self: Box; eX, eY: LONGINT; P: LedaSys.Port; nbr: SHORTINT; VAR keys: LedaSys.String);
+		(** precondition: no selection in document, focus unhighlited *)
+	InsertProc* = PROCEDURE (self: Box; eX, eY: LONGINT; P: LedaSys.Port; VAR B: Buffer);
+		(** precondition: no selection in document, focus unhighlited *)
+	SizeProc* = PROCEDURE (self: Box; W, H: LONGINT; caller: Box; draw: BOOLEAN; VAR res: INTEGER);
+		(** W/H > 0: accept value; caller: box notifying size change; res = 0: call successful *)
+	CopyProc* = PROCEDURE (foc: Box; P: LedaSys.Port);
+		(** procedure that inserts a data structure in the box foc [example: restore deletion, copy selection to focus] *)
+		(** precondition: no selection in document, focus unhighlited *)
+	
+	BoxHandler* = POINTER TO BoxHandlerDsc;
+	BoxHandlerDsc* = RECORD
+		(BoxTypeDsc)
+		new*: NewProc;	(* create default box or copy a box *)
+		load*: LoadProc;	(* create box, load instance data and contained boxes *)
+		store*: StoreProc;	(* store data and contained boxes *)
+		draw*: DrawProc;	(* draw a box *)
+		mark*: MarkProc;	(* show marks *)
+		mouse*: MouseProc;	(* mouse events *)
+		key*: KeyProc;	(* pressed keys *)
+		insert*: InsertProc;	(* insert text buffer *)
+		size*: SizeProc			(* calculate or set size *)
+	END;
+	
+	BoxMsg* = RECORD
+		(Msg)
+		id*: INTEGER;
+		b*: BOOLEAN;
+		l1*, l2*: LONGINT;
+		ctrl*: Control;
+		name*, s*: LedaSys.Name;
+	END;
+	
+	(*--- font control ---*)
+	Font* = POINTER TO FontDsc;
+	FontDsc* = RECORD
+		(PieceCtrlDsc)
+		fnt: Fonts.Font;	(* fnt.name -> can differ from name, size and face fields *)
+		name*: LedaSys.Name;	(* family name [no size, no face, no extensions] *)
+		size*: SHORTINT;	(* size of font *)
+		face*: CHAR;	(* face of font: Space = normal / i = italic / b = bold *)
+		fH*, bH*: LONGINT;	(* fontHeight, baseHeight [is negative] *)
+		blankW*: LONGINT;
+		w*, pat*: ARRAY 256 OF LONGINT;
+		dx*, x*, y*: ARRAY 256 OF SHORTINT;
+		sep*: ARRAY 256 OF CHAR
+	END;
+	
+	(*--- style control ---*)
+	Style* = POINTER TO StyleDsc;
+	StyleDsc* = RECORD
+		(PieceCtrlDsc)
+		rtId*: LONGINT;	(* runtime identification *)
+		name*: LedaSys.Name;
+		font*: Font;
+		clr*, voff*: INTEGER;
+		dy: INTEGER
+	END;
+
+	(*--- deputy control ---*)
+	Deputy = POINTER TO DeputyDsc;
+	DeputyDsc = RECORD
+		(PieceCtrlDsc)
+		mod, cmd: LedaSys.String;	(* original creator *)
+		file: Files.File;	(* original file *)
+		pos, len: LONGINT;	(* original data on file *)
+		ctrl: Control	(* for referencing a control [in control list] *)
+	END;
+	
+	(*--- name table ---*)
+	Table = POINTER TO TabDsc;
+	TabDsc = RECORD
+		next: Table;
+		entry: ARRAY TabRange OF LedaSys.Name	(* name table used for loading/storing *)
+	END;
+
+
+VAR
+	Recall*: CopyProc;	(* to insert most recent deletion *)
+	inCtrl*: PieceCtrl;	(* input control: used for typed characters [always # NIL] *)
+	version*: CHAR;	(* file version [set by LoadDocument, StoreDocument] *)
+	(*--- stamps ---*)
+	curStamp, stampCount: INTEGER;
+	(*--- name table ---*)
+	table: Table;	(* name table used for loading/storing *)
+	tabInd: INTEGER;	(* index in name table *)
+	(*--- basic control handling ---*)
+	depositedCtrl*: Control;	(* deposited control; used by CreateControl *)
+	nofCtrls: INTEGER;	(* used in RegisterControl *)
+	processCtrl: PorcessProc;	(* used in AccessControls and LibAccess *)
+	ctrlPos: LONGINT;	(* ctrlPos # NotDef -> extensions to control list allowed *)
+	ctrlL: Control;	(* control list [storing/loading] *)
+	ctrlLast: Control;	(* used for storing *)
+	ctrlLID: INTEGER;	(* used for storing *)
+	storeStamp: INTEGER;	(* used for storing *)
+	ctrls: ARRAY PreDefCtrls OF Control;	(* predefined controls; used for loading *)
+	(*--- font control ---*)
+	fontDoOp: CtrlProc;	(* control handle for fonts *)
+	defFont: Font;
+	fAccess: RECORD name: LedaSys.Name; size: SHORTINT; face: CHAR; font: Font END;
+		(* used for accessing fonts in FontProcess and CheckFont *)
+	(*--- style control ---*)
+	styleRTId: LONGINT;	(* run time id for styles *)
+	styleDoOp: CtrlProc;	(* control handle for styles *)
+	defStyle: Style;
+	(*--- format base control ---*)
+	formBaseDoOp: CtrlProc;	(* control handle for format control *)
+	(*--- deputy control ---*)
+	deputyDoOp: CtrlProc;	(* control handle for deputy control *)
+	
+
+	PROCEDURE DefDraw*(ctrl: PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+												   VAR x: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		Display.ReplConst(LedaSys.fg, x, y, 10, 10, mode); INC(x, 10)
+	END DefDraw;
+	
+	PROCEDURE DefWidth*(ctrl: PieceCtrl; ch: CHAR; I: FormatInfo;
+														VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		W := 10 * LedaSys.scnUnit; w := 10
+	END DefWidth;
+
+	PROCEDURE DefHeight*(ctrl: PieceCtrl; VAR H, bH: LONGINT);
+	BEGIN
+		H := 10 * LedaSys.scnUnit; bH := 0	(* default height *)
+	END DefHeight;
+	
+(*--- file handling ---*)
+
+	PROCEDURE Store*(VAR r: Rider; x: CHAR);
+	BEGIN Files.Write(r, x)
+	END Store;
+
+	PROCEDURE StoreI*(VAR r: Rider; i: INTEGER);
+		VAR f: INTEGER;
+	BEGIN
+		IF i < 0 THEN i := ABS(i); f := 128 + 64 + (i MOD 64) ELSE f := 128 + (i MOD 64) END;
+		i := i DIV 64; WHILE i > 0 DO Files.Write(r, CHR(i MOD 128)); i := i DIV 128 END;
+		Files.Write(r, CHR(f))
+	END StoreI;
+
+	PROCEDURE StoreLI*(VAR r: Rider; i: LONGINT);
+	BEGIN Files.WriteBytes(r, i, 4)
+	END StoreLI;
+	
+	PROCEDURE StoreVal*(VAR r: Rider; v: LONGINT);
+	(* stores the  value v in a coded form conssisting of numerator and factor *)
+		VAR f: INTEGER;
+	BEGIN
+		IF v < 0 THEN f := 128 + 64; v := ABS(v) ELSE f := 128 END;	(* negativ sign *)
+		IF v MOD 360000 = 0 THEN INC(f, 2); v := v DIV 360000	(* 1 cm *)
+		ELSIF v MOD 36000 = 0 THEN INC(f, 3); v := v DIV 36000	(* 1 mm *)
+		ELSIF v MOD 3600 = 0 THEN INC(f, 4); v := v DIV 3600	(* 1/10 mm *)
+		ELSIF v MOD 12700 = 0 THEN INC(f, 5); v := v DIV 12700	(* 1/72 inch *)
+		ELSIF v MOD 3048 = 0 THEN INC(f, 6); v := v DIV 3048	(* 1/300 inch *)
+		ELSIF v MOD 1524 = 0 THEN INC(f, 7); v := v DIV 1524	(* 1/600 inch *)
+		ELSIF v MOD 10000 = 0 THEN INC(f, 8); v := v DIV 10000
+		ELSIF v MOD 1000 = 0 THEN INC(f, 9); v := v DIV 1000
+		ELSIF v MOD 100 = 0 THEN INC(f, 10); v := v DIV 100
+		ELSIF v MOD 10 = 0 THEN INC(f, 11); v := v DIV 10
+		ELSIF v MOD 8 = 0 THEN INC(f, 12); v := v DIV 8
+		ELSIF v MOD 4 = 0 THEN INC(f, 13); v := v DIV 4
+		ELSE INC(f, 1)		(* no coding *)
+		END;
+		WHILE v > 0 DO Files.Write(r, CHR(v MOD 128)); v := v DIV 128 END;	(* numerator *)
+		Files.Write(r, CHR(f))	(* coded factor *)
+	END StoreVal;
+
+	PROCEDURE StoreS*(VAR r: Rider; s: SET);
+		VAR l: LONGINT;	f: INTEGER;
+	BEGIN
+		l := 0; f := 31;
+		WHILE f > 0 DO DEC(f); l := l * 2; IF f IN s THEN INC(l) END END;
+		f := 128 + SHORT(l MOD 128); l := l DIV 128;
+		WHILE l > 0 DO Files.Write(r, CHR(l MOD 128)); l := l DIV 128 END;
+		Files.Write(r, CHR(f))
+	END StoreS;
+
+	PROCEDURE StoreStr*(VAR r: Rider; s: ARRAY OF CHAR);
+		VAR i: SHORTINT;
+	BEGIN
+		i := 0; WHILE s[i] # 0X DO INC(i) END;
+		Files.Write(r, i);	(* write length *)
+		IF i > 0 THEN Files.WriteBytes(r, s, i) END
+	END StoreStr;
+	
+	PROCEDURE StoreName*(VAR r: Rider; VAR name: LedaSys.Name);
+	(** the name name is not changed inside the procedure *)
+		VAR t, u: Table;	i: INTEGER;
+	BEGIN
+		u := table; WHILE u.next # NIL DO u := u.next END;	(* search last table *)
+		u.entry[tabInd MOD TabRange] := name;	(* enter name as sentinel in table *)
+		i := 0; t := table;
+		WHILE t.entry[i] # name DO
+			INC(i); IF i MOD TabRange = 0 THEN t := t.next END
+		END;
+		StoreI(r, i);
+		IF i = tabInd THEN	(* name is new entry in table *)
+			INC(tabInd);
+			IF tabInd MOD TabRange = 0 THEN	(* enlarge table *)
+				NEW(u.next); u := u.next; u.next := NIL
+			END
+		END
+	END StoreName;
+	
+	PROCEDURE StoreJump*(VAR r: Rider; VAR fixPos: LONGINT);
+	(** stores a relative jump; builds starting point of jump *)
+	(** returned fixPos allows to fixup jump with procedure FixupJump *)
+	BEGIN
+		fixPos := Files.Pos(r);
+		Files.Write(r, CHR(241)); Files.Write(r, CHR(242)); Files.Write(r, CHR(243))
+	END StoreJump;
+	
+	PROCEDURE FixupJump*(VAR r: Rider; fixPos: LONGINT);
+	(** fixes the relative jump with starting point at fixPos to the current rider position r *)
+		VAR R: Files.Rider;
+	BEGIN
+		Files.Set(R, r.f, fixPos);
+		fixPos := Files.Pos(r) - fixPos;	(* fixPos now used as relative jump length *)
+		IF fixPos >= 0 THEN Files.Write(R, CHR(fixPos MOD 128))
+		ELSE fixPos := ABS(fixPos); Files.Write(R, CHR(128 + fixPos MOD 128))
+		END;
+		fixPos := fixPos DIV 128;
+		IF fixPos = 0 THEN Files.Write(R, CHR(244))
+		ELSE Files.Write(R, CHR(fixPos MOD 240)); fixPos := fixPos DIV 240
+		END;
+		IF fixPos = 0 THEN Files.Write(R, CHR(248))
+		ELSE Files.Write(R, CHR(fixPos MOD 240))
+		END
+	END FixupJump;
+	
+	PROCEDURE Load*(VAR r: Rider; VAR x: CHAR);
+	BEGIN Files.Read(r, x)
+	END Load;
+
+	PROCEDURE LoadI*(VAR r: Rider; VAR i: INTEGER);
+		VAR f: INTEGER;	ch: CHAR;
+	BEGIN
+		Files.Read(r, ch); i := 0; f := 1;
+		IF ch < CHR(128) THEN
+			i := ORD(ch); f := 1; Files.Read(r, ch);
+			WHILE ch < CHR(128) DO f := f * 128; i := i + f * ORD(ch); Files.Read(r, ch) END;
+			i := i * 64
+		END;
+		f := ORD(ch) - 128;
+		IF f >= 64 THEN DEC(f, 64); INC(i, f); i := -i ELSE INC(i, f) END
+	END LoadI;
+
+	PROCEDURE LoadLI*(VAR r: Rider; VAR i: LONGINT);
+	BEGIN Files.ReadBytes(r, i, 4)
+	END LoadLI;
+	
+	PROCEDURE LoadVal*(VAR r: Rider; VAR v: LONGINT);
+	(* loades a coded value consisting of numerator and factor *)
+		VAR f: LONGINT;	ch: CHAR;
+	BEGIN
+		Files.Read(r, ch); v := 0; f := 1;
+		IF ch < CHR(128) THEN
+			v := ORD(ch); f := 1; Files.Read(r, ch);
+			WHILE ch < CHR(128) DO f := f * 128; v := v + f * ORD(ch); Files.Read(r, ch) END
+		END;	(* numerator *)
+		f := ORD(ch) - 128;	(* coded factor *)
+		IF f >= 64 THEN v := -v; DEC(f, 64) END;
+		IF f <= 13 THEN 
+			CASE f OF 0, 1:	(* no coding *)
+			| 2: v := v * 360000	(* 1 cm *)
+			| 3: v := v * 36000	(* 1 mm *)
+			| 4: v := v * 3600	(* 1/10 mm *)
+			| 5: v := v * 12700	(* 1/72 inch *)
+			| 6: v := v * 3048	(* 1/300 inch *)
+			| 7: v := v * 1524	(* 1/600 inch *)
+			| 8: v := v * 10000
+			| 9: v := v * 1000
+			| 10: v := v * 100
+			| 11: v := v * 10
+			| 12: v := v * 8
+			| 13: v := v * 4
+			END
+		END
+	END LoadVal;
+
+	PROCEDURE LoadS*(VAR r: Rider; VAR s: SET);
+		VAR l, f: LONGINT;	ch: CHAR;
+	BEGIN
+		Files.Read(r, ch); l := 0; f := 1;
+		IF ch < CHR(128) THEN
+			l := ORD(ch); f := 1; Files.Read(r, ch);
+			WHILE ch < CHR(128) DO f := f * 128; l := l + f * ORD(ch); Files.Read(r, ch) END
+		END;
+		l := l * 128 + (ORD(ch) - 128);
+		f := 0; s := {};
+		WHILE (f < 31) & (l > 0) DO
+			IF ODD(l) THEN INCL(s, f) END;
+			INC(f); l := l DIV 2
+		END
+	END LoadS;
+
+	PROCEDURE LoadStr*(VAR r: Rider; VAR s: ARRAY OF CHAR);
+		VAR i: SHORTINT;
+	BEGIN
+		Files.Read(r, i);	(* read length *)
+		IF i > 0 THEN Files.ReadBytes(r, s, i) END;
+		s[i] := 0X
+	END LoadStr;
+	
+	PROCEDURE LoadName*(VAR r: Rider; VAR name: LedaSys.Name);
+		VAR t: Table;	ind: INTEGER;
+	BEGIN
+		LoadI(r, ind);
+		IF ind >= tabInd THEN LedaSys.Halt("bad index") END;	(*###*)
+		t := table; WHILE ind >= TabRange DO DEC(ind, TabRange); t := t.next END;
+		name := t.entry[ind]
+	END LoadName;
+
+	PROCEDURE LoadJump*(VAR r: Rider; VAR returnPos, jumpPos: LONGINT);
+	(** loads a relative jump and sets the absolute positions jumpPos and returnPos *)
+		VAR ch: CHAR;	neg: BOOLEAN;
+	BEGIN
+		returnPos := Files.Pos(r);
+		Files.Read(r, ch); neg := ~ (ch < CHR(128));
+		jumpPos := ORD(ch); IF neg THEN DEC(jumpPos, 128) END;
+		Files.Read(r, ch); IF ch < CHR(240) THEN jumpPos := jumpPos + 128*ORD(ch) END;
+		Files.Read(r, ch); IF ch < CHR(240) THEN jumpPos := jumpPos + LONG(128*240)*ORD(ch) END;
+		IF jumpPos > 0 THEN
+			IF neg THEN jumpPos := - jumpPos END;
+			jumpPos := returnPos + jumpPos
+		ELSE jumpPos := -1	(* invalid *)
+		END;
+		INC(returnPos, 3)
+	END LoadJump;
+	
+	PROCEDURE SetRider*(VAR r: Rider; pos: LONGINT);
+	BEGIN
+		IF pos < 0 THEN LedaSys.Halt("invalid position") END;
+		Files.Set(r, r.f, pos)
+	END SetRider;
+	
+	PROCEDURE RiderPos*(VAR r: Rider): LONGINT;
+	BEGIN RETURN Files.Pos(r)
+	END RiderPos;
+	
+	PROCEDURE OpenRider*(name: LedaSys.String; VAR r: Rider);
+	(* opens a rider to the existing file with name name; done if r.res = Done *)
+	BEGIN
+		r.f := Files.Old(name);
+		IF r.f # NIL THEN r.state := "o"; Files.Set(r, r.f, 0); r.res := Done ELSE r.state := "-"; r.res := -999 END
+	END OpenRider;
+	
+	PROCEDURE NewRider*(name: LedaSys.String; VAR r: Rider);
+	(* opens a rider to a new temporary file with the name name *)
+	(* registering occurs in procedure CloseRider *)
+	BEGIN
+		r.f := Files.New(name);
+		IF r.f # NIL THEN
+			r.state := "n"; Files.Set(r, r.f, 0); r.res := Done
+		ELSE r.state := "-"; r.res := -999
+		END
+	END NewRider;
+	
+	PROCEDURE CloseRider*(VAR r: Rider);
+	BEGIN
+		IF r.state = "n" THEN Files.Register(r.f)	(* flushes all buffers *)
+		ELSIF r.state = "o" THEN Files.Close(r.f)	(* to flush buffers *)
+		END
+	END CloseRider;
+	
+	PROCEDURE RenameFile(name: LedaSys.String);
+	(* renames an an already existing file by adding ".Bak" *)
+		VAR i: INTEGER;	bak: ARRAY 32 OF CHAR;
+	BEGIN
+		IF name # "" THEN
+			i := 0; WHILE (i < 32-5) & (name[i] # 0X) DO bak[i] := name[i]; INC(i) END;
+			bak[i] := "."; INC(i); bak[i] := "B"; INC(i); bak[i] := "a"; INC(i); bak[i] := "k"; INC(i);  bak[i] := 0X;
+			Files.Rename(name, bak, i);
+			(* i = 0: done / i = 2: name not existing / i = 1: existing bak replaced by name *)
+		END
+	END RenameFile;
+	
+(*--- name table ---*)
+
+	PROCEDURE NameTable(op: INTEGER);
+	BEGIN
+		IF op = NewNT THEN NEW(table); table.next := NIL; tabInd := 0
+		ELSIF op = DisposeNT THEN table := NIL; tabInd := -1
+		END
+	END NameTable;
+
+	PROCEDURE StoreNameTable(VAR r: Rider);
+	(** stores the name table; name table remains valid *)
+		VAR t: Table;	i: INTEGER;
+	BEGIN
+		StoreI(r, tabInd);
+		t := table; i := 0;
+		WHILE i < tabInd DO
+			StoreStr(r, t.entry[i MOD TabRange]); INC(i)
+		END;
+		Store(r, NTTag)		(* end of name table *)
+	END StoreNameTable;
+	
+	PROCEDURE LoadNameTable(VAR r: Rider);
+	(** loads the name table; the name table has to be created [NameTable(NewNT)] *)
+		VAR t: Table;	i: INTEGER;	ch: CHAR;
+	BEGIN
+		Load(r, ch);
+		IF ch # NTTag THEN LedaSys.Halt("bad file format [name table]") END;	(*###*)
+		i := 0; t := table; LoadI(r, tabInd);
+		WHILE i < tabInd DO
+			LoadStr(r, t.entry[i MOD TabRange]); INC(i);
+			IF i MOD TabRange = 0 THEN	(* enlarge table *)
+				NEW(t.next); t := t.next; t.next := NIL
+			END
+		END;
+		Load(r, ch);
+		IF ch # NTTag THEN LedaSys.Halt("bad file format [end of name table]") END;	(*###*)
+	END LoadNameTable;
+	
+(*--- stamps ---*)
+	
+	PROCEDURE NewStamp*;
+	BEGIN
+		IF stampCount = 0 THEN INC(curStamp);
+			IF curStamp = MAX(INTEGER) THEN curStamp := StampBeg END
+		END
+	END NewStamp;
+	
+	PROCEDURE Unstamped*(stamp: INTEGER): BOOLEAN;
+	BEGIN RETURN stamp # curStamp
+	END Unstamped;
+	
+	PROCEDURE CurStamp*(): INTEGER;
+	BEGIN RETURN curStamp
+	END CurStamp;
+	
+	PROCEDURE DefStamp*(): INTEGER;
+	BEGIN RETURN MAX(INTEGER)
+	END DefStamp;
+	
+	PROCEDURE LockStamp*(op: INTEGER);
+	BEGIN
+		IF op = MAX(INTEGER) THEN stampCount := 0
+		ELSIF op > 0 THEN INC(stampCount)
+		ELSIF op = 0 THEN stampCount := 0; LedaSys.OutT("stamp reset", 1)
+		ELSE DEC(stampCount)
+		END
+	END LockStamp;
+	
+(*--- control libraries ---*)
+
+	(*---
+		- the control library mechanism provides global access to controls
+		- a control referenced by a control library can be accessed
+			with Objects.Enumerate() and a approbriate procedure of type Objects.EnumProc
+	---*)
+	
+	PROCEDURE *LibAccess(L: Objects.Library);
+		VAR lib: Library;
+	BEGIN	(* processCtrl # NIL *)
+		IF L IS Library THEN
+			lib := L(Library); IF lib.ctrl # NIL THEN processCtrl(lib.ctrl) END
+		END
+	END LibAccess;
+	
+	PROCEDURE *LibNOP(L: Objects.Library); END LibNOP;
+	
+	PROCEDURE *LibNew(): Objects.Library;
+		VAR lib: Library;
+	BEGIN
+		NEW(lib); Objects.OpenLibrary(lib);
+		lib.Load := LibNOP; lib.Store := LibNOP;
+		lib.name := "LedaXXXX.Ctrl";
+		lib.ctrl := NIL; RETURN lib
+	END LibNew;
+	
+(*--- accessing controls ---*)
+
+	PROCEDURE InitControl*(ctrl: Control; doOp: CtrlProc);
+	(** intitalizes an allocated control *)
+	BEGIN
+		ctrl.lib := NIL; ctrl.fLink := NIL; ctrl.link := NIL;
+		ctrl.fId := NotDef; ctrl.fStamp := NotDef;
+		ctrl.kindId := NotDef; ctrl.stamp := MAX(INTEGER);
+		ctrl.doOp := doOp
+	END  InitControl;
+
+	PROCEDURE CreateControl*(mod, cmd: LedaSys.String): Control;
+	(** to create an arbitrary control; mod, cmd -> module and *)
+	(** command name that deposits the desired control *)
+	BEGIN
+		IF mod # "" THEN
+			depositedCtrl := NIL; LedaSys.Execute(mod, cmd);
+			(* call to mod.cmd sets global variable depositedCtrl *)
+			RETURN depositedCtrl
+		ELSIF cmd = "DefStyle" THEN RETURN defStyle
+		ELSE RETURN NIL
+		END
+	END CreateControl;
+	
+	PROCEDURE RegisterControl*(ctrl: Control);
+	(** registers the control ctrl for global access by creating a control library *)
+	(** the created control library will be accessible with  the Oberon library mechanism *)
+		VAR lib: Objects.Library;	name: ARRAY 14 OF CHAR;	n, i: INTEGER;
+	BEGIN
+		REPEAT
+			name := "Leda0000.Ctrl";	(* extension has to be equal in Objects.Register *)
+			n := nofCtrls; i := 7;
+			REPEAT name[i] := CHR(n MOD 10 + 30H); n := n DIV 10; DEC(i) UNTIL n = 0;
+			nofCtrls := (nofCtrls + 1) MOD 10000;
+			lib := Objects.ThisLibrary(name)
+		UNTIL (lib # NIL) & (lib(Library).ctrl = NIL);	(* lib(Library).ctrl = NIL -> new control library *)
+		lib(Library).ctrl := ctrl; ctrl.lib := lib
+	END RegisterControl;
+	
+	PROCEDURE AccessControls*(process: PorcessProc);
+	(** calls the procedure process for all global accessible controls *)
+	BEGIN
+		IF processCtrl # NIL THEN LedaSys.Halt("not reentrant") END;
+		processCtrl := process; Objects.Enumerate(LibAccess); processCtrl := NIL
+	END AccessControls;
+	
+	PROCEDURE CheckControl*(ctrl: Control);
+	(** makes control ctrl check its instance data *)
+		VAR m: CtrlMsg;
+	BEGIN
+		m.id := CheckId; m.ctrl := NIL; ctrl.doOp(ctrl, m)
+	END CheckControl;
+	
+	PROCEDURE RPC*(ctrl: Control; kindId: INTEGER);
+	(** registers the predefined control ctrl with kind id kindId *)
+	BEGIN
+		ctrls[kindId] := ctrl
+	END RPC;
+	
+(*--- storing and loading of controls ---*)
+	
+(*---
+	- that an instance of a control is stored put it to the control list
+	- all elements of the control list will get unique id's that they
+		can use as reference numbers
+	- the control list will be stored and loaded by the control support
+	- predefined controls: font, style, text, format, line
+	- predefined controls support also the FileId operation
+		in the ControlProc to set the kindId field
+---*)
+
+	(*--- about the control list:
+		- the control list is used for storing and loading of documents;
+			it represents a linearisation of the controls used in a document 
+		- every control in the control list has a unique reference id: its number
+			in the control list; the first control has a refId = 1
+		- storing: all controls are stored in the linear control list ctrlL;
+			for efficency the reference number of a control put to the control
+			list is stored in the control; for security a stamp is used to
+			decide if the in the control stored reference number is valid
+	---*)
+
+	PROCEDURE PutToList*(ctrl: Control; VAR refId: INTEGER);
+	(** puts the control ctrl to the control list if it is not yet in *)
+	(** returns in refId a unique reference number *)
+	BEGIN
+		IF ctrl.fStamp # storeStamp THEN	(* not yet in control list *)
+			IF ctrlPos = NotDef THEN LedaSys.Halt(CtrlErr) END;	(* adding not allowed *)
+			IF ctrlL = NIL THEN ctrlL := ctrl ELSE ctrlLast.fLink := ctrl END;
+			ctrlLast := ctrl; ctrl.fLink := NIL;
+			refId := ctrlLID; INC(ctrlLID);
+			ctrl.fId := refId; ctrl.fStamp := storeStamp	(* for further calls *)
+		ELSE refId := ctrl.fId
+		END
+	END PutToList;
+	
+	(*--- deputy control ---*)
+		
+		(*---
+			- a deputy control is used when an external defined control cannot be loaded
+			- the deputy control keeps all information to save the original data at storing;
+				if the original data contains references to other controls a deputy control
+				should not be stored again [file could become unreadable]
+			- a deputy control will never be loaded directly
+			- a deputy control can also be used to reference an control that is already in
+				the control list; a single control may only be once in this list
+		---*)
+	
+	PROCEDURE SameDeputy(d0, d1: Deputy): BOOLEAN;
+	BEGIN RETURN (d0.mod = d1.mod) & (d0.cmd = d1.cmd)
+	END SameDeputy;
+	
+	PROCEDURE NewDeputy(mod, cmd: LedaSys.String; f: Files.File; ctrl: Control): Deputy;
+		VAR deputy: Deputy;
+	BEGIN
+		NEW(deputy); InitControl(deputy, deputyDoOp);
+		deputy.draw := DefDraw; deputy.width := DefWidth; deputy.height := DefHeight;
+		deputy.mod := mod; deputy.cmd := cmd;
+		deputy.file := f; deputy.pos := 0; deputy.len := 0;
+		deputy.ctrl := ctrl; RETURN deputy
+	END NewDeputy;
+	
+	PROCEDURE DeputyStore(deputy: Deputy; VAR r: Rider);
+		VAR orgR: Files.Rider;	l: LONGINT;	ch: CHAR;
+	BEGIN
+		Files.Set(orgR, deputy.file, deputy.pos); l := deputy.len;
+		WHILE l > 0 DO
+			Files.Read(orgR, ch); Store(r, ch); DEC(l)
+		END
+	END DeputyStore;
+		
+	PROCEDURE *DeputyDoOp(ctrl: Control; VAR m: Msg);
+	(* handle for deputy control; multiple references *)
+		VAR deputy: Deputy;
+	BEGIN
+		IF m IS CtrlMsg THEN
+			WITH m: CtrlMsg DO
+				CASE m.id OF CopyId:  m.ctrl := ctrl	(* reference copy *)
+				| RegisterId:  PutToList(ctrl, m.ctrlId)
+				| StoreId:	DeputyStore(ctrl(Deputy), m.r)
+				| LoadId:  LedaSys.Halt("deputy control error")
+				| StoreModCmd:  deputy := ctrl(Deputy);
+						StoreStr(m.r, deputy.mod); StoreStr(m.r, deputy.cmd)
+				| ReplaceId:  IF m.ch = "X" THEN m.ctrlId := 1 END	(* every exchange okay *)
+				ELSE
+				END
+			END
+		END
+	END DeputyDoOp;
+	
+	PROCEDURE GetFromList*(VAR ctrl: Control; refId: INTEGER);
+	(** gets the control with the reference number refId *)
+	(** from the control list and returns it in ctrl *)
+		VAR id: INTEGER;
+	BEGIN
+		ctrl := ctrlL; id := 1;
+		WHILE id < refId DO INC(id); ctrl := ctrl.fLink END;
+		IF (ctrl IS Deputy) & (ctrl(Deputy).ctrl # NIL) THEN ctrl := ctrl(Deputy).ctrl END;
+	END GetFromList;
+	
+	(*--- format of control block:
+		CtrlTag  endTagJump  {control}  EndTag  nbr  {name}  EndTag
+	---*)
+	
+	PROCEDURE InitStore(VAR r: Rider);
+	(* initializes the controls for storing *)
+	BEGIN
+		StoreJump(r, ctrlPos);	(* fix jump in StoreBlock *)
+		ctrlL := NIL; ctrlLast := NIL; ctrlLID := 1;	(* initialize control list *)
+		INC(storeStamp);	(* used for security in PutToList *)
+		IF storeStamp = MAX(INTEGER) THEN storeStamp := StampBeg END;
+		NameTable(NewNT);	(* initialize name table *)
+		(* ctrlPos # NotDef -> extensions to control list allowed *)
+	END InitStore;
+	
+	(*--- file format for stored control:
+		(NewTag kindId mod cmd | ExistTag kindId) [relEndPos] InstanceData
+	---*)
+	
+	PROCEDURE CtrlStore(VAR fM: CtrlMsg; ctrl: Control; VAR kindId: INTEGER);
+	(* stores the control ctrl and its instance data to the control block *)
+		VAR h: Control;	pos: LONGINT;
+	BEGIN
+		IF ctrl.kindId = NotDef THEN	(* new kind of control *)
+			INC(kindId); ctrl.kindId := kindId;
+			Store(fM.r, NewTag); StoreI(fM.r, ctrl.kindId);
+			fM.id := StoreModCmd; ctrl.doOp(ctrl, fM);
+			IF ctrl IS Deputy THEN
+				h := ctrl.fLink;	(* set kindId of same kind of control *)
+				WHILE h # NIL DO
+					IF (h IS Deputy) & SameDeputy(h(Deputy), ctrl(Deputy)) THEN h.kindId := ctrl.kindId END;
+					h := h.fLink
+				END
+			ELSE
+				h := ctrl.fLink;	(* set kindId of same kind of control *)
+				WHILE h # NIL DO
+					IF h.doOp = ctrl.doOp THEN h.kindId := ctrl.kindId END;
+					h := h.fLink
+				END
+			END
+		ELSE
+			Store(fM.r, ExistTag); StoreI(fM.r, ctrl.kindId)
+		END;
+		IF ctrl.kindId > MaxPredefId THEN
+			StoreJump(fM.r, pos)	(* defined in extern module -> allow to skip instance data *)
+		END;
+		fM.id := StoreId; ctrl.doOp(ctrl, fM);	(* store instance data *)
+		IF ctrl.kindId > MaxPredefId THEN
+			FixupJump(fM.r, pos)	(* fixup for skipping instance data *)
+		END
+	END CtrlStore;
+	
+	PROCEDURE StoreCtrlBlock(VAR r: Rider);
+	(* stores the controls put to the control list as control block *)
+		VAR h: Control;	fM: CtrlMsg;	pos: LONGINT;	kindId: INTEGER;
+	BEGIN
+		FixupJump(r, ctrlPos);	(* to jump to control block at loading *)
+		ctrlPos := NotDef;	(* no extensions to control list allowed *)
+		Store(r, CtrlTag);	(* begin of control block *)
+		StoreJump(r, pos);	(* for jump to name table *)
+		fM.r := r; SetRider(fM.r, RiderPos(r));	(* rider fM.r is set like rider r *)
+		h := ctrlL;
+		WHILE h # NIL DO
+			h.kindId := NotDef; fM.id := FileId; h.doOp(h, fM); h := h.fLink
+		END;	(* kindId is set for predefined controls *)
+		h := ctrlL; kindId := MaxPredefId;
+		WHILE h # NIL DO CtrlStore(fM, h, kindId); h := h.fLink END;
+		FixupJump(fM.r, pos);
+		Store(fM.r, EndTag);		(* end of control block *)
+		StoreNameTable(fM.r); NameTable(DisposeNT);
+		SetRider(fM.r, RiderPos(fM.r));
+		WHILE ctrlL # NIL DO
+			h := ctrlL; ctrlL := ctrlL.fLink; h.fLink := NIL
+		END	(* disband control list *)
+	END StoreCtrlBlock;
+	
+	PROCEDURE CtrlLoad(VAR fM: CtrlMsg; VAR ctrl: Control; ch: CHAR; VAR depNbr: INTEGER);
+	(* loads a control and its instance data and puts it to the control list *)
+	(* ch -> read character: equals NewTag or ExistTag / last -> last control of control list *)
+		VAR h: Control;	ret, jmp: LONGINT;	kindId: INTEGER;
+			mod, cmd: LedaSys.String;
+	BEGIN
+		LoadI(fM.r, kindId);
+		IF ch = NewTag THEN
+			LoadStr(fM.r, mod); LoadStr(fM.r, cmd);
+			h := CreateControl(mod, cmd);
+			IF h = NIL THEN
+				LedaSys.OutT(" - ", 0); LedaSys.OutT(mod, 0); LedaSys.OutC(".", 0); LedaSys.OutT(cmd, 0);
+				LedaSys.OutT(": module not found or bad command", 1);
+				h := NewDeputy(mod, cmd, fM.r.f, NIL)	(* create deputy instance *)
+			END
+		ELSE	(* ch = ExistTag *)
+			IF kindId > MaxPredefId THEN	(* search same kind of control *)
+				h := ctrlL; WHILE (h # NIL) & (kindId # h.kindId) DO h := h.fLink END;
+				IF (h # NIL) & (h IS Deputy) THEN		(* create new deputy instance *)
+					WITH h: Deputy DO h := NewDeputy(h.mod, h.cmd, fM.r.f, NIL) END
+				END
+			ELSE
+				h := ctrls[kindId]	(* predefined control kind *)
+			END
+		END;	(* h set to needed control kind or nil *)
+		IF h = NIL THEN LedaSys.Halt("basic control not found")	(*###*)
+		ELSIF h IS Deputy THEN
+			INC(depNbr); LoadJump(fM.r, ret, jmp);
+			h(Deputy).pos := ret; h(Deputy).len := jmp-ret;	(* save file location [pos, len] *)
+			SetRider(fM.r, jmp); ctrl := h	(* skip instance data *)
+		ELSE
+			IF kindId > MaxPredefId THEN LoadJump(fM.r, ret, jmp) END;	(* skip jump *)
+			fM.id := LoadId; fM.ctrl := NIL; h.doOp(NIL, fM);	(* creates control and loads its instance data *)
+			IF fM.ctrl = NIL THEN LedaSys.Halt("control not loaded") ELSE ctrl := fM.ctrl END	(*###*)
+		END;	(* ctrl -> loaded control *)
+		IF (ctrl.kindId # NotDef) OR (ctrl.fLink # NIL) THEN	(* ctrl in control list ? *)
+			h := ctrlL; WHILE (h # NIL) & (h # ctrl) DO h := h.fLink END;
+			IF h = ctrl THEN	(* ctrl already in control list *)
+				ctrl := NewDeputy("", "", NIL, ctrl);	(* deputy references original ctrl *)
+				LedaSys.OutT(" - reference conflict occured", 1)
+			END
+		END;
+		ctrl.kindId := kindId
+	END CtrlLoad;
+	
+	PROCEDURE LoadCtrlBlock(VAR r: Rider);
+	(* loads the control block and builds the control list *)
+		VAR last, ctrl: Control;	fM: CtrlMsg;	ret, pos: LONGINT;	depNbr, i: INTEGER;	ch: CHAR;
+	BEGIN	
+		LoadJump(r, ret, ctrlPos); 
+		fM.r := r; SetRider(fM.r, ctrlPos);	(* fM.r at beginn of control block *)
+		Load(fM.r, ch);
+		IF ch # CtrlTag THEN LedaSys.Halt("bad file format [begin control block]") END;	(*###*)
+		NameTable(NewNT);
+		LoadJump(fM.r, ret, pos);	(* position of name table *)
+		SetRider(fM.r, pos);	(* fM.r at beginn of name table *)
+		LoadNameTable(fM.r);
+		ctrlPos := RiderPos(fM.r);	(* save end position of control block *)
+		SetRider(fM.r, ret);
+		ctrlL := NIL; last := NIL; depNbr := 0;
+		Load(fM.r, ch);
+		WHILE (ch = NewTag) OR (ch = ExistTag) DO
+			CtrlLoad(fM, ctrl, ch, depNbr);
+			IF ctrlL = NIL THEN ctrlL := ctrl ELSE last.fLink := ctrl END;	(* add to control list *)
+			ctrl.fLink := NIL; last :=  ctrl;
+			Load(fM.r, ch)
+		END;
+		IF depNbr # 0 THEN
+			LedaSys.OutT(" - ", 0); LedaSys.OutI(depNbr, 0); LedaSys.OutT(" deputy control[s] created", 1);
+			LedaSys.OutT(" - warning: file may become unreadable if stored again", 1)
+		END;
+		IF ch # EndTag THEN LedaSys.Halt("bad file format [end controls]") END	(*###*)
+	END LoadCtrlBlock;
+	
+	PROCEDURE TermLoad(VAR r: Rider);
+	(* disbands control list and terminates loading of controls *)
+		VAR h: Control;
+	BEGIN
+		SetRider(r, ctrlPos);	(* set rider to end of control block *)
+		ctrlPos := NotDef;	(* control list not in use *)
+		WHILE ctrlL # NIL DO
+			h := ctrlL; ctrlL := ctrlL.fLink; h.fLink := NIL
+		END;	(* disband control list *)
+		NameTable(DisposeNT)
+	END TermLoad;
+	
+	PROCEDURE StoreCtrl*(VAR r: Rider; ctrl: Control);
+	(** stores the reference to a control; for use by controls using  *)
+	(** other controls or boxes refering to a control *)
+		VAR cM: CtrlMsg;
+	BEGIN
+		IF ctrl = NIL THEN cM.ctrlId := -1 ELSE cM.id := RegisterId; ctrl.doOp(ctrl, cM) END;
+		StoreI(r, cM.ctrlId)
+	END StoreCtrl;
+	
+	PROCEDURE LoadCtrl*(VAR r: Rider; VAR ctrl: Control);
+	(** loads the reference to a control; for use by controls using  *)
+	(** other controls or boxes refering to a control *)
+		VAR refId: INTEGER;
+	BEGIN
+		LoadI(r, refId);
+		IF refId = -1 THEN ctrl := NIL ELSE  GetFromList(ctrl, refId) END
+	END LoadCtrl;
+	
+	PROCEDURE StoreBox*(VAR r: Rider; box: Box);
+	(** stores the box type and its instance data *)
+	(** fileds X, Y, W, H and bL of box not stored [responsibility of caller] *)
+		VAR fixup: LONGINT;	cM: CtrlMsg;
+	BEGIN	(* type block:  RefId  Flags  Jump  InstanceData *)
+		IF box = NIL THEN StoreI(r, -9999)
+		ELSE
+			cM.id := RegisterId; box.do.doOp(box.do, cM);	(* box type puts itself to the control list *)
+			StoreI(r, cM.ctrlId); StoreS(r, box.flags);
+			StoreJump(r, fixup);
+			box.do(BoxHandler).store(box, r);	(* store instance data of box *)
+			FixupJump(r, fixup)
+		END
+	END StoreBox;
+
+	PROCEDURE LoadBox*(VAR r: Rider; caller: Box; VAR box: Box);
+	(** creates a box type and loads its instance data *)
+	(** fileds X, Y, W, H and bL of box not set *)
+		VAR ctrl: Control;	ret, jmp: LONGINT;	flags: SET;	refId: INTEGER;
+	BEGIN	(* type block:  RefId  Flags  Jump  InstanceData *)
+		LoadI(r, refId);
+		IF refId = -9999 THEN box := NIL
+		ELSE
+			LoadS(r, flags);
+			GetFromList(ctrl, refId);
+			LoadJump(r, ret, jmp);
+			IF (ctrl = NIL) OR (ctrl IS Deputy) THEN	(* box type not available *)
+				box := NIL; SetRider(r, jmp)		(* skip instance data *)
+			ELSE
+				box := ctrl(BoxHandler).load(r, ctrl(BoxHandler), flags, caller);	(* load instance data *)
+				IF RiderPos(r) # jmp THEN
+					SetRider(r, jmp);
+					LedaSys.OutT(" - LedaBase.LoadBox: incorrect number of bytes read", 1)
+				END
+			END
+		END
+	END LoadBox;
+		
+(*--- document support ---*)
+
+	PROCEDURE LoadDocument*(VAR box: Box; name: LedaSys.String);
+		VAR r: Rider;	T: LONGINT;	tag0, tag1: CHAR;
+	BEGIN
+		OpenRider(name, r);
+		IF r.res < 0 THEN box := NIL	(* no document available *)
+		ELSE
+			T := LedaSys.Time();
+			Load(r, tag0); Load(r, tag1);
+			Load(r, version);	(* file version of document *)
+			IF (tag0 # FileTag0) OR (tag1 # FileTag1) THEN box := NIL
+			ELSE
+				LoadCtrlBlock(r);	(* load control block *)
+				LoadBox(r, NIL, box);	(* load document box *)
+				TermLoad(r)	(* terminates loading of control block *)
+			END;
+			version := InvFileVer;
+			CloseRider(r);
+			LedaSys.OutI(LedaSys.Time() - T, 3)
+		END
+	END LoadDocument;
+	
+	PROCEDURE StoreDocument*(VAR box: Box; name: LedaSys.String);
+		VAR r: Rider;	T: LONGINT;
+	BEGIN
+		NewRider(name, r);
+		IF r.res >= 0 THEN
+			T := LedaSys.Time();
+			Store(r, FileTag0); Store(r, FileTag1);
+			version := FileVer; Store(r, version);
+			InitStore(r);		(* initializes the control block for storing *)
+			StoreBox(r, box);		(* stores the document *)
+			StoreCtrlBlock(r);	(* stores the control block *)
+			RenameFile(name);	(* to rename an existing file by adding ".Bak" *)
+			CloseRider(r);
+			version := InvFileVer;
+			LedaSys.OutI(LedaSys.Time() - T, 3)
+		END
+	END StoreDocument;
+	
+(*--- font control ---*)
+
+(*---
+	- font control is a predefined control with instance data [family
+		name, size and face]; there can exist many font instances
+	- to get a font call GetFont
+	- incremental font size changes not executed for font styles
+		because font styles are referenced many times (also outside
+		the text where the size change takes place)
+---*)
+
+	PROCEDURE FntInvChar(ch: CHAR; X, Y: INTEGER; VAR s: SET);
+		VAR dx, x, y, w, h: INTEGER;	pat: LONGINT;
+	BEGIN
+		IF ch = Tab THEN ch := "B"				(* tab icon *)
+		ELSIF ch = LEnd THEN ch := "C"		(* return icon *)
+		ELSIF ch = Hyphen THEN ch := "D"		(* soft separator icon *)
+		ELSE RETURN	(*###*)
+		END;
+		LedaSys.GetIcon(ch, dx, x, y, w, h, pat);
+		Display.CopyPattern(LedaSys.inv, pat, X + x, Y + y, Display.invert);
+		INCL(s, InvertSepId)
+	END FntInvChar;
+	
+	PROCEDURE DrawCh(font: Font; ch: CHAR; y, clr, mode: INTEGER; last: BOOLEAN;
+										VAR x: INTEGER; VAR sepKind: CHAR);
+		VAR pat: LONGINT;	i: INTEGER;	(*-MAC-	obj: Objects.Object;	-MAC-*)
+	BEGIN
+		i := ORD(ch); sepKind := font.sep[i]; pat := font.pat[i];
+		IF pat # 0 THEN	(* draw character *)
+			(*-MAC-	font.fnt.GetObj(font.fnt, i, obj);	-MAC-*)
+			Display.CopyPattern(clr, pat, x + font.x[i], y + font.y[i], mode)
+		ELSIF last & (sepKind = Hyphen) THEN
+			i := ORD(Divis); pat := font.pat[i];
+			(*-MAC-	font.fnt.GetObj(font.fnt, i, obj);	-MAC-*)
+			Display.CopyPattern(clr, pat, x + font.x[i], y + font.y[i], mode)
+		END;
+		x := x + font.dx[i]
+	END DrawCh;
+	
+	PROCEDURE *FntDraw(font: PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		DrawCh(font(Font), ch, y, LedaSys.fg, mode, last, x, sepKind)
+	END FntDraw;
+
+	PROCEDURE *FntWidth(font: PieceCtrl; ch: CHAR; I: FormatInfo;
+											 VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR f: Font;	i: INTEGER;
+	BEGIN
+		i := ORD(ch); f := font(Font); sepKind := f.sep[i]; W := f.w[i]; w := f.dx[i]
+	END FntWidth;
+	
+	PROCEDURE *FntHeight(font: PieceCtrl; VAR H, bH: LONGINT);
+	BEGIN
+		H := font(Font).fH; bH := font(Font).bH
+	END FntHeight;
+	
+	PROCEDURE  FntInfo*(font: Font; id: INTEGER; VAR fName: LedaSys.String; VAR i: INTEGER);
+	(** returns basic information about screen font contained in font according selector id *)
+	BEGIN
+		CASE id OF 0: i := font.fnt.type
+		| 1: COPY(font.fnt.name, fName)
+		| 2: i := font.fnt.height
+		| 3: i := font.fnt.minX
+		| 4: i := font.fnt.maxX
+		| 5: i := font.fnt.minY 
+		| 6: i := font.fnt.maxY
+		END
+	END FntInfo;
+	
+	PROCEDURE FntName*(name, ext: LedaSys.Name; size: SHORTINT; face: CHAR; VAR fName: LedaSys.String);
+	(** builds file name fName given by family name name, size , face and extension ext *)
+	(** size > 99 or size < 0 -> neglect size and face [also used in LedaFrames] *)
+		VAR i, j: INTEGER;
+	BEGIN
+		i := 0; WHILE (name[i] # 0X) & (name[i] # ".") & (name[i] > "9") DO fName[i] := name[i]; INC(i) END;
+		IF (0 < size) & (size < 100) THEN
+			IF size > 9 THEN fName[i] := CHR( ORD("0") + size DIV 10 ); INC(i) END;
+			fName[i] := CHR( ORD("0") + size MOD 10 ); INC(i);
+		END;
+		IF (face # Space) & (face # 0X) THEN fName[i] := face; INC(i) END;
+		j := 0; WHILE ext[j] # 0X DO fName[i] := ext[j]; INC(i); INC(j) END;
+		fName[i] := 0X
+	END FntName;
+	
+	PROCEDURE LoadFntData(font: Font);
+	(* loads font data; priority:  metric , screen metric  *)
+		VAR mLib: Objects.Library;	fnt: Fonts.Font;	fName: LedaSys.String;
+			obj: Objects.Object;	chr: Fonts.Char;	empty: Fonts.CharDesc;
+			nullPat, emptyW: LONGINT;	i, ah, dh, h: INTEGER;
+	BEGIN
+		mLib := NIL;
+		(*-MAC-
+		FntName(font.name, ".Metric", font.size, font.face, fName);
+		mLib := Objects.ThisLibrary(fName);
+		-MAC-*)
+		IF (mLib = NIL) OR (mLib(Fonts.Font).type # MetricTyp) THEN
+			FntName(font.name, Metric, font.size, font.face, fName);
+			mLib := Objects.ThisLibrary(fName)
+		END;
+		IF (mLib = NIL) OR (mLib(Fonts.Font).type # MetricTyp) THEN
+			mLib := NIL; LedaSys.OutT(" - no metric data for ", 0);
+			LedaSys.OutT(font.name, 0);
+			IF font.size > 0 THEN LedaSys.OutI(font.size, 0) END;
+			LedaSys.OutC(font.face, 1)
+		END;
+		fnt := font.fnt; ah := fnt.maxY; dh := ABS(fnt.minY); h := fnt.height;
+		IF ah + dh > h THEN h := ah + dh;
+			LedaSys.OutT(" - data inconsistent in ", 0); LedaSys.OutT(fnt.name, 1)
+		END;
+		font.fH := LONG(h) * LedaSys.scnUnit;
+		font.bH := - LONG(dh) * LedaSys.scnUnit;	(* negative value *)
+		fnt.GetObj(fnt, 0, obj); nullPat := obj(Fonts.Char).pat;	(* not defined character *)
+		fnt.GetObj(fnt, ORD("?"), obj); empty := obj(Fonts.Char)^;
+		IF mLib = NIL THEN emptyW := LONG(empty.dx) * ScnScale
+		ELSE mLib.GetObj(mLib, ORD("?"), obj); emptyW := LONG(obj(Fonts.Char).dx) * MtrScale
+		END;
+		(*- set all array elements in font -*)
+		i := 0;
+		WHILE i < 256 DO
+			fnt.GetObj(fnt, i, obj); chr := obj(Fonts.Char);	(* get size data of character *)
+			IF (chr.pat = nullPat) OR (chr.pat = 0) THEN
+				font.x[i] := SHORT(empty.x); font.y[i] := SHORT(empty.y);
+				font.dx[i] :=  SHORT(empty.dx); font.pat[i] := empty.pat; font.w[i] := emptyW
+			ELSE
+				font.x[i] := SHORT(chr.x); font.y[i] := SHORT(chr.y);
+				font.dx[i] := SHORT(chr.dx); font.pat[i] := chr.pat;
+				IF mLib = NIL THEN font.w[i] := LONG(chr.dx) * ScnScale 
+				ELSE mLib.GetObj(mLib, i, obj); font.w[i] := LONG(obj(Fonts.Char).dx) * MtrScale
+				END
+			END;
+			font.sep[i] := 0X; INC(i)
+		END;
+		(*- special adjustments -*)
+		font.sep[ORD(Space)] := Space; font.pat[ORD(Space)] := 0;
+		font.sep[ORD(LEnd)] := LEnd; font.pat[ORD(LEnd)] := 0;
+			font.w[ORD(LEnd)] := font.fH DIV 3; font.dx[ORD(LEnd)] := SHORT(fnt.height DIV 3);
+		font.sep[ORD(Tab)] := Tab; font.pat[ORD(Tab)] := 0;
+		font.sep[ORD(Hyphen)] := Hyphen; font.pat[ORD(Hyphen)] := 0;
+			font.w[ORD(Hyphen)] := 0; font.dx[ORD(Hyphen)] := 0;
+		font.pat[ORD(Glue)] := 0;	(* no separator *)
+			font.w[ORD(Glue)] := font.w[ORD(Space)]; font.dx[ORD(Glue)] := font.dx[ORD(Space)];
+		font.pat[ORD(OldGlue)] := 0;	(* no separator *)
+			font.w[ORD(OldGlue)] := font.w[ORD(Space)]; font.dx[ORD(OldGlue)] := font.dx[ORD(Space)];
+		font.sep[ORD(Divis)] := Break;
+		font.sep[ORD("-")] := Break;
+	END LoadFntData;
+
+	PROCEDURE NewFont(fnt: Fonts.Font; VAR name: LedaSys.Name;
+									size: SHORTINT; face: CHAR; register: BOOLEAN): Font;
+	(* creates a new font control according parameters *)
+		VAR font: Font;	
+	BEGIN
+		NEW(font); InitControl(font, fontDoOp);
+		font.draw := FntDraw; font.width := FntWidth; font.height := FntHeight;
+		font.name := name; font.size := size; font.face := face;
+		font.fnt := fnt; LoadFntData(font);
+		IF register THEN RegisterControl(font) END;	(* make font global accessible *)
+		RETURN font
+	END NewFont;
+	
+	PROCEDURE *FontProcess(ctrl: Control);
+		VAR f: Font;
+	BEGIN	(* ctrl # NIL *)
+		IF ctrl IS Font THEN f := ctrl(Font);
+			IF (f.name = fAccess.name) & (f.size = fAccess.size) & (f.face = fAccess.face) THEN
+				fAccess.font := f
+			END
+		END
+	END FontProcess;
+	
+	PROCEDURE CheckFont(VAR name: LedaSys.Name; size: SHORTINT; face: CHAR;
+											VAR font: Font; VAR fnt: Fonts.Font);
+	(* checks if the font specified by family name name, size size and face face is available *)
+	(* result:  font # NIL -> font control existing / fnt = NIL -> no screen font available *)
+		VAR fName: LedaSys.String;
+	BEGIN
+		fAccess.name := name; fAccess.size := size; fAccess.face := face; fAccess.font := NIL;
+		AccessControls(FontProcess);
+		font := fAccess.font; fAccess.font := NIL;
+		IF font = NIL THEN	(* no font control found; check for screen font *)
+			FntName(name, ScnMetric, size, face, fName);
+			fnt := Fonts.This(fName);
+			IF (fnt # NIL) & (fnt.type # Fonts.font) THEN fnt := NIL END	(* original screen font not available *)
+		ELSE fnt := font.fnt
+		END
+	END CheckFont;
+	
+	PROCEDURE ExistFont*(name: LedaSys.Name; size: SHORTINT; face: CHAR): BOOLEAN;
+	(** checks if the font specified by family name name, size size and face face is available [screen and metric] *)
+		VAR font: Font;	fnt: Fonts.Font;
+	BEGIN
+		CheckFont(name, size, face, font, fnt);
+		RETURN (font # NIL) OR (fnt # NIL)	(* (font # NIL) OR ((font = NIL) & (fnt # NIL)) -> TRUE *)
+	END ExistFont;
+	
+	PROCEDURE GetFont*(name: LedaSys.Name; size: SHORTINT; face: CHAR): Font;
+	(** returns the font specified by name, size and face *)
+		VAR font: Font;	fnt: Fonts.Font;	fName: LedaSys.String;	register: BOOLEAN;
+	BEGIN
+		CheckFont(name, size, face, font, fnt);
+		IF font = NIL THEN	(* no font control available yet *)
+			register := fnt # NIL;	(* only if screen font is available *)
+			IF fnt = NIL THEN	(* screen font not available *)
+				LedaSys.OutT(" - ", 0);
+				LedaSys.OutT(name, 0);
+				IF size > 0 THEN LedaSys.OutI(size, 0) END;
+				 LedaSys.OutC(face, 0);
+				LedaSys.OutT(" replaced", 1);
+				FntName(DefFamily, ScnMetric, 12, " ", fName);
+				fnt := Fonts.This(fName);	(* if font fName not available default font is returned *)
+				IF fnt = NIL THEN fnt := Fonts.Default END;
+			END;
+			font := NewFont(fnt, name, size, face, register)
+		END;
+		RETURN font
+	END GetFont;
+	
+	PROCEDURE FontAdjustSize(VAR font: Font; ds: SHORTINT);
+	(* adjusts the font size about ds; thereby the font control is exchanged *)
+	(* because it could be referenced also outside the environement the size *)
+	(* change takes place *)
+		VAR nFont: Font;	nFnt: Fonts.Font;	size: SHORTINT;
+	BEGIN
+		IF ds # 0 THEN
+			size := font.size + ds;
+			CheckFont(font.name, size, font.face, nFont, nFnt);
+			IF nFnt = NIL THEN	(* screen font in new size not available *)
+				LedaSys.OutT(" - ", 0); LedaSys.OutT(font.name, 0);
+				IF size > 0 THEN LedaSys.OutI(size, 0) END;
+				LedaSys.OutC(font.face, 0); LedaSys.OutT(" not available", 1);
+				font := NewFont(font.fnt, font.name, size, font.face, FALSE)	(* new control with original screen font *)
+			ELSIF nFont = NIL THEN	(* font control not yet available *)
+				font := NewFont(nFnt, font.name, size, font.face, TRUE)	(* new control *)
+			ELSE font := nFont
+			END
+		END
+	END FontAdjustSize;
+	
+	PROCEDURE *FontDoOp(ctrl: Control; VAR m: Msg);
+	(* handle for font control [=predefined control]; multiple references *)
+		VAR name: LedaSys.Name;	size: SHORTINT;	ch: CHAR;
+	BEGIN
+		IF m IS CtrlMsg THEN
+			WITH m: CtrlMsg DO
+				CASE m.id OF CopyId:  m.ctrl := ctrl	(* reference copy *)
+				| RegisterId:  PutToList(ctrl, m.ctrlId)
+				| StoreId:
+						WITH ctrl: Font DO
+							StoreName(m.r, ctrl.name);
+							Store(m.r, CHR(ctrl.size)); Store(m.r, ctrl.face)
+						END
+				| LoadId: 
+						LoadName(m.r, name);
+						Load(m.r, ch); size := SHORT(ORD(ch));
+						Load(m.r, ch);	(* face *)
+						m.ctrl := GetFont(name, size, ch)
+				| StoreModCmd:  LedaSys.Halt("font control error")
+				| FileId:  ctrl.kindId := FontId
+				| ReplaceId:  IF (m.ch = "X") & (m.ctrl IS Font) THEN m.ctrlId := 1 END
+				| UpdateId:  IF ctrl = m.ctrl THEN m.ctrlId := PourAll ELSE ctrl.stamp := CurStamp() END	(* font changed *)
+				| InvertSepId:  FntInvChar(m.ch, m.x, m.y, m.s)
+				ELSE
+				END
+			END
+		ELSIF m IS BoxMsg THEN
+			WITH m: BoxMsg DO
+				IF m.id = NameId THEN m.name := ctrl(Font).name; m.b :=  m.ctrl = ctrl
+				ELSIF m.id = SizeId THEN (* may not be handled --> see note above *)
+				END
+			END
+		END
+	END FontDoOp;
+	
+(*--- style control ---*)
+
+(*---
+	- style control is a predefined control with instance data [name,
+		font, color, vertical offset]; there can exist many instances
+	- incremental font size changes only executed for standard named styles
+		[style name starts with small letter]
+---*)
+
+	PROCEDURE *StyleDraw(style: PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		WITH style: Style DO
+			DrawCh(style.font, ch, y + style.dy, style.clr, mode, last, x, sepKind)
+		END
+	END StyleDraw;
+	
+	PROCEDURE *StyleWidth(style: PieceCtrl; ch: CHAR; I: FormatInfo;
+												 VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		FntWidth(style(Style).font, ch, I, W, w, sepKind)
+	END StyleWidth;
+	
+	PROCEDURE *StyleHeight(style: PieceCtrl; VAR H, bH: LONGINT);
+		VAR d: LONGINT;
+	BEGIN
+		FntHeight(style(Style).font, H, bH);
+		WITH style: Style DO
+			IF style.voff # 0 THEN
+				d := LONG(ABS(style.dy)) * LedaSys.scnUnit;	(* d := (H * ABS(style.voff) + 50) DIV 100;  *)
+				IF style.voff > 0 THEN INC(H, d)
+				ELSIF style.voff < 0 THEN INC(H, d); DEC(bH, d)
+				END
+			END
+		END
+	END StyleHeight;
+	
+	PROCEDURE StylePrint(style: Style; last: BOOLEAN; VAR ch, sep: CHAR; 
+											VAR id, clr: INTEGER; VAR W, dY: LONGINT; VAR font: Control);
+		VAR f: Font;	i: INTEGER;
+	BEGIN
+		clr := style.clr; dY := 0;
+		font := style.font; f := style.font;
+		IF style.voff # 0 THEN
+			dY := (LedaSys.scnUnit * f.fnt.height * ABS(style.voff)) DIV 100;
+			IF style.voff < 0 THEN dY := - dY END
+		END;
+		i := ORD(ch); sep := f.sep[i];
+		IF f.pat[i] # 0 THEN
+			W := f.w[i]; id := 1	(* print ch *)
+		ELSIF last THEN
+			IF sep = Hyphen THEN ch := Divis; W := f.w[ORD(Divis)]; id := 1	(* print ch *)
+			ELSE W := 0; id := 3		(* do not print *)
+			END
+		ELSE W := f.w[i]; id := 3	(* do not print *)
+		END
+	END StylePrint;
+	
+	PROCEDURE NewStyle*(name: LedaSys.Name; font: Font; clr, voff: INTEGER): Style;
+	(** creates a new style control according parameters *)
+		VAR style: Style;	m: CtrlMsg;
+	BEGIN
+		IF name = "" THEN name := UnNamed END;
+		NEW(style); InitControl(style, styleDoOp);
+		style.draw := StyleDraw; style.width := StyleWidth; style.height := StyleHeight;
+		style.rtId := styleRTId; INC(styleRTId);
+		style.name := name; style.font := font;
+		style.clr := clr; style.voff := voff;
+		m.id := CheckId; style.doOp(style, m);	(* check settings *)
+		RETURN style
+	END NewStyle;
+	
+	PROCEDURE PutStyle(style: Style; VAR refId: INTEGER);
+		VAR cM: CtrlMsg;
+	BEGIN
+		cM.id := RegisterId; style.font.doOp(style.font, cM); PutToList(style, refId)
+	END PutStyle;
+	
+	PROCEDURE CopyStyle(style: Style): Style;
+	BEGIN
+		IF style.name # Anon THEN RETURN style	(* reference copy *)
+		ELSE RETURN NewStyle(style.name, style.font, style.clr, style.voff)	(* deep copy *)
+		END
+	END CopyStyle;
+	
+	PROCEDURE CheckStyle(style: Style);
+	BEGIN
+		IF style.voff > 50 THEN style.voff := 50 END;
+		IF style.voff < -50 THEN style.voff := -50 END;
+		style.dy := (style.font.fnt.height * ABS(style.voff) + 50) DIV 100;
+		IF style.voff <  0 THEN style.dy := -style.dy END
+	END CheckStyle;
+	
+	PROCEDURE StyleChangeSize(style: Style; ds: SHORTINT);
+	(* changes the font size about ds of a standard named style *)
+	BEGIN
+		IF (style.name[0] >= "a") & Unstamped(style.stamp) THEN
+			FontAdjustSize(style.font, ds);
+			CheckStyle(style);	(* to adjust style.dy *)
+			style.stamp := CurStamp()	(* to prevent further change *)
+		END
+	END StyleChangeSize;
+	
+	PROCEDURE *StyleDoOp(ctrl: Control; VAR m: Msg);
+	(* handle for style control [=predefined control]; multiple references *)
+		VAR clr, voff: INTEGER;	name: LedaSys.Name;	style: Style;
+	BEGIN
+		IF m IS PrintMsg THEN
+			WITH m: PrintMsg DO StylePrint(ctrl(Style), m.last, m.ch, m.sepKind, m.id, m.clr, m.W, m.dY, m.font) END
+		ELSIF m IS CtrlMsg THEN
+			WITH m: CtrlMsg DO
+				CASE m.id OF CopyId:  m.ctrl := CopyStyle(ctrl(Style))
+				| RegisterId:  PutStyle(ctrl(Style), m.ctrlId)
+				| StoreId: 
+						WITH ctrl: Style DO 
+							StoreName(m.r, ctrl.name); StoreCtrl(m.r, ctrl.font);
+							StoreI(m.r, ctrl.clr); StoreI(m.r, ctrl.voff)
+						END
+				| LoadId:
+						LoadName(m.r, name); LoadCtrl(m.r, ctrl);
+						LoadI(m.r, clr); LoadI(m.r, voff);
+						m.ctrl := NewStyle(name, ctrl(Font), clr, voff)
+				| StoreModCmd:  LedaSys.Halt("style control error")
+				| FileId:  ctrl.kindId := StyleId
+				| CheckId:  CheckStyle(ctrl(Style))
+				| ChangeId:  ctrl.stamp := CurStamp()
+				| ReplaceId:	(* replacement of ctrl by m.ctrl possible ? *)
+						IF m.ctrl IS Style THEN style := ctrl(Style);
+							IF m.ch = "X" THEN m.ctrlId := 1;	(* exchange okay *)
+								IF m.ctrl(Style).name = Anon THEN
+									IF style.name = Anon THEN style.font := m.ctrl(Style).font; style.clr := m.ctrl(Style).clr; 
+										style.voff := m.ctrl(Style).voff; style.dy := m.ctrl(Style).dy; m.ctrl := style	(* copy attributes *)
+									ELSE m.ctrl := CopyStyle(m.ctrl(Style))	(* create new instance *)
+									END
+								END
+							ELSIF m.ch = "=" THEN style := ctrl(Style);
+								IF (style.name # Anon) & (style.name = m.ctrl(Style).name) THEN m.ctrlId := 1 END	(* substitution okay *)
+							
+							ELSIF m.ch = "I" THEN
+								IF (style.name = Anon) & (style.name = m.ctrl(Style).name)
+									& (style.font = m.ctrl(Style).font) & (style.clr = m.ctrl(Style).clr)
+									& (style.voff = m.ctrl(Style).voff) THEN m.ctrlId := 1 END	(* same anonymous styles *)
+							END
+						END
+				| UpdateId:
+						IF ctrl = m.ctrl THEN m.ctrlId := PourAll ELSE ctrl.stamp := CurStamp() END	(* style changed *)
+				| InvertSepId: FntInvChar(m.ch, m.x, m.y, m.s)
+				ELSE
+				END
+			END
+		ELSIF m IS BoxMsg THEN
+			WITH m: BoxMsg DO
+				IF m.id = NameId THEN m.name := ctrl(Style).name; m.b :=  m.ctrl = ctrl
+				ELSIF m.id = SizeId THEN StyleChangeSize(ctrl(Style), SHORT(SHORT(m.l1)))
+				END
+			END
+		END
+	END StyleDoOp;
+	
+(*--- format base control ---*)
+
+(*---
+	_ format base is a predefined control with instance data
+	_ format base controls the basic formatting of a text
+	_ exported fields can be accessed directly [read only]
+---*)
+	
+	PROCEDURE InitFormat*(VAR f: FormatDsc);
+	BEGIN
+		f.lt := -1; f.rt := -1; f.gap := 0; f.lsp := -1; f.adj := 0X
+	END InitFormat;
+	
+	PROCEDURE CheckFormat*(VAR f: FormatDsc);
+	(** checks the settings of format f *)
+		VAR gap, wrap, v: LONGINT;
+	BEGIN
+		IF ~ ODD(f.lt) & (f.lt < 0) THEN f.lt := 0 END;
+		IF ~ ODD(f.rt) & (f.rt < 0) THEN f.rt := 0 END;
+		IF f.gap < 0 THEN f.gap := 0
+		ELSE
+			gap := f.gap MOD 100H; wrap := (f.gap DIV 100H) MOD 100H;
+			v := f.gap DIV 10000H;
+			IF gap >= 16 THEN gap := 0FFH END;
+			IF wrap > 15 THEN wrap := 15 END;
+			IF v * 1000 < LedaSys.scnUnit THEN v := 0 END;
+			f.gap := gap + wrap * 100H + v * 10000H
+		END;
+		IF f.lsp < -1 THEN f.lsp := -1 END;
+		IF (f.adj # "a") & (f.adj # "l") & (f.adj # "c") & (f.adj # "r") & (f.adj # "d") THEN f.adj := 0X END
+	END CheckFormat;
+	
+	PROCEDURE CheckBaseData(defFB: FormBase; VAR bd: BaseData);
+	BEGIN
+		IF defFB # NIL THEN
+			IF bd.sW = "d" THEN bd.width := defFB.data.width END;
+			IF bd.sCols = "d" THEN bd.cols := defFB.data.cols END;
+			IF bd.sDX = "d" THEN bd.colDX := defFB.data.colDX END;
+			IF bd.sLsp = "d" THEN bd.lsp := defFB.data.lsp END;
+			IF bd.sAdj = "d" THEN bd.adj := defFB.data.adj END
+		END;
+		IF (bd.sW # "o") & ((defFB = NIL) OR (bd.sW # "d")) THEN bd.sW := "o" END;
+		IF bd.width < 3 * CM THEN bd.width := 3 * CM; bd.sW := "o" END;	(* width *)
+		IF (bd.sCols # bd.cols) & ((defFB = NIL) OR (bd.sCols # "d")) THEN bd.sCols := bd.cols END;
+		IF ~ LedaSys.EqualCh("123m", bd.cols) THEN bd.cols := "1"; bd.sCols := "1" END;	(* cols *)
+		IF ~ LedaSys.EqualCh("no", bd.sDX) & ((defFB = NIL) OR (bd.sDX # "d")) THEN bd.sDX := "o" END;
+		IF bd.colDX < LedaSys.scnUnit THEN bd.colDX := LedaSys.scnUnit; bd.sDX := "o" END;	(* colDX *)
+		IF ~ LedaSys.EqualCh("nwro", bd.sLsp) & ((defFB = NIL) OR (bd.sLsp # "d")) THEN bd.sLsp := "o" END;
+		IF bd.lsp < 6 * LedaSys.scnUnit THEN bd.lsp := 6 * LedaSys.scnUnit; bd.sLsp := "o" END;	(* line space *)
+		IF (bd.sAdj # bd.adj) & ((defFB = NIL) OR (bd.sAdj # "d")) THEN bd.sAdj := bd.adj END;
+		IF ~ LedaSys.EqualCh("alcr", bd.adj) THEN bd.adj := "l"; bd.sAdj := "l" END	(* adjust *)
+	END CheckBaseData;
+	
+	PROCEDURE NewFormBase*(def: FormBase): FormBase;
+	(** creates a new format base refering to default format base def *)
+		VAR fB: FormBase;
+	BEGIN
+		NEW(fB); InitControl(fB, formBaseDoOp);
+		fB.name := Anon;
+		IF def = NIL THEN
+			fB.def := NIL;	(* no default reference *)
+			fB.data.width := 8 * CM; fB.data.sW := "o";
+			fB.data.lsp := (12 + 3) * LedaSys.scnUnit; fB.data.sLsp := "o";
+			fB.data.colDX := 12 * LONG(MM DIV 2); fB.data.sDX := "o";
+			fB.data.cols := "1"; fB.data.sCols := "1";
+			fB.data.adj := "a"; fB.data.sAdj := "a"
+		ELSE
+			fB.def := def;
+			fB.data.sW := "d"; fB.data.sLsp := "d"; fB.data.sDX := "d"; fB.data.sCols := "d"; fB.data.sAdj := "d";
+			fB.data.width := def.data.width; fB.data.lsp := def.data.lsp; fB.data.adj := def.data.adj;
+			fB.data.cols := def.data.cols; fB.data.colDX := def.data.colDX;
+			CheckBaseData(def, fB.data)
+		END;
+		RETURN fB
+	END NewFormBase;
+	
+	PROCEDURE DuplicateFormBase(ref: FormBase): FormBase;
+	(* duplicate given form base ref [dep copy] *)
+		VAR fB: FormBase;
+	BEGIN
+		NEW(fB); InitControl(fB, formBaseDoOp);
+		fB.name := ref.name; fB.def := ref.def; fB.data := ref.data;
+		RETURN fB
+	END DuplicateFormBase;
+	
+	PROCEDURE PutFormBase(fB: FormBase; VAR refId: INTEGER);
+		VAR cM: CtrlMsg;
+	BEGIN
+		IF fB.def # NIL THEN cM.id := RegisterId; fB.def.doOp(fB.def, cM) END;
+		PutToList(fB, refId)
+	END PutFormBase;
+	
+	PROCEDURE StoreFormBase(VAR r: Rider; fB: FormBase);
+	BEGIN
+		StoreCtrl(r, fB.def);
+		IF fB.name # Anon THEN Store(r, ExtKey); StoreName(r, fB.name) END;	(* extension *)
+		Store(r, fB.data.sW); IF fB.data.sW # "d" THEN StoreVal(r, fB.data.width) END;
+		Store(r, fB.data.sLsp); IF fB.data.sLsp # "d" THEN StoreVal(r, fB.data.lsp) END;
+		Store(r, fB.data.sDX); IF fB.data.sDX # "d" THEN StoreVal(r, fB.data.colDX) END;
+		Store(r, fB.data.sAdj); Store(r, fB.data.sCols);
+	END StoreFormBase;
+	
+	PROCEDURE LoadFormBase(VAR r: Rider): FormBase;
+		VAR ctrl: Control;	fB, def: FormBase;
+	BEGIN
+		NEW(fB); InitControl(fB, formBaseDoOp);
+		def := NIL; LoadCtrl(r, ctrl); IF ctrl # NIL THEN def := ctrl(FormBase) END;
+		Load(r, fB.data.sW);
+		IF fB.data.sW = ExtKey THEN LoadName(r, fB.name); Load(r, fB.data.sW)	(* extension *) 
+		ELSE fB.name := Anon
+		END;
+		IF fB.data.sW # "d" THEN LoadVal(r, fB.data.width) ELSE fB.data.width := def.data.width END;
+		Load(r, fB.data.sLsp); IF fB.data.sLsp # "d" THEN LoadVal(r, fB.data.lsp) ELSE fB.data.lsp := def.data.lsp END;
+		Load(r, fB.data.sDX); IF fB.data.sDX # "d" THEN LoadVal(r, fB.data.colDX) ELSE fB.data.colDX := def.data.colDX END;
+		Load(r, fB.data.sAdj); IF fB.data.sAdj # "d" THEN fB.data.adj := fB.data.sAdj ELSE fB.data.adj := def.data.adj END;
+		Load(r, fB.data.sCols); IF fB.data.sCols # "d" THEN fB.data.cols := fB.data.sCols ELSE fB.data.cols := def.data.cols END;
+		fB.def := def; RETURN fB
+	END LoadFormBase;
+	
+	PROCEDURE CheckFormBase(fB: FormBase; ctrl: Control; VAR res: INTEGER);
+	(* checks if update of control ctrl has any effect for format base fB *)
+	(* in case of an effect the res parameter is changed *)
+		VAR def: FormBase;
+	BEGIN
+		IF fB = ctrl THEN res := PourAll				(* changed itself *)
+		ELSIF fB.def = ctrl THEN def := fB.def;	  (* default format base changed *)
+			IF fB.data.sW = "d" THEN fB.data.width := def.data.width; res := PourAll END;
+			IF fB.data.sLsp = "d" THEN fB.data.lsp := def.data.lsp; res := PourAll END;
+			IF fB.data.sDX = "d" THEN fB.data.colDX := def.data.colDX; res := PourAll END;
+			IF fB.data.sAdj = "d" THEN fB.data.adj := def.data.adj; res := PourAll END;
+			IF fB.data.sCols = "d" THEN fB.data.cols := def.data.cols; res := PourAll END
+		END
+	END CheckFormBase;
+	
+	PROCEDURE *FormBaseDoOp(ctrl: Control; VAR m: Msg);
+	(* handle for format control [=predefined control]; multiple references *)
+		VAR res: INTEGER;
+	BEGIN
+		IF m IS CtrlMsg THEN
+			WITH m: CtrlMsg DO
+				CASE m.id OF CopyId:  m.ctrl := ctrl	(* reference copy *)
+				| DuplicateId:  m.ctrl := DuplicateFormBase(ctrl(FormBase))	(* deep copy *)
+				| RegisterId:  PutFormBase(ctrl(FormBase), m.ctrlId)
+				| StoreId:  StoreFormBase(m.r, ctrl(FormBase))
+				| LoadId:  m.ctrl := LoadFormBase(m.r)
+				| StoreModCmd:  LedaSys.Halt("format control error")
+				| FileId:  ctrl.kindId := FormBaseId
+				| CheckId:  CheckBaseData(ctrl(FormBase).def, ctrl(FormBase).data)
+				| ChangeId:  CheckFormBase(ctrl(FormBase), m.ctrl, res)
+				| UpdateId:  CheckFormBase(ctrl(FormBase), m.ctrl, m.ctrlId)
+				ELSE
+				END
+			END
+		ELSIF m IS BoxMsg THEN
+			WITH m: BoxMsg DO
+				IF m.id = NameId THEN m.name := ctrl(FormBase).name; m.b :=  m.ctrl = ctrl END
+			END
+		END
+	END FormBaseDoOp;
+	
+
+BEGIN
+	Recall := NIL;
+	curStamp := StampBeg; stampCount := 0;
+	(*--- basic control handling ---*)
+	ctrlL := NIL; ctrlLast := NIL; ctrlLID := NotDef;
+	storeStamp := StampBeg;
+	ctrlPos := 0; WHILE ctrlPos < PreDefCtrls DO ctrls[ctrlPos] := NIL; INC(ctrlPos) END;	(* ctrlPos used as index *)
+	depositedCtrl := NIL;
+	ctrlPos := NotDef;
+	nofCtrls := 0; processCtrl := NIL;
+	Objects.Register("Ctrl", LibNew);	(* "Ctrl" -> extension used in RegisterControl *)
+	(*--- deputy control ---*)
+	deputyDoOp := DeputyDoOp;	(* deputyDoOp -> used by NewDeputy *)
+	(*--- font control ---*)
+	fontDoOp := FontDoOp;	(* fontDoOp -> used by NewFont *)
+	defFont := GetFont(DefFamily, 12, " ");
+	fAccess.font := NIL;
+	RPC(defFont, FontId);	(* register type *)
+	(*--- style control ---*)
+	styleRTId := 0;	(* run time id for styles *)
+	styleDoOp := StyleDoOp;	(* styleDoOp -> used by NewStyle *)
+	defStyle := NewStyle("normal", defFont, DefColor , DefVoff);
+	RPC(defStyle, StyleId);	(* register type *)
+	(*--- format base control ---*)
+	formBaseDoOp := FormBaseDoOp;	(* formDoOp -> used by NewFormBase *)
+	RPC(NewFormBase(NIL), FormBaseId);	(* register type *)
+	(*--- own ---*)
+	inCtrl := defStyle;
+	version := InvFileVer
+END LedaBase.

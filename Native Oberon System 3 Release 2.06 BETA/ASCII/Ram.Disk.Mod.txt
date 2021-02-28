@@ -1,0 +1,218 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Disk;	(* pmuller 06.06.95 *)
+
+(* Disk driver for native Oberon (Installation version *)
+
+IMPORT Kernel, Diskette0, SYSTEM;
+
+TYPE
+	Sector* = RECORD END;	(** 2k Oberon Sector *)
+
+CONST
+	SectorSize* = 2048;
+	
+	MaxSectors = 400;	(* size of installation ramdisk *)
+
+	SS = SectorSize;	(* Oberon sector size *)
+	BPS = SectorSize DIV 512;	(* Diskette blocks per sector *)
+
+VAR
+		(* sector management *)
+	numused: LONGINT;	(* number of used Sectors *)
+	nummax: LONGINT;	(* total number of Sectors *)
+	map: POINTER TO ARRAY OF SET;
+	disk: POINTER TO ARRAY MaxSectors OF ARRAY SS OF CHAR;
+	rootoffset: INTEGER;
+	drive: SHORTINT;
+
+(* InitTable - Initialise sector reservation table *)
+
+PROCEDURE InitTable;
+VAR s, err, x: LONGINT;  b: ARRAY 512 OF CHAR;  num: INTEGER;
+BEGIN
+		(* read boot block to get offset *)
+	Diskette0.GetSectors(drive, 0, 1, b, 0);
+	x := 0;  SYSTEM.GET(SYSTEM.ADR(b[510]), SYSTEM.VAL(INTEGER, x));
+	b[0] := "x"; b[1] := "x"; b[2] := "x";  b[9] := 0X;
+	IF (x = 0AA55H) & (b = "xxxOBERON") THEN	(* valid boot block *)
+		SYSTEM.GET(SYSTEM.ADR(b[0EH]), rootoffset);
+		SYSTEM.GET(SYSTEM.ADR(b[13H]), num);	(* total sectors *)
+		num := (num-rootoffset) DIV BPS	(* number of Oberon sectors *)
+	ELSE HALT(99)
+	END;
+		(* set up sector reservation table *)
+	IF num > MaxSectors THEN HALT(99) END;
+	nummax := MaxSectors;
+	s := (nummax+31) DIV 32;
+	NEW(map, s);
+	WHILE s # 0 DO DEC(s); map[s] := {} END;
+	INCL(map[0], 0);	(* reserve sector 0 (illegal to use) *)
+		(* create the disk image *)
+	SYSTEM.NEW(disk, nummax*SS);
+	Diskette0.GetSectors(drive, rootoffset, num*BPS, disk^, 0);
+	Diskette0.StopMotor(drive)
+END InitTable;
+
+(* ---- Ceres-like interface ---- *)
+
+(* InSector - "Decode" and check an Oberon sector number. *)
+
+PROCEDURE InSector(VAR sec: LONGINT);                
+BEGIN
+	IF (sec < 29) OR (sec MOD 29 # 0) THEN
+		HALT(21) (* Illegal sector address *)
+	END;
+	sec := sec DIV 29
+END InSector;
+
+PROCEDURE *Dummy;
+END Dummy;
+
+(** AllocSector - Allocate a new Sector.  "hint" can be previously allocated
+	Sector to preserve adjacency, or 0 if previous Sector not known *)
+
+PROCEDURE AllocSector*(hint: LONGINT; VAR sec: LONGINT);
+VAR i : LONGINT;
+BEGIN
+	i := hint+29;
+	InSector(i);  hint := i-1;
+	IF hint >= nummax THEN hint := 0 END;
+	LOOP
+		IF i >= nummax THEN i := 0 END;
+		IF (i MOD 32) IN map[i DIV 32] THEN INC(i)	(* in use *)
+		ELSE
+			sec := i;  INCL(map[i DIV 32], i MOD 32);  INC(numused);
+			sec := sec*29;	(* "Encode" sector number. *)
+			EXIT
+		END;
+		IF i = hint THEN HALT(22) (* Disk full *) END
+	END
+END AllocSector;
+
+(** MarkSector - Mark an unused Sector as used.  Do not mark already marked sectors. *)
+
+PROCEDURE MarkSector*(sec: LONGINT);
+BEGIN
+	InSector(sec);
+	INCL(map[sec DIV 32], sec MOD 32);
+	INC(numused)
+END MarkSector;
+
+(** FreeSector - Mark a used Sector as unused.  Do not unmark already unmarked sectors. *)
+
+PROCEDURE FreeSector*(sec: LONGINT);
+BEGIN
+	InSector(sec);
+	EXCL(map[sec DIV 32], sec MOD 32);
+	DEC(numused)
+END FreeSector;
+
+(** Marked - Test if a sector is marked as used. *)
+
+PROCEDURE Marked*(sec: LONGINT): BOOLEAN;
+BEGIN
+	InSector(sec);
+	RETURN (sec MOD 32) IN map[sec DIV 32]
+END Marked;
+
+(** GetSector - Read a 2k Sector from disk *)
+
+PROCEDURE GetSector*(src: LONGINT; VAR dest: Sector);
+BEGIN
+	InSector(src);
+	IF (src < 1) OR (src > nummax) THEN HALT(20) END;
+	SYSTEM.MOVE(SYSTEM.ADR(disk[src-1]), SYSTEM.ADR(dest), SS)
+END GetSector;
+
+(** PutSector - Write a 2k Sector to disk *)
+
+PROCEDURE PutSector*(dest: LONGINT; VAR src: Sector);
+BEGIN
+	InSector(dest);
+	IF (dest < 1) OR (dest > nummax) THEN HALT(20) END;
+	SYSTEM.MOVE(SYSTEM.ADR(src), SYSTEM.ADR(disk[dest-1]), SS);
+	(* Diskette0.PutSectors *)
+END PutSector;
+
+(** GetBlocks - Read 512-byte disk blocks.  Low-level interface to driver.
+	"drive" - hard disk number (0 or 1)
+	"start" - start sector number
+	"num" - number of sectors
+	"buf" - buffer to read into
+	"ofs" - offset from start of buf in bytes *)
+
+PROCEDURE GetBlocks*(drive: SHORTINT;  start, num: LONGINT;  VAR buf: ARRAY OF SYSTEM.BYTE;  ofs: LONGINT);
+BEGIN
+	HALT(99)
+END GetBlocks;
+
+(** PutBlocks - Write 512-byte disk blocks.  Low-level interface to driver.
+	"drive" - hard disk number (0 or 1)
+	"start" - start sector number
+	"num" - number of sectors
+	"buf" - buffer to write from
+	"ofs" - offset from start of buf in bytes *)
+
+PROCEDURE PutBlocks*(drive: SHORTINT;  start, num: LONGINT;  VAR buf: ARRAY OF SYSTEM.BYTE;  ofs: LONGINT);
+BEGIN
+	HALT(99)
+END PutBlocks;
+
+(** ResetDisk - Reset the disk driver *)
+
+PROCEDURE ResetDisk*;
+BEGIN
+	(* not implemented, not required *)
+END ResetDisk;
+
+(** Available - Return number of 2k Sectors available (unmarked) on disk *)
+
+PROCEDURE Available*(): LONGINT;
+BEGIN
+	RETURN nummax - numused
+END Available;
+
+(** Size - Return total number of 2k Sectors on disk *)
+
+PROCEDURE Size*(): LONGINT;
+BEGIN
+	RETURN nummax
+END Size;
+
+(** NumDrives - Return number of disk drives available *)
+
+PROCEDURE NumDrives*(): SHORTINT;
+BEGIN
+	HALT(99)
+END NumDrives;
+
+(** GetParams - Return parameters of drive (for Install) *)
+
+PROCEDURE GetParams*(drive: SHORTINT;  VAR cyls, hds, spt: LONGINT);
+BEGIN
+	HALT(99)
+END GetParams;
+
+(* ---- Initialisation ---- *)
+
+BEGIN
+	drive := 0;
+		(* initialise tables *)
+	nummax := 0;  numused := 0;  map := NIL;
+	InitTable;
+	IF nummax = 0 THEN
+		Kernel.WriteString("Install disk error");  Kernel.WriteLn	(* error message *)
+	END
+END Disk.

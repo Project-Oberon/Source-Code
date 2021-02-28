@@ -1,0 +1,1438 @@
+MODULE DOCE;  (*NW 7.6.87 / 5.3.91 // ARD 18. 2. 93 *)
+(* ARD 22. 12. 93: Bug with Float compare --> Flags *)
+(* ARD 22. 12. 93: Bug with array indices  --> Mult, IndAdd *)
+(* ARD 18.02.94: Bug with SYSTEM.VAL(REAL, a), a: ARRAY x OF BYTE  *)
+(* ARD Wed, 23-Mar-1994, NIL traps with debug registers *)
+(* ARD Wed, 6-Apr-1994 SYSTEM.PUT & SYSTEM.GET: error when NoTyp *)
+(* ARD 24.05.94 No overflow check after IDIV instruction *)
+(* ARD Tue, 14-Jun-1994 overflow check after INC/DEC *)
+(* ARD Wed, 22-Jun-1994 SYSTEM commands 40 - 43 *)
+(* ARD Wed, 23-Jun-1994 SYSTEM commands 44 - 45 *)
+(* ARD 20.04.95 No swap in conversion procs *)
+(* ARD 8.05.95 revision conversion procs *)
+(* ARD 8.08.95 const real expressions *)
+
+
+	IMPORT SYSTEM, DOCS, DOCT, DOCC;
+
+	CONST
+		(*object and item modes*)
+			Var = 1; VarX = 2; Ind = 3; IndX = 4; RegI = 5;
+			RegX = 6; Abs = 7; Con = 8; Stk = 9; Coc = 10;
+			Reg = 11; Fld = 12; Typ = 13;
+
+		(*structure forms*)
+			Undef = 0; Byte = 1; Bool = 2; Char = 3; SInt = 4; Int = 5; LInt = 6;
+			Real = 7; LReal = 8; Set = 9; String = 10; NilTyp = 11; NoTyp = 12;
+			Pointer = 13; ProcTyp = 14; Array = 15; DynArr = 16; Record = 17;
+
+		(* Registernumbers *)									(* <-- ARD *)
+			eax = 0; ecx = 1; edx = 2; ebx = 3; esp = 4; ebp = 5; esi = 6; edi = 7; 
+
+	VAR inxchk*, ovflchk*, nilcheck*: BOOLEAN;
+			log: INTEGER; (*side effect of mant*)
+			lengcode: ARRAY 18 OF INTEGER;
+			intSet, realSet: SET;
+			trapjmp*: LONGINT;	(* boundtrap *)
+			niltrap*: LONGINT; 		(* niltrap *)
+			newlink*, sysnewlink*: LONGINT;
+			FCon, FConl, Control, EAX, AH, EDX: DOCT.Item;
+			ovrproc*: DOCT.Object; level*: LONGINT;	(* ARD *)
+			boolset*: SET;
+			regSet: SET;
+
+	PROCEDURE inverted(x: LONGINT): LONGINT;
+	BEGIN (*inverted sense of condition code*)
+		IF ODD(x) THEN RETURN x-1 ELSE RETURN x+1 END
+	END inverted;
+
+	PROCEDURE load*(VAR x: DOCT.Item);
+		VAR y: DOCT.Item; L: INTEGER;
+	BEGIN 
+		IF x.mode < Reg THEN y := x; L := lengcode[x.typ.form];
+			IF (y.mode = Con) THEN DOCC.Register(L, x);
+				IF L = 0 THEN DOCC.PutOD(4, 1, 0B0H + x.a0, y.a0);		(* MOV Reg, Immediate *)
+				ELSE DOCC.PutOD(L+1, L+1, 0B8H + x.a0, y.a0) END;
+			ELSE DOCC.Register(L, x); 
+				DOCC.PutORM(L+1, 8BH, x.a0, y);	(* MOVE Mem/Reg to Reg *)
+				IF (y.mode IN {RegI, RegX}) THEN EXCL(DOCC.RegSet, y.a0) END;		(* <-- ARD Fri, 30-Apr-93*)
+				IF (y.mode IN {RegX, VarX, IndX}) THEN EXCL(DOCC.RegSet, y.a2) END;		(* <-- ARD Fri, 30-Apr-93*)
+			END;
+		ELSIF x.mode > Reg THEN DOCS.Mark(126) END
+	END load;
+
+	PROCEDURE loadX*(VAR x: DOCT.Item);
+		VAR y: DOCT.Item; L: INTEGER;
+	BEGIN L := lengcode[x.typ.form];
+		IF x.mode <= Reg THEN
+			y := x; 
+			IF (y.mode = Con) THEN DOCC.GetGenReg(x); DOCC.PutOD(4, 4, 0B8H + x.a0, y.a0)	(* MOV Reg, Immediate; *)
+			ELSIF (y.mode = Reg) THEN 
+				IF L = 0 THEN DOCC.PutORM(4, 0FBEH, x.a0, x) ELSIF L = 1 THEN DOCC.PutORM(4, 0FBFH, x.a0, x) END;
+			ELSE DOCC.Register(L, x);	(* MOVSX Mem/Reg to ExtReg *)
+				IF L = 0 THEN DOCC.PutORM(4, 0FBEH, x.a0, y) ELSIF L = 1 THEN DOCC.PutORM(4, 0FBFH, x.a0, y) 
+				ELSE DOCC.PutORM(4, 08BH, x.a0, y) END
+			END
+		ELSIF x.mode > Reg THEN DOCS.Mark(126) END
+	END loadX;
+
+	PROCEDURE loadF*(VAR x: DOCT.Item);
+	BEGIN
+		IF x.mode < Reg THEN
+			IF x.mode = Con THEN
+				IF lengcode[x.typ.form] = 1 THEN 
+					DOCC.PutOMD(4, 4, 0C7H, 0, FCon, x.a0);	(* MOV FCon, x.a0 *)
+					DOCC.PutOM(4, 0D9H, 0, FCon)					(* FLD ST(0), FCon *)
+				ELSE DOCC.PutOMD(4, 4, 0C7H, 0, FCon, x.a0); DOCC.PutOMD(4, 4, 0C7H, 0, FConl, x.a1);
+					DOCC.PutOM(4, 0DDH, 0, FCon) END;			(* FLD ST(0), FCon *)
+			ELSIF x.typ.form IN realSet THEN 
+				IF lengcode[x.typ.form] = 1 THEN DOCC.PutOM(4, 0D9H, 0, x)					(* FLD ST(0), x *)
+				ELSE DOCC.PutOM(4, 0DDH, 0, x) END;
+			ELSIF x.typ.form IN intSet THEN
+				loadX(x);
+				DOCC.PutORM(4, 089H, x.a0, FCon);					(* MOV FCon, x *)
+				DOCC.PutOM(4, 0DFH, 0, FCon);					(* FLD ST(0), FCon *)
+			ELSE DOCS.Mark(126)
+			END; x.mode := Reg; 
+			INC(DOCC.FStack); IF DOCC.FStack >= 8 THEN DOCC.FStack := 0; DOCS.Mark(216) END
+		ELSIF x.mode > Reg THEN DOCS.Mark(126) END
+	END loadF;
+
+	PROCEDURE loadB(VAR x: DOCT.Item);	(*Coc-Mode*)
+		VAR L0, L1: LONGINT;
+	BEGIN
+		IF (x.a1 = 0) & (x.a2 = 0) THEN
+			L0 := x.a0; DOCC.GetByteReg(x); DOCC.PutOM(4, 0F90H + SHORT(L0), 0, x);	(* Setcond x, L0 *)
+		ELSE DOCC.PutOD(4, 4, 0F80H + inverted(x.a0), x.a2); L0 := DOCC.pc - 4;
+			DOCC.FixLink(x.a1); DOCC.GetByteReg(x); DOCC.PutOD(4, 1, 0B0H + x.a0, 1);
+			DOCC.PutOD(4, 4, 0E9H, 0);L1 := DOCC.pc - 4; 
+			DOCC.FixLink(L0); DOCC.PutOD(4, 1, 0B0H + x.a0, 0); DOCC.fixup(L1)
+		END
+	END loadB;
+
+	PROCEDURE loadAdr*(VAR x: DOCT.Item);
+		VAR y: DOCT.Item;
+	BEGIN
+		IF x.mode < Con THEN
+			y := x; DOCC.GetGenReg(x);
+			IF (y.mode = Ind) & (y.a1 = 0) THEN y.mode := Var; DOCC.PutORM(4, 8BH, x.a0, y)
+			ELSE DOCC.PutORM(4, 8DH, x.a0, y); x.a1 := 0;
+				IF (y.mode IN {RegI, RegX}) THEN EXCL(DOCC.RegSet, y.a0) END;		(* <-- ARD Fri, 30-Apr-93*)
+				IF (y.mode IN {RegX, VarX, IndX}) THEN EXCL(DOCC.RegSet, y.a2) END;		(* <-- ARD Fri, 30-Apr-93*)
+			END;
+			x.mode := RegI; x.obj := NIL
+		ELSE DOCS.Mark(127) END
+	END loadAdr;
+
+	PROCEDURE setCC(VAR x: DOCT.Item; cc: LONGINT);
+	BEGIN
+		x.typ := DOCT.booltyp; x.mode := Coc; x.a0 := cc; x.a1 := 0; x.a2 := 0
+	END setCC;
+
+	PROCEDURE cmp(L: INTEGER; VAR x, y: DOCT.Item);
+	BEGIN 
+		IF (y.mode = Con) & (x.mode # Con) THEN load(y); DOCC.PutORM(L+1, 3BH, y.a0, x)	(* CMP Reg, Reg *)
+		ELSIF x.mode = Con THEN load(y); DOCC.PutOMD(L+1, L+1, 81H, 7, y, x.a0)				(* CMP Reg, Imm *)
+		ELSE load(x); DOCC.PutORM(L+1, 39H, x.a0, y)															(* CMP Reg, Mem *)
+		END
+	END cmp;
+
+	PROCEDURE add(L: INTEGER; VAR x, y: DOCT.Item);
+	BEGIN
+		IF (y.mode = Con) THEN DOCC.PutOMD(L+1, L+1, 81H, 0, x, y.a0)	(* ADD Reg/Mem, Imm *)
+		ELSE 
+			IF x.mode # Reg THEN load(y); DOCC.PutORM(L+1, 1H, y.a0, x)	(* ADD Reg/Mem, Reg *)
+			ELSE DOCC.PutORM(L+1, 3H, x.a0, y)											(* ADD Reg, Reg/Mem *)
+			END	
+		END;
+	END add;
+
+	PROCEDURE sub(L: INTEGER; VAR x, y: DOCT.Item);
+	BEGIN
+		IF (y.mode = Con) THEN DOCC.PutOMD(L+1, L+1, 81H, 5, x, y.a0)	(* SUB Reg/Mem, Imm *)
+		ELSE 
+			IF x.mode # Reg THEN load(y); DOCC.PutORM(L+1, 29H, y.a0, x)	(* SUB Reg/Mem, Reg *)
+			ELSE DOCC.PutORM(L+1, 2BH, x.a0, y)											(* SUB Reg, Reg/Mem *)
+			END;
+		END;
+	END sub;
+	
+	PROCEDURE mant(x: LONGINT): LONGINT;	(*x DIV 2^log*)
+	BEGIN log := 0;
+		IF x # 0 THEN
+			WHILE ~ODD(x) DO x := x DIV 2; INC(log) END;
+		END;
+		RETURN x
+	END mant;
+	
+	PROCEDURE Mult(VAR x, z: DOCT.Item);
+	VAR y: DOCT.Item;
+	BEGIN 
+		IF z.mode = Con THEN y.lev := x.lev; y.a0 := x.a2; y.mode := Reg;
+			IF z.a0 <= MAX(SHORTINT) THEN DOCC.PutORMD(4, 1, 6BH, y.a0, y, z.a0) 
+			ELSE DOCC.PutORMD(4, 4, 69H, y.a0, y, z.a0) END;
+		ELSE 	
+			DOCC.GetGenReg(y); DOCC.PutORM(4, 0FBFH, y.a0, z); DOCC.PutO(4, 40H+y.a0); 
+			DOCC.PutORM(4, 0FAFH, x.a2, y); DOCC.FreeReg(y)			(* IMUL x.a2, y *)
+		END
+	END Mult;
+	
+	PROCEDURE IndAdd(VAR x, z: DOCT.Item);
+	VAR y: DOCT.Item;
+	BEGIN y.lev := x.lev; y.a0 := x.a2; y.mode := Reg; DOCC.PutORM(4, 3, y.a0, z)		(* ADD x.a2, y *) 
+	END IndAdd;
+
+	PROCEDURE SetIntType*(VAR x: DOCT.Item);
+		VAR v: LONGINT;
+	BEGIN v := x.a0;
+		IF (-80H <= v) & (v <= 7FH) THEN x.typ := DOCT.sinttyp
+		ELSIF (-8000H <= v) & (v <= 7FFFH) THEN x.typ := DOCT.inttyp
+		ELSE x.typ := DOCT.linttyp END
+	END SetIntType;
+
+	PROCEDURE AssReal*(VAR x: DOCT.Item; y: REAL);
+	BEGIN SYSTEM.PUT(SYSTEM.ADR(x.a0), y)
+	END AssReal;
+
+	PROCEDURE AssLReal*(VAR x: DOCT.Item; y: LONGREAL);
+	BEGIN SYSTEM.PUT(SYSTEM.ADR(x.a0), y)
+	END AssLReal;
+	
+	PROCEDURE CheckOK*(VAR ok: BOOLEAN; reg: INTEGER; VAR y: DOCT.Item);
+	VAR z1: DOCT.Item;
+	BEGIN
+		IF ~ok THEN 
+			IF (y.a0 = reg) & (y.mode IN {Reg, RegI, RegX}) THEN 
+				DOCC.Register(lengcode[y.typ.form], z1); DOCC.PutORM(4, 89H, y.a0, z1); y.a0 := z1.a0; ok := TRUE END; 
+			IF (y.a2 = reg) & (y.mode IN {VarX, RegX, IndX}) THEN 
+				DOCC.Register(lengcode[y.typ.form], z1); DOCC.PutORM(4, 89H, y.a2, z1); y.a2 := z1.a0; ok := TRUE END;
+		END
+	END CheckOK;
+
+	PROCEDURE Index*(VAR x, y: DOCT.Item);
+		VAR f: INTEGER; i, n: LONGINT;
+			eltyp: DOCT.Struct; z: DOCT.Item;
+	BEGIN f := y.typ.form;
+		IF ~(f IN intSet) THEN DOCS.Mark(80); y.typ := DOCT.inttyp END;
+		IF x.typ = NIL THEN HALT(80) END;
+		IF x.typ.form = Array THEN
+			eltyp := x.typ.BaseTyp; n := x.typ.n;
+			IF eltyp = NIL THEN HALT(81) END;
+			IF y.mode = Con THEN
+				IF (0 <= y.a0) & (y.a0 < n) THEN i := y.a0 * eltyp.size ELSE DOCS.Mark(81); i := 0 END;
+				IF x.mode = Var THEN INC(x.a0, i)
+				ELSIF (x.mode = RegI) OR (x.mode = Ind) THEN INC(x.a1, i); x.obj := NIL
+				ELSE loadAdr(x); x.a1 := i END
+			ELSE
+				IF f = LInt THEN load(y) ELSE loadX(y) END;
+				IF inxchk THEN	(*z = bound descr*)
+					z.mode := Var; z.a0 := x.typ.adr; z.lev := -x.typ.mno;
+					DOCC.PutORM(4, 3BH, y.a0, z);						(* CMP index, upper bound *)
+					DOCC.PutOD(4, 4, 0F87H, trapjmp); trapjmp := DOCC.pc-4;	(* JA trap *)
+				END;
+				IF x.mode = Var THEN x.mode := VarX; x.a2 := y.a0
+				ELSIF x.mode = RegI THEN x.mode := RegX; x.a2 := y.a0
+				ELSIF x.mode = Ind THEN x.mode := IndX; x.a2 := y.a0;
+				ELSIF x.mode IN {VarX, RegX, IndX} THEN
+					z.mode := Con; z.typ := DOCT.linttyp; z.a0 := x.typ.size;	z.a0 := z.a0 DIV eltyp.size;
+					Mult(x, z); IndAdd(x, y);			(*INDEX*)
+					DOCC.FreeReg(y);					(* <-- ARD 18. 3. 93 *)
+				ELSE loadAdr(x); x.mode := RegX; x.a1 := 0; x.a2 := y.a0 END
+			END;
+			x.typ := eltyp
+		ELSIF x.typ.form = DynArr THEN
+			IF f = LInt THEN load(y) ELSE loadX(y) END;
+			IF inxchk THEN 
+				z.mode := Var; z.a0 := x.a0 + x.typ.adr; z.lev := x.lev;
+				DOCC.PutORM(4, 3BH, y.a0, z); 		(* CMP index, upper bound; JA trap*)
+				DOCC.PutOD(4, 4, 0F87H, trapjmp); trapjmp := DOCC.pc-4;
+			END;
+			IF x.mode = RegI THEN x.mode := RegX; x.a2 := y.a0
+			ELSIF x.mode IN {Var, Ind} THEN x.mode := IndX; x.a2 := y.a0;
+			ELSIF x.mode IN {RegX, IndX} THEN 
+				z.mode := Var; z.lev := x.lev; z.a0 := x.a0 + x.typ.adr; 
+				Mult(x, z); IndAdd(x, y); 		(*INDEX*)
+				DOCC.FreeReg(y);					(* <-- ARD 18. 3. 93 *)
+			ELSE loadAdr(x); x.mode := RegX; x.a1 := 0; x.a2 := y.a0 END;
+			x.typ := x.typ.BaseTyp
+		ELSE DOCS.Mark(82) END; 
+	END Index;
+
+	PROCEDURE Field*(VAR x: DOCT.Item; y: DOCT.Object);
+	BEGIN (*x.typ.form = Record*)
+		IF (y # NIL) & (y.mode = Fld) THEN
+			IF x.mode = Var THEN INC(x.a0, y.a0)
+			ELSIF (x.mode = Ind) OR (x.mode = RegI) THEN INC(x.a1, y.a0)
+			ELSE loadAdr(x); (*x.mode := RegI; *) x.a1 := y.a0 END;
+			x.typ := y.typ; x.obj := NIL
+		ELSE DOCS.Mark(83); x.typ := DOCT.undftyp; x.mode := Var END
+	END Field;
+
+	PROCEDURE DeRef*(VAR x: DOCT.Item);
+	VAR y: DOCT.Item;
+		
+		PROCEDURE LoadAndFree;
+		VAR oldreg, oldindex: LONGINT; del, delind: BOOLEAN;
+		BEGIN
+(*			del := FALSE; delind := FALSE;
+			IF (x.mode = RegI) OR (x.mode = RegX) THEN oldreg := x.a0; del := TRUE END; (* evtl. index reg loeschen *)
+			IF (x.mode = IndX) OR (x.mode = RegX) OR (x.mode = VarX) THEN oldindex := x.a2; delind := TRUE END;*)
+			load(x); 
+(*			IF del THEN EXCL(DOCC.RegSet, oldreg) END;	(* ARD *)
+			IF delind THEN EXCL(DOCC.RegSet, oldindex) END*)
+		END LoadAndFree;
+		
+	BEGIN	
+		IF x.typ.form = Pointer THEN 
+			IF ~nilcheck THEN LoadAndFree; 
+(*				x.mode := RegI; 
+				y := x; y.a1 := 0; DOCC.PutOMD(4, 4, 81H, 1, y, 0);*)
+				DOCC.PutOMD(4, 1, 83H, 7, x, 0); DOCC.PutOD(4, 4, 0F84H, niltrap); niltrap := DOCC.pc-4; x.mode := RegI
+			ELSIF (x.mode = Var) & (x.lev >= 0) THEN x.mode := Ind ELSE LoadAndFree; x.mode := RegI END;
+			x.typ := x.typ.BaseTyp; x.obj := DOCC.wasderef
+		ELSE DOCS.Mark(84) END;
+		x.a1 := 0
+	END DeRef;
+
+	PROCEDURE TypTest*(VAR x, y: DOCT.Item; test: BOOLEAN);
+	VAR help: BOOLEAN;
+
+		PROCEDURE GTT(t0, t1: DOCT.Struct; varpar: BOOLEAN);
+		VAR t: DOCT.Struct; xt, tdes, p: DOCT.Item;
+		BEGIN
+			IF t0 # t1 THEN t := t1;
+				REPEAT t := t.BaseTyp UNTIL (t = NIL) OR (t = t0);
+				IF t # NIL THEN x.typ := y.typ;
+					IF DOCC.typchk OR test THEN xt := x;
+						IF x.mode IN {VarX, RegX, IndX} THEN DOCC.Push(SHORT(x.a2)) END;
+						IF (xt.mode = Reg) OR (xt.mode = RegI) OR (xt.mode = RegX) THEN 
+							DOCC.GetGenReg(xt); DOCC.PutORM(4, 8BH, xt.a0, x) END;
+						IF varpar THEN xt.mode := Ind; xt.a0 := x.a0+4; 
+						ELSIF (x.mode = Var) & (x.lev >= 0) THEN
+							xt.mode := Ind; xt.a1 := -4; load(xt); xt.mode := RegI
+						ELSE load(xt); p := xt; p.mode := RegI; p.a1 := -4; DOCC.PutORM(4, 8BH, xt.a0, p); xt.mode := RegI
+						END;
+						xt.a1 := - 4 - t1.n * 4; tdes.mode := Var; tdes.lev := -t1.mno; tdes.a0 := t1.adr; tdes.typ := DOCT.linttyp;
+						load(tdes);	(* <-- ARD *)
+						DOCC.PutORM(4, 3BH, tdes.a0, xt); (*CMPD*)
+						DOCC.FreeReg(tdes); DOCC.FreeReg(xt); 		(* <-- NEW *)
+						IF ~test THEN 
+							DOCC.PutByte(74H); DOCC.PutByte(3); DOCC.PutByte(6AH); DOCC.PutByte(18); DOCC.PutByte(0CCH)
+							(* JE 3; PUSH 18; INT3 *)
+						ELSE setCC(x, 4) END;
+						IF x.mode IN {VarX, RegX, IndX} THEN DOCC.Pop(SHORT(x.a2)) END
+					END
+				ELSE DOCS.Mark(85);
+					IF test THEN x.typ := DOCT.booltyp END
+				END
+			ELSIF test THEN setCC(x, 16) END
+		END GTT;
+
+	BEGIN
+		help := (x.typ.form = Record) & (x.mode = Ind) & (x.obj # NIL);
+		IF x.typ.form = Pointer THEN
+			IF y.typ.form = Pointer THEN
+				GTT(x.typ.BaseTyp, y.typ.BaseTyp, FALSE)
+			ELSE DOCS.Mark(86) END
+		ELSIF help & (x.obj # DOCC.wasderef) & (y.typ.form = Record) THEN
+			GTT(x.typ, y.typ, TRUE)
+		ELSE DOCS.Mark(87) END
+	END TypTest;
+
+	PROCEDURE In*(VAR x, y: DOCT.Item);
+		VAR f: INTEGER;
+	BEGIN f := x.typ.form;
+		IF (f IN intSet) & (y.typ.form = Set) THEN
+			IF y.mode = Con THEN load(y) END;
+			IF x.mode = Con THEN DOCC.PutOMD(4, 1, 0FBAH, 4, y, x.a0) 				(* BT Mem/Reg, Imm *)
+			ELSE loadX(x); DOCC.PutORM(4, 0FA3H, x.a0, y)													(* BT Mem/Reg, Reg *)
+			END;
+			setCC(x, 2);
+		ELSE DOCS.Mark(92); x.mode := Reg END;
+		x.typ := DOCT.booltyp
+	END In;
+
+	PROCEDURE Set0*(VAR x, y: DOCT.Item);
+		VAR one: LONGINT; help: DOCT.Item; ok: BOOLEAN;
+	BEGIN x.typ := DOCT.settyp;
+		IF y.typ.form IN intSet THEN
+			IF y.mode = Con THEN x.mode := Con;
+				IF (0 <= y.a0) & (y.a0 < 32) THEN one := 1; x.a0 := SYSTEM.LSH(one, y.a0)
+				ELSE DOCS.Mark(202)
+				END
+			ELSE DOCC.GetGenReg(x); DOCC.PutOD(4, 4, 0B8H + x.a0, 1);
+				DOCC.GetThisReg(ecx, help, ok); CheckOK(ok, ecx, x); CheckOK(ok, ecx, y);
+				IF ~ok THEN DOCC.Push(ecx) END;
+				DOCC.PutORM(4, 8AH, ecx, y);
+				DOCC.PutOM(4, 0D3H, 4, x); (*SHL Mem/Reg, CL*)
+				IF ~ok THEN DOCC.Pop(ecx) ELSE DOCC.FreeReg(help) END;
+			END
+		ELSE DOCS.Mark(93) END
+	END Set0;
+
+	PROCEDURE Set1*(VAR x, y, z: DOCT.Item);
+		VAR s: LONGINT; a: DOCT.Item; ok: BOOLEAN;
+	BEGIN x.typ := DOCT.settyp;
+		IF (y.typ.form IN intSet) & (z.typ.form IN intSet) THEN
+			IF y.mode = Con THEN 
+				IF (0 <= y.a0) & (y.a0 < 32) THEN
+					y.typ := DOCT.settyp; s := -1; y.a0 := SYSTEM.LSH(s, y.a0);
+					IF z.mode = Con THEN 
+						x.mode := Con;
+						IF (y.a0 <= z.a0) & (z.a0 < 32) THEN s := -2; x.a0 := y.a0 - SYSTEM.LSH(s, z.a0)
+						ELSE DOCS.Mark(202); x.a0 := 0
+						END
+					ELSIF y.a0 = -1 THEN 
+						DOCC.GetGenReg(x); DOCC.PutOD(4, 4, 0B8H + x.a0, -2);		(* MOV Reg, Imm *)
+						DOCC.GetThisReg(ecx, a, ok); CheckOK(ok, ecx, x); CheckOK(ok, ecx, z);
+						IF ~ok THEN DOCC.Push(ecx) END;
+						DOCC.PutORM(4, 8AH, a.a0, z); 											(* MOV Mem/Reg, Reg *)
+						DOCC.PutOM(4, 0D3H, 4, x); 												(* SHL Mem/Reg, CL *)
+						DOCC.PutOM(4, 0F7H, 2, x); 													(* NOT Mem/Reg *)
+						IF ~ok THEN DOCC.Pop(ecx) ELSE DOCC.FreeReg(a) END;
+					ELSE 
+						DOCC.GetGenReg(x); DOCC.PutOD(4, 4, 0B8H + x.a0, y.a0);		(* MOV Reg, Imm *)
+						DOCC.GetGenReg(y); DOCC.PutOD(4, 4, 0B8H + y.a0, -2); 		(* MOV Reg, Imm *)
+						DOCC.GetThisReg(ecx, a, ok); CheckOK(ok, ecx, y); CheckOK(ok, ecx, x); CheckOK(ok, ecx, z);
+						IF ~ok THEN DOCC.Push(ecx) END;
+						DOCC.PutORM(4, 8AH, a.a0, z); 												(* MOV Mem/Reg, Reg *)
+						DOCC.PutOM(4, 0D3H, 4, y); 													(* SHL Mem/Reg, CL *)
+						DOCC.PutOM(4, 0F7H, 2, y); 														(* NOT Mem/Reg *)
+						DOCC.PutORM(4, 21H, y.a0, x);													(* AND x, y *)
+						IF ~ok THEN DOCC.Pop(ecx) ELSE DOCC.FreeReg(a) END;
+					END;
+				ELSE x.mode := Con; DOCS.Mark(202) END
+			ELSE 
+				DOCC.GetGenReg(x); DOCC.PutOD(4, 4, 0B8H + x.a0, -1); 		(* MOV Reg, Imm *)
+				DOCC.GetThisReg(ecx, a, ok); CheckOK(ok, ecx, y); CheckOK(ok, ecx, x); CheckOK(ok, ecx, z);
+				IF ~ok THEN DOCC.Push(ecx) END;
+				DOCC.PutORM(4, 8AH, a.a0, y); 												(* MOV Mem/Reg, Reg *)
+				DOCC.PutOM(4, 0D3H, 4, x); 													(* SHL Mem/Reg, CL *)
+				IF z.mode = Con THEN
+					IF (0 <= z.a0) & (z.a0 < 32) THEN
+						y.typ := DOCT.settyp; y.mode := Con; s := -2; y.a0 := SYSTEM.LSH(s, z.a0)
+					ELSE DOCS.Mark(202)
+					END;
+					load(y);
+				ELSE 
+					DOCC.GetGenReg(y); DOCC.PutOD(4, 4, 0B8H + y.a0, -2); 		(* MOV Reg, Imm *)
+					DOCC.PutORM(4, 8AH, a.a0, z); 												(* MOV Mem/Reg, Reg *)
+					DOCC.PutOM(4, 0D3H, 4, y); 													(* SHL Mem/Reg, CL *)
+				END;
+				DOCC.PutOM(4, 0F7H, 2, y); 														(* NOT Mem/Reg *)
+				DOCC.PutORM(4, 21H, y.a0, x);													(* AND x, y *)
+				IF ~ok THEN DOCC.Pop(ecx) ELSE DOCC.FreeReg(a) END
+			END
+		ELSE DOCS.Mark(93) END
+	END Set1;
+
+	PROCEDURE MOp*(op: INTEGER; VAR x: DOCT.Item);
+		VAR f, L: INTEGER; a: LONGINT;
+	BEGIN f := x.typ.form;
+		CASE op OF
+			5: (*&*)
+			IF x.mode = Coc THEN
+				IF x.a0 < 16 THEN DOCC.PutOD(4, 4, 0F80H + inverted(x.a0), x.a2)
+				ELSIF x.a0 = 17 THEN DOCC.PutOD(4, 4, 0E9H, x.a2) 
+				ELSE DOCC.PutOD(4, 4, 9090H, x.a2) END;
+				x.a2 := DOCC.pc-4; DOCC.FixLink(x.a1)
+			ELSIF (x.typ.form = Bool) & (x.mode # Con) THEN
+				DOCC.PutOMD(4, 1, 80H, 7, x, 1); setCC(x, 4);
+				DOCC.PutOD(4, 4, 0F85H, x.a2);
+				x.a2 := DOCC.pc-4; DOCC.FixLink(x.a1)
+			ELSIF x.typ.form # Bool THEN
+				DOCS.Mark(94); x.mode := Con; x.typ := DOCT.booltyp; x.a0 := 0
+			END; DOCC.FreeRegs(boolset);
+		| 6: (*+*)
+			IF ~(f IN intSet + realSet) THEN DOCS.Mark(96) END
+		| 7: (*-*)
+			L := lengcode[f];
+			IF f IN intSet THEN
+				IF x.mode = Con THEN x.a0 := -x.a0; SetIntType(x)
+				ELSE load(x); DOCC.PutOM(L+1, 0F7H, 3, x) (*NEGi*)
+				END
+			ELSIF f IN realSet THEN 
+				IF x.mode = Con THEN
+					IF f = Real THEN x.a0 := SYSTEM.VAL(LONGINT, (SYSTEM.VAL(SET, x.a0) / {31}))
+					ELSIF f = LReal THEN x.a1 := SYSTEM.VAL(LONGINT, (SYSTEM.VAL(SET, x.a1) / {31})) END
+				ELSE loadF(x); DOCC.PutO(4, 0D9E0H); (* FCHS ST(0) *) END
+			ELSIF f = Set THEN load(x); DOCC.PutOM(4, 0F7H, 2, x) (*COMD*)
+			ELSE DOCS.Mark(97) END
+		| 8: (*OR*)
+			IF x.mode = Coc THEN
+				IF x.a0 < 16 THEN DOCC.PutOD(4, 4, 0F80H + x.a0, x.a1)
+				ELSIF x.a0 = 16 THEN DOCC.PutOD(4, 4, 0E9H, x.a1) 
+				ELSE DOCC.PutOD(4, 4, 9090H, x.a1) END;
+				x.a1 := DOCC.pc-4; DOCC.FixLink(x.a2)
+			ELSIF (x.typ.form = Bool) & (x.mode # Con) THEN
+				DOCC.PutOMD(4, 1, 80H, 7, x, 1); setCC(x, 4);
+				DOCC.PutOD(4, 4, 0F84H, x.a1);
+				x.a1 := DOCC.pc-4; DOCC.FixLink(x.a2)
+			ELSIF x.typ.form # Bool THEN
+				DOCS.Mark(95); x.mode := Con; x.typ := DOCT.booltyp; x.a0 := 1
+			END; DOCC.FreeRegs(boolset);
+		| 9 .. 14: (*relations*)
+			IF x.mode = Coc THEN loadB(x) END
+		| 32: (*~*)
+			IF x.typ.form = Bool THEN
+				IF x.mode = Coc THEN x.a0 := inverted(x.a0);
+					a := x.a1; x.a1 := x.a2; x.a2 := a
+				ELSE 
+					IF x.mode = Con THEN load(x) END;
+					DOCC.PutOMD(4, 1, 80H, 7, x, 0); setCC(x, 4)
+				END
+			ELSE DOCS.Mark(98) END
+		END
+	END MOp;
+
+	PROCEDURE convert1(VAR x: DOCT.Item; typ: DOCT.Struct);
+		VAR y: DOCT.Item; L: LONGINT;
+	BEGIN
+		IF x.mode # Con THEN
+			y := x; L := lengcode[x.typ.form];
+			IF (x.mode = Reg) & (x.a0 = eax) THEN
+				IF (L = 0) & (typ.form = Int) THEN DOCC.PutO(2, 98H) 										(* CBW *)
+				ELSIF (L = 0) & (typ.form = LInt) THEN 
+					DOCC.PutORM(4, 0FBEH, x.a0, x); 						(* MOVSX Reg, Reg *)
+				ELSE DOCC.PutO(4, 98H) END;																			(* CBW *)
+			ELSIF x.mode = Reg THEN
+				IF (L = 0) & (typ.form = Int) THEN DOCC.PutORM(2, 0FBEH, x.a0, x)
+				ELSIF (L = 0) & (typ.form = LInt) THEN DOCC.PutORM(4, 0FBEH, x.a0, x)
+				ELSE DOCC.PutORM(4, 0FBFH, x.a0, x) END; 
+			ELSE DOCC.GetGenReg(x); 
+				IF (L = 0) & (typ.form = Int) THEN DOCC.PutORM(2, 0FBEH, x.a0, y)
+				ELSIF (L = 0) & (typ.form = LInt) THEN DOCC.PutORM(4, 0FBEH, x.a0, y)
+				ELSE DOCC.PutORM(4, 0FBFH, x.a0, y) END;
+			END;
+		END;
+		x.typ := typ
+	END convert1;
+
+	PROCEDURE convert2(VAR x: DOCT.Item; typ: DOCT.Struct);
+		VAR y: DOCT.Item;
+	BEGIN 
+		IF x.mode = Reg THEN 	(* Extendt to LONGINT *)
+			IF x.typ.form = SInt THEN DOCC.PutORM(4, 0FBEH, x.a0, x)
+			ELSIF x.typ.form = Int THEN DOCC.PutORM(4, 0FBFH, x.a0, x) END;
+			DOCC.PutORM(4, 89H, x.a0, FCon); DOCC.PutOM(4, 0DBH, 0, FCon)	(* MOV FCon, Reg; FILD ST(0), FCon *)
+		ELSIF x.mode = Con THEN 
+			IF x.a0 = 1 THEN DOCC.PutO(4, 0D9E8H)
+			ELSIF x.a0 = 0 THEN DOCC.PutO(4, 0D9EEH)
+			ELSE DOCC.PutOMD(4, 4, 0C7H, 0, FCon, x.a0); DOCC.PutOM(4, 0DBH, 0, FCon) END;
+		ELSE DOCC.GetGenReg(y); 
+			IF x.typ.form = SInt THEN DOCC.PutORM(4, 0FBEH, y.a0, x)
+			ELSIF x.typ.form = Int THEN DOCC.PutORM(4, 0FBFH, y.a0, x) 
+			ELSE DOCC.PutORM(4, 8BH, y.a0, x) END; 
+			DOCC.PutORM(4, 89H, y.a0, FCon); DOCC.PutOM(4, 0DBH, 0, FCon);
+			DOCC.FreeReg(y);
+		END; x.typ := typ; INC(DOCC.FStack); x.mode := Reg; 
+		IF DOCC.FStack >= 8 THEN DOCS.Mark(216); DOCC.FStack := 0 END
+	END convert2;
+
+	PROCEDURE convert3(VAR x: DOCT.Item);
+	BEGIN
+		(*IF x.mode < Reg THEN *)loadF(x); (* END; *)x.typ := DOCT.lrltyp (*MOVFL*)
+	END convert3;
+
+	PROCEDURE Overflow;
+	BEGIN IF ~ovflchk THEN DOCC.PutByte(0CEH) END END Overflow;
+
+	PROCEDURE RealConstExpr(op: INTEGER; VAR x, y: DOCT.Item);
+	VAR xval, yval: LONGREAL;
+	BEGIN
+		IF (x.typ = DOCT.realtyp) & (y.typ = DOCT.realtyp) THEN 
+			CASE op OF 
+				1: SYSTEM.PUT(SYSTEM.ADR(x.a0), SYSTEM.VAL(REAL, x.a0) * SYSTEM.VAL(REAL, y.a0))|
+				2: SYSTEM.PUT(SYSTEM.ADR(x.a0), SYSTEM.VAL(REAL, x.a0) / SYSTEM.VAL(REAL, y.a0))|
+				6: SYSTEM.PUT(SYSTEM.ADR(x.a0), SYSTEM.VAL(REAL, x.a0) + SYSTEM.VAL(REAL, y.a0))|
+				7: SYSTEM.PUT(SYSTEM.ADR(x.a0), SYSTEM.VAL(REAL, x.a0) - SYSTEM.VAL(REAL, y.a0))
+			ELSE DOCS.Mark(111) END
+		ELSIF (x.typ = DOCT.lrltyp) & (y.typ = DOCT.lrltyp) THEN 
+			SYSTEM.GET(SYSTEM.ADR(x.a0), xval); SYSTEM.GET(SYSTEM.ADR(y.a0), yval);
+			CASE op OF 
+				1: SYSTEM.PUT(SYSTEM.ADR(x.a0), xval * yval)|
+				2: SYSTEM.PUT(SYSTEM.ADR(x.a0), xval / yval)|
+				6: SYSTEM.PUT(SYSTEM.ADR(x.a0), xval + yval)|
+				7: SYSTEM.PUT(SYSTEM.ADR(x.a0), xval - yval)
+			ELSE DOCS.Mark(111) END
+		ELSIF (x.typ = DOCT.realtyp) & (y.typ = DOCT.lrltyp) THEN 
+			SYSTEM.GET(SYSTEM.ADR(y.a0), yval);
+			CASE op OF 
+				1: SYSTEM.PUT(SYSTEM.ADR(x.a0), SYSTEM.VAL(REAL, x.a0) * yval)|
+				2: SYSTEM.PUT(SYSTEM.ADR(x.a0), SYSTEM.VAL(REAL, x.a0) / yval)|
+				6: SYSTEM.PUT(SYSTEM.ADR(x.a0), SYSTEM.VAL(REAL, x.a0) + yval)|
+				7: SYSTEM.PUT(SYSTEM.ADR(x.a0), SYSTEM.VAL(REAL, x.a0) - yval)
+			ELSE DOCS.Mark(111) END; x.typ := DOCT.lrltyp;
+		ELSE (* (x.typ = DOCT.lrltyp) & (y.typ = DOCT.realtyp) *)
+			SYSTEM.GET(SYSTEM.ADR(x.a0), xval); 
+			CASE op OF 
+				1: SYSTEM.PUT(SYSTEM.ADR(x.a0), xval * SYSTEM.VAL(REAL, y.a0))|
+				2: SYSTEM.PUT(SYSTEM.ADR(x.a0), xval / SYSTEM.VAL(REAL, y.a0))|
+				6: SYSTEM.PUT(SYSTEM.ADR(x.a0), xval + SYSTEM.VAL(REAL, y.a0))|
+				7: SYSTEM.PUT(SYSTEM.ADR(x.a0), xval - SYSTEM.VAL(REAL, y.a0))
+			ELSE DOCS.Mark(111) END
+		END
+	END RealConstExpr;
+	
+	PROCEDURE Op*(op: INTEGER; VAR x, y: DOCT.Item);
+		VAR f, g, L: INTEGER; p, q, r: DOCT.Struct; help1, help2, help4: DOCT.Item; eaxok, edxok: BOOLEAN; L1: LONGINT;
+
+		PROCEDURE strings(): BOOLEAN;
+		VAR helpf, helpg: BOOLEAN;
+		BEGIN 
+			helpf := ((f=Array) OR (f=DynArr)) & (x.typ.BaseTyp.form=Char);
+			helpg := ((g=Array) OR (g=DynArr)) & (y.typ.BaseTyp.form=Char);
+			RETURN
+			(helpf OR (f=String)) & (helpg OR (g=String))
+		END strings;
+		
+		PROCEDURE CompStrings(cc: INTEGER);
+			VAR z, w: DOCT.Item; ediok, esiok: BOOLEAN;
+		BEGIN 
+			DOCC.GetThisReg(edi, z, ediok); CheckOK(ediok, edi, x); CheckOK(ediok, edi, y);	(* EDI *)
+			IF ~ediok THEN DOCC.Push(edi) END;
+			IF f = DynArr THEN DOCC.DynArrAdr(z, x)
+			ELSE IF x.mode = Con THEN x.mode := Var; x.lev := 0 END;
+				DOCC.PutORM(4, 8DH, z.a0, x) 	(* LEA Reg, Mem/Reg *)
+			END;
+			DOCC.GetThisReg(esi, w, esiok); CheckOK(esiok, esi, x); CheckOK(esiok, esi, y);	(* ESI *)
+			IF ~esiok THEN DOCC.Push(esi) END;
+			IF g = DynArr THEN DOCC.DynArrAdr(w, y)
+			ELSE IF y.mode = Con THEN y.mode := Var; y.lev := 0 END;
+				DOCC.PutORM(4, 8DH, w.a0, y)	(* LEA Reg, Mem/Reg *)
+			END;
+			DOCC.PutO(4, 0FCH);						(* CLD *)
+			L1 := DOCC.pc; w.mode := RegI; w.a1 := 0;
+			DOCC.PutOMD(4, 1, 80H, 7, w, 0);	(* CMP w, 0 *)
+			DOCC.PutOD(4, 1, 74H, 5);				(* JE 5 *)
+			DOCC.PutO(4, 0A6H);						(* CMPSB *)
+			DOCC.PutOD(4, 1, 74H, 0F7H);		(* JE -9 *)
+			DOCC.PutOD(4, 1, 0EBH, 1);			(* JMP 1 *)
+			DOCC.PutO(4, 0A6H);						(* CMPSB *)
+			IF ~esiok THEN DOCC.Pop(esi) ELSE DOCC.FreeReg(w) END;
+			IF ~ediok THEN DOCC.Pop(edi) ELSE DOCC.FreeReg(z) END;
+			setCC(x, cc)
+		END CompStrings;
+
+		PROCEDURE CompBool(cc: INTEGER);
+		BEGIN
+			IF y.mode = Coc THEN loadB(y) ELSE load(y) END; 
+			DOCC.PutORM(4, 3AH, y.a0, x);
+			setCC(x, cc)
+		END CompBool;
+		
+		PROCEDURE Divide;
+		BEGIN
+			IF (x.mode = Reg) & (x.a0 = eax) THEN eaxok := TRUE	(* ok *)
+			ELSE DOCC.GetThisReg(eax, help1, eaxok); CheckOK(eaxok, eax, y); CheckOK(eaxok, eax, x);
+				IF ~eaxok THEN DOCC.Push(eax) END END;
+			DOCC.GetThisReg(edx, help2, edxok); CheckOK(edxok, edx, y); CheckOK(edxok, edx, x);
+			IF ~edxok THEN DOCC.Push(edx) END;
+			IF x.mode = Con THEN DOCC.PutOD(4, 4, 0B8H+eax, x.a0)	(* MOV EAX, Imm *)
+			ELSE 
+				IF L = 3 THEN DOCC.PutORM(4, 08BH, eax, x)
+				ELSIF L = 1 THEN DOCC.PutORM(4, 0FBFH, eax, x)
+				ELSE DOCC.PutORM(4, 0FBEH, eax, x) END
+			END;
+			loadX(y); DOCC.PutO(4, 99H); DOCC.PutOM(4, 0F7H, 7, y); (*Overflow;*)
+			DOCC.PutOMD(4, 1, 83H, 7, EDX, 0); DOCC.PutOD(4, 1, 7DH, 2); 
+		END Divide;
+		
+		PROCEDURE Flags;
+		BEGIN
+			IF eax IN DOCC.RegSet THEN 
+				DOCC.Push(eax);
+				DOCC.PutO(4, 0DFE0H); DOCC.PutO(4, 9EH);		(* FSTSW AX; SAHF *)
+				DOCC.Pop(eax)
+			ELSE DOCC.PutO(4, 0DFE0H); DOCC.PutO(4, 9EH) END;
+			DEC(DOCC.FStack, 2)
+		END Flags;
+		
+	BEGIN
+		IF x.typ # y.typ THEN
+			g := y.typ.form;
+			CASE x.typ.form OF
+				Undef:
+			| SInt: IF g = Int THEN convert1(x, y.typ)
+							ELSIF g = LInt THEN convert1(x, y.typ)
+							ELSIF g = Real THEN convert2(x, y.typ); IF y.mode = Reg THEN DOCC.PutO(4, 0D9C9H) END
+							ELSIF g = LReal THEN convert2(x, y.typ); IF y.mode = Reg THEN DOCC.PutO(4, 0D9C9H) END
+							ELSE DOCS.Mark(100) END
+			| Int: IF g = SInt THEN convert1(y, x.typ)
+							ELSIF g = LInt THEN convert1(x, y.typ)
+							ELSIF g = Real THEN convert2(x, y.typ); IF y.mode = Reg THEN DOCC.PutO(4, 0D9C9H) END
+							ELSIF g = LReal THEN convert2(x, y.typ); IF y.mode = Reg THEN DOCC.PutO(4, 0D9C9H) END
+							ELSE DOCS.Mark(100) END
+			| LInt: IF g = SInt THEN convert1(y, x.typ)
+							ELSIF g = Int THEN convert1(y, x.typ)
+							ELSIF g = Real THEN convert2(x, y.typ); IF y.mode = Reg THEN DOCC.PutO(4, 0D9C9H) END
+							ELSIF g = LReal THEN convert2(x, y.typ); IF y.mode = Reg THEN DOCC.PutO(4, 0D9C9H) END
+							ELSE DOCS.Mark(100) END
+			| Real: IF g = SInt THEN loadF(x); convert2(y, x.typ)
+							ELSIF g = Int THEN loadF(x); convert2(y, x.typ)
+							ELSIF g = LInt THEN loadF(x); convert2(y, x.typ)
+							ELSIF g = LReal THEN 
+								IF x.mode # Reg THEN loadF(x);
+									IF y.mode = Reg THEN DOCC.PutO(4, 0D9C9H) END
+								END;
+								x.typ := DOCT.lrltyp;
+								(* convert3(x); IF (y.mode = Reg) THEN DOCC.PutO(4, 0D9C9H) END (* Korr. 7. 1. 93 *)*)
+							ELSE DOCS.Mark(100) END
+			| LReal: IF g = SInt THEN loadF(x); convert2(y, x.typ)
+							ELSIF g = Int THEN loadF(x); convert2(y, x.typ)
+							ELSIF g = LInt THEN loadF(x); convert2(y, x.typ)
+							ELSIF g = Real THEN 
+								IF x.mode # Reg THEN loadF(x);		(* ARD, 8. 8. 95 *)
+									IF y.mode = Reg THEN DOCC.PutO(4, 0D9C9H) END
+								END;
+								y.typ := DOCT.lrltyp;
+								(*loadF(x); convert3(y)*)
+							ELSE DOCS.Mark(100) END
+			| NilTyp: IF g # Pointer THEN DOCS.Mark(100) END
+			| Pointer: IF g = Pointer THEN
+								p := x.typ.BaseTyp; q := y.typ.BaseTyp;
+								IF (p.form = Record) & (q.form = Record) THEN
+									IF p.n < q.n THEN r := p; p := q; q := r END;
+									WHILE (p # q) & (p # NIL) DO p := p.BaseTyp END;
+									IF p = NIL THEN DOCS.Mark(100) END
+								ELSE DOCS.Mark(100) END
+							ELSIF g # NilTyp THEN DOCS.Mark(100) END
+			| ProcTyp: IF g # NilTyp THEN DOCS.Mark(100) END
+			| Array, DynArr, String:
+			| Byte, Bool, Char, Set, NoTyp, Record: DOCS.Mark(100)
+			END
+		END;
+		f := x.typ.form; g := y.typ.form; L := lengcode[f]; L1 := lengcode[g]; ovrproc := NIL;
+		CASE op OF
+			1: IF f IN intSet THEN (***)
+						IF (x.mode = Con) & (y.mode = Con) THEN (*ovfl test missing*)
+							x.a0 := x.a0 * y.a0; SetIntType(x)
+						ELSIF (x.mode = Con) & (mant(x.a0) = 1) THEN
+							help1 := x; x := y; y := help1; 	(* austauschen wegen Registerfreigabe *)
+							y.a0 := log; y.typ := DOCT.sinttyp;
+							load(x); DOCC.PutOMD(L+1, 1, 0C1H, 4, x, y.a0)	(* SHL Reg, y.a0 *)
+						ELSIF (y.mode = Con) & (mant(y.a0) = 1) THEN
+							y.a0 := log; y.typ := DOCT.sinttyp;
+							load(x); DOCC.PutOMD(L+1, 1, 0C1H, 4, x, y.a0)	(* SHL Reg, y.a0 *)
+						ELSIF (y.mode = Con) & (mant(y.a0) # 1) THEN
+							loadX(x);
+							IF L = 0 THEN DOCC.PutORMD(4, 1, 6BH, x.a0, x, y.a0)	(* MUL Reg, y.a0 *)
+							ELSE DOCC.PutORMD(L+1, L+1, 69H, x.a0, x, y.a0) END; Overflow;
+						ELSIF (x.mode = Con) & (mant(x.a0) # 1) THEN
+							help1 := x; x := y; y := help1;	(* austauschen wegen Registerfreigabe *)
+							loadX(x);
+							IF L = 0 THEN DOCC.PutORMD(4, 1, 6BH, x.a0, x, y.a0)	(* MUL Reg, y.a0 *)
+							ELSE DOCC.PutORMD(L+1, L+1, 69H, x.a0, x, y.a0) END; Overflow;
+						ELSE
+							IF L = 0 THEN loadX(y); loadX(x); DOCC.PutORM(4, 0FAFH, x.a0, y);
+							ELSE load(x); DOCC.PutORM(L+1, 0FAFH, x.a0, y) END; Overflow;	(* MUL Reg, Reg/Mem *)
+						END; 
+					ELSIF f IN realSet THEN
+						IF (x.mode = Con) & (y.mode = Con) THEN RealConstExpr(op, x, y)
+						ELSE loadF(x); loadF(y); DOCC.PutO(4, 0DEC9H); DEC(DOCC.FStack); (*MULf*)
+						END
+					ELSIF f = Set THEN
+						IF y.mode = Con THEN load(x); DOCC.PutOMD(4, 4, 81H, 4, x, y.a0) (* AND Reg, Imm *)
+						ELSE load(x); load(y); DOCC.PutORM(4, 23H, x.a0, y) (* AND Reg, Reg/Mem *)
+						END
+					ELSIF f = Undef THEN (* ok *)
+					END
+
+		| 2: IF f IN realSet THEN (*/*) 
+						IF (x.mode = Con) & (y.mode = Con) THEN RealConstExpr(op, x, y)
+						ELSE
+							IF (y.mode = Reg) & (x.mode # Reg) THEN loadF(x); DOCC.PutO(4, 0D9C9H) ELSE loadF(x); loadF(y) END; 
+							DOCC.PutO(4, 0DEF9H); DEC(DOCC.FStack)	(* FDIVP *)
+						END
+					ELSIF f IN intSet THEN
+						convert2(y, DOCT.realtyp); convert2(x, DOCT.realtyp);
+						DOCC.PutO(4, 0DEF1H); DEC(DOCC.FStack)				(*DIVF*)
+					ELSIF f = Set THEN load(x); 
+						IF y.mode = Con THEN DOCC.PutOMD(4, 4, 81H, 6, x, y.a0) (* XOR Reg, Imm *)
+						ELSE DOCC.PutORM(4, 33H, x.a0, y) (* XOR Reg, Reg/Mem *)
+						END
+					ELSIF f = Undef THEN (* ok *)
+					END
+
+		| 3: IF f IN intSet THEN (*DIV*)
+						IF (x.mode = Con) & (y.mode = Con) THEN
+							IF y.a0 # 0 THEN x.a0 := x.a0 DIV y.a0; SetIntType(x) ELSE DOCS.Mark(205) END
+						ELSIF (y.mode = Con) & (mant(y.a0) = 1) THEN
+							y.a0 := log; y.typ := DOCT.sinttyp;	(* ARD: positive log, 'cos of shr *)
+							load(x); DOCC.PutOMD(L+1, 1, 0C1H, 7, x, y.a0)	(* SAR Reg, y.a0 *)
+						ELSE 
+							Divide; DOCC.PutOM(4, 0FFH, 1, EAX);
+							IF ~edxok THEN DOCC.Pop(edx) ELSE DOCC.FreeReg(help2) END;
+							x.mode := Reg; x.a0 := eax;
+							IF ~eaxok THEN 
+								DOCC.GetByteReg(help2); DOCC.PutORM(4, 08BH, help2.a0, x); x.a0 := help2.a0; 
+								DOCC.Pop(eax) END;
+						END
+					ELSIF f # Undef THEN DOCS.Mark(103) END
+
+		| 4: IF f IN intSet THEN	(*MOD*)
+						IF (x.mode = Con) & (y.mode = Con) THEN
+							IF y.a0 # 0 THEN x.a0 := x.a0 MOD y.a0; x.typ := y.typ
+							ELSE DOCS.Mark(205)
+							END
+						ELSIF (y.mode = Con) & (mant(y.a0) = 1) THEN
+							y.a0 := -ASH(-1, log)-1; load(x); DOCC.PutOMD(L+1, L+1, 81H, 4, x, y.a0);
+						ELSE
+							Divide; DOCC.PutOM(4, 03, edx, y);
+							x.mode := Reg; x.a0 := edx;
+							IF ~edxok THEN 
+								DOCC.GetByteReg(help4); DOCC.PutORM(4, 08BH, help4.a0, x); x.a0 := help4.a0; 
+								DOCC.Pop(edx) END;
+							IF ~eaxok THEN DOCC.Pop(eax) ELSE DOCC.FreeReg(help1) END
+						END
+					ELSIF f # Undef THEN DOCS.Mark(104) END
+
+		| 5: IF y.mode # Coc THEN	(*&*)
+						IF y.mode = Con THEN
+							IF y.a0 = 1 THEN setCC(y, 16) ELSE setCC(y, 17) END
+						ELSIF y.mode <= Reg THEN 
+							IF (y.mode = Reg) & ((y.a0 = esi) OR (y.a0 = edi)) THEN 		(* 24.06.93 mode mustn't be RegI or RegX *)
+								DOCC.PutORMD(4, 4, 81H , 4, y, 0FFH); L := 1 END;
+							IF L = 0 THEN DOCC.PutOMD(4, 1, 80H, 7, y, 1); 				(* CMP y, 1 *)
+							ELSE DOCC.PutOMD(L+1, 1, 83H, 7, y, 1) END; setCC(y, 4)
+						ELSE DOCS.Mark(94); setCC(y, 4) END
+					END;
+					IF x.mode = Con THEN
+						IF x.a0 = 0 THEN DOCC.FixLink(y.a1); DOCC.FixLink(y.a2); setCC(y, 17) END;
+						setCC(x, 4)
+					END;
+					IF y.a2 # 0 THEN x.a2 := DOCC.MergedLinks(x.a2, y.a2) END;
+					x.a0 := y.a0; x.a1 := y.a1
+
+		| 6: IF f IN intSet THEN (*+*)
+						IF (x.mode = Con) & (y.mode = Con) THEN
+							INC(x.a0, y.a0); SetIntType(x)	(*ovfl test missing*)
+						ELSE load(x); add(L, x, y); Overflow END
+					ELSIF f IN realSet THEN
+						IF (x.mode = Con) & (y.mode = Con) THEN RealConstExpr(op, x, y)
+						ELSE loadF(x); loadF(y); DOCC.PutO(4, 0DEC1H); DEC(DOCC.FStack) (*ADDf*)
+						END
+					ELSIF f = Set THEN
+						IF (x.mode = Con) & (y.mode = Con) THEN 
+							x.a0 := SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET, x.a0) + SYSTEM.VAL(SET, y.a0))
+						ELSIF y.mode = Con THEN load(x); DOCC.PutOMD(4, 4, 81H, 1, x, y.a0) (* OR Reg, Imm *)
+						ELSE load(x); DOCC.PutORM(4, 0BH, x.a0, y) (* OR Reg, Reg/Mem *)
+						END
+					ELSIF f = Undef THEN (* ok *)
+					END
+
+		| 7: IF f IN intSet THEN (*-*)
+						IF (x.mode = Con) & (y.mode = Con) THEN
+							DEC(x.a0, y.a0); SetIntType(x)	(*ovfl test missing*)
+						ELSE load(x); sub(L, x, y); Overflow END
+					ELSIF f IN realSet THEN 
+						IF (x.mode = Con) & (y.mode = Con) THEN RealConstExpr(op, x, y)
+						ELSE
+							IF (y.mode = Reg) & (x.mode # Reg) THEN loadF(x); DOCC.PutO(4, 0D9C9H) ELSE loadF(x); loadF(y) END;
+							DOCC.PutO(4, 0DEE9H); DEC(DOCC.FStack)	(* FSUBP *)
+						END
+					ELSIF f = Set THEN load(x); load(y); DOCC.PutOM(4, 0F7H, 2, y);	(* NOT y *)
+						DOCC.PutORM(4, 23H, x.a0, y)											(* AND x, y *)
+					ELSIF f = Undef THEN (* ok *)
+					END
+
+		| 8: IF y.mode # Coc THEN	(*OR*)
+						IF y.mode = Con THEN
+							IF y.a0 = 1 THEN setCC(y, 16) ELSE setCC(y, 17) END
+						ELSIF y.mode <= Reg THEN 
+							IF (y.mode IN regSet) & ((y.a0 = esi) OR (y.a0 = edi)) THEN 
+								DOCC.PutORMD(4, 4, 81H , 4, y, 0FFH); L := 1 END;
+							IF L = 0 THEN DOCC.PutOMD(4, 1, 80H, 7, y, 1); 				(* CMP y, 1 *)
+							ELSE DOCC.PutOMD(L+1, 1, 83H, 7, y, 1) END; setCC(y, 4)
+						ELSE DOCS.Mark(95); setCC(y, 4) END
+					END;
+					IF x.mode = Con THEN
+						IF x.a0 = 1 THEN DOCC.FixLink(y.a1); DOCC.FixLink(y.a2); setCC(y, 16) END;
+						setCC(x, 4)
+					END;
+					IF y.a1 # 0 THEN x.a1 := DOCC.MergedLinks(x.a1, y.a1) END;
+					x.a0 := y.a0; x.a2 := y.a2
+
+		| 9: IF f IN {Undef, Char..LInt, Set, NilTyp, Pointer, ProcTyp} THEN
+						cmp(L, x, y); setCC(x, 4)
+					ELSIF f IN realSet THEN loadF(x); loadF(y); DOCC.PutO(4, 0DED9H); setCC(x, 4);
+						Flags;
+					ELSIF f = Bool THEN CompBool(4)
+					ELSIF strings() THEN CompStrings(4)
+					ELSE DOCS.Mark(107) END
+
+		| 10: IF f IN {Undef, Char..LInt, Set, NilTyp, Pointer, ProcTyp} THEN
+						cmp(L, x, y); setCC(x, 5)
+					ELSIF f IN realSet THEN loadF(x); loadF(y); DOCC.PutO(4, 0DED9H); setCC(x, 5);
+						Flags;
+					ELSIF f = Bool THEN CompBool(5)
+					ELSIF strings() THEN CompStrings(5)
+					ELSE DOCS.Mark(107) END
+
+		| 11: IF f IN intSet THEN cmp(L, x, y); setCC(x, 15)
+					ELSIF f = Char THEN cmp(0, x, y); setCC(x, 7)
+					ELSIF f IN realSet THEN 
+						IF (y.mode = Reg) & (x.mode # Reg) THEN loadF(x); DOCC.PutO(4, 0D9C9H) ELSE loadF(x); loadF(y) END;
+						DOCC.PutO(4, 0DED9H); setCC(x, 7);
+						Flags;
+					ELSIF strings() THEN CompStrings(7)
+					ELSE DOCS.Mark(108) END
+
+		| 12: IF f IN intSet THEN cmp(L, x, y); setCC(x, 13)
+					ELSIF f = Char THEN cmp(0, x, y); setCC(x, 3)
+					ELSIF f IN realSet THEN 
+						IF (y.mode = Reg) & (x.mode # Reg) THEN loadF(x); DOCC.PutO(4, 0D9C9H) ELSE loadF(x); loadF(y) END;
+						DOCC.PutO(4, 0DED9H); setCC(x, 3);
+						Flags;
+					ELSIF strings() THEN CompStrings(3)
+					ELSE DOCS.Mark(108) END
+
+		| 13: IF f IN intSet THEN cmp(L, x, y); setCC(x, 12)
+					ELSIF f = Char THEN cmp(0, x, y); setCC(x, 2)
+					ELSIF f IN realSet THEN 
+						IF (y.mode = Reg) & (x.mode # Reg) THEN loadF(x); DOCC.PutO(4, 0D9C9H) ELSE loadF(x); loadF(y) END;
+						DOCC.PutO(4, 0DED9H); setCC(x, 2);
+						Flags;
+					ELSIF strings() THEN CompStrings(2)
+					ELSE DOCS.Mark(108) END
+
+		| 14: IF f IN intSet THEN cmp(L, x, y); setCC(x, 14)
+					ELSIF f = Char THEN cmp(0, x, y); setCC(x, 6)
+					ELSIF f IN realSet THEN 
+						IF (y.mode = Reg) & (x.mode # Reg) THEN loadF(x); DOCC.PutO(4, 0D9C9H) ELSE loadF(x); loadF(y) END;
+						DOCC.PutO(4, 0DED9H); setCC(x, 6);
+						Flags;
+					ELSIF strings() THEN CompStrings(6)
+					ELSE DOCS.Mark(108) END
+		END
+	END Op;
+	
+	PROCEDURE SaveRegs(VAR x: DOCT.Item);
+	BEGIN 
+		IF (x.mode = Reg) OR (x.mode = RegI) OR (x.mode = RegX) THEN DOCC.Push(SHORT(x.a0)) END;
+		IF (x.mode = RegX) OR (x.mode = VarX) OR (x.mode = IndX) THEN DOCC.Push(SHORT(x.a2)) END
+	END SaveRegs;
+	
+	PROCEDURE RestoreRegs(VAR x: DOCT.Item);
+	VAR y: DOCT.Item;
+	BEGIN
+		IF (x.mode = RegX) OR (x.mode = VarX) OR (x.mode = IndX) THEN
+			IF x.a2 = eax THEN DOCC.GetGenReg(y); x.a2 := y.a0 END; 
+			DOCC.Pop(SHORT(x.a2)) 
+		END;
+		IF (x.mode = Reg) OR (x.mode = RegI) OR (x.mode = RegX) THEN
+			IF x.a0 = eax THEN DOCC.GetGenReg(y); x.a0 := y.a0 END; 
+			DOCC.Pop(SHORT(x.a0))
+		END
+	END RestoreRegs;
+		
+	PROCEDURE StPar1*(VAR x: DOCT.Item; fctno: INTEGER);
+		VAR f, L: INTEGER; y: DOCT.Item; ok: BOOLEAN;
+	BEGIN f := x.typ.form;
+		CASE fctno OF
+			0: (*HALT*)
+					IF ((f = SInt) OR (f = Int)) & (x.mode = Con) THEN
+						IF (x.a0 >= 20) THEN DOCC.PutOD(4, 4, 68H, x.a0); DOCC.PutO(4, 0CCH); (* PUSH IntNr, INT 3 *)
+						ELSE DOCS.Mark(218) END
+					ELSE DOCS.Mark(217) END;
+					x.typ := DOCT.notyp
+		| 1: (*NEW*) y := x;
+					IF f = Pointer THEN
+						x.typ := x.typ.BaseTyp; f := x.typ.form;
+						SaveRegs(y);
+						IF f = Record THEN
+							x.mode := Var; x.lev := -x.typ.mno; x.a0 := x.typ.adr; 
+							DOCC.PutOM(4, 0FFH, 6, x);
+							DOCC.PutOD(4, 4, 0E8H, newlink); newlink := DOCC.pc-4;
+						ELSIF f = Array THEN
+							x.a0 := x.typ.size; x.mode := Con; x.typ := DOCT.linttyp;
+							IF x.a0 < 128 THEN DOCC.PutOD(4, 1, 6AH, x.a0) ELSE DOCC.PutOD(4, 4, 68H, x.a0) END;
+							DOCC.PutOD(4, 4, 0E8H, sysnewlink); sysnewlink := DOCC.pc-4;
+						ELSE DOCS.Mark(111)
+						END;
+						RestoreRegs(y);
+						INCL(DOCC.RegSet, eax);
+						DOCC.PutORM(4, 89H, eax, y); 
+					ELSE DOCS.Mark(111) END;
+					x.typ := DOCT.notyp
+		| 2: (*CC*)
+					IF (f = SInt) & (x.mode = Con) THEN
+						IF (0 <= x.a0) & (x.a0 < 18) THEN setCC(x, x.a0) ELSE DOCS.Mark(219) END
+					ELSE DOCS.Mark(217) END
+		| 3: (*ABS*) y := x; L := lengcode[f]; 
+					IF f IN intSet THEN
+						IF x.mode = Con THEN 
+							IF x.a0 < 0 THEN x.a0 := -x.a0 END
+						ELSE
+							load(x);
+							IF L = 0 THEN 
+								DOCC.PutOMD(4, 1, 80H, 7, x, 0); (* CMP x, 0 *)
+								DOCC.PutOD(4, 1, 7FH, 2);			(* JG 2 *)
+								DOCC.PutOM(4, 0F6H, 3, x);			(* NEG x *)
+							ELSE
+								DOCC.PutOMD(L+1, 1, 83H, 7, x, 0); (* CMP x, 0 *)
+								IF L = 1 THEN DOCC.PutOD(4, 1, 7FH, 3) ELSE DOCC.PutOD(4, 1, 7FH, 2) END;			(* JG 2, 3 *)
+								DOCC.PutOM(L+1, 0F7H, 3, x);			(* NEG x *)
+							END
+						END
+					ELSIF f IN realSet THEN
+						loadF(x); DOCC.PutO(4, 0D9E1H) (*ABSf*)
+					ELSE DOCS.Mark(111) END
+		| 4: (*CAP*) y.mode := Con; y.typ := DOCT.chartyp; y.a0 := 5FH;
+					IF f = Char THEN load(x); 
+						IF x.a0 IN DOCC.byteregs THEN DOCC.PutOMD(4, 1, 80H, 4, x, y.a0);	(*ANDB*)
+						ELSE DOCC.PutORM(4, 0FB6H, x.a0, x); 	 (* MOVZX Reg, Reg *)
+							DOCC.PutOMD(2, 2, 81H, 4, x, y.a0);	(*ANDW*)
+						END;
+					ELSE DOCS.Mark(111); x.typ := DOCT.chartyp END
+		| 5: (*ORD*) 
+					IF (f = Char) OR (f = Byte) THEN (* MOVZX Reg, Reg *)
+						IF x.mode # Con THEN y := x; DOCC.GetGenReg(x); DOCC.PutORM(2, 0FB6H, x.a0, y) END
+					ELSE DOCS.Mark(111) END;
+					x.typ := DOCT.inttyp
+		| 6: (*ENTIER*)
+					IF f IN realSet THEN loadF(x);
+						DOCC.PutOM(4, 0D9H, 7, Control); (* FSTCW Control *)
+						DOCC.PutOM(4, 0D9H, 7, FCon); (* FSTCW FCon *)
+						DOCC.PutOMD(2, 2, 81H, 4, FCon, 0FEFFH);	(* Set rounding mode *)
+						DOCC.PutOMD(2, 2, 81H, 1, FCon, 400H);
+						DOCC.PutOM(4, 0D9H, 5, FCon); (* FLDCW FCon *)
+						DOCC.PutOM(4, 0DFH, 7, FCon);	(* FISTP FCon, ST(0) *)
+						DOCC.PutOM(4, 0D9H, 5, Control); (* FLDCW Control *)
+						DOCC.PutO(4, 9BH); DEC(DOCC.FStack);						(* WAIT *)
+						DOCC.GetGenReg(x); DOCC.PutORM(4, 8BH, x.a0, FCon)								(* MOV Reg, FCon *)
+					ELSE DOCS.Mark(111) END;
+					x.typ := DOCT.linttyp
+		| 7: (*SIZE*)
+					IF x.mode = Typ THEN x.a0 := x.typ.size
+					ELSE DOCS.Mark(110); x.a0 := 1 END;
+					x.mode := Con; SetIntType(x)
+		| 8: (*ODD*)
+					IF f IN intSet THEN
+						IF x.mode = Con THEN load(x) END; DOCC.PutOMD(4, 1, 0FBAH, 4, x, 0);	(* BT x, 0 *)
+					ELSE DOCS.Mark(111) END;
+					setCC(x, 2)
+		| 9: (*ADR*)
+					IF f = DynArr THEN y := x; DOCC.GetGenReg(x); DOCC.DynArrAdr(x, y)
+					ELSE loadAdr(x); x.mode := Reg
+					END;
+					x.typ := DOCT.linttyp
+		| 10: (*MIN*)
+					IF x.mode = Typ THEN x.mode := Con;
+						CASE f OF
+								Bool, Char: x.a0 := 0
+							| SInt: x.a0 := -80H
+							| Int: x.a0 := -8000H
+							| LInt: x.a0 := 80000000H
+							| Real: x.a0 := 0FF7FFFFFH
+							| LReal: x.a0 := 0FFFFFFFFH; x.a1 := 0FFEFFFFFH
+							| Set: x.a0 := 0; x.typ := DOCT.inttyp
+							| Undef, NilTyp .. Record: DOCS.Mark(111)
+						END
+					ELSE DOCS.Mark(110) END
+		| 11: (*MAX*)
+					IF x.mode = Typ THEN x.mode := Con;
+						CASE f OF
+								Bool: x.a0 := 1
+							| Char: x.a0 := 0FFH
+							| SInt: x.a0 := 7FH
+							| Int: x.a0 := 7FFFH
+							| LInt: x.a0 := 7FFFFFFFH
+							| Real: x.a0 := 7F7FFFFFH
+							| LReal: x.a0 := 0FFFFFFFFH; x.a1 := 7FEFFFFFH
+							| Set: x.a0 := 31; x.typ := DOCT.inttyp
+							| Undef, NilTyp .. Record: DOCS.Mark(111)
+						END
+					ELSE DOCS.Mark(110) END
+		| 12: (*CHR*) 
+					IF ~(f IN {Undef, Byte, SInt, Int, LInt}) THEN DOCS.Mark(111) END;
+					IF (x.mode = VarX) OR (x.mode = IndX) (*OR (x.mode = Con) *)THEN load(x) END;
+					IF (x.mode = Reg) & ~(x.a0 IN DOCC.byteregs) THEN
+						DOCC.GetByteReg(y); DOCC.PutORM(4, 8BH, y.a0, x); DOCC.FreeReg(x); x.a0 := y.a0 END;
+					x.typ := DOCT.chartyp
+		| 13: (*SHORT*)
+					IF f = LInt THEN (*range test missing*)
+						IF (x.mode = VarX) OR (x.mode = IndX) THEN load(x)
+						ELSIF x.mode = Con THEN SetIntType(x);
+							IF x.typ.form = LInt THEN DOCS.Mark(203) END
+						END;
+						x.typ := DOCT.inttyp
+					ELSIF f = LReal THEN (*MOVLF*)
+						loadF(x); x.typ := DOCT.realtyp
+					ELSIF f = Int THEN (*range test missing*)
+						IF (x.mode = VarX) OR (x.mode = IndX) THEN load(x)
+						ELSIF x.mode = Con THEN SetIntType(x);
+							IF x.typ.form # SInt THEN DOCS.Mark(203) END
+						END;
+						x.typ := DOCT.sinttyp
+					ELSE DOCS.Mark(111) END
+		| 14: (*LONG*)
+					IF f = Int THEN convert1(x, DOCT.linttyp)
+					ELSIF f = Real THEN convert3(x)
+					ELSIF f = SInt THEN convert1(x, DOCT.inttyp)
+					ELSIF f = Char THEN
+						y := x; DOCC.GetGenReg(x); DOCC.PutORM(4, 0FB6H, x.a0, y);	(* MOVZX dword, byte *)	
+						x.typ := DOCT.linttyp (*MOVZBD*)
+					ELSE DOCS.Mark(111) END
+		| 15: (*OVFL*)
+					IF (f = Bool) & (x.mode = Con) THEN DOCS.Mark(200) ELSE DOCS.Mark(111) END;
+					x.typ := DOCT.notyp
+		| 16,17: (*INC DEC*) 
+					IF x.mode >= Con THEN DOCS.Mark(112)
+					ELSIF ~(f IN intSet) THEN DOCS.Mark(111) END
+		| 18,19: (*INCL EXCL*)
+					IF x.mode >= Con THEN DOCS.Mark(112)
+					ELSIF x.typ # DOCT.settyp THEN DOCS.Mark(111); x.typ := DOCT.settyp END
+		| 20: (*LEN*)
+					IF (f # DynArr) & (f # Array) THEN DOCS.Mark(131) END
+		| 21: (*ASH*)
+					IF f = LInt THEN load(x)
+					ELSIF f IN intSet THEN loadX(x); x.typ := DOCT.linttyp
+					ELSE DOCS.Mark(111) END
+		| 22, 23: (*LSH ROT*)
+					IF f IN {Char, SInt, Int, LInt, Set} THEN load(x) ELSE DOCS.Mark(111) END
+		| 24,25,26, 42, 43: (*GET, PUT, BIT, GETLOW, PUTLOW *)
+					IF (f IN intSet) & (x.mode = Con) THEN x.mode := Abs
+					ELSIF f = LInt THEN 
+						IF (x.mode = Var) & (x.lev >= 0) THEN x.mode := Ind; x.a1 := 0
+						ELSE load(x); x.mode := RegI; x.a1 := 0 END
+					ELSE DOCS.Mark(111) END
+		| 27: (*VAL*)
+					IF x.mode # Typ THEN DOCS.Mark(110) END
+		| 28: (*SYSTEM.NEW*)
+					IF (f = Pointer) & (x.mode < Con) THEN (* nothing needed *)
+					ELSE DOCS.Mark(111) END
+		| 29: (*COPY*)
+					IF (((f=Array) OR (f=DynArr)) & (x.typ.BaseTyp.form = Char)) OR (f = String) THEN
+						DOCC.GetThisReg(esi, y, ok); CheckOK(ok, esi, x);	IF ~ok THEN DOCS.Mark(215) END;
+						IF f = DynArr THEN DOCC.DynArrAdr(y, x)
+						ELSE	IF x.mode = Con THEN x.mode := Var END;
+							DOCC.PutORM(4, 8DH, y.a0, x) 	(* LEA Reg, Mem/Reg *)
+						END;
+						DOCC.FreeReg(x);
+					ELSE DOCS.Mark(111) END
+		| 30, 44, 45: (* MOVE, MOVEHL, MOVLH *)
+					IF f = LInt THEN DOCC.GetThisReg(esi, y, ok);	IF ~ok THEN DOCS.Mark(215) END;
+						DOCC.PutORM(4, 8BH, y.a0, x); 	(* MOV Reg, Mem/Reg *)
+					ELSE DOCS.Mark(111) END
+		| 31: (*GETREG*)
+					IF x.mode # Con THEN DOCS.Mark(217) 
+					ELSIF (x.a0 > 7) OR (x.a0 < -1) THEN DOCS.Mark(220) END
+		| 32: (*PUTREG*)
+					IF x.mode # Con THEN DOCS.Mark(217) 
+					ELSIF (x.a0 > 7) OR (x.a0 < -1) THEN DOCS.Mark(220) END
+		| 33: (*PORTIN*)
+					DOCC.GetThisReg(edx, y, ok);	IF ~ok THEN DOCS.Mark(215) END;
+					IF x.mode = Con THEN DOCC.PutOD(2, 2, 0B8H + edx, x.a0);	(* MOV EDX, Portnr *)
+					ELSIF f = LInt THEN DOCC.PutORM(4, 8BH, edx, x) 
+					ELSIF f = Int THEN DOCC.PutORM(4, 0FBFH, edx, x)
+					ELSIF f = SInt THEN DOCC.PutORM(4, 0FBEH, edx, x)
+					ELSE DOCS.Mark(111) END;
+		| 34: (*PORTOUT*)
+					DOCC.GetThisReg(edx, y, ok);	IF ~ok THEN DOCS.Mark(215) END;
+					IF x.mode = Con THEN DOCC.PutOD(2, 2, 0B8H + edx, x.a0);	(* MOV EDX, Portnr *)
+					ELSIF f = LInt THEN DOCC.PutORM(4, 8BH, edx, x) 
+					ELSIF f = Int THEN DOCC.PutORM(4, 0FBFH, edx, x)
+					ELSIF f = SInt THEN DOCC.PutORM(4, 0FBEH, edx, x)
+					ELSE DOCS.Mark(111) END;
+		| 35: (*GETSELECTOR*)
+					IF x.mode # Con THEN DOCS.Mark(217) END;	(* Selectornr. *)
+					DOCC.PutO(4, 08CH); DOCC.PutByte(192+x.a0*8); (* MOV EAX, selector *)
+		| 38: (*INT*)
+					IF ((f = SInt) OR (f = Char)) & (x.mode = Con) THEN DOCC.PutO(4, 0CDH); DOCC.PutO(4, x.a0)
+					ELSE DOCS.Mark(111) END;
+					x.typ := DOCT.notyp
+		| 39: (*OP*)
+					IF x.mode # Con THEN DOCS.Mark(217) END;	(* Code *)
+					DOCC.PutO(4, x.a0); x.typ := DOCT.notyp
+		END
+	END StPar1;
+
+	PROCEDURE StPar2*(VAR p, x: DOCT.Item; fctno: INTEGER);
+		VAR f, L, hold: INTEGER; y, z: DOCT.Item; typ: DOCT.Struct; ok: BOOLEAN;
+	BEGIN f := x.typ.form;
+		IF (fctno < 16) OR (fctno = 39) THEN DOCS.Mark(64); RETURN END;
+		CASE fctno OF
+			16, 17: (*INC DEC*)
+					IF x.typ # p.typ THEN
+						IF (x.mode = Con) & (x.typ.form IN intSet) THEN x.typ := p.typ
+						ELSIF (x.typ.form IN intSet) & (x.typ.form < p.typ.form) THEN convert1(x, p.typ) (* <-- ARD 18. 1. 93 *)
+						ELSE DOCS.Mark(111) END
+					END;
+					L := lengcode[p.typ.form];
+					IF fctno = 16 THEN add(L, p, x) ELSE sub(L, p, x) END;
+					Overflow;
+					p.typ := DOCT.notyp
+		| 18: (*INCL*)
+					Set0(y, x); IF y.mode = Con THEN DOCC.PutOMD(4, 4, 81H, 1, p, y.a0);	(* OR Reg/Mem, Imm *)
+					ELSE DOCC.PutORM(4, 9H, y.a0, p) END;	(* OR Reg/Mem, Reg *)
+					p.typ := DOCT.notyp
+		| 19: (*EXCL*)
+					Set0(y, x); IF y.mode = Con THEN load(y) END;
+					DOCC.PutOM(4, 0F7H, 2, y);							(* NOT Reg, Reg *)
+					DOCC.PutORM(4, 21H, y.a0, p);					(* AND Reg/Mem, Reg *)
+					p.typ := DOCT.notyp
+		| 20: (*LEN*)
+					IF (x.mode = Con) & (f = SInt) THEN
+						L := SHORT(x.a0); typ := p.typ;
+						WHILE (L > 0) & (typ.form IN {DynArr, Array}) DO typ := typ.BaseTyp; DEC(L) END;
+						IF (L # 0) OR ~(typ.form IN {DynArr, Array}) THEN DOCS.Mark(132)
+						ELSE
+							IF typ.form = DynArr THEN
+								p.mode := Var; p.typ := DOCT.linttyp; INC(p.a0, typ.adr);
+								load(p); DOCC.PutO(4, 40H + p.a0);		(* INC p *)
+							ELSE p := x; p.a0 := typ.n; SetIntType(p)
+							END
+						END
+					ELSE DOCS.Mark(111) END
+		| 21, 22: (* ASH LSH *)
+					IF f IN intSet THEN L := lengcode[p.typ.form];
+						IF (x.mode = VarX) OR (x.mode = IndX) THEN load(x) END; x.typ := DOCT.sinttyp; 
+						IF x.mode = Con THEN
+							IF x.a0 > 0 THEN DOCC.PutOMD(L+1, 1, 0C1H, 4H, p, x.a0)				(* SAL Reg/Mem Imm *)
+							ELSIF fctno = 21 THEN DOCC.PutOMD(L+1, 1, 0C1H, 7H, p, -x.a0)	(* SAR Reg/Mem Imm *)
+							ELSE DOCC.PutOMD(L+1, 1, 0C1H, 5H, p, -x.a0)								(* SHR Reg/Mem Imm *)
+							END
+						ELSE 
+							IF (p.mode = Reg) & (p.a0 IN DOCC.byteregs) & 
+								(eax IN DOCC.RegSet) & (ebx IN DOCC.RegSet) & (edx IN DOCC.RegSet) THEN z := p;
+								DOCC.GetGenReg(z); DOCC.PutORM(4, 8BH, z.a0, p); DOCC.FreeReg(p); p.a0 := z.a0
+							END;
+							DOCC.GetThisReg(ecx, y, ok); CheckOK(ok, ecx, p); CheckOK(ok, ecx, x);
+							IF ~ok THEN DOCC.Push(ecx) END;
+							IF (x.mode = Reg) & ~(x.a0 IN DOCC.byteregs) THEN z := x;
+								DOCC.GetByteReg(z); DOCC.PutORM(4, 8BH, z.a0, x);
+								DOCC.PutORM(4, 8AH, ecx, z); DOCC.FreeReg(x);					(* MOV CL, x *)
+							ELSE DOCC.PutORM(4, 8AH, ecx, x) END;									(* MOV CL, x *)
+							DOCC.PutOMD(4, 1, 80H, 7, y, 0);													(* CMP CL, 0 *)
+							IF L = 1 THEN DOCC.PutOD(4, 1, 7CH, 5) ELSE DOCC.PutOD(4, 1, 7CH, 4) END;	(* JL 4/5 *)
+							DOCC.PutOM(L+1, 0D3H, 4, p);														(* SAL Reg/Mem CL *)
+							IF L = 1 THEN DOCC.PutOD(4, 1, 0EBH, 5) ELSE DOCC.PutOD(4, 1, 0EBH, 4) END;	(* JMP 4/5 *)
+							DOCC.PutOM(4, 0F6H, 3, y);																(* NEG CL, CL *)
+							IF fctno = 21 THEN DOCC.PutOM(L+1, 0D3H, 7, p)							(* SAR Reg/Mem CL *)
+							ELSE DOCC.PutOM(L+1, 0D3H, 5, p)													(* SHR Reg/Mem CL *)
+							END;
+							IF ~ok THEN DOCC.Pop(ecx) ELSE DOCC.FreeReg(y) END;
+						END;
+					ELSE DOCS.Mark(111) END
+		| 23: (* ROT *)
+					IF f IN intSet THEN L := lengcode[p.typ.form];
+						IF (x.mode = VarX) OR (x.mode = IndX) THEN load(x) END; x.typ := DOCT.sinttyp; 
+						IF x.mode = Con THEN 
+							IF x.a0 > 0 THEN DOCC.PutOMD(L+1, 1, 0C1H, 0, p, x.a0)			(* ROL Reg/Mem Imm *)
+							ELSE DOCC.PutOMD(L+1, 1, 0C1H, 1H, p, -x.a0)						(* ROR Reg/Mem Imm *)
+							END
+						ELSE 
+							IF (p.mode = Reg) & (p.a0 IN DOCC.byteregs) & 
+								(eax IN DOCC.RegSet) & (ebx IN DOCC.RegSet) & (edx IN DOCC.RegSet) THEN z := p;
+								DOCC.GetGenReg(z); DOCC.PutORM(4, 8BH, z.a0, p); DOCC.FreeReg(p); p.a0 := z.a0
+							END;
+							DOCC.GetThisReg(ecx, y, ok); CheckOK(ok, ecx, p); CheckOK(ok, ecx, x);
+							IF ~ok THEN DOCC.Push(ecx) END;
+							IF (x.mode = Reg) & ~(x.a0 IN DOCC.byteregs) THEN z := x;
+								DOCC.GetByteReg(z); DOCC.PutORM(4, 8BH, z.a0, x);
+								DOCC.PutORM(4, 8AH, ecx, z);													(* MOV CL, x *)
+							ELSE DOCC.PutORM(4, 8AH, ecx, x) END;									(* MOV CL, x *)
+							DOCC.PutOMD(4, 1, 80H, 7, y, 0);													(* CMP CL, 0 *)
+							IF L = 1 THEN DOCC.PutOD(4, 1, 7CH, 5) ELSE DOCC.PutOD(4, 1, 7CH, 4) END;	(* JL 4/5 *)
+							DOCC.PutOM(L+1, 0D3H, 0, p);														(* ROL Reg/Mem CL *)
+							IF L = 1 THEN DOCC.PutOD(4, 1, 0EBH, 5) ELSE DOCC.PutOD(4, 1, 0EBH, 4) END;	(* JMP 4/5 *)
+							DOCC.PutOM(4, 0F6H, 3, y);																(* NEG CL, CL *)
+							DOCC.PutOM(L+1, 0D3H, 1, p);														(* ROR Reg/Mem CL *)
+							IF ~ok THEN DOCC.Pop(ecx) ELSE DOCC.FreeReg(y) END;
+						END;
+					ELSE DOCS.Mark(111) END
+		| 24: (*GET *)
+					IF x.mode >= Con THEN DOCS.Mark(112)
+					ELSIF f IN {Undef..LInt, Set, Pointer, ProcTyp} THEN DOCC.GetByteReg(z); DOCC.PutORM(4, 8BH, z.a0, p);
+						DOCC.PutORM(lengcode[f]+1, 89H, z.a0, x)
+					ELSIF f = Real THEN DOCC.PutOM(4, 0D9H, 0, p); INC(DOCC.FStack);	(* FLD ST(0), p *)
+						IF DOCC.FStack > 8 THEN DOCS.Mark(216); DOCC.FStack := 0 END;
+						DOCC.PutOM(4, 0D9H, 3, x); DEC(DOCC.FStack)								(* FSTP x, ST(0) *)
+					ELSIF f = LReal THEN DOCC.PutOM(4, 0DDH, 0, p); INC(DOCC.FStack);
+						IF DOCC.FStack > 8 THEN DOCS.Mark(216); DOCC.FStack := 0 END;
+						DOCC.PutOM(4, 0DDH, 3, x); DEC(DOCC.FStack)
+					ELSE DOCS.Mark(111) END;
+					p.typ := DOCT.notyp
+		| 25: (*PUT *)
+					IF f IN {Undef..LInt, Set, Pointer, ProcTyp} THEN load(x); DOCC.PutORM(lengcode[f]+1, 89H, x.a0, p)
+					ELSIF f = Real THEN loadF(x); DOCC.PutOM(4, 0D9H, 3, p); DOCC.PutO(4, 9BH); DEC(DOCC.FStack)
+					ELSIF f = LReal THEN loadF(x); DOCC.PutOM(4, 0DDH, 3, p); DOCC.PutO(4, 9BH); DEC(DOCC.FStack);
+					ELSE DOCS.Mark(111) END;	(* FSTP p, ST(0) *)
+					p.typ := DOCT.notyp
+		| 26: (*BIT*)
+					IF f IN intSet THEN loadX(x); DOCC.PutORM(4, 0FA3H, x.a0, p)	(* BT Mem/Reg, Reg *)
+					ELSE DOCS.Mark(111) END;
+					setCC(p, 2)
+		| 27: (*VAL*)
+					IF (p.typ.form = Real) & ~(x.typ.form IN realSet) THEN
+						hold := x.typ.form;
+						x.typ.form := LInt;			(* ard, 18.02.94 16:10:30 *)
+						load(x); DOCC.PutORM(4, 89H, x.a0, FCon);					(* MOV FCon, Reg *)
+						DOCC.PutOM(4, 0D9H, 0, FCon);									(* FLD ST(0), FCon *)
+						x.typ.form := hold;
+					ELSIF (p.typ.form = LReal) & ~(x.typ.form IN realSet) THEN
+						DOCC.PutOM(4, 0DDH, 0, x)
+					END;
+					x.typ := p.typ; p := x
+		| 28: (*SYSTEM.NEW*)
+					SaveRegs(p);
+					IF x.mode # Con THEN loadX(x); DOCC.PutO(4, 50H + x.a0) ELSE 
+						IF x.a0 < 128 THEN DOCC.PutOD(4, 1, 6AH, x.a0) ELSE DOCC.PutOD(4, 4, 68H, x.a0) END
+					END;
+					IF (f # LInt) & (f # SInt) & (f # Int) THEN DOCS.Mark(111) END;
+					DOCC.PutOD(4, 4, 0E8H, sysnewlink); sysnewlink := DOCC.pc-4;
+					RestoreRegs(p);
+					INCL(DOCC.RegSet, eax);
+					DOCC.PutORM(4, 89H, eax, p); 
+					p.typ := DOCT.notyp
+		| 29: (*COPY*)
+					IF ((f = Array) OR (f = DynArr)) & (x.typ.BaseTyp.form = Char) THEN
+						DOCC.GetThisReg(edi, y, ok); y.a1 := 0;	IF ~ok THEN DOCC.Push(edi) END;
+						IF ecx IN DOCC.RegSet THEN DOCS.Mark(215) END;
+						IF f = DynArr THEN p := x; DOCC.DynArrAdr(y, x); 
+							p.mode := Var; INC(p.a0, p.typ.adr); DOCC.PutORM(4, 8BH, ecx, p) (* MOV ECX, p *)
+						ELSE DOCC.PutORM(4, 8DH, y.a0, x); 													(* LEA EDI, x *)
+							p.mode := Con; p.typ := DOCT.inttyp; p.a0:= x.typ.size-1; 
+							DOCC.PutOD(4, 4, 0B8H + ecx, p.a0)											(* MOV ECX, p *)
+						END;
+						DOCC.PutByte(0FCH);																			(* CLD *)
+						DOCC.PutByte(0F2H); DOCC.PutByte(0A4H);										(* REP MOVSB *)
+						y.mode := RegI; y.a0 := edi; y.a1 := 0; DOCC.PutOMD(4, 1, 0C6H, 0, y, 0)	 (* MOV [EDI], 0X *);
+						IF ~ok THEN DOCC.Pop(edi) END
+					ELSE DOCS.Mark(111) END;
+					p.typ := DOCT.notyp
+		| 30, 44, 45: (* MOVE, MOVEHL, MOVLH *)
+					IF f = LInt THEN DOCC.GetThisReg(edi, y, ok);	IF ~ok THEN DOCS.Mark(215) END;
+						DOCC.PutORM(4, 8BH, y.a0, x); 	(* MOV Reg, Mem/Reg *)
+					ELSE DOCS.Mark(111) END
+		| 31: (*GETREG*)
+					IF (p.a0 # -1) THEN DOCC.GetThisReg(SHORT(p.a0), p, ok) END;
+					IF (f = Set) & (p.a0 = -1) THEN DOCC.PutO(4, 9CH); DOCC.PutOM(4, 8FH, 0, x)
+					ELSIF f = LInt THEN DOCC.PutORM(4, 89H, p.a0, x) 
+					ELSIF f = Int THEN DOCC.PutORM(2, 89H, p.a0, x)
+					ELSIF (f = SInt) OR (f = Char) THEN DOCC.PutORM(1, 89H, p.a0, x)
+					ELSE DOCS.Mark(111) END;
+					p.typ := DOCT.notyp
+		| 32: (*PUTREG*)
+					IF x.mode = Con THEN DOCC.PutOD(4, 4, 0B8H+p.a0, x.a0)
+					ELSIF f = LInt THEN DOCC.PutORM(4, 8BH, p.a0, x) 
+					ELSIF f = Int THEN DOCC.PutORM(4, 0FBFH, p.a0, x)
+					ELSIF f = SInt THEN DOCC.PutORM(4, 0FBEH, p.a0, x)
+					ELSIF f = Char THEN DOCC.PutORM(4, 0FB6H, p.a0, x)
+					ELSE DOCS.Mark(111) END;
+					p.typ := DOCT.notyp
+		| 33: (*PORTIN*)
+					DOCC.GetThisReg(eax, y, ok); CheckOK(ok, eax, x);	IF ~ok THEN DOCS.Mark(215) END;
+					IF (f = Char) OR (f = SInt) THEN DOCC.PutO(4, 0ECH); DOCC.PutORM(1, 89H, y.a0, x) 
+					ELSIF f = Int THEN DOCC.PutO(2, 0EDH); DOCC.PutORM(2, 89H, y.a0, x)
+					ELSIF f = LInt THEN DOCC.PutO(4, 0EDH); DOCC.PutORM(4, 89H, y.a0, x)
+					ELSE DOCS.Mark(111) END;
+					p.typ := DOCT.notyp
+		| 34: (*PORTOUT*)
+					DOCC.GetThisReg(eax, y, ok); CheckOK(ok, eax, x);	IF ~ok THEN DOCS.Mark(215) END;
+					IF (f = Char) OR (f = SInt) THEN 
+						IF x.mode = Con THEN DOCC.PutOD(1, 1, 0B1H, x.a0) (* !!! *)
+						ELSE DOCC.PutORM(1, 8BH, y.a0, x) END;
+						DOCC.PutO(4, 0EEH)
+					ELSIF f = Int THEN 
+						IF x.mode = Con THEN DOCC.PutOD(2, 2, 0B8H, x.a0);
+						ELSE DOCC.PutORM(2, 8BH, y.a0, x) END;
+						DOCC.PutO(2, 0EFH);
+					ELSIF f = LInt THEN 
+						IF x.mode = Con THEN DOCC.PutOD(4, 4, 0B8H, x.a0);
+						ELSE DOCC.PutORM(4, 8BH, y.a0, x) END;
+						DOCC.PutO(4, 0EFH);
+					ELSE DOCS.Mark(111) END;
+					p.typ := DOCT.notyp
+		| 42: (* PUTLOW *)
+					IF f IN {Undef..LInt, Set, Pointer, ProcTyp} THEN load(x); 
+						IF p.mode IN {Ind, IndX} THEN loadAdr(p) END; 
+						DOCC.PutO(4, 26H);
+						DOCC.PutORM(lengcode[f]+1, 89H, x.a0, p)
+					ELSE DOCS.Mark(111) END;	(* FSTP p, ST(0) *)
+					p.typ := DOCT.notyp
+		| 43: (* GETLOW *)
+					IF x.mode >= Con THEN DOCS.Mark(112)
+					ELSIF f IN {Undef..LInt, Set, Pointer, ProcTyp} THEN DOCC.GetByteReg(z); 
+						IF p.mode IN {Ind, IndX} THEN loadAdr(p) END; 
+						DOCC.PutO(4, 26H);
+						DOCC.PutORM(4, 8BH, z.a0, p);
+						DOCC.PutORM(lengcode[f]+1, 89H, z.a0, x)
+					ELSE DOCS.Mark(111) END;
+					p.typ := DOCT.notyp
+		END
+	END StPar2;
+
+	PROCEDURE StPar3*(VAR p, x: DOCT.Item; fctno: INTEGER);
+		VAR f: INTEGER; y: DOCT.Item; ok: BOOLEAN;
+	BEGIN f := x.typ.form;
+		IF (fctno = 30) OR (fctno = 44) OR (fctno = 45) THEN (* MOVE, MOVEHL, MOVLH *)
+			DOCC.GetThisReg(ecx, y, ok);	IF ~ok THEN DOCS.Mark(215) END;
+			IF x.mode = Con THEN DOCC.PutOD(4, 4, 0B8H+ecx, x.a0);
+			ELSIF f = Int THEN DOCC.PutORM(4, 0FBFH, y.a0, x) 
+			ELSIF f = SInt THEN DOCC.PutORM(4, 0FBEH, y.a0, x) 
+			ELSIF f = LInt THEN DOCC.PutORM(4, 08BH, y.a0, x) 
+			ELSE DOCS.Mark(111) END;
+			IF (fctno = 44) THEN 
+				DOCC.PutO(4, 06H); DOCC.PutO(4, 01EH); 	(* PUSH ES, PUSH DS *)
+				DOCC.PutO(4, 07H); DOCC.PutO(4, 01FH) 	(* POP ES, POP DS *)
+			END;
+			DOCC.PutO(4, 0FCH); DOCC.PutO(4, 0F2H); DOCC.PutO(4, 0A4H);	(* REP MOVSB *)
+			IF (fctno = 44) THEN 
+				DOCC.PutO(4, 06H); DOCC.PutO(4, 01EH); 	(* PUSH ES, PUSH DS *)
+				DOCC.PutO(4, 07H); DOCC.PutO(4, 01FH) 	(* POP ES, POP DS *)
+			END;
+			p.typ := DOCT.notyp
+		ELSE DOCS.Mark(64) END
+	END StPar3;
+
+	PROCEDURE StFct*(VAR p: DOCT.Item; fctno, parno: INTEGER);
+	VAR L: INTEGER;
+	BEGIN L := lengcode[p.typ.form];
+		IF (fctno >= 16) THEN
+			IF (fctno = 16) & (parno = 1) THEN DOCC.PutOM(L+1, 0FFH, 0, p); Overflow; p.typ := DOCT.notyp	(*INC*)
+			ELSIF (fctno = 17) & (parno = 1) THEN DOCC.PutOM(L+1, 0FFH, 1, p); Overflow; p.typ := DOCT.notyp	(*DEC*)
+			ELSIF (fctno = 20) & (parno = 1) THEN (*LEN*)
+				IF p.typ.form = DynArr THEN
+					p.mode := Var; INC(p.a0, p.typ.adr); p.typ := DOCT.linttyp;
+					load(p); DOCC.PutOM(4, 0FFH, 0, p)	(*ADDQD 1 p*)
+				ELSE p.mode := Con; p.a0 := p.typ.n; SetIntType(p) END
+			ELSIF (fctno = 35) THEN p.mode := Reg; p.a0 := 0; p.typ := DOCT.inttyp
+			ELSIF (fctno = 36) THEN DOCC.PutO(4, 0FAH)
+			ELSIF (fctno = 37) THEN DOCC.PutO(4, 0FBH)
+			ELSIF (fctno = 40) THEN 
+				DOCC.PutO(4, 06H);	(* PUSH ES *)
+				DOCC.PutO(2, 0B8H); DOCC.PutO(4, 034H); DOCC.PutO(4, 0H); 	(* MOV AX, 34H; MOV ES, AX *)
+				DOCC.PutO(4, 08EH); DOCC.PutO(4, 0C0H); 
+			ELSIF (fctno = 41) THEN DOCC.PutO(4, 07H); 	(* POP ES *)
+			ELSIF (fctno = 38) OR (fctno = 39) THEN
+			ELSIF (parno < 2) OR ((fctno = 30) OR (fctno = 44) OR (fctno = 45)) & (parno < 3) THEN DOCS.Mark(65) END
+		ELSIF parno < 1 THEN DOCS.Mark(65) END
+	END StFct;
+
+BEGIN intSet := {SInt, Int, LInt}; realSet := {Real, LReal}; regSet := {Reg, RegI, RegX};
+	FCon.mode := Var; FCon.a0 := 0; FCon.lev := 0;
+	FConl.mode := Var; FConl.a0 := 4; FConl.lev := 0;
+	Control.mode := Var; Control.a0 := 8; Control.lev := 0;
+	EAX.mode := Reg; EAX.a0 := 0; EAX.lev := 0;
+	EDX.mode := Reg; EDX.a0 := 2; EDX.lev := 0;
+	AH.mode := Reg; AH.a0 := 4; AH.lev := 0;
+	lengcode[Undef] := 0;
+	lengcode[Byte] := 0;
+	lengcode[Bool] := 0;
+	lengcode[Char] := 0;
+	lengcode[SInt] := 0;
+	lengcode[Int] := 1;
+	lengcode[LInt] := 3;
+	lengcode[Real] := 1;
+	lengcode[LReal] := 0;
+	lengcode[Set] := 3;
+	lengcode[String] := 0;
+	lengcode[NilTyp] := 3;
+	lengcode[ProcTyp] := 3;
+	lengcode[Pointer] := 3;
+	lengcode[Array] := 1;
+	lengcode[DynArr] := 1;
+	lengcode[Record] := 1;
+END DOCE.

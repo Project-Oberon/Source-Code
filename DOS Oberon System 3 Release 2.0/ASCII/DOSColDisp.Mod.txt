@@ -1,0 +1,43 @@
+MODULE ColorDisplay;
+(* Name:      Module DOSColDisp.Mod                            *)
+(* Purpose:   Raster-Operation for VGA (Mode 12h) & DOS-Oberon *)
+(* Date:      13.3.92                                          *)
+(* Author:    Ott Hans-Werner                                  *)
+(* Changes:   24.3.92  Set/Getcolor added   HWO                *)
+(*            31.3.92  Clipping-Procedures                     *)
+(*                     added                HWO                *)
+		
+TYPE Pattern = LONGINT;
+
+
+PROCEDURE Init*(base: LONGINT; height, width: INTEGER);
+BEGIN END Init;
+
+PROCEDURE GetChar*;
+BEGIN END GetChar;
+
+PROCEDURE Dot*;
+BEGIN END Dot;
+
+PROCEDURE CopyPattern*;
+BEGIN END CopyPattern;
+
+PROCEDURE ReplConst*;
+BEGIN END ReplConst;
+
+PROCEDURE CopyBlock*;
+BEGIN END CopyBlock;
+
+PROCEDURE ReplPattern*;
+BEGIN END ReplPattern;
+
+PROCEDURE Resetclip*;
+BEGIN END Resetclip;
+
+PROCEDURE Setclip*(x,y,w,h : INTEGER);
+BEGIN END Setclip;
+
+PROCEDURE Getclip*(VAR x,y,w,h : INTEGER);
+BEGIN END Getclip;
+
+END ColorDisplay.

@@ -1,0 +1,52 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Lissajous;
+
+IMPORT
+	Math, Objects, Gadgets, BasicGadgets, Complex;
+	
+(* Return the value of a input gadget *)
+PROCEDURE GetValue(name: ARRAY OF CHAR; default: REAL): REAL;
+VAR obj: Objects.Object;
+BEGIN
+	obj := Gadgets.FindObj(Gadgets.context, name);
+	IF (obj # NIL) & (obj IS BasicGadgets.Real) THEN RETURN SHORT(obj(BasicGadgets.Real).val)
+	ELSIF (obj # NIL) & (obj IS BasicGadgets.Integer) THEN RETURN obj(BasicGadgets.Integer).val
+	ELSE RETURN default
+	END
+END GetValue;
+
+PROCEDURE Do*;
+VAR obj: Objects.Object; i: INTEGER; x, y, freqA, freqB: REAL;
+BEGIN
+	obj := Gadgets.FindObj(Gadgets.context, "Controller");
+	IF (obj # NIL) & (obj IS Complex.Complex) THEN
+		WITH obj: Complex.Complex DO
+			freqA := GetValue("FreqA", 2); freqB := GetValue("FreqB", 2);
+			i := 0;
+			WHILE i < 360 DO
+				obj.real := Math.sin(freqA * Math.pi / 180 * i); obj.imag := Math.sin(freqB *Math.pi / 180 * i);
+				Gadgets.Update(obj); (* and plot *)
+				INC(i)
+			END
+		END
+	END
+END Do;
+
+END Lissajous.
+
+Gadgets.Link Complex.New ~
+System.Free Lissajous Graphs~
+
+Gadgets.Insert Graphs.NewGraph ~

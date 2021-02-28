@@ -1,0 +1,87 @@
+MODULE Display; (*NW 3.3.89 / 19.1.91*)
+	IMPORT SYSTEM;
+
+	CONST black* = 0; white* = 15;
+		replace* = 0; paint* = 1; invert* = 2;
+ 
+	TYPE
+		Frame* = POINTER TO FrameDesc;
+		FrameMsg* = RECORD END;
+		Pattern* = LONGINT;
+		Font* = POINTER TO Bytes;
+		Bytes* = RECORD END;
+
+		Handler* = PROCEDURE (f: Frame; VAR msg: FrameMsg);
+
+		FrameDesc* = RECORD
+			dsc*, next*: Frame;
+			X*, Y*, W*, H*: INTEGER;
+			handle*: Handler
+		END;
+
+	VAR
+		Unit*: LONGINT; (*RasterUnit = Unit/36000 mm*)
+		Left*, ColLeft*, Bottom*, UBottom*, Width*, Height*: INTEGER;
+		arrow*, star*, hook*, cross*, downArrow*: Pattern;
+		grey0*, grey1*, grey2*, ticks*: Pattern;
+
+	PROCEDURE Map*(X: INTEGER): LONGINT;
+	END Map;
+
+	PROCEDURE SetMode*(X: INTEGER; s: SET);
+	END SetMode;
+
+	PROCEDURE SetColor*(col, red, green, blue: INTEGER); (*col < 0: overlay color*)
+	END SetColor;
+
+	PROCEDURE GetColor*(col: INTEGER; VAR red, green, blue: INTEGER);
+	END GetColor;
+
+	PROCEDURE SetCursor*(mode: SET);  (*color cursor; 0: crosshair, 1: arrow*)
+	END SetCursor;
+
+
+	PROCEDURE InitCC*;  (*default crosshair*)
+	END InitCC;
+
+	PROCEDURE InitCP*;  (*default arrow pattern*)
+	END InitCP;
+
+	PROCEDURE DefCC*(X, Y, W, H: INTEGER);  (*crosshair window*)
+	END DefCC;
+
+	PROCEDURE DefCP*(VAR raster: ARRAY OF SYSTEM.BYTE);  (*cursor pattern*)
+	END DefCP;
+
+	PROCEDURE DrawCX*(X, Y: INTEGER);
+	END DrawCX;
+
+	PROCEDURE FadeCX*(X, Y: INTEGER);
+	END FadeCX;
+
+	PROCEDURE GetChar*(f: Font; ch: CHAR; VAR dx, x, y, w, h: INTEGER; VAR p: LONGINT);
+		(*get raster data of character ch*)
+	END GetChar;
+
+
+	(*raster operations*)
+
+	PROCEDURE CopyBlock*(SX, SY, W, H, DX, DY, mode: INTEGER);
+	END CopyBlock;
+
+	PROCEDURE CopyPattern*(col: INTEGER; pat: Pattern; X, Y, mode: INTEGER);
+	END CopyPattern;
+
+	PROCEDURE ReplPattern*(col: INTEGER; pat: Pattern; X, Y, W, H, mode: INTEGER);
+	END ReplPattern;
+
+	PROCEDURE ReplConst*(col: INTEGER; X, Y, W, H, mode: INTEGER);
+	END ReplConst;
+
+	PROCEDURE Dot*(col: INTEGER; X, Y: LONGINT; mode: INTEGER);
+	END Dot;
+
+	PROCEDURE SetPattern*(VAR image: ARRAY OF SYSTEM.BYTE; W, H: INTEGER; VAR pat: Pattern);
+	END SetPattern;
+
+END Display.

@@ -1,0 +1,453 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Scavenger;  (*NW 21.3.89 / 26.8.90  Ceres-2 / ARD 23.02.94 DOS / pjm 13.06.96 Native *)
+	IMPORT SYSTEM, InstDisk, Out, Kernel;
+
+	CONST
+		DirMark      = 9B1EA38DH;
+		HeaderMark   = 9BA71D86H;
+		MapMark = 9C2F977FH;
+
+		FnLength     = 32;
+		SecTabSize   = 64;
+		ExTabSize    = 12;
+		SS           = 2048;
+		BPS = SS DIV 512;
+		HeaderSize   = 352;
+		IndexSize = SS DIV 4;
+		DirPgSize    = 50;
+		FillerSize   = 36;
+		MapIndexSize = (SS-4) DIV 4;
+		N = DirPgSize DIV 2;
+
+	(* TYPE DiskAdr : ((cylno*HeadsPerCyl + headno)*SecPerTrack + secno) * 29 *)
+
+	TYPE DiskAdr     = LONGINT;
+		FileName       = ARRAY FnLength OF CHAR;
+		SectorTable    = ARRAY SecTabSize OF DiskAdr;
+		ExtensionTable = ARRAY ExTabSize OF DiskAdr;
+
+		DirEntry =  (*B-tree node*)
+			RECORD
+				name: FileName;
+				adr:  DiskAdr; (*file address*)
+				p:    DiskAdr  (*descendant in directory*)
+			END ;
+
+		DirPage  =
+			RECORD
+				mark:  LONGINT;
+				m:     INTEGER;
+				p0:    DiskAdr;
+				fill:  ARRAY FillerSize OF CHAR;
+				e:  ARRAY DirPgSize OF DirEntry
+			END ;
+
+		FileHeader =
+			RECORD (*allocated in the first page of each file on disk*)
+				mark: LONGINT;
+				name: FileName;
+				aleng, bleng: INTEGER;
+				date, time: LONGINT;
+				ext:  ExtensionTable;
+				sec: SectorTable;
+				fill: ARRAY SS - HeaderSize OF CHAR;
+			END ;
+
+		IndexSector* =
+			RECORD
+				x*: ARRAY IndexSize OF DiskAdr
+			END ;
+
+		Page = POINTER TO PageRec;
+		
+		Item = RECORD
+						name: FileName;
+						time, date, adr: LONGINT;
+						alen, blen: INTEGER;
+						p: Page
+					 END ;
+
+		PageRec = RECORD
+						m: INTEGER;  (*no. of items on page*)
+						p0: Page;
+						e: ARRAY 2*N OF Item
+					 END ;
+
+		MapIndex = 
+			RECORD
+				mark: LONGINT;
+				index: ARRAY MapIndexSize OF DiskAdr
+			END ;
+			
+		Partition = RECORD
+			type: INTEGER;
+			letter: CHAR;
+			drive: SHORTINT;
+			boot: BOOLEAN;
+			start, size: LONGINT;
+			ptsector, ptoffset: LONGINT
+		END;
+	
+	VAR
+		count0: INTEGER;  (*nof new dir pages*)
+		count1: INTEGER;  (*nof old dir pages*)
+		count2: INTEGER;  (*nof files on screen*)
+		root: Page;
+		Dadr: LONGINT;
+		head: FileHeader;
+		free: ARRAY 256 OF LONGINT;
+		drive: SHORTINT;
+		offset, nummax: LONGINT;
+
+	(* ReadPrimary - Read primary partition table entries into p *)
+	
+	PROCEDURE ReadPrimary(VAR p: ARRAY OF Partition;  VAR n: SHORTINT);
+	VAR d, i: SHORTINT;  b: ARRAY 512 OF CHAR;  e: LONGINT;  size: LONGINT;
+	BEGIN
+		n := 0;
+		FOR d := 0 TO InstDisk.NumDrives()-1 DO
+			InstDisk.GetBlocks(d, 0, 1, b, 0);
+			IF (b[510] = 055X) & (b[511] = 0AAX) THEN
+				FOR i := 0 TO 3 DO
+					e := 01BEH + 16*i;  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+					IF (b[e+4] # 0X) & (size # 0) THEN
+						p[n].type := ORD(b[e+4]);  p[n].letter := 0X;  p[n].drive := d;
+						SYSTEM.GET(SYSTEM.ADR(b[e+8]), p[n].start);  p[n].size := size;
+						p[n].boot := (b[e] # 0X);  p[n].ptsector := 0;  p[n].ptoffset := e;
+						INC(n)
+					END
+				END
+			END
+		END
+	END ReadPrimary;
+	
+	(* ReadLogical - Read "logical drive" partitions into p *)
+	
+	PROCEDURE ReadLogical(d: SHORTINT;  first: LONGINT;  VAR p: ARRAY OF Partition;  VAR n, letter: SHORTINT);
+	VAR b: ARRAY 512 OF CHAR;  e: LONGINT;  sec, size: LONGINT;
+	BEGIN
+		sec := first;
+		LOOP
+			InstDisk.GetBlocks(d, sec, 1, b, 0);
+			IF (b[510] = 055X) & (b[511] = 0AAX) THEN
+				e := 01BEH;  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+				IF (b[e+4] = 5X) THEN HALT(99) END;
+				IF size # 0 THEN
+					p[n].type := ORD(b[e+4]);  p[n].drive := d;
+					IF (p[n].type < 32) & (p[n].type IN {1,4,6,7}) THEN
+						p[n].letter := CHR(letter);  INC(letter)
+					ELSE
+						p[n].letter := 0X
+					END;
+					SYSTEM.GET(SYSTEM.ADR(b[e+8]), p[n].start);  INC(p[n].start, sec);
+					p[n].boot := (b[e] # 0X);  p[n].size := size;
+					p[n].ptsector := sec;  p[n].ptoffset := e;
+					INC(n)
+				END;
+				INC(e, 16);  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+				IF (b[e+4] # 5X) OR (size = 0) THEN EXIT END;
+				SYSTEM.GET(SYSTEM.ADR(b[e+8]), sec);  INC(sec, first)
+			END
+		END
+	END ReadLogical;
+	
+	(* ReadPartitionTable - Read all partition tables into p *)
+	
+	PROCEDURE ReadPartitionTable(VAR p: ARRAY OF Partition;  VAR n: SHORTINT);
+	VAR
+		pt: ARRAY 8 OF Partition;
+		pn, letter, i: SHORTINT;
+	BEGIN
+		ReadPrimary(pt, pn);
+		letter := SHORT(ORD("C"));  n := 0;
+		FOR i := 0 TO pn-1 DO
+			IF (pt[i].type < 32) & (pt[i].type IN {1,4,6,7}) THEN
+				pt[i].letter := CHR(letter);  INC(letter)
+			END
+		END;
+		FOR i := 0 TO pn-1 DO
+			IF pt[i].type = 5 THEN
+				ReadLogical(pt[i].drive, pt[i].start, p, n, letter)
+			ELSE
+				p[n] := pt[i];  INC(n)
+			END
+		END
+	END ReadPartitionTable;
+	
+	PROCEDURE GetSector(src: DiskAdr; VAR dest: ARRAY OF SYSTEM.BYTE);
+	BEGIN
+		IF (src < 1) OR (src > nummax) THEN HALT(21) END;
+		InstDisk.GetBlocks(drive, offset+(src-1)*BPS, BPS, dest, 0)
+	END GetSector;
+
+	PROCEDURE PutSector(dest: DiskAdr; VAR src: ARRAY OF SYSTEM.BYTE);
+	VAR secno, track, surf: INTEGER;
+	BEGIN
+		IF (dest < 1) OR (dest > nummax) THEN HALT(21) END;
+		InstDisk.PutBlocks(drive, offset+(dest-1)*BPS, BPS, src, 0)
+	END PutSector;
+
+	PROCEDURE WritePair (n: LONGINT);
+	BEGIN Out.Char(CHR(48 + n DIV 10)); Out.Char(CHR(48 + n MOD 10))
+	END WritePair;
+
+	PROCEDURE WriteDate(t, d: LONGINT);
+	BEGIN
+		WritePair(d MOD 20H); Out.Char("."); WritePair(d DIV 20H MOD 10H); Out.Char(".");
+		WritePair(d DIV 200H MOD 80H); Out.Char(" "); WritePair(t DIV 1000H MOD 20H); Out.Char(":");
+		WritePair(t DIV 40H MOD 40H); Out.Char(":"); WritePair(t MOD 40H); Out.Char(" ")
+	END WriteDate;
+
+	PROCEDURE validname(): BOOLEAN;
+		VAR i: INTEGER; ch: CHAR; ok: BOOLEAN;
+	BEGIN ok := FALSE; ch := head.name[0];
+		IF (CAP(ch) >= "A") & (CAP(ch) <= "Z") THEN
+			i := 1;
+			LOOP ch := head.name[i];
+				IF ch = 0X THEN ok := TRUE; EXIT END ;
+				IF (CAP(ch) >= "A") & (CAP(ch) <= "Z") OR
+					(ch >= "0") & (ch <= "9") OR (ch = ".") THEN INC(i)
+				ELSE EXIT
+				END ;
+				IF i = FnLength THEN EXIT END
+			END
+		END ;
+		RETURN ok
+	END validname;
+
+	PROCEDURE search(a: Page; VAR h: BOOLEAN; VAR v: Item);
+		(*search head.name in B-tree with root a; if found, check time and date.
+			Otherwise insert new item.  If an item is passed up,
+			assign it to v. h := "tree has become higher"*)
+		VAR i, L, R: INTEGER; f: LONGINT;
+			b: Page; u: Item;
+	BEGIN (*~h*)
+		IF a = NIL THEN  (*not in tree*)
+			h := TRUE; v.name := head.name; v.time := head.time; 
+			v.date := head.date; v.adr := Dadr;
+			v.alen := head.aleng; v.blen := head.bleng; v.p := NIL
+		ELSE
+			L := 0; R := a.m;  (*binary search*)
+			WHILE L < R DO
+				i := (L+R) DIV 2;
+				IF head.name <= a.e[i].name THEN R := i ELSE L := i+1 END
+			END ;
+			IF (R < a.m) & (a.e[R].name = head.name) THEN (*found*)
+				IF (a.e[R].date <= head.date) & (a.e[R].time < head.time) THEN
+					f := a.e[R].adr; a.e[R].date := head.date; a.e[R].time := head.time;
+					a.e[R].adr := Dadr; a.e[R].alen := head.aleng; a.e[R].blen := head.bleng
+				ELSE f := Dadr
+				END ;
+				IF count1 < 256 THEN
+					free[count1] := f; INC(count1); (*Out.Char("H"); Out.Int(f, 1);  Out.Ln*)
+				END
+			ELSE (*item not on this page*)
+				IF R = 0 THEN search(a.p0, h, u)
+					ELSE search(a.e[R-1].p, h, u)
+				END ;
+				IF h THEN (*insert u to the left of a.e[R]*)
+					IF a.m < 2*N THEN
+						h := FALSE; i := a.m;
+						WHILE i > R DO DEC(i); a.e[i+1] := a.e[i] END ;
+						a.e[R] := u; INC(a.m)
+					ELSE NEW(b); INC(count0); (*overflow*)
+						(*split a into a,b and assign the middle item to v*)
+						IF R < N THEN (*insert in left page a*)
+							i := N-1; v := a.e[i];
+							WHILE i > R DO DEC(i); a.e[i+1] := a.e[i] END ;
+							a.e[R] := u; i := 0;
+							WHILE i < N DO b.e[i] := a.e[i+N]; INC(i) END
+						ELSE (*insert in right page b*)
+							DEC(R, N); i := 0;
+							IF R = 0 THEN v := u
+							ELSE v := a.e[N];
+								WHILE i < R-1 DO b.e[i] := a.e[i+N+1]; INC(i) END ;
+								b.e[i] := u; INC(i)
+							END ;
+							WHILE i < N DO b.e[i] := a.e[i+N]; INC(i) END
+						END ;
+						a.m := N; b.m := N; b.p0 := v.p; v.p := b
+					END
+				END
+			END
+		END
+	END search;
+
+	PROCEDURE show(p: Page);
+		VAR i: INTEGER;
+	BEGIN
+		IF p # NIL THEN
+			show(p.p0); i := 0;
+			WHILE i < p.m DO
+				IF count2 = 64 THEN count2 := 0 END ;
+				Out.Int(p.e[i].adr, 1);  Out.Char(" ");
+				Out.Int(p.e[i].alen, 1); Out.Char(" "); Out.Int(p.e[i].blen, 1); Out.Char(" ");
+				WriteDate(p.e[i].time, p.e[i].date);
+				p.e[i].name[FnLength-1] := 0X; Out.String(p.e[i].name); Out.Ln; INC(count2);
+				show(p.e[i].p); INC(i)
+			END
+		END
+	END show;
+
+	PROCEDURE restore(p: Page; VAR dadr: LONGINT);
+		VAR i, m: INTEGER; a: LONGINT;
+			dir: DirPage;
+	BEGIN a := free[count2]; INC(count2); m := p.m;
+		dir.mark := DirMark; dir.m := m; dir.p0 := 0; i := 0;
+		WHILE i < m DO
+			dir.e[i].name := p.e[i].name; dir.e[i].adr := p.e[i].adr * 29;
+			dir.e[i].p := 0; INC(i)
+		END ;
+		IF p.p0 # NIL THEN
+			restore(p.p0, dir.p0); i := 0;
+			WHILE i < m DO restore(p.e[i].p, dir.e[i].p); INC(i) END
+		END ;
+		Out.Int(a, 1);  Out.Ln;
+		PutSector(a, dir); dadr := a * 29
+	END restore;
+
+	PROCEDURE OK(a: DiskAdr): BOOLEAN;
+	BEGIN
+		RETURN (a >= 29) & (a MOD 29 = 0) & (a DIV 29 < nummax)
+	END OK;
+	
+	PROCEDURE FileOK(VAR hd: FileHeader;  adr: DiskAdr): BOOLEAN;
+	VAR i, j, n: INTEGER;  B: IndexSector;
+	BEGIN
+		IF hd.aleng < SecTabSize THEN j := hd.aleng + 1;
+			REPEAT
+				DEC(j);
+				IF ~OK(hd.sec[j]) THEN RETURN FALSE END
+			UNTIL j = 0
+		ELSE j := SecTabSize;
+			REPEAT
+				DEC(j); 
+				IF ~OK(hd.sec[j]) THEN RETURN FALSE END
+			UNTIL j = 0;
+			n := (hd.aleng - SecTabSize) DIV IndexSize; i := 0;
+			WHILE i <= n DO
+				IF ~OK(hd.ext[i]) THEN RETURN FALSE END;
+				GetSector(hd.ext[i] DIV 29, B); (*index sector*)
+				IF i < n THEN j := IndexSize ELSE j := (hd.aleng - SecTabSize) MOD IndexSize + 1 END ;
+				REPEAT
+					DEC(j); 
+					IF ~OK(B.x[j]) THEN RETURN FALSE END
+				UNTIL j = 0;
+				INC(i)
+			END
+		END;
+		RETURN TRUE
+	END FileOK;
+	
+	PROCEDURE Scan*;
+	VAR h: BOOLEAN;  u: Item;  q: Page;
+	BEGIN
+		Out.String("Scanning");  Out.Ln;
+		Dadr := 2; root := NIL; count0 := 0; free[0] := 1; count1 := 1;
+		WHILE Dadr < nummax DO
+			GetSector(Dadr, head);
+			IF (head.mark = HeaderMark) & validname() THEN
+				(*Out.String(head.name);  Out.Char(" ");  Out.Int(Dadr, 1);*)
+				IF FileOK(head, Dadr) THEN
+					h := FALSE; search(root, h, u);
+					IF h THEN (*insert new base page*)
+						q := root; NEW(root); INC(count0);
+						root.m := 1; root.p0 := q; root.e[0] := u
+					END ;
+				ELSE Out.String(head.name);  Out.String(" bad, deleted")
+				END;
+				(*Out.Ln*)
+			ELSIF (head.mark = DirMark) & (count1 < 256) THEN
+				free[count1] := Dadr; INC(count1);
+				(*Out.Char("D");  Out.Int(Dadr, 1);  Out.Ln*)
+			END ;
+			INC(Dadr)
+		END ;
+		Out.Ln;  Out.String("needed/available: ");
+		Out.Int(count0, 1); Out.Char(" ");  Out.Int(count1, 1);
+		Out.Ln
+	END Scan;
+	
+	PROCEDURE Display*;
+	BEGIN
+		count2 := 0; show(root)
+	END Display;
+	
+	PROCEDURE WriteDirectory*;
+	BEGIN
+		IF count1 > count0 THEN
+			count2 := 0; restore(root, Dadr);
+			Out.String("done");  Out.Ln
+		END
+	END WriteDirectory;
+
+	PROCEDURE Init;
+	VAR
+		s, err, x: LONGINT;  b: ARRAY 512 OF CHAR;  pt: ARRAY 16 OF Partition;  pn, pi: SHORTINT;
+		partitionoffset, rootoffset, partitionlen, parttype: LONGINT;  i: SHORTINT;
+	BEGIN
+		Kernel.GetConfig("PartType", b);
+		i := 0;  parttype := 0;
+		WHILE (b[i] >= "0") & (b[i] <= "9") DO
+			parttype := parttype*10 + (ORD(b[i])-48);
+			INC(i)
+		END;
+		IF parttype = 0 THEN parttype := 79 END;
+		Out.String("PartType = ");  Out.Int(parttype, 1);  Out.Ln;
+		ReadPartitionTable(pt, pn);
+		pi := 0;  x := pn;
+		WHILE pi # x DO
+			IF pt[pi].type = parttype THEN x := pi
+			ELSE INC(pi)
+			END
+		END;
+		IF pi = pn THEN HALT(99) END;
+		partitionoffset := pt[pi].start;  partitionlen := pt[pi].size;
+		drive := pt[pi].drive;
+			(* read boot block to get offset *)
+		InstDisk.GetBlocks(drive, partitionoffset, 1, b, 0);
+		rootoffset := 1;
+		x := 0;  SYSTEM.GET(SYSTEM.ADR(b[510]), SYSTEM.VAL(INTEGER, x));
+		b[0] := "x"; b[1] := "x"; b[2] := "x";  b[9] := 0X;
+		IF (x = 0AA55H) & (b = "xxxOBERON") THEN	(* valid boot block *)
+			SYSTEM.GET(SYSTEM.ADR(b[0EH]), SYSTEM.VAL(INTEGER, rootoffset))
+		ELSE HALT(99)
+		END;
+		offset := partitionoffset+rootoffset;
+		nummax := (partitionlen-rootoffset) DIV BPS
+	END Init;
+
+	PROCEDURE Invalidate;
+		VAR j, size: LONGINT;  mi: MapIndex;
+	BEGIN
+		size := nummax;
+		GetSector(size*29, mi);
+		IF mi.mark = MapMark THEN
+			FOR j := 0 TO MapIndexSize-1 DO	(* check consistency of index *)
+				IF (mi.index[j] < 0) OR (mi.index[j] MOD 29 # 0) THEN RETURN END
+			END;
+			mi.mark := 0;  PutSector(size*29, mi)	(* invalidate index to force GC on startup *)
+		END
+	END Invalidate;
+	
+BEGIN
+	count0 := 0;  count1 := 0;  count2 := 0;
+	Init;  Invalidate
+END Scavenger.
+
+Scavenger.Scan
+Scavenger.Display
+!Scavenger.WriteDirectory
+

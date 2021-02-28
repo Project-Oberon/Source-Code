@@ -1,0 +1,1114 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Install;
+
+(* Installation tool to run in RamDisk system *)
+
+IMPORT InstDisk, InstFileDir, InstFiles, Files, In, Texts, Viewers, Oberon, TextFrames, MenuViewers, Fonts, 
+	Diskette, SYSTEM, Kernel;
+
+CONST
+	BS = 512;	(* disk block size *)
+	SS = InstDisk.SectorSize;	(* Oberon sector size *)
+	BPS = SS DIV BS;	(* blocks per sector *)
+	BootFileName = "OBL.Bin";
+	NumParts = 16;	(* max number of partitions *)
+
+TYPE
+	Partition = RECORD
+		type: INTEGER;
+		letter: CHAR;
+		drive: SHORTINT;
+		boot: BOOLEAN;
+		start, size: LONGINT;
+		ptsector, ptoffset: LONGINT
+	END;
+	DiskBlock = ARRAY BS OF CHAR;
+
+VAR
+	W: Texts.Writer;
+	T: Texts.Text;
+	V: Viewers.Viewer;
+	safe, first: BOOLEAN;
+	numfiles: LONGINT;
+	parttype: INTEGER;
+
+(* ---- Read partition table ---- *)
+
+(* Partition table starts at 01BEH in partition table sector and consists
+	of 4 records of the type:
+	
+	00    bootind: Types.Byte;
+	01    head: Types.Byte;
+	02    sectorcyl: Types.Byte;
+	03    cyl: Types.Byte;
+	04    type: Types.Byte;
+	05    head2: Types.Byte;
+	06    sector2cyl: Types.Byte;
+	07    cyl2: Types.Byte;
+	08    start: Types.DWord;
+	12    num: Types.DWord
+*)
+
+(* WriteType - Write partition type as pair nnn:[type] *)
+
+PROCEDURE WriteType(type: INTEGER);
+VAR s: ARRAY 32 OF CHAR;
+BEGIN
+	Texts.WriteInt(W, type, 1);
+	CASE type OF	(* list from Linux fdisk *)
+		1: s := "DOS12"	(* DOS 12-bit FAT *)
+		|2: s := "XENIX"	(* XENIX root *)
+		|3: s := "XENIX"	(* XENIX usr *)
+		|4: s := "DOS16"	(* DOS 16-bit FAT <32M *)
+		|5: s := "Extended"
+		|6: s := "DOS"	(* DOS 16-bit FAT >=32M *)
+		|7: s := "HPFS/NTFS"	(* OS/2 HPFS or QNX or Advanced UNIX or NT FS *)
+		|8: s := "AIX"	(* AIX data *)
+		|9: s := "AIX"	(* AIX boot or Coherent *)
+		|10: s := "BootMan"	(* OS/2 Boot Manager *)
+		|16: s := "OPUS"
+		|64: s := "Venix"	(* Venix 80286 *)
+		|65: s := "Linux"	(* Linux/MINIX (sharing disk with DRDOS) *)
+		|66: s := "LinuxSwp"	(* Linux swap (sharing disk with DRDOS) *)
+		|67: s := "Linux"	(* Linux native (sharing disk with DRDOS) *)
+		|79: s := "Oberon"	(* new *)
+		|80: s := "DM"
+		|81: s := "DM6"	(* DM6 Aux1 (or Novell) *)
+		|82: s := "CP/M"	(* CP/M or Microport SysV/AT *)
+		|83: s := "DM6"	(* DM6 Aux3 *)
+		|84: s := "DM6"
+		|85: s := "EZD"
+		|86: s := "GB"
+		|97: s := "SpeedStor"
+		|99: s := "Hurd"	(* GNU HURD or Mach or Sys V/386 (such as ISC UNIX) *)
+		|100: s := "Net286"	(* Novell Netware 286 *)
+		|101: s := "Net386"	(* Novell Netware 386 *)
+		|117: s := "PC/IX"
+		|128: s := "MINIX"	(* MINIX until 1.4a *)
+		|129: s := "MINIX"	(* MINIX since 1.4b, early Linux *)
+		|130: s := "LinuxSwp"	(* Linux swap *)
+		|131: s := "Linux"	(* Linux native *)
+		|147: s := "Amoeba"
+		|148: s := "Amoeba"	(* Amoeba BBT (bad block table) *)
+		|165: s := "BSD/386"
+		|183: s := "BSDIfs"
+		|184: s := "BSDIswap"
+		|199: s := "Syrinx"
+		|219: s := "CP/M"	(* Concurrent CP/M or Concurrent DOS or CTOS *)
+		|225: s := "DOSa"	(* DOS access or SpeedStor 12-bit FAT extended partition *)
+		|226: s := "Hybrid"
+		|227: s := "OldNO"	(* old Native Oberon or DOS R/O or SpeedStor *)
+		|228: s := "SpeedStor"	(* SpeedStor 16-bit FAT extended partition *)
+		|241: s := "SpeedStor"
+		|242: s := "DOS3"	(* DOS 3.3+ secondary *)
+		|244: s := "SpeedStor"
+		|254: s := "LANstep"
+		|255: s := "BBT"	(* bad track table *)
+		ELSE s := ""
+	END;
+	Texts.Write(W, ":");  Texts.WriteString(W, s)
+END WriteType;
+
+(* ReadPrimary - Read primary partition table entries into p *)
+
+PROCEDURE ReadPrimary(VAR p: ARRAY OF Partition;  VAR n: SHORTINT);
+VAR d, i: SHORTINT;  b: ARRAY 512 OF CHAR;  e: LONGINT;  size: LONGINT;
+BEGIN
+	n := 0;
+	FOR d := 0 TO InstDisk.NumDrives()-1 DO
+		InstDisk.GetBlocks(d, 0, 1, b, 0);
+		IF (b[510] = 055X) & (b[511] = 0AAX) THEN
+			FOR i := 0 TO 3 DO
+				e := 01BEH + 16*i;  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+				IF (b[e+4] # 0X) & (size # 0) THEN
+					p[n].type := ORD(b[e+4]);  p[n].letter := 0X;  p[n].drive := d;
+					SYSTEM.GET(SYSTEM.ADR(b[e+8]), p[n].start);  p[n].size := size;
+					p[n].boot := (b[e] # 0X);  p[n].ptsector := 0;  p[n].ptoffset := e;
+					INC(n)
+				END
+			END
+		END
+	END
+END ReadPrimary;
+
+(* ReadLogical - Read "logical drive" partitions into p *)
+
+PROCEDURE ReadLogical(d: SHORTINT;  first: LONGINT;  VAR p: ARRAY OF Partition;  VAR n, letter: SHORTINT);
+VAR b: ARRAY 512 OF CHAR;  e: LONGINT;  sec, size: LONGINT;
+BEGIN
+	sec := first;
+	LOOP
+		InstDisk.GetBlocks(d, sec, 1, b, 0);
+		IF (b[510] = 055X) & (b[511] = 0AAX) THEN
+			e := 01BEH;  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+			IF (b[e+4] = 5X) THEN HALT(99) END;
+			IF size # 0 THEN
+				p[n].type := ORD(b[e+4]);  p[n].drive := d;
+				IF (p[n].type < 32) & (p[n].type IN {1,4,6,7}) THEN
+					p[n].letter := CHR(letter);  INC(letter)
+				ELSE
+					p[n].letter := 0X
+				END;
+				SYSTEM.GET(SYSTEM.ADR(b[e+8]), p[n].start);  INC(p[n].start, sec);
+				p[n].boot := (b[e] # 0X);  p[n].size := size;
+				p[n].ptsector := sec;  p[n].ptoffset := e;
+				INC(n)
+			END;
+			INC(e, 16);  SYSTEM.GET(SYSTEM.ADR(b[e+12]), size);
+			IF (b[e+4] # 5X) OR (size = 0) THEN EXIT END;
+			SYSTEM.GET(SYSTEM.ADR(b[e+8]), sec);  INC(sec, first)
+		END
+	END
+END ReadLogical;
+
+(* ReadPartitionTable - Read all partition tables into p *)
+
+PROCEDURE ReadPartitionTable(VAR p: ARRAY OF Partition;  VAR n: SHORTINT);
+VAR
+	pt: ARRAY NumParts OF Partition;
+	pn, letter, i: SHORTINT;
+BEGIN
+	ReadPrimary(pt, pn);
+	letter := SHORT(ORD("C"));  n := 0;
+	FOR i := 0 TO pn-1 DO
+		IF (pt[i].type < 32) & (pt[i].type IN {1,4,6,7}) THEN
+			pt[i].letter := CHR(letter);  INC(letter)
+		END
+	END;
+	FOR i := 0 TO pn-1 DO
+		IF pt[i].type = 5 THEN
+			ReadLogical(pt[i].drive, pt[i].start, p, n, letter)
+		ELSE
+			p[n] := pt[i];  INC(n)
+		END
+	END
+END ReadPartitionTable;
+
+(* InitViewer - Initialise the Install viewer V and text T *)
+
+PROCEDURE InitViewer;
+VAR X, Y: INTEGER;
+BEGIN
+	IF (V = NIL) OR (T = NIL) OR (V.state <= 1) THEN	(* open new viewer *)
+		T := TextFrames.Text("");
+		Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+		V := MenuViewers.New(TextFrames.NewMenu("Install", 
+				"System.Close System.Copy System.Grow"), 
+				TextFrames.NewText(T, 0), TextFrames.menuH, X, Y)
+	ELSE
+		Texts.Delete(T, 0, T.len)
+	END
+END InitViewer;
+
+(* DisplayPartitions - Read and display the partition tables *)
+
+PROCEDURE DisplayPartitions(VAR pt: ARRAY OF Partition;  VAR pn: SHORTINT;  mark: INTEGER);
+VAR i: INTEGER;  t: LONGINT;
+BEGIN
+	InitViewer;  Texts.WriteString(W, "All partitions");  Texts.WriteLn(W);  Texts.WriteLn(W);
+	Texts.SetFont(W, Fonts.This("Courier10.Scn.Fnt"));
+	Texts.WriteString(W, "Part HD  Drv  Mb    Start  Length Type");  Texts.WriteLn(W);
+	ReadPartitionTable(pt, pn);
+	FOR i := 0 TO pn-1 DO
+		Texts.WriteInt(W, i, 2);
+		IF pt[i].boot THEN Texts.Write(W, "*")
+		ELSE Texts.Write(W, " ")
+		END;
+		Texts.WriteInt(W, pt[i].drive, 4);
+		Texts.WriteString(W, "  ");
+		IF pt[i].letter = 0X THEN Texts.WriteString(W, "--")
+		ELSE Texts.Write(W, pt[i].letter);  Texts.Write(W, ":")
+		END;
+		t := pt[i].size DIV 2+102;	(* k *)
+		IF t < 100*1024 THEN
+			Texts.WriteInt(W, t DIV 1024, 4);
+			Texts.Write(W, ".");
+			Texts.WriteInt(W, (t MOD 1024)*10 DIV 1024, 1)
+		ELSE Texts.WriteInt(W, t DIV 1024, 6)
+		END;
+		Texts.WriteInt(W, pt[i].start, 8);  Texts.WriteInt(W, pt[i].size, 8);
+		Texts.Write(W, " ");  WriteType(pt[i].type);
+		IF i = mark THEN Texts.WriteString(W, " **") END;
+		Texts.WriteLn(W);
+		Texts.Append(T, W.buf)
+	END;
+	Texts.WriteLn(W);  Texts.Append(T, W.buf);
+	Texts.SetFont(W, Fonts.This("Oberon10.Scn.Fnt"))
+END DisplayPartitions;
+
+(** ShowPartitions - Display all partition tables, nicely formatted *)
+
+PROCEDURE ShowPartitions*;
+VAR pt: ARRAY NumParts OF Partition;  pn: SHORTINT;
+BEGIN
+	DisplayPartitions(pt, pn, -1)
+END ShowPartitions;
+
+(* GetParams - Get hard disk parameters. *)
+
+PROCEDURE GetParams(drive: SHORTINT; VAR cyls, hds, spt: LONGINT;  VAR ok: BOOLEAN);
+VAR
+	buf: ARRAY BS OF CHAR;
+	i: SHORTINT;
+	p, hd, sec, phd, psec: LONGINT;
+BEGIN
+	InstDisk.GetParams(drive, cyls, hds, spt);	(* get parameters from system setup *)
+	InstDisk.GetBlocks(drive, 0, 1, buf, 0);	(* read sector 0 *)
+	ok := TRUE;
+	IF (buf[510] = 055X) & (buf[511] = 0AAX) THEN	(* valid partition table *)
+		phd := -1;	(* find end head and sector for each valid primary partition *)
+		FOR i := 0 TO 3 DO
+			p := 01BEH + 16*i;
+			IF buf[p+4] # 0X THEN	(* partition i in use *)
+				hd := ORD(buf[p+5]); 	(* end head *)
+				sec := ORD(buf[p+6]) MOD 64;	(* end sector *)
+				IF phd = -1 THEN phd := hd;  psec := sec
+				ELSIF (phd = hd) & (psec = sec) THEN (* skip *)
+				ELSE ok := FALSE	(* inconsistent table *)
+				END
+			END
+		END;
+		IF ok & (phd # -1) THEN
+			(* modify the parameters to be consistent with the table.  Assume drive will do remapping. *)
+			cyls := cyls*hds*spt DIV ((phd+1)*psec);
+			hds := phd+1;  spt := psec
+		END
+	ELSE (* skip *)
+	END
+END GetParams;
+
+(* ReadPrimaryPart - Read and check primary partition table.
+	Returns: ok iff no errors found.  flen = number of free sectors.  fstart = first free sector *)
+	
+PROCEDURE ReadPrimaryPart(d: SHORTINT;  VAR buf: DiskBlock;  VAR ok: BOOLEAN;  VAR fstart, flen: LONGINT);
+TYPE
+	Entry = RECORD
+		valid: BOOLEAN;
+		start, end: LONGINT
+	END;
+VAR
+	i, j: SHORTINT;
+	p, type, start, len, cyls, hds, spt, sec, hd, cyl, size, g, t, start0, start1: LONGINT;
+	table: ARRAY 4 OF Entry;
+	ok0: BOOLEAN;
+BEGIN
+	fstart := MAX(LONGINT);  flen := 0;
+	Texts.WriteString(W, "Primary partitions on hard disk ");  Texts.WriteInt(W, d, 1);
+	Texts.WriteLn(W);  Texts.WriteLn(W);  Texts.Append(T, W.buf);
+	GetParams(d, cyls, hds, spt, ok);  size := cyls*hds*spt;  g := hds*spt;
+	InstDisk.GetBlocks(d, 0, 1, buf, 0);
+	IF ok & (buf[510] = 055X) & (buf[511] = 0AAX) THEN
+		Texts.SetFont(W, Fonts.This("Courier10.Scn.Fnt"));
+		Texts.WriteString(W, "ID  Mb    Start  Length Type");  Texts.WriteLn(W);
+		FOR i := 0 TO 3 DO
+			p := 01BEH + 16*i;  Texts.Write(W, CHR(97+i));
+			IF buf[p] = 0X THEN Texts.Write(W, " ")
+			ELSE Texts.Write(W, "*")
+			END;
+			SYSTEM.GET(SYSTEM.ADR(buf[p+12]), len);
+			SYSTEM.GET(SYSTEM.ADR(buf[p+8]), start);
+			type := ORD(buf[p+4]);
+			t := len DIV 2+102;	(* k *)
+			IF t < 100*1024 THEN
+				Texts.WriteInt(W, t DIV 1024, 3);
+				Texts.Write(W, ".");
+				Texts.WriteInt(W, (t MOD 1024)*10 DIV 1024, 1)
+			ELSE Texts.WriteInt(W, t DIV 1024, 5)
+			END;
+			Texts.WriteInt(W, start, 8);  Texts.WriteInt(W, len, 8);
+			Texts.Write(W, " ");
+			IF (type = 0) OR (len = 0) THEN
+				table[i].valid := FALSE;  table[i].start := 0;  table[i].end := -1;
+				Texts.WriteString(W, "(empty)")
+			ELSE
+				table[i].valid := TRUE;  table[i].start := start;  table[i].end := start+len-1;
+				sec := start MOD spt + 1;  hd := (start DIV spt) MOD hds;
+				cyl := start DIV (spt*hds);  ok0 := TRUE;
+				IF (hd # ORD(buf[p+1])) OR (sec # ORD(buf[p+2]) MOD 64) OR
+					(cyl # ASH(ASH(ORD(buf[p+2]), -6), 8) + ORD(buf[p+3])) THEN
+					ok0 := FALSE
+				END;
+				sec := (start+len-1) MOD spt + 1;  hd := ((start+len-1) DIV spt) MOD hds;
+				cyl := (start+len-1) DIV (spt*hds);
+				IF (hd # ORD(buf[p+5])) OR (sec # ORD(buf[p+6]) MOD 64) OR
+					(cyl # ASH(ASH(ORD(buf[p+6]), -6), 8) + ORD(buf[p+7])) THEN
+					ok0 := FALSE
+				END;
+				IF ~ok0 THEN
+					Texts.WriteString(W, "inconsistent");
+					ok := FALSE
+				ELSE
+					WriteType(SHORT(type))
+				END
+			END;
+			Texts.WriteLn(W)
+	    END;
+	    Texts.WriteLn(W);
+	    Texts.SetFont(W, Fonts.This("Oberon10.Scn.Fnt"));
+    	FOR i := 0 TO 3 DO
+    		IF table[i].valid & ((table[i].start >= size) OR (table[i].end >= size)) THEN
+    			Texts.WriteString(W, "Error: Partition ");  Texts.Write(W, CHR(97+i));
+    			Texts.WriteString(W, " larger than disk");  Texts.WriteLn(W);
+    			Texts.Append(T, W.buf);  ok := FALSE
+    		END;
+    		FOR j := 0 TO 3 DO
+    			IF (i # j) & table[i].valid & table[j].valid & 
+    				((table[i].start >= table[j].start) & (table[i].start <= table[j].end) OR
+    				(table[i].end >= table[j].start) & (table[i].end <= table[j].end)) THEN
+    				Texts.WriteString(W, "Error: Partitions ");  Texts.Write(W, CHR(97+i));  Texts.WriteString(W, " and ");
+    				Texts.Write(W, CHR(97+j));  Texts.WriteString(W, " overlap");  Texts.WriteLn(W);
+    				Texts.Append(T, W.buf);  ok := FALSE
+    			END
+	    	END
+		END;
+		IF ok THEN
+			start0 := spt;
+			LOOP
+				t := MAX(LONGINT);
+				FOR i := 0 TO 3 DO	(* find first partition start after or on start0 *)
+					IF table[i].valid & (table[i].start >= start0) & (table[i].start < t) THEN
+						t := table[i].start
+					END
+				END;
+				IF t = MAX(LONGINT) THEN t := size END;	(* end of disk *)
+					(* {start0..t-1 is free} *)
+				IF start0 = spt THEN start1 := start0	(* first partition starts first cylinder, second head *)
+				ELSE start1 := start0+((-start0) MOD g)	(* other partitions must start on cylinder boundary *)
+				END;
+					(* {start1..t-1 is free} *)
+				t := t - (t MOD g);	(* partition must end on cylinder boundary *)
+				IF t-start1 > flen THEN	(* biggest free space so far *)
+					fstart := start1;  flen := t-start1
+				END;
+				t := MAX(LONGINT);
+				FOR i := 0 TO 3 DO	(* find first partition end after start0 *)
+					IF table[i].valid & (table[i].end > start0) & (table[i].end < t) THEN
+						t := table[i].end
+					END
+				END;
+				IF t = MAX(LONGINT) THEN
+					EXIT	(* no more partitions end after start0 *)
+				ELSE
+					start0 := t+1
+				END
+			END
+	    END
+	ELSE
+		Texts.WriteString(W, "Partition table signature missing");
+		Texts.WriteLn(W);  ok := FALSE
+	END;
+	IF ~ok THEN
+		Texts.WriteString(W, "Disk parameters: ");  Texts.WriteInt(W, cyls, 1);
+		Texts.WriteString(W, " cylinders, ");  Texts.WriteInt(W, hds, 1);
+		Texts.WriteString(W, " heads, ");  Texts.WriteInt(W, spt, 1);
+		Texts.WriteString(W, " sectors per track");
+		Texts.WriteLn(W);  Texts.WriteLn(W);
+		Texts.WriteString(W, "Error detected in partition table:");  Texts.WriteLn(W);
+		Texts.SetFont(W, Fonts.This("Courier10.Scn.Fnt"));
+		FOR i := 0 TO 15 DO
+			SYSTEM.GET(SYSTEM.ADR(buf[01BEH + 4*i]), t);
+			Texts.WriteHex(W, t);
+			IF i MOD 4 = 3 THEN Texts.WriteLn(W) END
+		END;
+		Texts.WriteLn(W);  Texts.SetFont(W, Fonts.This("Oberon10.Scn.Fnt"))
+	END;
+	Texts.Append(T, W.buf)
+END ReadPrimaryPart;
+
+PROCEDURE ShowPrimary*;	(* hd *)
+VAR d: INTEGER;  ok: BOOLEAN;  fstart, flen: LONGINT;  buf: DiskBlock;
+BEGIN
+	In.Open;  In.Int(d);
+	IF In.Done THEN
+		InitViewer;  ReadPrimaryPart(SHORT(d), buf, ok, fstart, flen);
+		IF ok THEN
+			Texts.WriteInt(W, flen DIV 2, 1);
+			Texts.WriteString(W, "k free");  Texts.WriteLn(W);
+			Texts.Append(T, W.buf)
+		END
+	END
+END ShowPrimary;
+
+PROCEDURE ShowParams*;
+VAR cyls, hds, spt: LONGINT;  d: SHORTINT;  ok: BOOLEAN;
+BEGIN
+	InitViewer;  Texts.WriteString(W, "Number of compatible disk drives: ");
+	Texts.WriteInt(W, InstDisk.NumDrives(), 1);  Texts.WriteLn(W);
+	FOR d := 0 TO InstDisk.NumDrives()-1 DO
+		GetParams(d, cyls, hds, spt, ok);
+		Texts.WriteString(W, "Disk ");  Texts.WriteInt(W, d, 1);
+		Texts.WriteString(W, ": ");  Texts.WriteInt(W, cyls, 1);
+		Texts.WriteString(W, " cylinders, ");  Texts.WriteInt(W, hds, 1);
+		Texts.WriteString(W, " heads, ");  Texts.WriteInt(W, spt, 1);
+		Texts.WriteString(W, " sectors per track.");
+		IF ~ok THEN Texts.WriteString(W, " Table inconsistent.") END;
+		Texts.WriteLn(W)
+	END;
+	Texts.WriteLn(W);  Texts.Append(T, W.buf)
+END ShowParams;
+
+PROCEDURE CreatePrimary*;	(* hd sizeMb *)
+VAR
+	d, i: INTEGER;  ok: BOOLEAN;  fstart, flen, size, cyls, hds, spt, p, t, end: LONGINT;
+	buf: DiskBlock;
+BEGIN
+	In.Open;  In.Int(d);  In.LongInt(size);
+	IF In.Done THEN
+		InitViewer;  ReadPrimaryPart(SHORT(d), buf, ok, fstart, flen);
+		IF ~ok THEN
+			Texts.WriteString(W, "Error in partition table, can not continue");
+			Texts.Append(T, W.buf);  RETURN
+		END;
+		GetParams(SHORT(d), cyls, hds, spt, ok);
+		ASSERT(ok);	(* was checked above *)
+		size := size*1024*2;	(* number of sectors *)
+		IF size > flen THEN size := flen END;	(* use max *)
+		DEC(size, (fstart+size) MOD (hds*spt));	(* round end down to multiple of cylinder *)
+		IF (size <= 0) OR (flen < size) THEN
+			Texts.WriteString(W, "Error: Specified partition size too big");
+			Texts.Append(T, W.buf);  RETURN
+		END;
+		ok := FALSE;  i := 0;
+		WHILE (i # 4) & ~ok DO
+			p := 01BEH + 16*i;
+			SYSTEM.GET(SYSTEM.ADR(buf[p+12]), t);
+			IF t = 0 THEN ok := TRUE
+			ELSE INC(i)
+			END
+		END;
+		IF ok THEN	(* found free slot p, i *)
+			buf[p] := 0X;  buf[p+1] := CHR((fstart DIV spt) MOD hds);
+			t := fstart DIV (spt*hds);  buf[p+2] := CHR(ASH(ASH(t, -8), 6) + (fstart MOD spt) + 1);
+			buf[p+3] := CHR(t);  buf[p+4] := CHR(parttype);
+			end := fstart+size-1;  buf[p+5] := CHR((end DIV spt) MOD hds);
+			t := end DIV (spt*hds);  buf[p+6] := CHR(ASH(ASH(t, -8), 6) + (end MOD spt) + 1);
+			buf[p+7] := CHR(t);  SYSTEM.PUT(SYSTEM.ADR(buf[p+8]), fstart);
+			SYSTEM.PUT(SYSTEM.ADR(buf[p+12]), size);
+			InstDisk.PutBlocks(SHORT(d), 0, 1, buf, 0);
+			Texts.WriteString(W, "After creating partition:");  Texts.WriteLn(W);
+			ReadPrimaryPart(SHORT(d), buf, ok, fstart, flen)
+		ELSE
+			Texts.WriteString(W, "Error: Partition table full.  Nothing done.");  Texts.WriteLn(W);
+			Texts.Append(T, W.buf)
+		END
+	END
+END CreatePrimary;
+
+PROCEDURE DeletePrimary*;	(* hd id *)
+VAR
+	d, num: INTEGER;  ok: BOOLEAN;  fstart, flen, p: LONGINT;
+	id: ARRAY 10 OF CHAR;  buf: DiskBlock;
+BEGIN
+	In.Open;  In.Int(d);  In.Name(id);  num := ORD(id[0])-97;
+	IF In.Done & ~safe & (num >= 0) & (num <= 3) THEN
+		InitViewer;  ReadPrimaryPart(SHORT(d), buf, ok, fstart, flen);
+		IF ~ok THEN
+			Texts.WriteString(W, "Error in partition table, can not continue");
+			Texts.Append(T, W.buf);  RETURN
+		END;
+		p := 01BEH + 16*num;
+(*
+		IF (ORD(buf[p+4]) # parttype) & (ORD(buf[p+4]) # 227) THEN
+			Texts.WriteString(W, "Error: Can not delete non-Oberon partition");
+			Texts.Append(T, W.buf);  RETURN
+		END;
+*)
+		FOR num := 0 TO 15 DO buf[p+num] := 0X END;
+		InstDisk.PutBlocks(SHORT(d), 0, 1, buf, 0);
+		Texts.WriteString(W, "After deleting partition:");  Texts.WriteLn(W);
+		ReadPrimaryPart(SHORT(d), buf, ok, fstart, flen)
+	END
+END DeletePrimary;
+
+PROCEDURE SetActivePrimary*;	(* hd id *)
+VAR
+	d, num: INTEGER;  ok: BOOLEAN;  fstart, flen, p: LONGINT;
+	id: ARRAY 10 OF CHAR;  buf: DiskBlock;
+	i: SHORTINT;
+BEGIN
+	In.Open;  In.Int(d);  In.Name(id);  num := ORD(id[0])-97;
+	IF id = "none" THEN num := -1 END;
+	IF In.Done & (num >= -1) & (num <= 3) THEN
+		InitViewer;  ReadPrimaryPart(SHORT(d), buf, ok, fstart, flen);
+		IF ~ok THEN
+			Texts.WriteString(W, "Error in partition table, can not continue");
+			Texts.Append(T, W.buf);  RETURN
+		END;
+		FOR i := 0 TO 3 DO
+			p := 01BEH + 16*i;
+			IF i = num THEN buf[p] := 80X ELSE buf[p] := 0X END
+		END;
+		InstDisk.PutBlocks(SHORT(d), 0, 1, buf, 0);
+		Texts.WriteString(W, "After setting active partition:");  Texts.WriteLn(W);
+		ReadPrimaryPart(SHORT(d), buf, ok, fstart, flen)
+	END
+END SetActivePrimary;
+
+PROCEDURE GetPartition(VAR part: INTEGER);
+VAR pt: ARRAY NumParts OF Partition;  pn, i: SHORTINT;
+BEGIN
+	ReadPartitionTable(pt, pn);  i := 0;
+	WHILE i # pn DO
+		IF pt[i].type = parttype THEN
+			part := i;
+			RETURN 
+		END;
+		INC(i)
+	END;
+	part := -1
+END GetPartition;
+
+PROCEDURE InitBootFile*;	(* partition corename { env "=" strval {"+" strval} } ~ *)
+CONST Max = 100000H;
+VAR
+	error, name: ARRAY 32 OF CHAR;
+	val: ARRAY 80 OF CHAR;
+	core: InstFileDir.FileName;  adr: LONGINT;  h: InstFileDir.FileHeader;
+	a: ARRAY 1024 OF LONGINT;  i, j, k, n, m: INTEGER;
+	e: InstFileDir.IndexSector;  f: InstFiles.File;  r: InstFiles.Rider;
+	b0, b1: POINTER TO ARRAY Max OF CHAR;
+	map: ARRAY 128 OF RECORD adr, num: LONGINT END;
+	bi0, bi1, bim, sum, cc, hh, ss, ptoffset, pti: LONGINT;
+	rootofs, tsize, part: INTEGER;
+	big, ok: BOOLEAN;
+	pt: ARRAY NumParts OF Partition;  pn: SHORTINT;
+	s: Texts.Scanner;
+	partsec: ARRAY BS OF CHAR;
+	
+	PROCEDURE PhysSec(a: LONGINT): LONGINT;
+	BEGIN
+		RETURN rootofs+(a DIV 29-1)*BPS + pt[part].start
+	END PhysSec;
+	
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);  Texts.Scan(s);
+	IF s.class # Texts.Int THEN error := "partition number expected";  HALT(99) END;
+	IF s.i = -1 THEN GetPartition(part)
+	ELSE part := SHORT(s.i)
+	END;
+	IF part < 0 THEN
+		error := "partition not found";  HALT(99)
+	END;
+	Texts.Scan(s);
+	IF s.class # Texts.Name THEN error := "core file name expected"; HALT(99) END;
+	COPY(s.s, core);  big := FALSE;
+	InstFileDir.Init;  InstFileDir.Search(core, adr);
+	IF adr # 0 THEN
+		DisplayPartitions(pt, pn, part);
+		IF (part >= 0) & (part < pn) & (pt[part].type = parttype) THEN
+				(* get the root block offset *)
+			GetParams(pt[part].drive, cc, hh, ss, ok);
+			ASSERT(ok);
+			InstDisk.GetBlocks(pt[part].drive, pt[part].start, 1, a, 0);
+			bim := 0;  SYSTEM.GET(SYSTEM.ADR(a[0])+510, SYSTEM.VAL(INTEGER, bim));
+			SYSTEM.MOVE(SYSTEM.ADR(a[0])+3, SYSTEM.ADR(error[0]), 8);
+			error[6] := 0X;
+			IF (bim # 0AA55H) OR (error # "OBERON") THEN	(* valid boot block *)
+				error := "Not an Oberon partition"; HALT(99)
+			END;
+			SYSTEM.GET(SYSTEM.ADR(a[0])+0EH, rootofs);
+			tsize := 0;  SYSTEM.GET(SYSTEM.ADR(a[0])+10H, SYSTEM.VAL(CHAR, tsize));
+			tsize := tsize*BS DIV 4;
+				(* get the file's physical sector addresses *)
+			Texts.WriteString(W, "** Locating ");  Texts.WriteString(W, core);
+			Texts.WriteLn(W);  Texts.Append(T, W.buf);
+			InstDisk.GetSector(adr, h);
+			IF h.bleng > 0 THEN n := h.aleng+1 ELSE n := h.aleng END;
+			j := 0;
+			WHILE (j # n) & (j # InstFileDir.SecTabSize) DO
+				a[j] := PhysSec(h.sec[j]);  INC(j)
+			END;
+			k := 0;
+			WHILE j # n DO
+				InstDisk.GetSector(h.ext[k], e);  i := 0;
+				WHILE (j # n) & (i # InstFileDir.IndexSize) DO
+					a[j] := PhysSec(e.x[i]);  INC(j);  INC(i)
+				END;
+				INC(k)
+			END;
+				(* compress the table *)
+			i := 0;  j := 1;  m := 0;
+			WHILE i # n DO
+				WHILE (j # n) & (j-i < 64*1024 DIV SS) & (a[j] = a[j-1]+BPS) DO INC(j) END;	(* inv: i..j-1 is contiguous *)
+				map[m].adr := a[i];  map[m].num := (j-i)*BPS;  INC(m);
+				i := j;  INC(j)
+			END;
+				(* now verify that the physical sectors are correct *)
+			f := InstFiles.Old(core);  InstFiles.Set(r, f, 0);
+			SYSTEM.NEW(b0, InstFiles.Length(f));
+			SYSTEM.NEW(b1, InstFiles.Length(f)+InstFileDir.HeaderSize+SS-1);
+			InstFiles.ReadBytes(r, b0^, InstFiles.Length(f));
+			IF r.res # 0 THEN error := "Read error"; HALT(99) END;
+			i := 0;  bi1 := 0;
+			WHILE i # m DO
+				InstDisk.GetBlocks(pt[part].drive, map[i].adr, map[i].num, b1^, bi1);
+				INC(bi1, map[i].num*BS);  INC(i)
+			END;
+				(* compute checksum of sectors *)
+			sum := 0;
+			REPEAT DEC(bi1); sum := (sum+ORD(b1[bi1])) MOD 100H UNTIL bi1 = 0;
+			sum := (-sum) MOD 100H;
+			bi0 := 0;  bi1 := InstFileDir.HeaderSize;  bim := InstFiles.Length(f);
+			WHILE (bi0 # bim) & (b0[bi0] = b1[bi1]) DO INC(bi0);  INC(bi1) END;
+			IF bi0 # bim THEN error := "Phys. & logical file mismatch"; HALT(99) END;
+				(* start the table *)
+			i := 0;  a[i] := 7 (* frag. kernel *);  INC(i);  a[i] := 20+8*m;  INC(i);
+			a[i] := 1000H - InstFileDir.HeaderSize;  INC(i);  a[i] := m + ASH(sum, 16);  INC(i);
+			a[i] := 1000H;  INC(i);  j := 0;	(* note: addr MOD 4096 # 0 *)
+			WHILE j # m DO
+				IF (map[j].adr+map[j].num-1) DIV ss DIV hh > 1024 THEN big := TRUE END;
+				a[i] := map[j].adr;  INC(i);  a[i] := map[j].num;  INC(i);  INC(j)
+			END;
+				(* config *)
+			Texts.Scan(s);  bi0 := SYSTEM.ADR(a[i])+8;  bi1 := bi0;
+			WHILE s.class = Texts.Name DO
+				COPY(s.s, name);
+				Texts.Scan(s);	(* "=" *)
+				IF (s.class # Texts.Char) OR (s.c # "=") THEN error := "config: syntax error";  HALT(99) END;
+				Texts.Scan(s);	(* val *)
+				IF (s.class # Texts.Name) & (s.class # Texts.String) THEN error := "config: syntax error";  HALT(99) END;
+				COPY(s.s, val);
+				j := 0;  WHILE val[j] # 0X DO INC(j) END;	(* j = length of val *)
+				IF j >= 31 THEN error := "config: string too long; use +";  HALT(99) END;
+				Texts.Scan(s);	(* next name, or "+" *)
+				WHILE (s.class = Texts.Char) & (s.c = "+") DO
+					Texts.Scan(s);	(* val *)
+					IF (s.class # Texts.Name) & (s.class # Texts.String) THEN error := "config: syntax error";  HALT(99) END;
+					k := 0;  WHILE s.s[k] # 0X DO val[j] := s.s[k]; INC(j); INC(k) END;
+					val[j] := 0X;
+					IF k >= 31 THEN error := "config: string too long; use +";  HALT(99) END;
+					Texts.Scan(s)
+				END;
+				k := 0;  WHILE name[k] # 0X DO INC(k) END;	(* k = length of name *)
+				IF bi1+k+j+3 >= SYSTEM.ADR(a[tsize-1]) THEN error := "Table overflow";  HALT(99) END;
+				j := 0;  WHILE name[j] # 0X DO SYSTEM.PUT(bi1, name[j]); INC(bi1); INC(j) END;
+				SYSTEM.PUT(bi1, 0X);  INC(bi1);
+				j := 0;  WHILE val[j] # 0X DO SYSTEM.PUT(bi1, val[j]); INC(bi1); INC(j) END;
+				SYSTEM.PUT(bi1, 0X);  INC(bi1)
+			END;
+			IF bi1 # bi0 THEN	(* some config strings were added *)
+				SYSTEM.PUT(bi1, 0X);  INC(bi1);	(* end of config *)
+				WHILE (bi1-bi0) MOD 4 # 0 DO SYSTEM.PUT(bi1, 0X);  INC(bi1) END;
+				a[i] := 8 (* patch *);  INC(i);  a[i] := 8+(bi1-bi0);
+				INC(i, SHORT(1+(bi1-bi0) DIV 4))
+			END;
+				(* end the table *)
+			IF i >= tsize-1 THEN error := "Table overflow"; HALT(99) END;
+			WHILE i # tsize DO a[i] := -1; INC(i) END;
+				(* write the table *)
+			tsize := tsize*4 DIV BS;	(* number of blocks in table *)
+			InstDisk.PutBlocks(pt[part].drive, pt[part].start+rootofs-tsize, tsize, a, 0);
+				(* activate the partition *)
+			InstDisk.GetBlocks(pt[part].drive, pt[part].ptsector, 1, partsec, 0);
+			ptoffset := pt[part].ptoffset;
+			IF (ORD(partsec[ptoffset+4]) # parttype) OR (partsec[510] # 055X) OR (partsec[511] # 0AAX) OR
+					(ptoffset < 1BEH) OR (ptoffset > 1BEH+16*3) THEN HALT(99) END;	(* double check *)
+			FOR i := 0 TO 3 DO
+				j := 01BEH + 16*i;
+				IF j = ptoffset THEN partsec[j] := 80X ELSE partsec[j] := 0X END
+			END;
+			InstDisk.PutBlocks(pt[part].drive, pt[part].ptsector, 1, partsec, 0);
+				(* say it went ok *)
+			Texts.WriteString(W, "** Boot file installed");
+			IF big THEN
+				Texts.WriteLn(W);  Texts.WriteString(W, "** Warning: Boot file may be outside BIOS limits")
+			END;
+			Texts.WriteLn(W);  Texts.WriteLn(W);  Texts.WriteString(W, "done");
+			Texts.Append(T, W.buf)
+		END
+	END
+END InitBootFile;
+
+PROCEDURE InitBootLoader*;
+CONST Size = 4*BS;
+VAR 
+	heads, spt, tsize, rsize, oldrsize, i, part: INTEGER;  b: ARRAY Size OF CHAR;
+	cc, hh, ss: LONGINT;  pt: ARRAY NumParts OF Partition;  pn: SHORTINT;
+	f: Files.File;  r: Files.Rider;  ok: BOOLEAN;
+BEGIN
+	GetPartition(part);
+	IF part >= 0 THEN
+		DisplayPartitions(pt, pn, part);
+		IF (part >= 0) & (part < pn) & (pt[part].type = parttype) THEN
+			GetParams(pt[part].drive, cc, hh, ss, ok);  heads := SHORT(hh);  spt := SHORT(ss);
+			ASSERT(ok);
+			InstDisk.GetBlocks(pt[part].drive, pt[part].start, 1, b, 0);
+			b[0] := "x";  b[1] := "x";  b[2] := "x";  b[9] := 0X;
+			IF b = "xxxOBERON" THEN SYSTEM.GET(SYSTEM.ADR(b[0EH]), oldrsize)
+			ELSE oldrsize := MAX(INTEGER)
+			END;
+			f := Files.Old(BootFileName);  Files.Set(r, f, 0);
+			IF (f # NIL) & (Files.Length(f) <= Size) THEN
+				Files.ReadBytes(r, b, Files.Length(f));
+				IF r.res # 0 THEN HALT(99) END;
+					(* get parameters from boot loader *)
+				SYSTEM.GET(SYSTEM.ADR(b[0EH]), rsize);  tsize := ORD(b[10H]);
+				IF (rsize-tsize)*BS # Files.Length(f) THEN HALT(99) END;
+				IF (rsize > oldrsize) THEN
+					Texts.WriteString(W, "** Warning: Oberon file system will have to be reinitialised");
+					Texts.WriteLn(W);  Texts.Append(T, W.buf);
+					IF safe THEN RETURN END
+				END;
+					(* set parameters in boot loader *)
+				IF pt[part].size < 10000H THEN
+					SYSTEM.PUT(SYSTEM.ADR(b[13H]), SYSTEM.VAL(INTEGER, pt[part].size))
+				ELSE
+					SYSTEM.PUT(SYSTEM.ADR(b[13H]), SYSTEM.VAL(INTEGER, 0));
+					SYSTEM.PUT(SYSTEM.ADR(b[20H]), pt[part].size)
+				END;
+				SYSTEM.PUT(SYSTEM.ADR(b[18H]), spt);
+				SYSTEM.PUT(SYSTEM.ADR(b[1AH]), heads);
+				SYSTEM.PUT(SYSTEM.ADR(b[1CH]), pt[part].start+1);
+				SYSTEM.PUT(SYSTEM.ADR(b[24H]), CHR(80H+pt[part].drive));
+					(* now write the boot loader to disk *)
+				InstDisk.PutBlocks(pt[part].drive, pt[part].start, Files.Length(f) DIV BS, b, 0);
+					(* write the table *)
+				FOR i := 0 TO tsize*BS-1 DO b[i] := 0FFX END;
+				InstDisk.PutBlocks(pt[part].drive, pt[part].start+rsize-tsize, tsize, b, 0);
+				Texts.WriteString(W, "** New boot loader & empty table written");
+				Texts.WriteLn(W);  Texts.WriteLn(W);
+				Texts.WriteString(W, "done");  Texts.Append(T, W.buf)
+			ELSE HALT(99)
+			END
+		END
+	END
+END InitBootLoader;
+
+PROCEDURE InitFileSystem*;
+VAR
+	buf: ARRAY SS*2 OF CHAR;  i, rsize, part: INTEGER;
+	pt: ARRAY NumParts OF Partition;  pn: SHORTINT;
+BEGIN
+	IF safe THEN RETURN END;
+	GetPartition(part);
+	IF part >= 0 THEN
+		DisplayPartitions(pt, pn, part);
+		IF (part >= 0) & (part < pn) & (pt[part].type = parttype) THEN
+			InstDisk.GetBlocks(pt[part].drive, pt[part].start, 1, buf, 0);	(* get boot sector *)
+			SYSTEM.GET(SYSTEM.ADR(buf[0EH]), rsize);
+			buf[0] := "x";  buf[1] := "x";  buf[2] := "x";  buf[9] := 0X;
+			IF (buf # "xxxOBERON") OR (rsize < 0) THEN HALT(99) END;	(* check if it is us *)
+			FOR i := 0 TO SS*2-1 DO buf[i] := 0X END;
+			InstDisk.PutBlocks(pt[part].drive, pt[part].start+rsize, BPS*2, buf, 0);	(* overwrite first 2 Oberon sectors with 0 *)
+			Texts.WriteString(W, "** File system initialised");  Texts.WriteLn(W);
+			Texts.WriteLn(W);  Texts.WriteString(W, "done");  
+			Texts.Append(T, W.buf)
+		END
+	END
+END InitFileSystem;
+
+PROCEDURE Copy(from, to: ARRAY OF CHAR);
+	VAR f: Files.File; g: InstFiles.File; Rf: Files.Rider; Rg: InstFiles.Rider; ch: CHAR;
+BEGIN
+	Texts.WriteString(W, from);
+	IF to # from THEN
+		Texts.WriteString(W, " => ");  Texts.WriteString(W, to)
+	END;
+	Texts.WriteString(W, " copying");
+	Texts.WriteLn(W);  Texts.Append(T, W.buf);
+	f := Files.Old(from);  IF f = NIL THEN HALT(99) END;
+	g := InstFiles.New(to);
+	Files.Set(Rf, f, 0); InstFiles.Set(Rg, g, 0); Files.Read(Rf, ch);
+	WHILE ~Rf.eof DO InstFiles.Write(Rg, ch); Files.Read(Rf, ch) END;
+	InstFiles.Register(g)
+END Copy;
+
+PROCEDURE Retrieve(from, to: ARRAY OF CHAR);
+	VAR f: InstFiles.File; g: Files.File; Rf: InstFiles.Rider; Rg: Files.Rider; ch: CHAR;
+BEGIN
+	Texts.WriteString(W, from);
+	IF to # from THEN
+		Texts.WriteString(W, " => ");  Texts.WriteString(W, to)
+	END;
+	Texts.WriteString(W, " retrieving");
+	Texts.WriteLn(W);  Texts.Append(T, W.buf);
+	f := InstFiles.Old(from);  IF f = NIL THEN HALT(99) END;
+	g := Files.New(to);
+	InstFiles.Set(Rf, f, 0); Files.Set(Rg, g, 0); InstFiles.Read(Rf, ch);
+	WHILE ~Rf.eof DO Files.Write(Rg, ch); InstFiles.Read(Rf, ch) END;
+	Files.Register(g)
+END Retrieve;
+
+PROCEDURE CopyFile(name: ARRAY OF CHAR; VAR S: Texts.Scanner);
+BEGIN Texts.Scan(S);
+	IF (S.class = Texts.Char) & (S.c = "=") THEN Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = ">") THEN Texts.Scan(S);
+			IF S.class = Texts.Name THEN
+				Copy(name, S.s);  Texts.Scan(S)
+			END
+		END
+	ELSE Copy(name, name)
+	END
+END CopyFile;
+
+PROCEDURE RetrieveFile(name: ARRAY OF CHAR; VAR S: Texts.Scanner);
+BEGIN Texts.Scan(S);
+	IF (S.class = Texts.Char) & (S.c = "=") THEN Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = ">") THEN Texts.Scan(S);
+			IF S.class = Texts.Name THEN
+				Retrieve(name, S.s);  Texts.Scan(S)
+			END
+		END
+	ELSE Retrieve(name, name)
+	END
+END RetrieveFile;
+
+PROCEDURE InitDisk(): BOOLEAN;
+BEGIN
+	InitViewer;
+	InstDisk.ResetDisk;
+	IF InstDisk.file = "" THEN
+		Texts.WriteString(W, "Installing to Oberon partition")
+	ELSE
+		Texts.WriteString(W, "Installing to DOS file: ");
+		Texts.WriteString(W, InstDisk.file)
+	END;
+	Texts.WriteLn(W);  Texts.Append(T, W.buf);
+	IF InstDisk.error # "" THEN
+		Texts.WriteString(W, "Error: ");  Texts.WriteString(W, InstDisk.error);
+		Texts.WriteLn(W);  Texts.Append(T, W.buf);
+		RETURN FALSE
+	ELSE
+		InstFileDir.Init;
+		RETURN TRUE
+	END
+END InitDisk;
+
+PROCEDURE CopyFiles*;	(* {file [=> file]} ~ *)
+VAR s: Texts.Scanner;
+BEGIN
+	IF ~InitDisk() THEN RETURN END;
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);  Texts.Scan(s);
+	WHILE s.class = Texts.Name DO CopyFile(s.s, s) END
+END CopyFiles;
+
+PROCEDURE RetrieveFiles*;	(* {file [=> file]} ~ *)
+VAR s: Texts.Scanner;
+BEGIN
+	IF ~InitDisk() THEN RETURN END;
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos);  Texts.Scan(s);
+	WHILE s.class = Texts.Name DO RetrieveFile(s.s, s) END
+END RetrieveFiles;
+
+PROCEDURE *List(name: ARRAY OF CHAR;  time, date, size: LONGINT;  VAR cont: BOOLEAN);
+VAR i: SHORTINT;
+BEGIN
+	Texts.WriteString(W, name);
+	i := 0;  WHILE name[i] # 0X DO INC(i) END;
+	WHILE i < 32-5 DO Texts.Write(W, " "); INC(i) END;
+	IF (time # 0) & (date # 0) & (size # MIN(LONGINT))  THEN
+	    Texts.WriteDate(W, time, date);
+		Texts.WriteInt(W, size, 8)
+	END;
+	Texts.WriteLn(W)
+END List;
+
+PROCEDURE Directory*;
+VAR
+	X, Y: INTEGER;
+	t: Texts.Text;
+	V: MenuViewers.Viewer;
+BEGIN
+	Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);  t := TextFrames.Text("");
+	V := MenuViewers.New(TextFrames.NewMenu("Install.Directory", 
+		"System.Close System.Copy System.Grow Edit.Store"),
+		TextFrames.NewText(t, 0), TextFrames.menuH, X, Y);
+	InstFileDir.Init;
+	Texts.SetFont(W, Fonts.This("Courier10.Scn.Fnt"));
+	InstFiles.Enumerate("", TRUE, List);  Texts.Append(t, W.buf);
+	Texts.SetFont(W, Fonts.This("Oberon10.Scn.Fnt"))
+END Directory;
+
+PROCEDURE *Count(name: ARRAY OF CHAR;  time, date, size: LONGINT;  VAR cont: BOOLEAN);
+BEGIN
+	INC(numfiles)
+END Count;
+
+PROCEDURE ReadInstallFloppy*;	(* label *)
+CONST
+	BufSize = BS*16;
+	N = 16384;
+	NumBlocks = 2880;	(* 2880=1.44Mb *)
+	End = 0C0X;  Esc = 0DBX;  EscEnd = 0DCX;  EscEsc = 0DDX;
+VAR
+	name, label: ARRAY 32 OF CHAR;
+	in: ARRAY BufSize OF CHAR;
+	inpos, inblock, bufSize: INTEGER;
+	table: ARRAY N OF CHAR;	(* hash table for compression *)
+	hash, val, bit: LONGINT;
+	f: InstFiles.File;  r: InstFiles.Rider;
+	ch: CHAR;  eof: BOOLEAN;
+
+	PROCEDURE Get0(VAR ch: CHAR);	(* get character from input *)
+	BEGIN
+		IF inpos = bufSize THEN
+			bufSize := NumBlocks - inblock;	(* max number of blocks *)
+			IF bufSize <= 0 THEN HALT(99)
+			ELSIF bufSize > BufSize DIV BS THEN bufSize := BufSize DIV BS
+			ELSE (* skip *)
+			END;
+			bufSize := bufSize*BS;	(* convert to bytes *)
+			Diskette.GetSectors(inblock, bufSize DIV BS, in, 0);
+			INC(inblock, bufSize DIV BS);  inpos := 0
+		END;
+		ch := in[inpos];  INC(inpos)
+	END Get0;
+	
+	PROCEDURE Open;
+	VAR i: LONGINT;  ch: CHAR;
+	BEGIN
+			(* check if boot disk & init buffer *)
+		Diskette.GetSectors(0, 1, in, 0);
+		i := 0;  SYSTEM.GET(SYSTEM.ADR(in[510]), SYSTEM.VAL(INTEGER, i));
+		in[0] := "x"; in[1] := "x"; in[2] := "x";  in[9] := 0X;
+		IF (i = 0AA55H) & (in = "xxxOBERON") THEN	(* valid boot block *)
+			inblock := 0;
+			SYSTEM.GET(SYSTEM.ADR(in[13H]), inblock)	(* total sectors *)
+		ELSE HALT(99)
+		END;
+		inpos := 0;  bufSize := 0;
+			(* init compression *)
+		i := 0; REPEAT table[i] := 0X; INC(i) UNTIL i = N;
+		hash := 0; bit := 0;  Get0(ch);  val := ORD(ch)
+	END Open;
+
+	PROCEDURE Get(VAR ch1: CHAR);	(* read character from input with decompression *)
+	VAR byte: LONGINT;  ch: CHAR;
+	BEGIN
+		INC(bit);
+		IF ODD(val) THEN	(* Incorrect prediction -> 1'xxxx'xxxx *)
+			Get0(ch);
+			IF bit = 8 THEN byte := ORD(ch)
+			ELSE byte := val DIV 2 + ASH(ORD(ch), 8-bit) MOD 256; val := ASH(ORD(ch), -bit)
+			END;
+			table[hash] := CHR(byte)
+		ELSE byte := ORD(table[hash]); val := val DIV 2	(* correct prediction *)
+		END;
+		hash := (16*hash+byte) MOD N; ch1 := CHR(byte);
+		IF bit = 8 THEN Get0(ch); val := ORD(ch); bit := 0 END
+	END Get;
+	
+	PROCEDURE Read(VAR ch: CHAR;  VAR eof: BOOLEAN);	(* Read character from input, with SLIP byte stuffing & decompression *)
+	BEGIN
+		Get(ch);  eof := FALSE;
+		IF ch = Esc THEN
+			Get(ch);
+			IF ch = EscEnd THEN ch := End
+			ELSIF ch = EscEsc THEN ch := Esc
+			ELSE HALT(99)
+			END
+		ELSIF ch = End THEN eof := TRUE;  ch := 0X
+		ELSE (* skip *)
+		END
+	END Read;
+	
+	PROCEDURE ReadString(VAR s: ARRAY OF CHAR);
+	VAR i: LONGINT;  eof: BOOLEAN;
+	BEGIN
+		i := -1;  REPEAT INC(i); Read(s[i], eof); ASSERT(~eof) UNTIL s[i] = 0X
+	END ReadString;
+	
+BEGIN
+	ASSERT((BufSize MOD BS = 0) & (BufSize <= MAX(INTEGER)));
+	IF ~InitDisk() THEN RETURN END;
+	IF first THEN
+		numfiles := 0;  InstFiles.Enumerate("", FALSE, Count);
+		first := FALSE;
+		IF numfiles # 0 THEN
+			Texts.WriteLn(W);  Texts.WriteString(W, "Warning: The destination file system already contains ");
+			Texts.WriteInt(W, numfiles, 1);  Texts.WriteString(W, " files.");
+			Texts.WriteLn(W);  Texts.WriteString(W, "Files with the same names will be overwritten by the new installation.");
+			Texts.WriteLn(W);  Texts.WriteLn(W);
+			Texts.WriteString(W, "Re-execute the ReadInstallFloppy command to continue installation.");
+			Texts.WriteLn(W);  Texts.Append(T, W.buf);
+			RETURN
+		END
+	END;
+	In.Open;  In.Name(name);
+	IF In.Done THEN
+		Open;  ReadString(label);
+		IF name = label THEN
+			LOOP
+				ReadString(name);
+				IF name = "" THEN EXIT END;
+				Texts.WriteString(W, name); Texts.WriteString(W, " reading");
+				Texts.WriteLn(W);  Texts.Append(T, W.buf);
+				f := InstFiles.New(name);  InstFiles.Set(r, f, 0);  Read(ch, eof);
+				WHILE ~eof DO InstFiles.Write(r, ch); Read(ch, eof) END;
+				InstFiles.Register(f)
+			END;
+			Texts.WriteLn(W);  Texts.WriteString(W, "done");
+			Texts.Append(T, W.buf)
+		ELSE
+			Texts.WriteString(W, label);  Texts.WriteString(W, " incorrect label");
+			Texts.WriteLn(W);  Texts.Append(T, W.buf)
+		END
+	END
+END ReadInstallFloppy;
+
+PROCEDURE ChangeType*;	(* partition from to *)
+VAR
+	b: ARRAY 512 OF CHAR;  part, from, to: INTEGER;  e: LONGINT;
+	pt: ARRAY NumParts OF Partition;  pn: SHORTINT;
+BEGIN
+	In.Open;  In.Int(part);  In.Int(from);  In.Int(to);
+	IF In.Done THEN
+		DisplayPartitions(pt, pn, part);
+		IF (part >= 0) & (part < pn) & (pt[part].type = from) THEN
+			InstDisk.GetBlocks(pt[part].drive, pt[part].ptsector, 1, b, 0);
+			e := pt[part].ptoffset;
+			IF (ORD(b[e+4]) # from) OR (b[510] # 055X) OR (b[511] # 0AAX) THEN HALT(99) END;	(* double check *)
+			b[e+4] := CHR(to);
+			InstDisk.PutBlocks(pt[part].drive, pt[part].ptsector, 1, b, 0);
+			Texts.WriteString(W, "** Type changed to ");
+			WriteType(to);  Texts.WriteLn(W);  Texts.Append(T, W.buf)
+		END
+	END
+END ChangeType;
+
+PROCEDURE Unsafe*;
+BEGIN
+	safe := FALSE
+END Unsafe;
+
+PROCEDURE Safe*;
+BEGIN
+	safe := TRUE
+END Safe;
+
+PROCEDURE Init;
+VAR s: ARRAY 20 OF CHAR;  i: SHORTINT;
+BEGIN
+	Kernel.GetConfig("PartType", s);
+	i := 0;  parttype := 0;
+	WHILE (s[i] >= "0") & (s[i] <= "9") DO
+		parttype := parttype*10 + (ORD(s[i])-48);
+		INC(i)
+	END;
+	IF parttype = 0 THEN
+		parttype := 79
+	ELSE
+		Texts.WriteString(W, "Partition type: ");  Texts.WriteInt(W, parttype, 1);  Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf)
+	END
+END Init;
+
+BEGIN
+	V := NIL;  T := NIL;  safe := TRUE;  first := TRUE;
+	Texts.OpenWriter(W);  Init
+END Install.
+
+Backup.ReadFiles OBL.BIN OBL.ASM ~	System.RenameFiles OBL.BIN => OBL.Bin OBL.ASM => OBL.Asm ~
+Miscellaneous.MakeOberonText OBL.Asm => OBL.Asm ~

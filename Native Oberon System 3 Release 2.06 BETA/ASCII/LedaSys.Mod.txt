@@ -1,0 +1,774 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaSys;	(* uh, Mon, 25-Oct-1993 *)
+
+	(*--- remarks:
+		- special support for the Macintosh [search for MAC]
+		- provides access to all documents in use
+		- provides exception handling: an exception with
+			a handler can be specified that will be activated
+			at a not normal termination of a command
+		- provides device definitions
+		- implements patterns for the leda system
+		- implements a simple line drawing algorithm
+		- implements mouse and character input
+	---*)
+
+	IMPORT Modules, Input, Objects, Display, Fonts, Oberon, Texts;
+
+CONST
+	NameRange* = 24;	StringRange* = 32;
+	
+	(*--- flags for port's state field ---*)
+	UpdateFlag* = 0;	DrawFlag* = 1;	FocFlag* = 2;	SelFlag* = 3;
+	NoClearFlag* = 4;	PrintFlag* = 5;
+	
+	(*--- regular paterns ---*)
+	White* = 0;	Grey1* = 1;	Grey2* = 2;	Grey3* = 3;	Grey4* = 4;	Black* = 5;
+	TxtrUp* = 6;	TxtrDown* = 7;	TxtrVert* = 8;	TxtrHor* = 9;
+	Mark0* = 10;	Mark1* = 11;	Mark2* = 12;
+	
+	(*--- mouse keys ---*)
+	ML* = 2;	MM* = 1; 	MR* = 0;	MX* = 4;	(* MX: execute *)
+	
+	(*--- hand cursor ---*)
+	HandPat = "A";	(* character in leda font *)
+	
+TYPE
+	Name* = ARRAY NameRange OF CHAR;
+	String* = ARRAY StringRange OF CHAR;
+	
+	(*--- document access ---*)
+	Access* = POINTER TO AccessDsc;
+	AccessDsc* = RECORD
+		trailer*: Display.Frame;	(* document trailer *)
+		next*: Access
+	END;
+	Document = POINTER TO DocumentDsc;
+	DocumentDsc = RECORD
+		(Objects.LibDesc)
+		trailer: Display.Frame	(* document trailer *)
+	END;
+	
+	(*--- output in document world ---*)
+	Port* = POINTER TO PortDsc;
+	PortDsc* = RECORD
+		X*, Y*, W*, H*, unit*: LONGINT;
+		state*: SET;
+		eraseCol*: INTEGER;
+	END;
+		(*--- remarks:
+			_ dynamic structure in order to pass port as parameter in a message
+			_ P.X, P.Y, P.W, P.H: area to regard [example: drawing];
+				P.W = MAX(LONGINT) -> area not specified, regard every area
+			_ P.unit: resolution of port
+		---*)
+		
+	(*--- device definitions ---*)
+	Device* = POINTER TO DeviceDsc;
+	DvcColorProc* = PROCEDURE (col: INTEGER; VAR red, green, blue: INTEGER);
+	DeviceDsc* = RECORD
+		depth*: INTEGER;	(* bits per pixel [color resolution] *)
+		col*: INTEGER;	(* current color value *)
+		getColor*: DvcColorProc;	(* procedure type allows replacing of procedure *)
+		replConst*: PROCEDURE (D: Device; X, Y, W, H, col, mode: INTEGER);
+		replPattern*: PROCEDURE (D: Device; X, Y, W, H, col, pNr, mode: INTEGER);
+		string*: PROCEDURE (D: Device; X, Y: INTEGER; VAR s, fName: ARRAY OF CHAR; col, mode: INTEGER);
+		picture*: PROCEDURE (D: Device; X, Y, W, H: INTEGER; pict: Objects.Object; wdt, hgt, mode: INTEGER)
+	END;
+	
+	DeviceCtrl* = POINTER TO DvcCtrlDsc;
+	DvcCtrlDsc* = RECORD
+		open*: PROCEDURE (P: Port; pageW, pageH, mrgnX, mrgnY: LONGINT);
+		initPage*: PROCEDURE (P: Port; refX, refY: LONGINT);
+		termPage*: PROCEDURE (P: Port; nbrOfCopies: INTEGER);
+		close*: PROCEDURE (P: Port)
+	END;
+	
+	PrtPort* = POINTER TO PrtPortDsc;
+	PrtPortDsc* = RECORD
+		(PortDsc)
+		status*, name*: String;
+		fX*, fY*, fW*, fH*: INTEGER;	(* printing frame [printable area] in printer units *)
+		mrgnX*, mrgnY*: INTEGER;	(* displacement of the printer bitmap *)
+		deltaX*, deltaY*: INTEGER;	(* displacement because of  smaller page size *)
+		refX*, refY*: LONGINT;	(* reference point [upper left paper corner] in document units *)
+		(*- to control printing -*)
+		printer*: DeviceCtrl;
+		(*- printing functionality -*)
+		out*: Device;
+	END;
+	
+	(*--- patterns
+	Pat = POINTER TO RECORD w, h, image: SHORTINT END;
+	PatternList = POINTER TO PatternDesc;
+	PatternDesc = RECORD
+		next: PatternList;
+		p: Pat
+	END;
+	---*)
+	
+	(*--- line drawing --*)
+	Stretch = POINTER TO StretchDesc;
+	StretchDesc = RECORD
+		next: Stretch;
+		relX, relY, w: INTEGER
+	END;
+	OutStretch* = PROCEDURE (x, y, w, pNr, col , mode: INTEGER);
+		(** procedure to draw a horizontal one pixel line *)
+	
+	(*--- exceptions ---*)
+	Excpt* = POINTER TO ExcptDsc;
+	ExcptProc* = PROCEDURE (ex: Excpt);
+	ExcptDsc* = RECORD
+		remove*: BOOLEAN;
+		handle*: ExcptProc
+	END;
+	Task = POINTER TO TaskDsc;
+	TaskDsc = RECORD
+		(Oberon.TaskDesc)
+		ex: Excpt
+	END;
+	
+VAR
+	scnUnit*: LONGINT;	(* size of a pixel on the screen *)
+	bg*, fg*, inv*: INTEGER;	(* colors: background, foreground, invert color *)
+	dialogMod*: Name;	(* module implementing dialog *)
+	execRes*: INTEGER;	(* execute result *)
+	tW*: Texts.Writer;		(* to append messages to log *)
+	(*--- patterns ---*)
+	scrPat*: ARRAY 13 OF Display.Pattern;
+	prtPat*: ARRAY 10 OF INTEGER;
+	(*--- leda icon ---*)
+	lFnt: Fonts.Font;	(* implements patterns and icons *)
+	Hand: Oberon.Marker;	(* hand cursor [marker for Oberon.Mouse] *)
+	(*--- document access ---*)
+	nofDocs: INTEGER;	(* used in NewDocument *)
+	aList: Access;	(* temporary in DocEnum and GetDocuemnts *)
+	(*--- line drawing ---*)
+	freeStretches: Stretch;	(* free list of stretches *)
+	outStretch: OutStretch;	(* all out... variables used during DrawLine *)
+	outPnr, outCol, outMode: INTEGER;
+	(*--- own ---*)
+	prtPort: PrtPort;	(* noted printer port; used in ThisPrtPort and SetPrtPort *)
+	debug: BOOLEAN;	(* used in procedures In and Debug *)
+	
+(*--- load module ---*)
+
+	PROCEDURE Execute*(mod, cmd: ARRAY OF CHAR);
+	(** executes the command cmd in module mod *)
+		VAR Mod: Modules.Module;	Cmd: Modules.Command;
+	BEGIN
+		Mod := Modules.ThisMod(mod);
+		IF (Modules.res = 0) & (cmd # "") THEN
+			Cmd := Modules.ThisCommand(Mod, cmd);
+			IF (Modules.res = 0) & (Cmd # NIL) THEN Cmd END	(* call command *)
+		END;
+		IF Modules.res # 0 THEN Modules.res := 0 END	(* reset to avoid call error *)
+	END Execute;
+	
+(*--- document access ---*)
+	
+	(*--- remarks:
+		- a document library [Document] and a document trailer exists for every document in use;
+			library and trailer are unique and point to each other
+		- the document library allows access to all documents currently in use [via Objects.Enumerate]
+		- every document frame points to the according document trailer
+		- the document library and trailer will be removed when there is
+			no reference to it [by garbage collector]
+	---*)
+	
+	PROCEDURE *DocEnum(L: Objects.Library);
+		VAR a: Access;
+	BEGIN
+		IF L IS Document THEN	(* extend document access list *)
+			NEW(a); a.trailer := L(Document).trailer;
+			a.next := aList; aList := a
+		END
+	END DocEnum;
+	
+	PROCEDURE *LibNOP(L: Objects.Library); END LibNOP;
+	
+	PROCEDURE *DocNew(): Objects.Library;
+		VAR lib: Document;
+	BEGIN	
+		NEW(lib); Objects.OpenLibrary(lib);
+		lib.Load := LibNOP; lib.Store := LibNOP;
+		lib.name := "DocXXXX.Leda";
+		lib.trailer := NIL; RETURN lib
+	END DocNew;
+	
+	PROCEDURE NewDocument*(trailer: Display.Frame);
+	(** creates a new  document library for the given document trailer trailer *)
+		VAR lib: Objects.Library;	name: ARRAY 14 OF CHAR;	n, i: INTEGER;
+	BEGIN
+		REPEAT
+			name := "Doc0000.Leda";	(* extension has to be equal in Objects.Register in module body *)
+			n := nofDocs; i := 6;
+			REPEAT name[i] := CHR(n MOD 10 + 30H); n := n DIV 10; DEC(i) UNTIL n = 0;
+			nofDocs := (nofDocs + 1) MOD 10000;
+			lib := Objects.ThisLibrary(name)
+		UNTIL (lib # NIL) & (lib(Document).trailer = NIL);	(* lib(Document).trailer = NIL -> new document library *)
+		lib(Document).trailer := trailer;
+		trailer.lib := lib
+	END NewDocument;
+	
+	PROCEDURE GetDocuments*(VAR access: Access);
+	(** returns in access a list with all documents currently in use *)
+	BEGIN
+		aList := NIL;
+		Objects.Enumerate(DocEnum);	(* builds access list [DocEnum] *)
+		access := aList; aList := NIL
+	END GetDocuments;
+	
+(*--- patterns ---*)
+	
+	PROCEDURE NewPattern*(VAR image: ARRAY OF SET; w, h: INTEGER): LONGINT; (* 0 < w <= 32, 0 < h *)
+	BEGIN RETURN Display.NewPattern(w, h, image)
+	END NewPattern;
+
+	PROCEDURE PatternSize*(pat: LONGINT; VAR w, h: INTEGER);
+	BEGIN Display.GetDim(pat, w, h)
+	END PatternSize;
+	
+	PROCEDURE DefinePatterns;
+	(* defines the screen and printer patterns: intializies scrPat and prtPat *)
+		VAR image: ARRAY 32 OF SET;	i: INTEGER;
+	BEGIN
+		(*-- initialize screen patterns ---*)
+			image[0] := {};
+		scrPat[White] := NewPattern(image, 32, 1);
+			image[3] := {0, 8, 16, 24};
+			image[2] := {};
+			image[1] := {4, 12, 20, 28};
+			image[0] := {};
+		scrPat[Grey1] := NewPattern(image, 32, 4);
+			image[1] := {0, 4, 8, 12, 16, 20, 24, 28};
+			image[0] := {2, 6, 10, 14, 18, 22, 26, 30};
+		scrPat[Grey2] :=  NewPattern(image, 32, 2);
+			image[1] := {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30};
+			image[0] := {1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31};
+		scrPat[Grey3] :=  NewPattern(image, 32, 2);
+			image[1] := {1..3, 5..7, 9..11, 13..15, 17..19, 21..23, 25..27, 29..31};
+			image[0] := {0, 1, 3..5, 7..9, 11..13, 15..17, 19..21, 23..25, 27..29, 31};
+		scrPat[Grey4] :=  NewPattern(image, 32, 2);
+			image[0] := {0..31};
+		scrPat[Black] := NewPattern(image, 32, 1);
+			image[3] :={3, 7, 11, 15, 19, 23, 27, 31};
+			image[2] :={2, 6, 10, 14, 18, 22, 26, 30};
+			image[1] :={1, 5, 9, 13, 17, 21, 25, 29};
+			image[0] :={0, 4, 8, 12, 16, 20, 24, 28};
+		scrPat[TxtrUp] := NewPattern(image, 32, 4);
+			image[3] :={0, 4, 8, 12, 16, 20, 24, 28};
+			image[2] :={1, 5, 9, 13, 17, 21, 25, 29};
+			image[1] :={2, 6, 10, 14, 18, 22, 26, 30};
+			image[0] :={3, 7, 11, 15, 19, 23, 27, 31};
+		scrPat[TxtrDown] := NewPattern(image, 32, 4);
+			image[0] := {2, 6, 10, 14, 18, 22, 26, 30};
+		scrPat[TxtrVert] := NewPattern(image, 32, 1);
+			image[3] := {};
+			image[2] := {};
+			image[1] := {};
+			image[0] := {0..31};
+		scrPat[TxtrHor] := NewPattern(image, 32, 4);
+			image[3] := {};
+			image[2] := {};
+			image[1] := {0..31};
+			image[0] := {0..31};
+		scrPat[Mark0] := NewPattern(image, 32, 4);
+			image[5] := {};
+			image[4] := {};
+			image[3] := {};
+			image[2] := {};
+			image[1] := {};
+			image[0] := {0..31};
+		scrPat[Mark1] := NewPattern(image, 32, 6);
+			image[1] := {};
+			image[0] := {0..31};
+		scrPat[Mark2] := NewPattern(image, 32, 2);
+		(*-- initialize printer patterns ---*)
+		i := 0; WHILE i < LEN(prtPat) DO prtPat[i] := i; INC(i) END
+	END DefinePatterns;
+	
+(*--- leda icons ---*)
+	
+	PROCEDURE GetIcon*(id: CHAR; VAR dx, x, y, w, h: INTEGER; VAR pat: LONGINT);
+	(** gets the icon with id id of the leda font *)
+	BEGIN
+		IF lFnt = NIL THEN lFnt := Fonts.This("Leda.Scn.Fnt") END;
+		IF lFnt = NIL THEN dx := 0; x := 0; y := 0; w := 0; h := 0; pat := 0
+		ELSE Fonts.GetChar(lFnt, id, dx, x, y, w, h, pat)
+		END
+	END GetIcon;
+	
+(*--- utilities ---*)
+
+	PROCEDURE Min*(l1, l2: LONGINT): LONGINT;
+	BEGIN
+		IF l1 < l2 THEN RETURN l1 ELSE RETURN l2 END
+	END Min;
+	
+	PROCEDURE Max*(l1, l2: LONGINT): LONGINT;
+	BEGIN
+		IF l1 > l2 THEN RETURN l1 ELSE RETURN l2 END
+	END Max;
+	
+	PROCEDURE InRect*(ptX, ptY, X, Y, W, H: LONGINT): BOOLEAN;
+	(** tests if point ptX, ptY is in box X, Y, W, H *)
+	BEGIN
+		RETURN (X <= ptX) & (ptX < X + W) & (Y <= ptY) & (ptY <= Y + H)
+	END InRect;
+	
+	PROCEDURE Touch*(X1, Y1, W1, H1, X2, Y2, W2, H2: LONGINT): BOOLEAN;
+	(** tests if the two rectangles touch one another *)
+	BEGIN
+		IF X2 >= X1 + W1 THEN RETURN FALSE
+		ELSIF X2 + W2 <= X1 THEN RETURN FALSE
+		ELSIF Y2 >= Y1 + H1 THEN RETURN FALSE
+		ELSIF Y2 + H2 <= Y1 THEN RETURN FALSE
+		ELSE RETURN TRUE
+		END
+	END Touch;
+	
+	PROCEDURE InRange*(Z, beg, len: LONGINT): BOOLEAN;
+	(** tests if Z is in range beginning at [beg,  beg + len[ *)
+	BEGIN
+		RETURN (beg <= Z) & (Z < beg + len)
+	END InRange;
+	
+	PROCEDURE ValToStr*(val: LONGINT; VAR s: Name);
+		VAR i, j: INTEGER;	a: ARRAY 10 OF CHAR;
+	BEGIN
+		i := 0; j := 0;
+		IF val < 0 THEN s[0] := "-"; j := 1; val := -val END;
+		REPEAT	
+			a[i] := CHR(val MOD 10 + 30H); val := val DIV 10; INC(i)
+		UNTIL val = 0;
+		REPEAT DEC(i); s[j] := a[i]; INC(j) UNTIL i = 0;
+		s[j] := 0X
+	END ValToStr;
+
+	PROCEDURE StrToVal*(VAR s: Name; VAR val: LONGINT);
+		VAR i, j: INTEGER;	neg: BOOLEAN;
+	BEGIN
+		i := 0; val := 0; neg := FALSE;
+		IF s[0] = "-" THEN neg := TRUE; i := 1 END;
+		j := i; WHILE ("0" <= s[j]) & (s[j] <= "9") DO INC(j) END;
+		WHILE i # j DO
+			IF (MAX(LONGINT) - (ORD(s[i]) - 30H)) DIV 10 < val THEN val := MAX(LONGINT) - 1; i := j
+			ELSE val := val * 10  + (ORD(s[i]) - 30H); INC(i)
+			END
+		END;
+		IF neg THEN val := - val END
+	END StrToVal;
+
+	PROCEDURE CopyStr*(VAR src, dsc: ARRAY OF CHAR);
+		VAR i, l: INTEGER;
+	BEGIN
+		i := 0; l := SHORT(LEN(dsc) - 1);
+		WHILE (i < l) & (src[i] # 0X) DO dsc[i] := src[i]; INC(i) END;
+		dsc[i] := 0X
+	END CopyStr;
+
+	PROCEDURE EqualStr*(part: ARRAY OF CHAR; VAR s: ARRAY OF CHAR): BOOLEAN;
+	(** returns true if the beginning of string s is equal to string part *)
+		VAR i: INTEGER;
+	BEGIN
+		i := 0; WHILE (part[i] # 0X) & (part[i] = s[i]) DO INC(i) END;
+		RETURN part[i] = 0X
+	END EqualStr;
+
+	PROCEDURE EqualCh*(chars: ARRAY OF CHAR; ch: CHAR): BOOLEAN;
+	(** returns true if the character ch is contained in string chars *)
+		VAR i: INTEGER;
+	BEGIN
+		i := 0; WHILE (chars[i] # 0X) & (ch # chars[i]) DO INC(i) END;
+		RETURN chars[i] # 0X	(* search stopped before terminating 0X character *)
+	END EqualCh;
+	
+	PROCEDURE Halt*(msg: ARRAY OF CHAR);
+		VAR error: ARRAY 32 OF CHAR;
+	BEGIN
+		CopyStr(msg, error); HALT(99)
+	END Halt;
+	
+	PROCEDURE Time*(): LONGINT;
+	BEGIN RETURN Oberon.Time() END Time;
+	
+	PROCEDURE AppendLog;
+		VAR x, y, w, h: INTEGER;
+	BEGIN
+		(* clipping may be changed by appending text [-> broadcast] *)
+		Display.GetClip(x, y, w, h);	(* save clipping *)
+		IF dialogMod # "" THEN Execute(dialogMod, "ATL") END;	(* ATL -> append text to log *)
+		IF tW.buf.len > 0 THEN Texts.Append(Oberon.Log, tW.buf) END;
+		Display.SetClip(x, y, w, h)
+	END AppendLog;
+	
+	PROCEDURE OutT*(s: ARRAY OF CHAR; mode: SHORTINT);
+	(** mode=0: write / mode=1: write and add CR *)
+	(** mode=2: if debug the write / mode=3: if debug the write and add CR *)
+	BEGIN
+		CASE mode OF -1:	Texts.WriteString(tW, s); AppendLog
+		| 0:	Texts.WriteString(tW, s)
+		| 1:	Texts.WriteString(tW, s); Texts.WriteLn(tW); AppendLog
+		| 2:	IF debug THEN Texts.WriteString(tW, s) END
+		| 3:	IF debug THEN Texts.WriteString(tW, s); Texts.WriteLn(tW); AppendLog END
+		END
+	END OutT;
+	
+	PROCEDURE OutI*(i: LONGINT; mode: SHORTINT);
+	(** mode=0: write / mode=1: write and add CR *)
+	(** mode=2: if debug the write / mode=3: if debug the write and add CR *)
+	BEGIN
+		CASE mode OF -1:	Texts.WriteInt(tW, i, 0); AppendLog
+		| 0:	Texts.WriteInt(tW, i, 0)
+		| 1:	Texts.WriteInt(tW, i, 0); Texts.WriteLn(tW); AppendLog
+		| 2:	IF debug THEN Texts.WriteInt(tW, i, 0) END
+		| 3:	IF debug THEN Texts.WriteInt(tW, i, 0); Texts.WriteLn(tW); AppendLog END
+		END
+	END OutI;
+	
+	PROCEDURE OutC*(ch: CHAR; mode: SHORTINT);
+	(** mode=0: write / mode=1: write and add CR *)
+	(** mode=2: if debug the write / mode=3: if debug the write and add CR *)
+	BEGIN
+		CASE mode OF -1:	Texts.Write(tW, ch); AppendLog				
+		| 0:	Texts.Write(tW, ch)
+		| 1:	Texts.Write(tW, ch); Texts.WriteLn(tW); AppendLog
+		| 2:	IF debug THEN Texts.Write(tW, ch) END
+		| 3:	IF debug THEN Texts.Write(tW, ch); Texts.WriteLn(tW); AppendLog END
+		END
+	END OutC;
+	
+	PROCEDURE In*(s: ARRAY OF CHAR);
+		VAR ch: CHAR;
+	BEGIN
+		IF s = "debug on" THEN debug := TRUE
+		ELSIF s = "debug off" THEN debug := FALSE
+		ELSIF debug THEN
+			OutT(s, 1);
+			Input.Read(ch);	(* wait for input *)
+			IF CAP(ch) = "H" THEN HALT(99)
+			ELSIF (CAP(ch) = "O") OR (ch = "-") OR (ch = 01BX) THEN debug := FALSE
+			END
+		END
+	END In;
+	
+	PROCEDURE Debug*(): BOOLEAN;
+	BEGIN RETURN debug
+	END Debug;
+	
+(*--- exceptions ---*)
+	
+	(*- CERES -*)
+	PROCEDURE *TaskHandle(self: Oberon.Task);
+		VAR task: Task;
+	BEGIN
+		task := self(Task);
+	(*- MAC -
+	PROCEDURE *TaskHandle;
+		VAR task: Task;
+	BEGIN
+		task := Oberon.CurTask(Task);
+	- MAC -*)
+		IF ~ task.ex.remove THEN  task.ex.handle(task.ex) END;	(* remove field can be set *)
+		IF task.ex.remove THEN Oberon.Remove(task) END
+	END TaskHandle;
+	
+	PROCEDURE InstallExcpt*(ex: Excpt);
+		VAR task: Task;
+	BEGIN
+		NEW(task); task.safe := FALSE; task.handle := TaskHandle; 
+		ex.remove := FALSE; task.ex := ex; Oberon.Install(task)
+	END InstallExcpt;
+	
+(*--- line drawing algorithm ---*)
+	
+	PROCEDURE IMin(i1, i2: INTEGER): INTEGER;
+	BEGIN
+		IF i1 < i2 THEN RETURN i1 ELSE RETURN i2 END
+	END IMin;
+	
+	PROCEDURE IMax(i1, i2: INTEGER): INTEGER;
+	BEGIN
+		IF i1 > i2 THEN RETURN i1 ELSE RETURN i2 END
+	END IMax;
+	
+	PROCEDURE NewStretch(): Stretch;
+		VAR s: Stretch;
+	BEGIN
+		IF freeStretches # NIL THEN
+			s := freeStretches; freeStretches := freeStretches.next
+		ELSE NEW(s)
+		END;
+		s.next := NIL; RETURN s
+	END NewStretch;
+	
+	PROCEDURE NewBrush(d: INTEGER; VAR brush, trace: Stretch);
+	(* uses same adjustment of brush as for thick lines in rectangles *)
+		VAR b, c: Stretch;	i, dx, dy: INTEGER;
+	BEGIN
+		dx := 0; dy:= 0; IF d > 2 THEN DEC(dx, (d - 1) DIV 2); dy := ABS(dx) END; 
+		b := NewStretch(); b.relX := dx; b.relY := dy; b.w := d;
+		c := NewStretch(); c^ := b^;
+		i := 1; brush := b; trace := c;	(* initialize trace as a copy of brush *)
+		WHILE i < d DO
+			INC(i); DEC(dy);
+			b.next := NewStretch(); b := b.next; c.next  := NewStretch(); c := c.next;
+			b.relX := dx; b.relY := dy; b.w := d; c^ := b^
+		END;
+		IF d > 2 THEN
+			INC(brush.relX); DEC(brush.w, 2); INC(trace.relX); DEC(trace.w, 2); 
+			INC(b.relX); DEC(b.w, 2); INC(c.relX); DEC(c.w, 2)
+		END;	(* rounded edges *)
+		b.next := brush; c.next := trace;	(* close to a ring *)
+	END NewBrush;
+	
+	PROCEDURE DisposeBrush(VAR brush: Stretch);
+		VAR b: Stretch;
+	BEGIN
+		b := brush; WHILE b.next # brush DO b := b.next END;
+		b.next := freeStretches; freeStretches := brush; brush := NIL
+	END DisposeBrush;
+	
+	PROCEDURE Right(VAR trace: Stretch);
+		VAR t: Stretch;
+	BEGIN
+		t := trace; DEC(t.relX); INC(t.w);	(* move stretch to right *)
+		WHILE t.next # trace DO t := t.next; DEC(t.relX); INC(t.w) END	(* move stretches to right *)
+	END Right;
+	
+	PROCEDURE Down(x, y, incX: INTEGER;  brush: Stretch; VAR trace: Stretch);
+	(* x, y: old position; move brush to x+incX, y-1 by adjusting trace *)
+		VAR b, t: Stretch;	max: INTEGER;
+	BEGIN
+		outStretch(x + trace.relX, y + trace.relY, trace.w, outPnr, outCol, outMode);	(* draw top stretch of trace *)
+		t := trace.next; b := brush;	(* higher stretch of brush affectes lower stretch of trace *)
+		WHILE t # trace DO
+			DEC(t.relX, incX);	(* because of move to right *)
+			max := IMax(t.relX + t.w, b.relX + b.w);
+			t.relX := IMin(t.relX, b.relX); t.w := max - t.relX; INC(t.relY);	(* adjusted stretch of trace *)
+			t := t.next; b := b.next
+		END;
+		trace.relX := b.relX; trace.relY := b.relY; trace.w := b.w;	(* new bottom stretch of trace *)
+		trace := trace.next
+	END Down;
+	
+	PROCEDURE Up(x, y, incX: INTEGER; brush: Stretch; VAR trace: Stretch);
+	(* x, y: old position; move brush to x+incX, y+1 by adjusting trace *)
+		VAR b, t: Stretch;	max: INTEGER;
+	BEGIN
+		t := trace; WHILE t.next # trace DO t := t.next END;	(* search bottom stretch of trace *)
+		outStretch(x + t.relX, y + t.relY, t.w, outPnr, outCol, outMode);	(* draw bottom stretch of trace *)
+		t := trace; b := brush.next;	(* lower stretch of brush affectes higher stretch of trace *) 
+		WHILE t.next # trace DO	(* move/adjust other stretches in trace *) 
+			DEC(t.relX, incX);	(* because of move to right *)
+			max := IMax(t.relX + t.w, b.relX + b.w);
+			t.relX := IMin(t.relX, b.relX); t.w := max - t.relX; DEC(t.relY);	(* adjusted stretch of trace *)
+			t := t.next; b := b.next
+		END;
+		trace := t; trace.relX := brush.relX; trace.relY := brush.relY; trace.w := brush.w	(* new top stretch of trace *)
+	END Up;
+	
+	PROCEDURE DrawBrush(x, y: INTEGER; trace: Stretch);
+		VAR t: Stretch;
+	BEGIN
+		t := trace; outStretch(x + t.relX, y + t.relY, t.w, outPnr, outCol, outMode);	(* first stretch *)
+		WHILE t.next # trace DO
+			t := t.next; outStretch(x + t.relX, y + t.relY, t.w, outPnr, outCol, outMode)
+		END
+	END DrawBrush;
+	
+	PROCEDURE DrawLine*(x0, y0, x1, y1, d: INTEGER; stretch: OutStretch; pNr, col, mode: INTEGER);
+	(** draws a line from x0, y0 to x1, y1 using a brush with thickness d *)
+	(** stretch specifies a procedure to draw a horizontal one pixel line *)
+	(** precondition: x0 < x1 -> drawing process always from left to right *)
+		CONST XRight = 1;	XKeep = 0;
+		VAR a, b, h: LONGINT;	brush, trace: Stretch;
+	BEGIN
+		outStretch := stretch; outPnr := pNr; outCol := col; outMode := mode;	
+		NewBrush(d, brush, trace);
+		a := x1 - x0; b := ABS(y1 - y0);
+		IF a < b THEN	(* regard a rotated coordinate system: procede along y *)
+			h := a; a := b; b := h;
+			h := b - a DIV 2;
+			IF y1 < y0 THEN
+				WHILE y0 > y1 DO
+					IF h > 0 THEN
+						Down(x0, y0, XRight, brush, trace); INC(x0); DEC(y0); h := h + b - a
+					ELSE	(* down *)
+						Down(x0, y0, XKeep, brush, trace); DEC(y0); h := h + b
+					END
+				END
+			ELSE
+				WHILE y0 < y1 DO
+					IF h > 0 THEN
+						Up(x0, y0, XRight, brush, trace); INC(x0); INC(y0); h := h + b - a
+					ELSE
+						Up(x0, y0, XKeep, brush, trace); INC(y0); h := h + b
+					END
+				END
+			END
+		ELSE
+			h := b - a DIV 2;
+			IF y1 < y0 THEN 
+				WHILE x0 < x1 DO
+					IF h > 0 THEN
+						Down(x0, y0, XRight, brush, trace); DEC(y0); INC(x0); h := h + b - a
+					ELSE
+						Right(trace); INC(x0); h := h + b
+					END
+				END
+			ELSE
+				WHILE x0 < x1 DO
+					IF h > 0 THEN
+						Up(x0, y0, XRight, brush, trace);
+						INC(y0); INC(x0); h := h + b - a
+					ELSE
+						Right(trace);
+						INC(x0); h := h + b
+					END
+				END
+			END
+		END;
+		DrawBrush(x0, y0, trace);
+		DisposeBrush(brush); DisposeBrush(trace)
+	END DrawLine;
+	
+(*--- printer port ---*)
+
+	PROCEDURE SetPrtPort*(P: Port);
+	(** sets the global variable prtPort to the given printer port P [used with ThisPrtPort] *)
+	BEGIN
+		IF P IS PrtPort THEN prtPort := P(PrtPort) END
+	END SetPrtPort;
+	
+	PROCEDURE ThisPrtPort*(module: Name): Port;
+	(** returns the printer port that is defined in module module *)
+		VAR cmd: ARRAY 12 OF CHAR;
+	BEGIN
+		prtPort := NIL; cmd := "SetPrinter";
+		Execute(module, cmd);	(* module.cmd calls SetPrtPort to return printer port *)
+		RETURN prtPort
+	END ThisPrtPort;
+	
+(*--- mouse and key input ---*)
+	
+	PROCEDURE *FlipHand(X, Y: INTEGER);
+		VAR dx, x, y, w, h, Left, Bottom: INTEGER;	pat: LONGINT;
+	BEGIN
+		GetIcon(HandPat, dx, x, y, w, h, pat);
+		IF pat = 0 THEN RETURN END;	(*###*)
+		IF X < Display.ColLeft THEN Left := Display.Left ELSE Left := Display.ColLeft END;
+		IF X + x < Left THEN X := Left - x 
+		ELSIF X + x + w > Left + Display.Width THEN X := Left + Display.Width - x - w
+		END;	(* X clipped *)
+		IF Y < Display.Bottom THEN Bottom := Display.UBottom ELSE Bottom := Display.Bottom END;
+		IF Y + y < Bottom THEN Y := Bottom - y
+		ELSIF Y + y + h > Bottom + Display.Height THEN Y := Bottom + Display.Height - y - h
+		END;	(* Y clipped *)
+		Display.CopyPattern(15, pat, X + x, Y + y, Display.invert)
+	END FlipHand;
+	
+	PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
+		VAR ch: CHAR;	i, j: INTEGER;	s: ARRAY 2, 32 OF CHAR;
+	BEGIN
+		Input.Mouse(keys, x, y);
+		IF debug & (Input.Available() > 0) THEN
+			Oberon.FadeCursor(Oberon.Mouse);
+			i := 0; j := 0; s[0,0] := 0X; s[1, 0] := 0X;
+			Input.Read(ch);
+			WHILE ch # 0DX DO
+				IF ch = "." THEN s[j, i] := 0X; i := 0; j := 1 - j ELSE s[j, i] := ch; INC(i) END;
+				Input.Read(ch)
+			END;
+			s[j, i] := 0X;
+			IF (s[0] # "") & (s[1] # "") THEN Execute(s[0], s[1]) END
+		END
+	END Mouse;
+
+	PROCEDURE TrackKeys*(iKey: SET; VAR ml, mm, mr: BOOLEAN; VAR x, y: INTEGER);
+	(** tracks the mouse and the keys pressed; iKey: initial key pressed *)
+		VAR s: SET;
+	BEGIN	(* (iKeys = {ML} OR (iKeys = {MR}) OR (iKeys = {MM}) *)
+		s := iKey; ml := FALSE; mm := FALSE; mr := FALSE;
+		WHILE s # {} DO
+			Mouse(s, x, y);
+			IF ML IN s THEN ml := TRUE END;
+			IF MM IN s THEN mm := TRUE END;
+			IF MR IN s THEN mr := TRUE END;
+			IF ((iKey = {MM}) & ~ (ml & mr)) OR ((iKey = {ML}) & ~ mm & ~ mr)
+				OR ((iKey = {MR}) & ~ mm & ~ ml) THEN
+				Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, x, y)
+			END
+		END
+	END TrackKeys;
+	
+	PROCEDURE TrackHand*(VAR u, v, x, y: INTEGER; VAR ml, mr: BOOLEAN);
+	(** trackes the hand cursor; reports dragged distance *)
+		VAR s: SET;
+	BEGIN	(* MM pressed *)
+		Mouse(s, x, y);
+		u := x; v := y; ml := FALSE; mr := FALSE;
+		WHILE s # {} DO
+			IF ML IN s THEN ml := TRUE ELSIF MR IN s THEN mr := TRUE END;
+			IF ml & mr THEN Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, u, v)
+			ELSE Oberon.DrawCursor(Oberon.Mouse, Hand, x, y)
+			END;
+			Mouse(s, x, y)
+		END
+	END TrackHand;
+	
+	PROCEDURE GetMouse*(F: Display.Frame; margW: INTEGER; VAR keys: SET; VAR x, y: INTEGER);
+	(* gets the mouse coordinates clipped to frame F and the mouse keys *)
+	BEGIN
+		Mouse(keys, x, y);
+		Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, x, y);
+		IF x < F.X + margW THEN x := F.X + margW
+		ELSIF x >= F.X +F.W THEN x := F.X + F.W - 1
+		END;	(* coordinate x clipped to F *)
+		IF y < F.Y THEN y := F.Y
+		ELSIF y >= F.Y + F.H THEN y := F.Y + F.H - 1
+		END	(* coordinate y clipped to F *)
+	END GetMouse;
+	
+	PROCEDURE GetChars*(ch: CHAR; VAR nbr: SHORTINT; VAR s: String);
+	(** gets all characters available starting with character ch *)
+	BEGIN
+		s[0] := ch; IF ch # 0X THEN nbr := 1 ELSE nbr := 0 END;
+		WHILE (Input.Available() > 0) & (nbr < StringRange - 1) DO Input.Read(s[nbr]); INC(nbr) END;
+		s[nbr] := 0X
+	END GetChars;
+	
+	
+BEGIN
+	scnUnit := Display.Unit;
+	bg := Display.BG; fg := Display.FG; inv := Display.FG; 
+	dialogMod := "";
+	prtPort := NIL; debug := FALSE;
+	Texts.OpenWriter(tW);
+	
+	(*--- document access ---*)
+	Objects.Register("Leda", DocNew);	(* "Leda" -> extension used in NewDocument *)
+	nofDocs := 0;
+	
+	(*--- leda icons ---*)
+	lFnt := NIL;
+	Hand.Fade := FlipHand; Hand.Draw := FlipHand;	(* initialize hand cursor [marker for Oberon.Mouse] *)
+	
+	(*--- patterns ---*)
+	DefinePatterns;
+	
+END LedaSys.

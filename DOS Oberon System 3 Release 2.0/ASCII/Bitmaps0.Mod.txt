@@ -1,0 +1,39 @@
+MODULE Bitmaps0;
+
+PROCEDURE InitMod* (DisplayAddress:LONGINT; DispWidth,DispHeight:INTEGER);
+BEGIN END InitMod;
+
+PROCEDURE Copy*;
+BEGIN END Copy;
+
+PROCEDURE CopyBlock*;
+BEGIN END CopyBlock;
+
+PROCEDURE CopyPattern*;
+BEGIN END CopyPattern;
+
+PROCEDURE Define*;
+BEGIN END Define;
+
+PROCEDURE Dot*;
+BEGIN END Dot;
+
+PROCEDURE Get*;
+BEGIN END Get;
+
+PROCEDURE ReplConst*;
+BEGIN END ReplConst;
+
+PROCEDURE ReplPattern*;
+BEGIN END ReplPattern;
+
+PROCEDURE Clear*;
+BEGIN END Clear;
+
+PROCEDURE GetPix*;
+BEGIN END GetPix;
+
+PROCEDURE PutPix*;
+BEGIN END PutPix;
+
+END Bitmaps0.

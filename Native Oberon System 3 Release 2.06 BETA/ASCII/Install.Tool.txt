@@ -1,0 +1,244 @@
+Oberon_0 - The Native Oberon Install Tool
+-----------------------------------
+
+This install tool should be used with the
+instructions contained in the document 
+"Installing ETH Native Oberon".
+
+Execute one of the blue commands below 
+to configure your disk controller type.  To 
+execute a command, point the mouse 
+cursor at it and click the middle button.
+
+Config.Disk 0 Standard IDE or ESDI
+Config.Disk 1 Adaptec 1520 SCSI
+
+Now execute Install.ShowPartitions to see if
+the disk driver can access your hard disk.  If it 
+executes correctly, a new viewer displaying 
+the current partition tables will open.  If a 
+"System.Trap" viewer appears, something 
+went wrong.  In that case, see the note in
+the appendix of this text. 
+
+1a. Installing to a FAT file system
+--------------------------
+
+This section describes how to install Native
+Oberon to a file on a FAT file system.  If 
+you want to do this, you must first create
+a suitable host file in a root directory of your
+disk drive (say c:\native.dsk) using the
+extend.exe program.  You must then use 
+the command "FileSystem=c:\native.dsk"
+at the "OBL>" prompt when booting the
+install disk.
+
+Execute Config.FAT to confirm that the 
+FileSystem setting was made correctly.
+
+Then skip straight to section 3, and then
+create a boot diskette in section 4.
+
+If you have not created the host file yet,
+execute System.Reboot now and do it.
+
+1b. Creating a new primary partition
+-----------------------------
+
+This section describes how to create a new
+primary partition for Native Oberon.  Skip
+to section 3 if you already have an Oberon
+partition.  The number after a command 
+specifies the drive (0 is the first drive).
+
+Install.ShowPrimary 0
+Install.CreatePrimary 0 <size in Mb>
+Install.ShowPartitions
+
+Now go to section 2.
+
+1c. Overwriting a partition of another OS
+---------------------------------
+
+This section describes how to overwrite an
+existing partition of another operating
+system (e.g. DOS) with Native Oberon.  
+Using this technique you can install to any 
+partition, even a logical drive in an 
+extended partition, but then you will have
+to boot with a boot diskette or with a boot
+manager like Linux's LILO.
+
+Warning: Use the commands in this section
+only if you know what you are doing!
+
+Install.ShowPartitions
+Install.ChangeType <part> <fromtype> <totype>
+
+The Oberon partition type is 79 in decimal.
+
+2. Initialising the Oberon file system
+-----------------------------
+
+Here we initialise the Oberon boot loader
+and file system.  You must skip this section if 
+you are installing to a FAT file system.
+
+Install.ShowPartitions
+Install.InitBootLoader
+
+InitBootLoader should display "done".
+
+The following commands clear the Oberon
+partition.  Skip them if you want to retain
+the files of an existing Oberon installation.
+
+Install.Unsafe
+Install.InitFileSystem
+
+InitFileSystem should display "done".
+
+3. Installing the files
+----------------
+
+Here we install the basic Native Oberon 
+system on the hard disk.
+
+The Gadgets, Network and other packages
+may be installed once the basic system is
+running.  Leave the install diskette in the 
+boot drive and execute the command:
+
+Install.ReadInstallFloppy SYSTEM
+
+ReadInstallFloppy should display "done".
+
+4. Initialising the boot file
+---------------------
+
+Here we initialise the boot file.  Specify your 
+display type by executing a command below:
+
+Config.Display 0 Standard VGA 640x480
+Config.Display 1 Generic S3-805 1024x768
+Config.Display 2 Generic S3-924 1024x768
+Config.Display 3 Tseng W32 1024x768
+Config.Display 4 Tseng ET4000 1280x1024
+Config.Display 5 Tseng ET4000 1024x768
+Config.Display 6 Tseng ET4000 800x600
+Config.Display 9 Tseng ET4000 640x480
+Config.Display 7 Cirrus GD5430 1024x768
+Config.Display 8 Video7 Mirage 1024x768
+
+Specify your keyboard type by executing a
+command below:
+
+Config.Keyboard 0 US 101-key
+Config.Keyboard 1 Swiss
+Config.Keyboard 2 German
+Config.Keyboard 3 Norwegian
+
+In Native Oberon, F2 is used as neutralise
+key, and the Esc key generates the ASCII Esc 
+character.  If you want to use the Esc key as 
+neutralise, execute: Config.EscNeutralise on
+
+Native Oberon uses the Oberon font.  It 
+automatically converts from the Syntax 
+font when loading documents.  If you do 
+not want this automatic conversion, 
+execute: Config.FontConversion off
+
+If you plan to use the SoundBlaster driver,
+you have to allocate more space for the
+DMA buffer: Config.DMABuffer 14800H
+
+If you are installing to a FAT file system, 
+you have to make a boot diskette.  Insert 
+a formatted 1.44Mb diskette in the boot 
+drive and execute:
+
+Backup.Format\H	(only if unformatted)
+Config.BootDiskette
+
+This command should display "done".
+Proceed to section 5.
+
+If you are installing to a native partition, 
+there are two options:  you can create a 
+boot diskette using the command above, or 
+you can make your native partition bootable
+using the command below.  In the latter
+case the PC will always boot into Oberon.
+To use another operating system, you 
+will have boot it from a diskette.
+
+Config.BootPartition
+
+This command should display "done".
+
+5. Testing the installation
+--------------------
+
+Installation of the basic system is now 
+completed.  If you created a boot diskette, 
+you can now boot from it.  The Native
+Oberon core should boot from the diskette,
+and then load the rest of the system from
+hard disk.
+
+If you made a bootable native partition, 
+remove any diskette from the boot drive,
+and reboot.  Native Oberon should boot 
+from the hard disk.
+
+System.Reboot
+
+If your PC does not boot correctly from the
+Native Oberon partition, boot the install 
+diskette again and retry the installation 
+process carefully.
+
+You can reactive your previous operating 
+system using the commands below.  The 
+number after the commands specify the 
+drive (0 is the first drive).
+
+Install.ShowPrimary 0
+Install.SetActivePrimary 0 <id>
+Install.ShowPartitions
+
+In the ShowPartitions display a "*" after the
+partition number indicates the active 
+partition.  This is the partition that will be 
+booted when your PC is turned on.
+
+If this does not work, boot your old 
+operating system from a diskette, and
+use its "fdisk" command (or equivalent)
+to reactive its partition.
+
+Appendix: Sending in an error report
+------------------------------
+
+If an unexplainable System.Trap occurs, or
+if some Install commands give error reports,
+you can send the trap text to the author.  
+Move the mouse cursor into the System.Trap 
+or Install viewer and press F1 to mark it.  
+Then execute the command:  ET.StoreAscii *  
+to store the text in a file.  Then put a DOS 
+diskette in the boot drive and execute the 
+command:  Backup.WriteFiles System.Trap ~
+Send an explanation of your problem with
+the file "SYSTEM.TRA" to muller@inf.ethz.ch.
+
+The following additional commands are available:
+
+Config.Manual on	run in manual mode
+Install.ShowParams	show disk parameters
+Install.CopyFiles ~	copy files to hard disk
+Install.RetrieveFiles ~	copy files from hard disk
+Install.Unsafe	put Install in expert mode
+Install.DeletePrimary 0 <id>	delete partitions

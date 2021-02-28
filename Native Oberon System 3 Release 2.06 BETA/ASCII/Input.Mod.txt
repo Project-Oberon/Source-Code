@@ -1,0 +1,1178 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Input;	(* pjm *)
+
+(*
+	Native Oberon Input, pmuller 09.06.95
+	Keyboard translation from Hybrid (apj, University of Stellenbosch)
+	Mouse protocol information from XFree in X11R6 distribution (Thomas Roell & David Dawes)
+	PS/2 Aux port information from Linux (Johan Myreen et al.)
+	
+	pjm 08.05.96 - keyboard mouse emulation
+	pjm 30.05.96 - double break & ctrl-alt-del
+	pjm 26.06.96 - new V24
+*)
+
+(**
+Module Input is responsible for event timing, mouse and keyboard input.
+*)
+
+IMPORT
+	Display, Kernel, V24, SYSTEM;
+
+CONST
+	TimeUnit* = 1000;	(** timer ticks per second (platform dependent). *)
+
+	BufSize = 32;	(* keyboard buffer size *)
+	AuxSize = 301;	(* PS/2 aux port buffer size (multiple of 3 + 1)*)
+
+	ScrollLock = 0;  NumLock = 1;  CapsLock = 2;  LAlt = 3;  RAlt = 4;
+	LCtrl = 5;  RCtrl = 6;  LShift = 7;  RShift = 8;  GreyEsc = 9;
+	Resetting = 10;  SetTypematic = 11;  SendingLEDs = 12;
+	DeadKey = 0;
+
+		(* mouse types: Microsoft, Mouse Systems Corp, MMseries, Logitech, Mouse Systems Corp alt, MouseMan/TrackMan, PS/2 mouse *)
+	MS = 0;  MSC = 1;  MM = 2;  Logi = 3;  MSC2 = 4;  LogiMan = 5;  PS2 = 6;
+
+VAR
+	mouseErrors, auxoverflows: LONGINT;
+	
+		(* mouse state *)
+	maxWidth, maxHeight, mouseX, mouseY: LONGINT;
+	port, rate: INTEGER;	(* Serial mouse port, bps and report rate (if supported) *)
+	bps: LONGINT;
+	first, twobutton, qp: BOOLEAN;	(* flags for mouse *)
+	type: SHORTINT;	(* mouse type *)
+	mbufp, numb: SHORTINT;	(* buffer pointer & protocol bytes *)
+	mbuf: ARRAY 5 OF SET;	(* protocol buffer *)
+	mask0, val0, mask1, val1, lastkeys: SET;	(* protocol parameters *)
+	auxbuf: ARRAY AuxSize OF CHAR;	(* aux port buffer *)
+	auxhd, auxtl: INTEGER;	(* aux buffer pointers *)
+	available: PROCEDURE(port: LONGINT): LONGINT;	(* serial or aux *)
+	read: PROCEDURE(port: LONGINT;  VAR c: SYSTEM.BYTE;  VAR res: LONGINT);	(* serial or aux *)
+	threshold: INTEGER;	(* speedup threshold *)
+	speedup: LONGINT;
+
+		(* keyboard state *)
+	buffer: ARRAY 1+BufSize OF CHAR;	(* first byte not used (security) *)
+	head, tail, dkey: SHORTINT;
+	escNeutralise: BOOLEAN;
+	lastport: LONGINT;
+	lastvalue: SYSTEM.BYTE;
+	keyval: INTEGER;
+	table: LONGINT;
+	flags: SET;
+	breakproc: PROCEDURE;
+	kpmap: SET;
+	timerproc: Kernel.Proc;
+	kdx, kdy, counter0, counter1: INTEGER;
+
+(* ---- Keyboard Driver ---- *)
+
+(* Translation table format:  
+
+	table = { scancode unshifted-code shifted-code flags }  0FFX .
+	scancode = <scancode byte from keyboard, bit 7 set for "grey" extended keys>
+	unshifted-code = <CHAR produced by this scancode, without shift>
+	shifted-code = <CHAR produced by this scancode, with shift>
+	flags = <bit-mapped flag byte indicating special behaviour>
+	
+	flag bit	function
+		0	01	DeadKey: Set dead key flag according to translated key code (1-7)
+		1	02	NumLock: if set, the state of NumLock will reverse the action of shift (for num keypad)
+		2	04	CapsLock: if set, the state of CapsLock will reverse the action of shift (for alpha keys)
+		3	08	LAlt:  \ the state of these two flags in the table and the current state of the two...
+		4	10	RAlt: / ...Alt keys must match exactly, otherwise the search is continued.
+		5	20	\
+		6	40	 >  dead key number (0-7), must match current dead key flag
+		7	80	/
+	
+	The table is scanned sequentially (speed not critical).  Ctrl/Ctrl-Alt Break & Ctrl-F10
+	are always defined and are not in the table.   The control keys are also always defined. *)
+
+(* TableUS - US keyboard translation table *)
+
+PROCEDURE TableUS(): LONGINT;
+CODE
+	CALL L1
+L1:
+	POP EAX
+	ADD EAX,8
+	POP EBP
+	RET
+		(* alphabet *)
+	DB 1EX, "a", "A", 4X,	30X, "b", "B", 4X,	2EX, "c", "C", 4X,	20X, "d", "D", 4X
+	DB 12X, "e", "E", 4X,	21X, "f", "F", 4X,	22X, "g", "G", 4X,	23X, "h", "H", 4X
+	DB 17X, "i", "I", 4X,	24X, "j", "J", 4X,	25X, "k", "K", 4X,	26X, "l", "L", 4X
+	DB 32X, "m", "M", 4X,	31X, "n", "N", 4X,	18X, "o", "O", 4X,	19X, "p", "P", 4X
+	DB 10X, "q", "Q", 4X,	13X, "r", "R", 4X,	1FX, "s", "S", 4X,	14X, "t", "T", 4X
+	DB 16X, "u", "U", 4X,	2FX, "v", "V", 4X,	11X, "w", "W", 4X,	2DX, "x", "X", 4X
+	DB 15X, "y", "Y", 4X,	2CX, "z", "Z", 4X
+		(* Oberon accents (LAlt & RAlt) *)
+	DB 1EX, "É", "Ä", 0CX,	12X, "ë", 0FFX, 0CX,	18X, "Ñ", "Å", 0CX,	16X, "Ö", "Ç", 0CX
+	DB 17X, "í", 0FFX, 0CX,	1FX, "ñ", 0FFX, 0CX,	2EX, "ì", 0FFX, 0CX,	31X, "ï", 0FFX, 0CX
+	DB 1EX, "É", "Ä", 14X,	12X, "ë", 0FFX, 14X,	18X, "Ñ", "Å", 14X,	16X, "Ö", "Ç", 14X
+	DB 17X, "í", 0FFX, 14X,	1FX, "ñ", 0FFX, 14X,	2EX, "ì", 0FFX, 14X,	31X, "ï", 0FFX, 14X
+		(* numbers at top *)
+	DB 0BX, "0", ")", 0X,	02X, "1", "!", 0X,	03X, "2", "@", 0X,	04X, "3", "#", 0X
+	DB 05X, "4", "$", 0X,	06X, "5", "%", 0X,	07X, "6", "^", 0X,	08X, "7", "&", 0X
+	DB 09X, "8", "*", 0X,	0AX, "9", "(", 0X
+		(* symbol keys *)
+	DB 28X, "'", 22X, 0X,	33X, ",", "<", 0X,	0CX, "-", "_", 0X,	34X, ".", ">", 0X
+	DB 35X, "/", "?", 0X,	27X, ";", ":", 0X,	0DX, "=", "+", 0X,	1AX, "[", "{", 0X
+	DB 2BX, "\", "|", 0X,	1BX, "]", "}", 0X,	29X, "`", "~", 0X
+		(* control keys *)
+	DB 0EX, 7FX, 7FX, 0X	(* backspace *)
+	DB 0FX, 09X, 09X, 0X	(* tab *)
+	DB 1CX, 0DX, 0DX, 0X	(* enter *)
+	DB 39X, 20X, 20X, 0X	(* space *)
+	DB 01X, 1BX, 1BX, 0X	(* esc *)
+	 	(* keypad *)
+	DB 4FX, 0A9X, "1", 2X	(* end/1 *)
+	DB 50X, 0C2X, "2", 2X	(* down/2 *)
+	DB 51X, 0A3X, "3", 2X	(* pgdn/3 *)
+	DB 4BX, 0C4X, "4", 2X	(* left/4 *)
+	DB 4CX, 0FFX, "5", 2X	(* center/5 *)
+	DB 4DX, 0C3X, "6", 2X	(* right/6 *)
+	DB 47X, 0A8X, "7", 2X	(* home/7 *)
+	DB 48X, 0C1X, "8", 2X	(* up/8 *)
+	DB 49X, 0A2X, "9", 2X	(* pgup/9 *)
+	DB 52X, 0A0X, "0", 2X	(* insert/0 *)
+	DB 53X, 0A1X, 2EX, 2X	(* del/. *)
+		(* gray keys *)
+	DB 4AX, "-", "-", 0X	(* gray - *)
+	DB 4EX, "+", "+", 0X	(* gray + *)
+	DB 0B5X, "/", "/", 0X	(* gray / *)
+	DB 37X, "*", "*", 0X	(* gray * *)
+	DB 0D0X, 0C2X, 0C2X, 0X	(* gray down *)
+	DB 0CBX, 0C4X, 0C4X, 0X	(* gray left *)
+	DB 0CDX, 0C3X, 0C3X, 0X	(* gray right *)
+	DB 0C8X, 0C1X, 0C1X, 0X	(* gray up *)
+	DB 09CX, 0AX, 0AX, 0X	(* gray enter *)
+	DB 0D2X, 0A0X, 0A0X, 0X	(* gray ins *)
+	DB 0D3X, 0A1X, 0A1X, 0X	(* gray del *)
+	DB 0C9X, 0A2X, 0A2X, 0X	(* gray pgup *)
+	DB 0D1X, 0A3X, 0A3X, 0X	(* gray pgdn *)
+	DB 0C7X, 0A8X, 0A8X, 0X	(* gray home *)
+	DB 0CFX, 0A9X, 0A9X, 0X	(* gray end *)
+		(* function keys *)
+	DB 3BX, 0A4X, 0F1X, 0X	(* F1 *)
+	DB 3CX, 0A5X, 0F2X, 0X	(* F2 *)
+	DB 3DX, 0A6X, 0F3X, 0X	(* F3 *)
+	DB 3EX, 0A7X, 0F4X, 0X	(* F4 *)
+	DB 3FX, 0FCX, 0FFX, 0X	(* F5 *)
+	DB 40X, 0FDX, 0FFX, 0X	(* F6 *)
+	DB 41X, 0FEX, 0FFX, 0X	(* F7 *)
+	DB 0FFX
+END TableUS;
+
+(* TableNorwegian - Norwegian keyboard translation table *)
+
+PROCEDURE TableNorwegian(): LONGINT;
+CODE
+	CALL L1
+L1:
+	POP EAX
+	ADD EAX,8
+	POP EBP
+	RET
+	 	(* alphabet *)
+	DB 1EX, "a", "A", 4X,	30X, "b", "B", 4X,	2EX, "c", "C", 4X,	20X, "d", "D", 4X
+	DB 12X, "e", "E", 4X,	21X, "f", "F", 4X,	22X, "g", "G", 4X,	23X, "h", "H", 4X
+	DB 17X, "i", "I", 4X,	24X, "j", "J", 4X,	25X, "k", "K", 4X,	26X, "l", "L", 4X
+	DB 32X, "m", "M", 4X,	31X, "n", "N", 4X,	18X, "o", "O", 4X,	19X, "p", "P", 4X
+	DB 10X, "q", "Q", 4X,	13X, "r", "R", 4X,	1FX, "s", "S", 4X,	14X, "t", "T", 4X
+	DB 16X, "u", "U", 4X,	2FX, "v", "V", 4X,	11X, "w", "W", 4X,	2DX, "x", "X", 4X
+	DB 15X, "y", "Y", 4X,	2CX, "z", "Z", 4X
+		(* Oberon accents *)
+	DB 1EX, "É", "Ä", 0CX,	12X, "ë", 0FFX, 0CX,	18X, "Ñ", "Å", 0CX,	16X, "Ö", "Ç", 0CX
+	DB 17X, "í", 0FFX, 0CX,	1FX, "ñ", 0FFX, 0CX,	2EX, "ì", 0FFX, 0CX,	31X, "ï", 0FFX, 0CX
+	DB 1EX, "É", "Ä", 14X,	12X, "ë", 0FFX, 14X,	18X, "Ñ", "Å", 14X,	16X, "Ö", "Ç", 14X
+	DB 17X, "í", 0FFX, 14X,	1FX, "ñ", 0FFX, 14X,	2EX, "ì", 0FFX, 14X,	31X, "ï", 0FFX, 14X
+		(* numbers at top *)
+	DB 0BX, "0", "=", 0X,	02X, "1", "!", 0X,	03X, "2", 22X, 0X,	04X, "3", "#", 0X
+	DB 05X, "4", 0FFX, 0X,	06X, "5", "%", 0X,	07X, "6", "&", 0X,	08X, "7", "/", 0X
+	DB 09X, "8", "(", 0X,	0AX, "9", ")", 0X
+		(* symbol keys *)
+	DB 28X, 0FFX, 0FFX, 0X,	33X, ",", ";", 0X,	0CX, "+", "?", 0X,	34X, ".", ":", 0X
+	DB 35X, "-", "_", 0X,	27X, 0FFX, 0FFX, 0X,	0DX, "\", "`", 0X,	1AX, 0FFX, 0FFX, 0X
+	DB 1BX, 0FFX, "^", 0X,	29X, "|", 0FFX, 0X,	5DX, ",", "*", 0X,	61X, "<", ">", 0X
+	DB 2BX, ",", "*", 0X,	56X, "<", ">", 0X
+		(* AltGr keys *)
+	DB 0BX, "}", 0FFX, 10X,	03X, "@", 0FFX, 10X,	04X, 0FFX, 0FFX, 10X,	05X, "$", 0FFX, 10X
+	DB 08X, "{", 0FFX, 10X,	09X, "[", 0FFX, 10X,	0AX, "]", 0FFX, 10X,	1BX, "~", 0FFX, 10X
+	DB 0DX, "'", 0FFX, 10X
+		(* control keys *)
+	DB 0EX, 7FX, 7FX, 0X	(* backspace *)
+	DB 0FX, 09X, 09X, 0X	(* tab *)
+	DB 1CX, 0DX, 0DX, 0X	(* enter *)
+	DB 39X, 20X, 20X, 0X	(* space *)
+	DB 01X, 1BX, 1BX, 0X	(* esc *)
+		(* keypad *)
+	DB 4FX, 0A9X, "1", 2X	(* end/1 *)
+	DB 50X, 0C2X, "2", 2X	(* down/2 *)
+	DB 51X, 0A3X, "3", 2X	(* pgdn/3 *)
+	DB 4BX, 0C4X, "4", 2X	(* left/4 *)
+	DB 4CX, 0FFX, "5", 2X	(* center/5 *)
+	DB 4DX, 0C3X, "6", 2X	(* right/6 *)
+	DB 47X, 0A8X, "7", 2X	(* home/7 *)
+	DB 48X, 0C1X, "8", 2X	(* up/8 *)
+	DB 49X, 0A2X, "9", 2X	(* pgup/9 *)
+	DB 52X, 0A0X, "0", 2X	(* insert/0 *)
+	DB 53X, 0A1X, 2EX, 2X	(* del/. *)
+		(* gray keys *)
+	DB 4AX, "-", "-", 0X	(* gray - *)
+	DB 4EX, "+", "+", 0X	(* gray + *)
+	DB 0B5X, "/", "/", 0X	(* gray / *)
+	DB 37X, "*", "*", 0X	(* gray * *)
+	DB 0D0X, 0C2X, 0C2X, 0X	(* gray down *)
+	DB 0CBX, 0C4X, 0C4X, 0X	(* gray left *)
+	DB 0CDX, 0C3X, 0C3X, 0X	(* gray right *)
+	DB 0C8X, 0C1X, 0C1X, 0X	(* gray up *)
+	DB 09CX, 0AX, 0AX, 0X	(* gray enter *)
+	DB 0D2X, 0A0X, 0A0X, 0X	(* gray ins *)
+	DB 0D3X, 0A1X, 0A1X, 0X	(* gray del *)
+	DB 0C9X, 0A2X, 0A2X, 0X	(* gray pgup *)
+	DB 0D1X, 0A3X, 0A3X, 0X	(* gray pgdn *)
+	DB 0C7X, 0A8X, 0A8X, 0X	(* gray home *)
+	DB 0CFX, 0A9X, 0A9X, 0X	(* gray end *)
+		(* function keys *)
+	DB 3BX, 0A4X, 0F1X, 0X	(* F1 *)
+	DB 3CX, 0A5X, 0F2X, 0X	(* F2 *)
+	DB 3DX, 0A6X, 0F3X, 0X	(* F3 *)
+	DB 3EX, 0A7X, 0F4X, 0X	(* F4 *)
+	DB 3FX, 0FCX, 0FFX, 0X	(* F5 *)
+	DB 40X, 0FDX, 0FFX, 0X	(* F6 *)
+	DB 41X, 0FEX, 0FFX, 0X	(* F7 *)
+	DB 0FFX
+END TableNorwegian;
+
+(* TableGerman - German keyboard translation table *)
+
+PROCEDURE TableGerman(): LONGINT;
+CODE
+	CALL L1
+L1:
+	POP EAX
+	ADD EAX,8
+	POP EBP
+	RET
+		(* alphabet *)
+	DB 1EX, "a", "A", 4X,	30X, "b", "B", 4X,	2EX, "c", "C", 4X,	20X, "d", "D", 4X
+	DB 12X, "e", "E", 4X,	21X, "f", "F", 4X,	22X, "g", "G", 4X,	23X, "h", "H", 4X
+	DB 17X, "i", "I", 4X,	24X, "j", "J", 4X,	25X, "k", "K", 4X,	26X, "l", "L", 4X
+	DB 32X, "m", "M", 4X,	31X, "n", "N", 4X,	18X, "o", "O", 4X,	19X, "p", "P", 4X
+	DB 10X, "q", "Q", 4X,	13X, "r", "R", 4X,	1FX, "s", "S", 4X,	14X, "t", "T", 4X
+	DB 16X, "u", "U", 4X,	2FX, "v", "V", 4X,	11X, "w", "W", 4X,	2DX, "x", "X", 4X
+	DB 15X, "z", "Z", 4X,	2CX, "y", "Y", 4X
+		(* Oberon accents (LAlt & RAlt) *)
+	DB 1EX, "É", "Ä", 0CX,	12X, "ë", 0FFX, 0CX,	18X, "Ñ", "Å", 0CX,	16X, "Ö", "Ç", 0CX
+	DB 17X, "í", 0FFX, 0CX,	1FX, "ñ", 0FFX, 0CX,	2EX, "ì", 0FFX, 0CX,	31X, "ï", 0FFX, 0CX
+	DB 1EX, "É", "Ä", 14X,	12X, "ë", 0FFX, 14X,	18X, "Ñ", "Å", 14X,	16X, "Ö", "Ç", 14X
+	DB 17X, "í", 0FFX, 14X,	1FX, "ñ", 0FFX, 14X,	2EX, "ì", 0FFX, 14X,	31X, "ï", 0FFX, 14X
+		(* numbers at top *)
+	DB 0BX, "0", "=", 0X,	02X, "1", "!", 0X,	03X, "2", 22X, 0X,	04X, "3", 0FFX, 0X
+	DB 05X, "4", "$", 0X,	06X, "5", "%", 0X,	07X, "6", "&", 0X,	08X, "7", "/", 0X
+	DB 09X, "8", "(", 0X,	0AX, "9", ")", 0X
+		(* symbol keys *)
+	DB 28X, "É", "Ä", 0X,	33X, ",", ";", 0X,	0CX, "ñ", "?", 0X,	34X, ".", ":", 0X
+	DB 35X, "-", "_", 0X,	27X, "Ñ", "Å", 0X,	0DX, "'", "`", 0X,	1AX, "Ö", "Ç", 0X
+	DB 2BX, "#", "'", 0X,	1BX, "+", "*", 0X,	29X, "^", 0FFX, 0X,	56X, "<", ">", 0X
+		(* AltGr keys *)
+	DB 32X, 0FFX, 0FFX, 10X,	10X, "@", 0FFX, 10X,	0BX, "}", 0FFX, 10X,	03X, 0FFX, 0FFX, 10X
+	DB 04X, 0FFX, 0FFX, 10X,	08X, "{", 0FFX, 10X,	09X, "[", 0FFX, 10X,	0AX, "]", 0FFX, 10X
+	DB 0CX, "\", 0FFX, 10X,	1BX, "~", 0FFX, 10X,	56X, "|", 0FFX, 10X
+		(* control keys *)
+	DB 0EX, 7FX, 7FX, 0X	(* backspace *)
+	DB 0FX, 09X, 09X, 0X	(* tab *)
+	DB 1CX, 0DX, 0DX, 0X	(* enter *)
+	DB 39X, 20X, 20X, 0X	(* space *)
+	DB 01X, 1BX, 1BX, 0X	(* esc *)
+		(* keypad *)
+	DB 4FX, 0A9X, "1", 2X	(* end/1 *)
+	DB 50X, 0C2X, "2", 2X	(* down/2 *)
+	DB 51X, 0A3X, "3", 2X	(* pgdn/3 *)
+	DB 4BX, 0C4X, "4", 2X	(* left/4 *)
+	DB 4CX, 0FFX, "5", 2X	(* center/5 *)
+	DB 4DX, 0C3X, "6", 2X	(* right/6 *)
+	DB 47X, 0A8X, "7", 2X	(* home/7 *)
+	DB 48X, 0C1X, "8", 2X	(* up/8 *)
+	DB 49X, 0A2X, "9", 2X	(* pgup/9 *)
+	DB 52X, 0A0X, "0", 2X	(* insert/0 *)
+	DB 53X, 0A1X, 2EX, 2X	(* del/. *)
+		(* gray keys *)
+	DB 4AX, "-", "-", 0X	(* gray - *)
+	DB 4EX, "+", "+", 0X	(* gray + *)
+	DB 0B5X, "/", "/", 0X	(* gray / *)
+	DB 37X, "*", "*", 0X	(* gray * *)
+	DB 0D0X, 0C2X, 0C2X, 0X	(* gray down *)
+	DB 0CBX, 0C4X, 0C4X, 0X	(* gray left *)
+	DB 0CDX, 0C3X, 0C3X, 0X	(* gray right *)
+	DB 0C8X, 0C1X, 0C1X, 0X	(* gray up *)
+	DB 09CX, 0AX, 0AX, 0X	(* gray enter *)
+	DB 0D2X, 0A0X, 0A0X, 0X	(* gray ins *)
+	DB 0D3X, 0A1X, 0A1X, 0X	(* gray del *)
+	DB 0C9X, 0A2X, 0A2X, 0X	(* gray pgup *)
+	DB 0D1X, 0A3X, 0A3X, 0X	(* gray pgdn *)
+	DB 0C7X, 0A8X, 0A8X, 0X	(* gray home *)
+	DB 0CFX, 0A9X, 0A9X, 0X	(* gray end *)
+		(* function keys *)
+	DB 3BX, 0A4X, 0F1X, 0X	(* F1 *)
+	DB 3CX, 0A5X, 0F2X, 0X	(* F2 *)
+	DB 3DX, 0A6X, 0F3X, 0X	(* F3 *)
+	DB 3EX, 0A7X, 0F4X, 0X	(* F4 *)
+	DB 3FX, 0FCX, 0FFX, 0X	(* F5 *)
+	DB 40X, 0FDX, 0FFX, 0X	(* F6 *)
+	DB 41X, 0FEX, 0FFX, 0X	(* F7 *)
+	DB 0FFX
+END TableGerman;
+
+(* TableSwiss - Swiss keyboard translation table (dead keys: ^=1, '=2, `=3, ~=4, "=5) *)
+
+PROCEDURE TableSwiss(): LONGINT;
+CODE
+	CALL L1
+L1:
+	POP EAX
+	ADD EAX,8
+	POP EBP
+	RET
+		(* alphabet *)
+	DB 1EX, "a", "A", 4X,	30X, "b", "B", 4X,	2EX, "c", "C", 4X,	20X, "d", "D", 4X
+	DB 12X, "e", "E", 4X,	21X, "f", "F", 4X,	22X, "g", "G", 4X,	23X, "h", "H", 4X
+	DB 17X, "i", "I", 4X,	24X, "j", "J", 4X,	25X, "k", "K", 4X,	26X, "l", "L", 4X
+	DB 32X, "m", "M", 4X,	31X, "n", "N", 4X,	18X, "o", "O", 4X,	19X, "p", "P", 4X
+	DB 10X, "q", "Q", 4X,	13X, "r", "R", 4X,	1FX, "s", "S", 4X,	14X, "t", "T", 4X
+	DB 16X, "u", "U", 4X,	2FX, "v", "V", 4X,	11X, "w", "W", 4X,	2DX, "x", "X", 4X
+	DB 15X, "z", "Z", 4X,	2CX, "y", "Y", 4X
+		(* Oberon accents (LAlt & RAlt) *)
+	DB 1EX, "É", "Ä", 0CX,	12X, "ë", 0FFX, 0CX,	18X, "Ñ", "Å", 0CX,	16X, "Ö", "Ç", 0CX
+	DB 17X, "í", 0FFX, 0CX,	1FX, "ñ", 0FFX, 0CX,	2EX, "ì", 0FFX, 0CX,	31X, "ï", 0FFX, 0CX
+	DB 1EX, "É", "Ä", 14X,	12X, "ë", 0FFX, 14X,	18X, "Ñ", "Å", 14X,	16X, "Ö", "Ç", 14X
+	DB 17X, "í", 0FFX, 14X,	1FX, "ñ", 0FFX, 14X,	2EX, "ì", 0FFX, 14X,	31X, "ï", 0FFX, 14X
+		(* numbers at top *)
+	DB 0BX, "0", "=", 0X,	02X, "1", "+", 0X,	03X, "2", 22X, 0X,	04X, "3", "*", 0X
+	DB 05X, "4", "ì", 0X,	06X, "5", "%", 0X,	07X, "6", "&", 0X,	08X, "7", "/", 0X
+	DB 09X, "8", "(", 0X,	0AX, "9", ")", 0X
+	 	(* symbol keys *)
+	DB 28X, "É", "ã", 0X,	33X, ",", ";", 0X,	0CX, "'", "?", 0X,	34X, ".", ":", 0X
+	DB 35X, "-", "_", 0X,	27X, "Ñ", "ê", 0X,	0DX, 1X, 3X, 1X,	1AX, "Ö", "å", 0X
+	DB 2BX, "$", 0FFX, 0X,	1BX, 5X, "!", 1X,	29X, 0FFX, 0FFX, 0X,	56X, "<", ">", 0X
+		(* AltGr keys *)
+	DB 02X, "|", 0FFX, 10X,	03X, "@", 0FFX, 10X,	04X, "#", 0FFX, 10X,	28X, "{", 0FFX, 10X
+	DB 0CX, 2X, 0FFX, 11X,	27X, "ê", "Ñ", 10X,	0DX, 4X, 0FFX, 11X,	1AX, "[", 0FFX, 10X
+	DB 56X, "\", 0FFX, 10X,	1BX, "]", 0FFX, 10X,	2BX, "}", 0FFX, 10X,	08X, "|", 0FFX, 10X
+		(* dead keys *)
+	DB 39X, "^", 0FFX, 20X,	39X, "'", 0FFX, 40X,	39X, "`", 0FFX, 60X,	39X, "~", 0FFX, 80X
+	DB 1EX, "Ü", 0FFX, 24X,	1EX, "î", 0FFX, 44X,	1EX, "ã", 0FFX, 64X,	1EX, "É", "Ä", 0A4X
+	DB 12X, "á", 0FFX, 24X,	12X, "ê", 0FFX, 44X,	12X, "å", 0FFX, 64X,	12X, "ë", 0FFX, 0A4X
+	DB 17X, "à", 0FFX, 24X,	17X, "ç", 0FFX, 64X,	17X, "í", 0FFX, 0A4X,	31X, "ï", 0FFX, 84X
+	DB 18X, "â", 0FFX, 24X,	18X, "é", 0FFX, 64X,	18X, "Ñ", "Å", 0A4X
+	DB 16X, "ä", 0FFX, 24X,	16X, "è", 0FFX, 64X,	16X, "Ö", "Ç", 0A4X
+		(* control keys *)
+	DB 0EX, 7FX, 7FX, 0X	(* backspace *)
+	DB 0FX, 09X, 09X, 0X	(* tab *)
+	DB 1CX, 0DX, 0DX, 0X	(* enter *)
+	DB 39X, 20X, 20X, 0X	(* space *)
+	DB 01X, 1BX, 1BX, 0X	(* esc *)
+		(* keypad *)
+	DB 4FX, 0A9X, "1", 2X	(* end/1 *)
+	DB 50X, 0C2X, "2", 2X	(* down/2 *)
+	DB 51X, 0A3X, "3", 2X	(* pgdn/3 *)
+	DB 4BX, 0C4X, "4", 2X	(* left/4 *)
+	DB 4CX, 0FFX, "5", 2X	(* center/5 *)
+	DB 4DX, 0C3X, "6", 2X	(* right/6 *)
+	DB 47X, 0A8X, "7", 2X	(* home/7 *)
+	DB 48X, 0C1X, "8", 2X	(* up/8 *)
+	DB 49X, 0A2X, "9", 2X	(* pgup/9 *)
+	DB 52X, 0A0X, "0", 2X	(* insert/0 *)
+	DB 53X, 0A1X, 2EX, 2X	(* del/. *)
+		(* gray keys *)
+	DB 4AX, "-", "-", 0X	(* gray - *)
+	DB 4EX, "+", "+", 0X	(* gray + *)
+	DB 0B5X, "/", "/", 0X	(* gray / *)
+	DB 37X, "*", "*", 0X	(* gray * *)
+	DB 0D0X, 0C2X, 0C2X, 0X	(* gray down *)
+	DB 0CBX, 0C4X, 0C4X, 0X	(* gray left *)
+	DB 0CDX, 0C3X, 0C3X, 0X	(* gray right *)
+	DB 0C8X, 0C1X, 0C1X, 0X	(* gray up *)
+	DB 09CX, 0AX, 0AX, 0X	(* gray enter *)
+	DB 0D2X, 0A0X, 0A0X, 0X	(* gray ins *)
+	DB 0D3X, 0A1X, 0A1X, 0X	(* gray del *)
+	DB 0C9X, 0A2X, 0A2X, 0X	(* gray pgup *)
+	DB 0D1X, 0A3X, 0A3X, 0X	(* gray pgdn *)
+	DB 0C7X, 0A8X, 0A8X, 0X	(* gray home *)
+	DB 0CFX, 0A9X, 0A9X, 0X	(* gray end *)
+		(* function keys *)
+	DB 3BX, 0A4X, 0F1X, 0X	(* F1 *)
+	DB 3CX, 0A5X, 0F2X, 0X	(* F2 *)
+	DB 3DX, 0A6X, 0F3X, 0X	(* F3 *)
+	DB 3EX, 0A7X, 0F4X, 0X	(* F4 *)
+	DB 3FX, 0FCX, 0FFX, 0X	(* F5 *)
+	DB 40X, 0FDX, 0FFX, 0X	(* F6 *)
+	DB 41X, 0FEX, 0FFX, 0X	(* F7 *)
+	DB 0FFX
+END TableSwiss;
+
+(* TableCanadian - Canadian keyboard translation table *)
+
+PROCEDURE TableCanadian(): LONGINT;
+CODE
+	CALL L1
+L1:
+	POP EAX
+	ADD EAX,8
+	POP EBP
+	RET
+		(* alphabet *)
+	DB 1EX, "a", "A", 4X,	30X, "b", "B", 4X,	2EX, "c", "C", 4X,	20X, "d", "D", 4X
+	DB 12X, "e", "E", 4X,	21X, "f", "F", 4X,	22X, "g", "G", 4X,	23X, "h", "H", 4X
+	DB 17X, "i", "I", 4X,	24X, "j", "J", 4X,	25X, "k", "K", 4X,	26X, "l", "L", 4X
+	DB 32X, "m", "M", 4X,	31X, "n", "N", 4X,	18X, "o", "O", 4X,	19X, "p", "P", 4X
+	DB 10X, "q", "Q", 4X,	13X, "r", "R", 4X,	1FX, "s", "S", 4X,	14X, "t", "T", 4X
+	DB 16X, "u", "U", 4X,	2FX, "v", "V", 4X,	11X, "w", "W", 4X,	2DX, "x", "X", 4X
+	DB 15X, "y", "Y", 4X,	2CX, "z", "Z", 4X
+	 	(* Oberon accents (LAlt & RAlt) *)
+	DB 1EX, "É", "Ä", 0CX,	12X, "ë", 0FFX, 0CX,	18X, "Ñ", "Å", 0CX,	16X, "Ö", "Ç", 0CX
+	DB 17X, "í", 0FFX, 0CX,	1FX, "ñ", 0FFX, 0CX,	2EX, "ì", 0FFX, 0CX,	31X, "ï", 0FFX, 0CX
+	DB 1EX, "É", "Ä", 14X,	12X, "ë", 0FFX, 14X,	18X, "Ñ", "Å", 14X,	16X, "Ö", "Ç", 14X
+	DB 17X, "í", 0FFX, 14X,	1FX, "ñ", 0FFX, 14X,	2EX, "ì", 0FFX, 14X,	31X, "ï", 0FFX, 14X
+		(* numbers at top *)
+	DB 0BX, "0", ")", 0X,	02X, "1", "!", 0X,	03X, "2", "@", 0X,	04X, "3", "#", 0X
+	DB 05X, "4", "$", 0X,	06X, "5", "%", 0X,	07X, "6", "^", 0X,	08X, "7", "&", 0X
+	DB 09X, "8", "*", 0X,	0AX, "9", "(", 0X
+		(* symbol keys *)
+	DB 28X, "'", 22X, 0X,	33X, ",", "<", 0X,	0CX, "-", "_", 0X,	34X, ".", ">", 0X
+	DB 35X, "/", "?", 0X,	27X, ";", ":", 0X,	0DX, "=", "+", 0X,	1AX, "[", "{", 0X
+	DB 2BX, "\", "|", 0X,	1BX, "]", "}", 0X,	29X, "`", "~", 0X
+		(* control keys *)
+	DB 0EX, 7FX, 7FX, 0X	(* backspace *)
+	DB 0FX, 09X, 09X, 0X	(* tab *)
+	DB 1CX, 0DX, 0DX, 0X	(* enter *)
+	DB 39X, 20X, 20X, 0X	(* space *)
+	DB 01X, 1BX, 1BX, 0X	(* esc *)
+		(* keypad *)
+	DB 4FX, 0A9X, "1", 2X	(* end/1 *)
+	DB 50X, 0C2X, "2", 2X	(* down/2 *)
+	DB 51X, 0A3X, "3", 2X	(* pgdn/3 *)
+	DB 4BX, 0C4X, "4", 2X	(* left/4 *)
+	DB 4CX, 0FFX, "5", 2X	(* center/5 *)
+	DB 4DX, 0C3X, "6", 2X	(* right/6 *)
+	DB 47X, 0A8X, "7", 2X	(* home/7 *)
+	DB 48X, 0C1X, "8", 2X	(* up/8 *)
+	DB 49X, 0A2X, "9", 2X	(* pgup/9 *)
+	DB 52X, 0A0X, "0", 2X	(* insert/0 *)
+	DB 53X, 0A1X, 2EX, 2X	(* del/. *)
+		(* gray keys *)
+	DB 4AX, "-", "-", 0X	(* gray - *)
+	DB 4EX, "+", "+", 0X	(* gray + *)
+	DB 0B5X, "/", "/", 0X	(* gray / *)
+	DB 37X, "*", "*", 0X	(* gray * *)
+	DB 0D0X, 0C2X, 0C2X, 0X	(* gray down *)
+	DB 0CBX, 0C4X, 0C4X, 0X	(* gray left *)
+	DB 0CDX, 0C3X, 0C3X, 0X	(* gray right *)
+	DB 0C8X, 0C1X, 0C1X, 0X	(* gray up *)
+	DB 09CX, 0AX, 0AX, 0X	(* gray enter *)
+	DB 0D2X, 0A0X, 0A0X, 0X	(* gray ins *)
+	DB 0D3X, 0A1X, 0A1X, 0X	(* gray del *)
+	DB 0C9X, 0A2X, 0A2X, 0X	(* gray pgup *)
+	DB 0D1X, 0A3X, 0A3X, 0X	(* gray pgdn *)
+	DB 0C7X, 0A8X, 0A8X, 0X	(* gray home *)
+	DB 0CFX, 0A9X, 0A9X, 0X	(* gray end *)
+		(* function keys *)
+	DB 3BX, 0A4X, 0F1X, 0X	(* F1 *)
+	DB 3CX, 0A5X, 0F2X, 0X	(* F2 *)
+	DB 3DX, 0A6X, 0F3X, 0X	(* F3 *)
+	DB 3EX, 0A7X, 0F4X, 0X	(* F4 *)
+	DB 3FX, 0FCX, 0FFX, 0X	(* F5 *)
+	DB 40X, 0FDX, 0FFX, 0X	(* F6 *)
+	DB 41X, 0FEX, 0FFX, 0X	(* F7 *)
+	DB 0FFX
+END TableCanadian;
+
+(* Translate - Translate scan code "c" to key. *)
+
+PROCEDURE Translate(flags: SET;  c: CHAR): INTEGER;
+CONST
+	Alt = {LAlt, RAlt};  Ctrl = {LCtrl, RCtrl};  Shift = {LShift, RShift};
+	AltShift = {LAlt, RAlt, LShift, RShift};
+	All = {LAlt, RAlt, LCtrl, RCtrl, LShift, RShift};
+VAR a: LONGINT;  s1: CHAR;  s: SET;  k: INTEGER;  dkn: SHORTINT;
+BEGIN
+	IF (c = 46X) & (flags * Ctrl # {}) THEN RETURN -2 END;	(* Ctrl-Break - break *)
+	IF (c = 44X) & (flags * Ctrl # {}) THEN RETURN 0FFH END;	(* Ctrl-F10 - exit *)
+	IF (c = 53X) & (flags * Ctrl # {}) & (flags * Alt # {}) THEN RETURN 0FFH END;	(* Ctrl-Alt-Del - exit *)
+	IF GreyEsc IN flags THEN c := CHR(ORD(c)+80H) END;
+	a := table;
+	LOOP
+		SYSTEM.GET(a, s1);
+		IF s1 = 0FFX THEN	(* end of table, unmapped key *)
+			k := -1;  dkey := 0;  EXIT
+		ELSIF s1 = c THEN	(* found scan code in table *)
+			SYSTEM.GET(a+3, SYSTEM.VAL(CHAR, s));	(* flags from table *)
+			dkn := SYSTEM.VAL(SHORTINT, SYSTEM.LSH(s * {5..7}, -5));
+			s := s * {DeadKey, NumLock, CapsLock, LAlt, RAlt, LCtrl, RCtrl};  k := 0;
+			IF ((s * Alt = flags * Alt) OR (NumLock IN s)) & (dkn = dkey) THEN	(* Alt & dead keys match exactly *)
+				IF flags * Shift # {} THEN INCL(s, LShift) END;	(* check if shift pressed *)
+					(* handle CapsLock *)
+				IF (CapsLock IN s) & (CapsLock IN flags) THEN s := s / {LShift} END;
+					(* handle NumLock *)
+				IF NumLock IN s THEN
+					IF flags * Alt # {} THEN INCL(s, LShift)
+					ELSIF NumLock IN flags THEN s := s / {LShift}
+					END
+				END;
+					(* get key code *)
+				IF LShift IN s THEN SYSTEM.GET(a+2, SYSTEM.VAL(CHAR, k))	(* shifted value *)
+				ELSE SYSTEM.GET(a+1, SYSTEM.VAL(CHAR, k))	(* unshifted value *)
+				END;
+				IF (DeadKey IN s) & (k <= 7) THEN	(* dead key *)
+					dkey := SHORT(k);  k := -1	(* set new dead key state *)
+				ELSIF k = 0FFH THEN	(* unmapped key *)
+					k := -1;  dkey := 0	(* reset dead key state *)
+				ELSE	(* mapped key *)
+					IF (flags * Ctrl # {}) & (((k >= 64) & (k <= 95)) OR ((k >= 97) & (k <= 122))) THEN
+						k := SYSTEM.VAL(INTEGER, SYSTEM.VAL(SET, k) * {0..4})	(* control *)
+					END;
+					IF flags * Alt # {} THEN	(* Alt-keypad *)
+						IF (k >= ORD("0")) & (k <= ORD("9")) & (NumLock IN s) THEN	(* keypad num *)
+							IF keyval = -1 THEN keyval := k-ORD("0")
+							ELSE keyval := (10*keyval + (k-ORD("0"))) MOD 1000
+							END;
+							k := -1
+						END
+					END;
+					dkey := 0	(* reset dead key state *)
+				END;
+				EXIT
+			END
+		END;
+		INC(a, 4)
+	END; (* LOOP *)
+	IF escNeutralise & (k = 27) & (flags * All = {}) THEN k := 0A5H END;
+	RETURN k
+END Translate;
+
+(* Wait - Wait for keyboard serial port to acknowledge byte. *)
+
+PROCEDURE Wait;
+VAR t: LONGINT; s: SET;
+BEGIN
+	t := Kernel.GetTimer();
+	REPEAT
+		SYSTEM.PORTIN(64H, SYSTEM.VAL(CHAR, s))
+	UNTIL ~(1 IN s) OR (Kernel.GetTimer() - t > 5)	(* wait up to 17 ms *)
+END Wait;
+
+(* SendByte - Send a byte to the keyboard. *)
+
+PROCEDURE SendByte(port: LONGINT;  value: SYSTEM.BYTE);
+BEGIN
+	Wait;  SYSTEM.PORTOUT(port, SYSTEM.VAL(CHAR, value));
+	lastport := port;  lastvalue := value
+END SendByte;
+
+(* ShiftKey - Handle shift keys. *)
+
+PROCEDURE ShiftKey(left, right: SHORTINT;  in: BOOLEAN);
+BEGIN
+	IF in THEN
+		IF GreyEsc IN flags THEN INCL(flags, right)
+		ELSE INCL(flags, left)
+		END
+	ELSE
+		IF GreyEsc IN flags THEN EXCL(flags, right)
+		ELSE EXCL(flags, left)
+		END
+	END
+END ShiftKey;
+
+(* LedKey - Handle "lock" keys. *)
+
+PROCEDURE LedKey(VAR flags: SET;  lock: SHORTINT;  c: CHAR;
+		VAR k: INTEGER);
+BEGIN
+	IF flags * {LAlt, RAlt, LCtrl, RCtrl, LShift, RShift} = {} THEN
+		flags := flags / {lock}
+	ELSE
+		k := Translate(flags, c)
+	END
+END LedKey;
+
+(* MapScanCode - Map a scan code "c" to a key code. *)
+
+PROCEDURE MapScanCode(c: CHAR): INTEGER;
+VAR k: INTEGER;  oldleds: SET;
+BEGIN
+	SendByte(64H, 0ADX);  Wait;	(* disable keyboard *)
+	k := -1;  oldleds := flags * {ScrollLock, NumLock, CapsLock};
+	IF c = 0X THEN	(* overrun, ignore *)
+	ELSIF c = 0FAX THEN	(* keyboard ack *)
+		IF Resetting IN flags THEN
+			EXCL(flags, Resetting);  INCL(flags, SendingLEDs);
+			SendByte(60H, 0EDX)	(* set keyboard LEDs *)
+		ELSIF SendingLEDs IN flags THEN
+			SendByte(60H, SYSTEM.VAL(CHAR, oldleds));
+			EXCL(flags, SendingLEDs)
+		ELSIF SetTypematic IN flags THEN
+			EXCL(flags, SetTypematic);  INCL(flags, Resetting);
+			SendByte(60H, 020X)	(* 30Hz, 500 ms *)
+		ELSE (* assume ack was for something else *)
+		END
+	ELSIF c = 0FEX THEN	(* keyboard resend *)
+		SendByte(lastport, lastvalue)
+	ELSIF c = 038X THEN	(* Alt make *)
+		ShiftKey(LAlt, RAlt, TRUE)
+	ELSIF c = 01DX THEN	(* Ctrl make *)
+		ShiftKey(LCtrl, RCtrl, TRUE)
+	ELSIF c = 02AX THEN	(* LShift make *)
+		INCL(flags, LShift)
+	ELSIF c = 036X THEN	(* RShift make *)
+		INCL(flags, RShift)
+	ELSIF c = 03AX THEN	(* Caps make *)
+		LedKey(flags, CapsLock, c, k)
+	ELSIF c = 046X THEN	(* Scroll make *)
+		LedKey(flags, ScrollLock, c, k);
+		SYSTEM.CLI();
+		IF ScrollLock IN flags THEN
+			IF Kernel.timer = NIL THEN Kernel.timer := timerproc END
+		ELSE
+			IF Kernel.timer = timerproc THEN Kernel.timer := NIL END
+		END;
+		SYSTEM.STI()
+	ELSIF c = 045X THEN	(* Num make *)
+		LedKey(flags, NumLock, c, k)
+	ELSIF c = 0B8X THEN	(* Alt break *)
+		ShiftKey(LAlt, RAlt, FALSE);
+		IF (keyval >= 0) & (keyval <= 255) THEN k := keyval END;
+		keyval := -1
+	ELSIF c = 09DX THEN	(* Ctrl break *)
+		ShiftKey(LCtrl, RCtrl, FALSE)
+	ELSIF c = 0AAX THEN	(* LShift break *)
+		EXCL(flags, LShift)
+	ELSIF c = 0B6X THEN	(* RShift break *)
+		EXCL(flags, RShift)
+	ELSIF (flags * {ScrollLock, GreyEsc} = {ScrollLock}) & (c >= 47X) & (c <= 53X) & (c # 4AX) & (c # 4EX) THEN	(* key mouse *)
+		INCL(kpmap, ORD(c)-47H)
+	ELSIF c < 080X THEN	(* Other make *)
+		k := Translate(flags, c)
+	ELSIF (flags * {ScrollLock, GreyEsc} = {ScrollLock}) & (c >= 0C7X) & (c <= 0D3X) THEN	(* key mouse *)
+		EXCL(kpmap, ORD(c)-0C7H)
+	ELSE	(* ignore *)
+	END;
+	IF c = 0E0X THEN INCL(flags, GreyEsc) ELSE EXCL(flags, GreyEsc) END;
+	IF flags * {ScrollLock, NumLock, CapsLock} # oldleds THEN
+		INCL(flags, SendingLEDs);
+		SendByte(60H, 0EDX)	(* set keyboard LEDs *)
+	END;
+	SendByte(64H, 0AEX);	(* enable keyboard *)
+	RETURN k
+END MapScanCode;
+
+PROCEDURE -CS(): LONGINT
+	033H, 0C0H,	(* XOR EAX,EAX *)
+	066H, 08CH, 0C8H;	(* MOV AX,CS *)
+
+(* KeyboardInterrupt - Handle interrupts from keyboard *)
+
+PROCEDURE KeyboardInterrupt;
+VAR
+	m: SET;  c: CHAR;  k: INTEGER;  fp, esp, tmp, cs: LONGINT;  i: SHORTINT;
+BEGIN
+	SYSTEM.PORTIN(060H, c);	(* get scan code *)
+	SYSTEM.PORTIN(061H, SYSTEM.VAL(CHAR, m));
+	INCL(m, 7);  SYSTEM.PORTOUT(061H, SYSTEM.VAL(CHAR, m));
+	EXCL(m, 7);  SYSTEM.PORTOUT(061H, SYSTEM.VAL(CHAR, m));	(* ack *)
+	SYSTEM.STI();
+	k := MapScanCode(c);
+	IF k = -2 THEN	(* break *)
+		IF ~Kernel.break THEN	(* first try: soft break *)
+			Kernel.break := TRUE
+		ELSIF ~Kernel.inGC THEN	(* second try: do hard break *)
+			Kernel.break := FALSE;	(* cancel other break *)
+			SYSTEM.GETREG(5, fp);	(* EBP *)
+			SYSTEM.GET(fp+52, tmp);	(* get CS'' *)
+			cs := CS();
+			IF tmp MOD 4 # cs MOD 4 THEN	(* we interrupted at different level *)
+					(* assume we are currently on system stack *)
+					(* simulate a CALL to breakproc *)
+				SYSTEM.GET(fp+48, tmp);	(* save old EIP *)
+				SYSTEM.PUT(fp+48, breakproc);
+				SYSTEM.GET(fp+60, esp);	(* get outer ESP *)
+				DEC(esp, 4);
+				SYSTEM.PUT(fp+60, esp);
+				SYSTEM.PUT(esp, tmp)	(* PUSH old EIP *)
+			ELSE	(* we interrupted at same level *)
+					(* simulate a JMP to breakproc *)
+				SYSTEM.PUT(fp+48, breakproc)
+			END
+		END
+	END;
+	IF k >= 0 THEN
+		i := (tail+1) MOD BufSize;
+		IF i # head THEN
+			buffer[1+tail] := CHR(k);  tail := i
+		END
+	END
+END KeyboardInterrupt;
+
+(* InitKeyboard - Initialise the keyboard. *)
+
+PROCEDURE InitKeyboard;
+VAR s: SET;  c: CHAR;  i: SHORTINT;  k: ARRAY 10 OF CHAR;
+BEGIN
+	head := 0;  tail := 0;  keyval := -1;  buffer[0] := 0X;  dkey := 0;
+		(* Get table *)
+	Kernel.GetConfig("Keyboard", k);
+	IF k = "N" THEN table := TableNorwegian()
+	ELSIF k = "D" THEN table := TableGerman()
+	ELSIF k = "CH" THEN table := TableSwiss()
+	ELSIF k = "CA" THEN table := TableCanadian()
+	ELSE table := TableUS()
+	END;
+		(* Get compatability option *)
+	Kernel.GetConfig("EscCompat", k);
+	escNeutralise := (k = "1");
+		(* install interrupt *)
+	flags := {};
+	Kernel.InstallIP(KeyboardInterrupt, Kernel.IRQ+1);
+		(* clear the keyboard's internal buffer *)
+	i := 8;
+	LOOP
+		SYSTEM.PORTIN(64H, SYSTEM.VAL(CHAR, s));
+		IF ~(0 IN s) OR (i = 0) THEN EXIT END;
+		SYSTEM.PORTIN(60H, c);	(* read byte *)
+		SYSTEM.PORTIN(61H, SYSTEM.VAL(CHAR, s));
+		INCL(s, 7);  SYSTEM.PORTOUT(61H, SYSTEM.VAL(CHAR, s));
+		EXCL(s, 7);  SYSTEM.PORTOUT(61H, SYSTEM.VAL(CHAR, s));	(* ack *)
+		DEC(i)
+	END;
+	flags := {SetTypematic, NumLock};
+	SendByte(60H, 0F3X)	(* settypedel, will cause Ack from keyboard *)
+END InitKeyboard;
+
+(* ---- PS/2 aux port driver ---- *)
+
+PROCEDURE Detect82C710(): BOOLEAN;
+VAR b: CHAR;  i: INTEGER;
+BEGIN
+	SYSTEM.PORTOUT(2FAH, 55X);  SYSTEM.PORTOUT(3FAH, 0AAX);  SYSTEM.PORTOUT(3FAH, 36X);
+	SYSTEM.PORTOUT(3FAH, 0E4X);  SYSTEM.PORTOUT(2FAH, 1BX);
+	SYSTEM.PORTOUT(390H, 0FX);  SYSTEM.PORTIN(391H, b);
+	RETURN b = 0E4X
+END Detect82C710;
+
+PROCEDURE PollAux;
+VAR s: SET;  t: LONGINT;  i: SHORTINT;
+BEGIN
+	i := 10;	(* up to 0.2s! *)
+	LOOP
+		SYSTEM.PORTIN(64H, SYSTEM.VAL(CHAR, s));
+		IF (s * {0,1} = {}) OR (i = 0) THEN EXIT END;
+		SYSTEM.PORTIN(64H, SYSTEM.VAL(CHAR, s));
+		IF s * {0,5} = {0,5} THEN SYSTEM.PORTIN(60H, SYSTEM.VAL(CHAR, s)) END;	(* byte avail *)
+		t := Kernel.GetTimer();  REPEAT UNTIL Kernel.GetTimer() - t > TimeUnit DIV 50;	(* 20ms *)
+		DEC(i)
+	END
+END PollAux;
+
+PROCEDURE WriteDev(b: CHAR);
+BEGIN
+	PollAux;  SYSTEM.PORTOUT(64H, 0D4X);	(* aux data coming *)
+	PollAux;  SYSTEM.PORTOUT(60H, b)
+END WriteDev;
+
+PROCEDURE WriteAck(b: CHAR);
+VAR s: SET;  t: LONGINT;  i: SHORTINT;
+BEGIN
+	WriteDev(b);  i := 10;	(* up to 0.2s! *)
+	LOOP
+		SYSTEM.PORTIN(64H, SYSTEM.VAL(CHAR, s));
+		IF (s * {0,5} = {0,5}) OR (i = 0) THEN EXIT END;
+		t := Kernel.GetTimer();  REPEAT UNTIL Kernel.GetTimer() - t > TimeUnit DIV 50;	(* 20ms *)
+		DEC(i)
+	END;
+	IF i # 0 THEN SYSTEM.PORTIN(60H, SYSTEM.VAL(CHAR, s)) END	(* byte avail *)
+END WriteAck;
+
+PROCEDURE WriteCmd(b: CHAR);
+BEGIN
+	PollAux;  SYSTEM.PORTOUT(64H, 60X);
+	PollAux;  SYSTEM.PORTOUT(60H, b)
+END WriteCmd;
+
+PROCEDURE AuxInterrupt;
+VAR c: CHAR;  t: INTEGER;
+BEGIN
+	SYSTEM.PORTIN(60H, c);	(* read byte *)
+	t := (auxtl+1) MOD AuxSize;
+	IF t # auxhd THEN auxbuf[auxtl] := c;  auxtl := t
+	ELSE INC(auxoverflows)
+	END
+END AuxInterrupt;
+
+PROCEDURE ReadAux(port: LONGINT;  VAR c: SYSTEM.BYTE;  VAR res: LONGINT);
+BEGIN
+	REPEAT UNTIL auxhd # auxtl;
+	SYSTEM.CLI();  c := auxbuf[auxhd];  auxhd := (auxhd+1) MOD AuxSize;  SYSTEM.STI();
+	res := 0
+END ReadAux;
+
+PROCEDURE AvailableAux(port: LONGINT): LONGINT;
+VAR n: LONGINT;
+BEGIN
+	SYSTEM.CLI();  n := auxtl-auxhd;  SYSTEM.STI();
+	IF n < 0 THEN INC(n, AuxSize) END;
+	RETURN n
+END AvailableAux;
+
+PROCEDURE InitAux;
+BEGIN
+	PollAux;
+	SYSTEM.PORTOUT(64H, 0A8X);	(* enable aux *)
+	WriteAck(0F3X);  WriteAck(CHR(rate));	(* set sample rate (was 100) *)
+	WriteAck(0E8X);  WriteAck(3X);	(* 8 counts/mm *)
+	WriteAck(0E7X);	(* 2:1 scale *)
+	PollAux;
+	SYSTEM.CLI();  auxhd := 0;  auxtl := 0;  SYSTEM.STI();
+	Kernel.InstallIP(AuxInterrupt, Kernel.IRQ+12);
+	WriteDev(0F4X);	(* enable aux device *)
+	WriteCmd(47X);	(* controller interrupts on *)
+	PollAux
+END InitAux;
+
+(* ---- Mouse driver ---- *)
+
+(* SetSpeed - Set mouse speed *)
+
+PROCEDURE SetSpeed(old, new: LONGINT);
+VAR word, stop, par: INTEGER;  c: CHAR;  t: LONGINT;
+BEGIN
+	IF type # PS2 THEN
+		IF first THEN first := FALSE ELSE V24.Stop(port) END;
+		CASE type OF
+			MS:  word := 7;  stop := V24.Stop1;  par := V24.ParNo |
+			MSC, MSC2:  word := 8;  stop := V24.Stop2;  par := V24.ParNo |
+			MM:  word := 8;  stop := V24.Stop1;  par := V24.ParOdd |
+			Logi:  word := 8;  stop := V24.Stop2;  par := V24.ParNo |
+			LogiMan:  word := 7;  stop := V24.Stop1;  par := V24.ParNo
+		END;
+		IF (type = Logi) OR (type = LogiMan) THEN
+			V24.Start(port, old, word, par, stop, t);
+			IF t # 0 THEN HALT(99) END;
+			IF new = 9600 THEN c := "q"
+			ELSIF new = 4800 THEN c := "p"
+			ELSIF new = 2400 THEN c := "o"
+			ELSE c := "n"
+			END;
+			V24.Send(port, "*", t);  V24.Send(port, c, t);
+			t := Kernel.GetTimer();  REPEAT UNTIL Kernel.GetTimer() - t > TimeUnit DIV 10;
+			V24.Stop(port)
+		END;
+		V24.Start(port, new, word, par, stop, t);
+		IF t # 0 THEN HALT(99) END
+	END
+END SetSpeed;
+
+(* InitMouse - Initialise mouse.
+	"type" - mouse type from list
+	"port" - V24.COM[12]
+	"bps" - V24.BPS*
+	"rate" - sample rate (not all mice support this) *)
+
+PROCEDURE InitMouse;
+VAR c: CHAR;  t, res: LONGINT;
+BEGIN
+	available := V24.Available;  read := V24.Receive;
+	IF type = PS2 THEN
+		IF Detect82C710() THEN qp := TRUE END;	(* QuickPort mouse not supported *)
+		InitAux;  available := AvailableAux;  read := ReadAux
+	ELSIF type = LogiMan THEN
+		SetSpeed(1200, 1200);
+		V24.Send(port, "*", t);  V24.Send(port, "X", t);
+		SetSpeed(1200, bps)
+	ELSE
+		SetSpeed(9600, bps);
+		SetSpeed(4800, bps);
+		SetSpeed(2400, bps);
+		SetSpeed(1200, bps);
+		IF type = Logi THEN
+			V24.Send(port, "S", t);  type := MM;  SetSpeed(bps, bps);  type := Logi
+		END;
+			(* set sample rate *)
+		IF rate <= 0 THEN c := "O"	(* continuous - don't use *)
+		ELSIF rate <= 15 THEN c := "J"	(* 10 Hz *)
+		ELSIF rate <= 27 THEN c := "K"	(* 20 *)
+		ELSIF rate <= 42 THEN c := "L"	(* 35 *)
+		ELSIF rate <= 60 THEN c := "R"	(* 50 *)
+		ELSIF rate <= 85 THEN c := "M"	(* 70 *)
+		ELSIF rate <= 125 THEN c := "Q"	(* 100 *)
+		ELSE c := "N"	(* 150 *)
+		END;
+		V24.Send(port, c, t);
+		IF type = MSC2 THEN
+			V24.ClearMC(port, {V24.DTR, V24.RTS})
+		END
+	END;
+	mbufp := 0;  lastkeys := {};
+		(* protocol parameters *)
+	CASE type OF
+		MS:  numb := 3;  mask0 := {6};  val0 := {6};  mask1 := {6};  val1 := {} |
+		MSC, MSC2:  numb := 5;  mask0 := {3..7};  val0 := {7};  mask1 := {};  val1 := {} |
+		MM:  numb := 3;  mask0 := {5..7};  val0 := {7};  mask1 := {7};  val1 := {} |
+		Logi:  numb := 3;  mask0 := {5..7};  val0 := {7};  mask1 := {7};  val1 := {} |
+		LogiMan:  numb := 3;  mask0 := {6};  val0 := {6};  mask1 := {6};  val1 := {} |
+		PS2:  numb := 3;  mask0 := {6,7};  val0 := {};  mask1 := {};  val1 := {}
+	END;
+		(* ignore the first few bytes from the mouse (e.g. Logitech MouseMan Sensa) *)
+	t := Kernel.GetTimer();
+	REPEAT
+		IF available(port) > 0 THEN read(port, c, res) END
+	UNTIL Kernel.GetTimer() - t > TimeUnit DIV 2	(* wait 0.5s *)
+END InitMouse;
+
+(* GetMouseEvent - Read a mouse event *)
+
+PROCEDURE GetMouseEvent(VAR keys: SET;  VAR dx, dy: INTEGER): BOOLEAN;
+VAR b: SET;  res: LONGINT;
+BEGIN
+	WHILE available(port) > 0 DO
+		b := {};  read(port, SYSTEM.VAL(CHAR, b), res);
+			(* check for resync *)
+		IF (mbufp # 0) & (type # PS2) & ((b * mask1 # val1) OR (b = {7})) THEN mbufp := 0 END;
+		IF (mbufp = 0) & (b * mask0 # val0) THEN
+				(* skip package, unless it is a LogiMan middle button... *)
+			IF ((type = MS) OR (type = LogiMan)) & (b * {0,2..4,6,7} = {}) THEN
+				keys := lastkeys * {0,2};
+				IF 5 IN b THEN INCL(keys, 1) END;
+				dx := 0;  dy := 0;
+				RETURN TRUE
+			ELSE
+				INC(mouseErrors)
+			END
+		ELSE
+			mbuf[mbufp] := b;  INC(mbufp);
+			IF mbufp = numb THEN
+				CASE type OF
+					MS, LogiMan:
+						keys := lastkeys * {1};
+						IF 5 IN mbuf[0] THEN INCL(keys, 2) END;
+						IF 4 IN mbuf[0] THEN INCL(keys, 0) END;
+						dx := SYSTEM.VAL(SHORTINT, SYSTEM.LSH(mbuf[0] * {0,1}, 6) + mbuf[1] * {0..5});
+						dy := SYSTEM.VAL(SHORTINT, SYSTEM.LSH(mbuf[0] * {2,3}, 4) + mbuf[2] * {0..5}) |
+					MSC, MSC2:
+						keys := {0..2} - (mbuf[0] * {0..2});
+						dx := LONG(SYSTEM.VAL(SHORTINT, mbuf[1])) + LONG(SYSTEM.VAL(SHORTINT, mbuf[3]));
+						dy := -(LONG(SYSTEM.VAL(SHORTINT, mbuf[2])) + LONG(SYSTEM.VAL(SHORTINT, mbuf[4]))) |
+					MM, Logi:
+						keys := mbuf[0] * {0..2};
+						dx := SYSTEM.VAL(INTEGER, mbuf[1]);
+						IF ~(4 IN mbuf[0]) THEN dx := -dx END;
+						dy := SYSTEM.VAL(INTEGER, mbuf[2]);
+						IF 3 IN mbuf[0] THEN dy := -dy END |
+					PS2:
+						keys := {};
+						IF 2 IN mbuf[0] THEN INCL(keys, 1) END;
+						IF 1 IN mbuf[0] THEN INCL(keys, 0) END;
+						IF 0 IN mbuf[0] THEN INCL(keys, 2) END;
+						dx := SYSTEM.VAL(INTEGER, mbuf[1]);
+						IF 4 IN mbuf[0] THEN DEC(dx, 256) END;
+						dy := -SYSTEM.VAL(INTEGER, mbuf[2]);
+						IF 5 IN mbuf[0] THEN INC(dy, 256) END
+				END; (* CASE *)
+				mbufp := 0;
+				RETURN TRUE
+			END
+		END
+	END;
+	keys := lastkeys;  dx := 0;  dy := 0;
+	RETURN FALSE
+END GetMouseEvent;
+
+PROCEDURE ConfigMouse;
+VAR s: ARRAY 10 OF CHAR;  i: SHORTINT;
+BEGIN
+	Kernel.GetConfig("MouseType", s);
+	IF s = "" THEN type := PS2
+	ELSE
+		type := SHORT(ORD(s[0])-48);
+		IF (type < MS) OR (type > PS2) OR (s[1] # 0X) THEN HALT(67) END
+	END;
+	Kernel.GetConfig("Buttons", s);
+	twobutton := (type = MS) OR (s[0] = "2");
+	Kernel.GetConfig("MousePort", s);
+	IF (s = "") OR (s[0] = "1") THEN port := 0
+	ELSIF s[0] = "2" THEN port := 1
+	ELSE HALT(68)
+	END;
+	Kernel.GetConfig("MouseBPS", s);
+	IF (s = "") OR (s = "1200") THEN bps := 1200
+	ELSIF s = "9600" THEN bps := 9600
+	ELSE HALT(68)
+	END;
+	Kernel.GetConfig("MouseRate", s);
+	IF s = "" THEN rate := 100
+	ELSE
+		rate := 0;  i := 0;
+		WHILE s[i] # 0X DO rate := rate*10+ORD(s[i])-48; INC(i) END;
+		IF (rate <= 0) OR (rate > 150) THEN HALT(69) END
+	END;
+	Kernel.GetConfig("Threshold", s);
+	IF s = "" THEN threshold := 5
+	ELSE
+		threshold := 0;  i := 0;
+		WHILE s[i] # 0X DO threshold := threshold*10+ORD(s[i])-48; INC(i) END
+	END;
+	IF threshold <= 0 THEN threshold := 1 END;
+	Kernel.GetConfig("Speedup", s);
+	IF s = "" THEN speedup := 15
+	ELSE
+		speedup := 0;  i := 0;
+		WHILE s[i] # 0X DO speedup := speedup*10+ORD(s[i])-48; INC(i) END
+	END;
+	IF speedup <= 0 THEN speedup := 10 END
+END ConfigMouse;
+
+(* ---- Interface ---- *)
+
+(** Returns the number of keystrokes in the keyboard input buffer. *)
+PROCEDURE Available*() : INTEGER;
+VAR x: INTEGER;
+BEGIN
+	SYSTEM.CLI();  x := tail-head;  SYSTEM.STI();
+	IF x < 0 THEN INC(x, BufSize) END;
+	RETURN x
+END Available;
+
+(** Reads the current mouse position x, y and the key state of the mouse buttons 
+(also called keys). The mouse buttons are numbered from the right to the left as 
+0, 1, 2 (i.e. 1 is the middle mouse button). For example, when the left and middle 
+buttons are pressed, keys will be set to {1, 2}. *)
+PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
+VAR dx, dy: INTEGER;  ok: BOOLEAN;
+BEGIN
+	IF Kernel.break THEN Kernel.break := FALSE; HALT(24) END;
+	IF ScrollLock IN flags THEN
+		keys := {};
+		IF 11 IN kpmap THEN INCL(keys, 2) END;
+		IF 5 IN kpmap THEN INCL(keys, 1) END;
+		IF 12 IN kpmap THEN INCL(keys, 0) END;
+		SYSTEM.CLI();
+		INC(mouseX, LONG(kdx));
+		INC(mouseY, LONG(kdy));
+		kdx := 0;  kdy := 0;
+		SYSTEM.STI()
+	ELSE
+		REPEAT
+			ok := GetMouseEvent(keys, dx, dy);
+			IF (ABS(dx) > threshold) OR (ABS(dy) > threshold) THEN
+				dx := SHORT(dx*speedup DIV 10); dy := SHORT(dy*speedup DIV 10)
+			END;
+			IF twobutton THEN
+				IF (flags * {LCtrl, RCtrl} # {}) THEN INCL(keys, 1)
+				ELSE EXCL(keys, 1)
+				END
+			END;
+			INC(mouseX, LONG(dx));  INC(mouseY, LONG(dy))
+		UNTIL ~ok OR (keys # lastkeys);
+		lastkeys := keys
+	END;
+	IF mouseX < 0 THEN mouseX := 0 END;
+	IF mouseX > maxWidth THEN mouseX := maxWidth END;
+	IF mouseY < 0 THEN mouseY := 0 END;
+	IF mouseY > maxHeight THEN mouseY := maxHeight END;
+	x := SHORT(mouseX);
+	y := SHORT(mouseY);
+	y := (Display.Height - 1) - y;
+	IF (x >= Display.Width) THEN x := Display.Width - 1 END
+END Mouse;
+
+(** Read a character from the keyboard buffer. Blocks if no character is available. *)
+PROCEDURE Read*(VAR ch: CHAR);
+BEGIN
+	REPEAT (* skip *) UNTIL (head # tail) OR Kernel.break;
+	IF Kernel.break THEN Kernel.break := FALSE; HALT(24) END;
+	SYSTEM.CLI();
+	ch := buffer[1+head];  head := (head+1) MOD BufSize;
+	SYSTEM.STI()
+END Read;
+
+(** Returns the elapsed number of timer ticks from Oberon startup. *)
+PROCEDURE Time*(): LONGINT;
+BEGIN
+	IF Kernel.break THEN Kernel.break := FALSE; HALT(24) END;
+	RETURN Kernel.GetTimer()
+END  Time;
+
+(** Restricts the extent of the mouse coordinates returned by Mouse. *)
+PROCEDURE SetMouseLimits*(w, h: INTEGER);
+BEGIN
+	maxWidth := w-1;  maxHeight := h-1
+END SetMouseLimits;
+
+PROCEDURE *UnsafeBreak;
+VAR note1, note2, note3: ARRAY 32 OF CHAR;
+BEGIN
+	note1 := "Warning: Interrupting a module";
+	note2 := "may invalidate its invariants";
+	note3 := "and make it unstable.";
+	HALT(24)
+END UnsafeBreak;
+
+PROCEDURE *Timer;
+VAR i: INTEGER;
+BEGIN
+	IF counter1 = TimeUnit DIV 100 THEN
+		counter1 := 0;
+		IF kpmap * {0..2, 4, 6, 8..10} = {} THEN counter0 := 0
+		ELSIF counter0 < 100 THEN INC(counter0)
+		END;
+		i := counter0 DIV (100 DIV 12)+1;
+		IF kpmap * {0,4,8} # {} THEN DEC(kdx, i) END;
+		IF kpmap * {0,1,2} # {} THEN DEC(kdy, i) END;
+		IF kpmap * {2,6,10} # {} THEN INC(kdx, i) END;
+		IF kpmap * {8,9,10} # {} THEN INC(kdy, i) END
+	ELSE
+		INC(counter1)
+	END
+END Timer;
+
+BEGIN
+	timerproc := Timer;  kpmap := {};  kdx := 0;  kdy := 0;  counter0 := 0;
+	breakproc := UnsafeBreak;
+	InitKeyboard;
+		(* initialise mouse state *)
+	maxWidth := Display.Width-1;  maxHeight := Display.Height-1;  auxoverflows := 0;
+	mouseX := 0;  mouseY := 0;  first := TRUE;  mouseErrors := 0;
+	ConfigMouse;  InitMouse
+END Input.
+
+(** Remarks:
+
+1. Keyboard character codes correspond to the ASCII character set. 
+Some other important codes are:
+
+	F1, SETUP	0A4X
+	F2, NEUTRALISE	0A5X
+	F3, SCRL	0A6X	(used in Draw)
+	F4, NOSCRL	0A7X	(used in Draw)
+	UP ARROW	0C1X
+	RIGHT ARROW	0C3X
+	DOWN ARROW	0C2X
+	LEFT ARROW	0C4X
+	INSERT	0A0X
+
+2. On some platforms, SetMouseLimits may not influence the physical movement 
+of the mouse cursor itself, only the magnitude of the coordinates returned by Mouse.
+*)

@@ -1,0 +1,511 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaRuler;	(* uh, Mon, 18-Oct-1993 *)
+
+	IMPORT LedaSys, LedaBase, LedaFrames, Display, Oberon, Fonts;
+	
+(* pjm 28.06.96 changed to Oberon font *)
+
+CONST
+	IconRange = 6;
+	GroupRange = 8;	(* has to be even *)
+	PatRange = 32;
+	DX = 5;	DY = 3;
+	SclH = 6;	PatH = 12;	RulH = SclH + PatH;
+	
+	(*--- colors ---*)
+	Col = 13;	InvCol = Display.FG - Col;
+	
+	(*--- mouse keys ---*)
+	ML = LedaSys.ML;	MM = LedaSys.MM;	MR = LedaSys.MR;
+	
+	ScaleUnit = LedaBase.MM DIV 2;
+	NameFont = "Oberon10.Scn.Fnt";
+	UnDefName = "!##########!";
+
+
+TYPE
+	Group = RECORD
+		x, y, w, h: INTEGER;	(* rectangle of group [absolute screen coordinates] *)
+		noSel: BOOLEAN;	(* no selection allowed *)
+		sel: INTEGER;	(* selected icon *)
+		icnId: ARRAY IconRange OF CHAR
+	END;
+	
+	Pattern = RECORD
+		nr: INTEGER;	(* pattern number [index in r.pat] *)
+		X: LONGINT	(* position in ruler [document units] *)
+	END;
+	
+	Ruler = RECORD
+		Len: LONGINT;	(* length of ruler [document units] *)
+		len: INTEGER;	(* length of ruler [screen units] *)
+		x, y, w, h: INTEGER;	(* ruler area [absolute screen coordinates] *)
+		vx, vy, vw, vh: INTEGER;	(* visible area of ruler *)
+		s: LedaSys.String;
+		g: ARRAY GroupRange OF Group;
+		add, rem: BOOLEAN;	(* allow to add/remove patterns *)
+		c: INTEGER;	(* group that is inspected when a pattern is added *)
+		patId: ARRAY IconRange OF CHAR;	(* pattern icons *)
+		p: ARRAY PatRange OF Pattern;	(* moveable patterns in ruler; positions of patterns not sorted *)
+	END;
+	
+VAR
+	r: Ruler;
+	nFnt: Fonts.Font;
+	
+	PROCEDURE WaitNoKeys;
+		VAR x, y: INTEGER;	keys: SET;
+	BEGIN
+		REPEAT
+			LedaSys.Mouse(keys, x, y); Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, x, y)
+		UNTIL keys = {}
+	END WaitNoKeys;
+	
+	PROCEDURE ScalePosToScn(X: LONGINT; VAR x: INTEGER);
+	BEGIN	(* X: relative to ruler *)
+		IF ABS(X - r.Len) <= ScaleUnit THEN x := r.len - 1
+		ELSIF ABS(X) <= ScaleUnit THEN x := 0
+		ELSE x := SHORT(X DIV LedaSys.scnUnit)
+		END
+	END ScalePosToScn;
+		
+	PROCEDURE ScaleScnToPos(x: INTEGER; VAR X: LONGINT);
+	BEGIN	(* x: relative to ruler *)
+		IF ABS(r.len - x) <= 1 THEN X := r.Len
+		ELSIF x <= 1 THEN X := 0 
+		ELSE
+			IF x >= r.len THEN x := r.len - 1 END;  
+			X := x * LedaSys.scnUnit;
+			INC(X, ScaleUnit - 1); X := (X DIV ScaleUnit) * ScaleUnit	(* round to ScaleUnit *)
+		END
+	END ScaleScnToPos;
+	
+	PROCEDURE IconsNotAvail(): BOOLEAN;
+		VAR dx, x, y, w, h: INTEGER;	pat: LONGINT;
+	BEGIN
+		LedaSys.GetIcon(" ", dx, x, y, w, h, pat);
+		RETURN pat = 0
+	END IconsNotAvail;
+	
+	PROCEDURE AddGroup(VAR g: Group);
+		VAR i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE (i < GroupRange) & (r.g[i].w > 0) DO INC(i) END;
+		IF i < GroupRange THEN r.g[i] := g END
+	END AddGroup;
+	
+	PROCEDURE SizeRuler(F: LedaFrames.Frame; X, Y, W: LONGINT);
+	(* sizes the ruler and arragnes the group icons *)
+		VAR i, j, w, h, l0, l1, l2, dh: INTEGER;	p: LONGINT;
+	BEGIN
+		LedaFrames.DocToFrm(F, X, Y, r.x, r.y); LedaFrames.DocToFrmLen(F, W, r.len);
+		r.Len := W; DEC(r.x); r.w := r.len + 2;	(* range [0..r.len-1] has to be visible *)
+		l0 := 0; i := 0;
+		WHILE r.s[i] # 0X DO	(* calculate width of string *)
+			Fonts.GetChar(nFnt, r.s[i], w, j, j, j, j, p); INC(l0, w); INC(i)
+		END;
+		i := 0; l1 := 0; l2 := 0; h := 1;
+		WHILE i < GroupRange DO
+			IF r.g[i].w > l1 THEN l1 := r.g[i].w END;
+			IF r.g[i+1].w > l2 THEN l2 := r.g[i+1].w END;
+			IF r.g[i+1].h > r.g[i].h THEN dh := r.g[i+1].h ELSE dh := r.g[i].h END;
+			IF dh > 0 THEN INC(h, DY + dh) ELSIF i = 0 THEN INC(h, DY + nFnt.height) END;
+			r.g[i].y := h; INC(i); r.g[i].y := h; INC(i)
+		END;
+		r.h := h + DY + 1 + RulH + 1; w := l0 + l1 + l2 + 8*DX;
+		IF r.w > w  THEN j := (r.w - w) DIV 2 ELSE r.w := w; j := 3 * DX END;
+		i := 0; l2 := r.w - l2 - DX - 1; l1 := 1 + DX + l0 + j;
+		WHILE i < GroupRange DO	(* set absolute coordinates of groups *)
+			r.g[i].x := r.x + l1; r.g[i].y := r.y + r.h - r.g[i].y; INC(i);
+			r.g[i].x := r.x + l2; r.g[i].y := r.y + r.h - r.g[i].y; INC(i)
+		END;
+		(* r.g[0].y: used to draw string *)
+	END SizeRuler;
+
+	PROCEDURE ClipRuler(F: LedaFrames.Frame);
+	(* determines the visible area of the ruler [clipping] *)
+		VAR x2, y2: INTEGER;
+	BEGIN
+		r.vx := r.x; r.vy := r.y;	(* lower left; inside area *)
+		x2 := r.x + r.w - 1; y2 := r.y + r.h - 1;	(* upper right; inside area *)
+		IF (x2 < F.X + F.margW) OR (F.X + F.W <= r.vx) OR (F.Y + F.H <=  r.vy) OR (y2 < F.Y) THEN 
+			r.vw := 0; r.vh := 0	(* area outside frame [empty area] *)
+		ELSE
+			IF r.vy < F.Y THEN r.vy := F.Y END;
+			IF y2 >= F.Y + F.H THEN y2 := F.Y + F.H - 1 END;
+			IF r.vx < F.X + F.margW THEN r.vx := F.X + F.margW END;
+			IF x2 >= F.X + F.W THEN x2 := F.X + F.W - 1 END;
+			r.vw := x2 - r.vx + 1; r.vh := y2 - r.vy + 1
+		END
+	END ClipRuler;
+	
+	PROCEDURE DrawName(X, Y: INTEGER);
+		VAR i, x, y, dx, z: INTEGER;	pat: LONGINT;
+	BEGIN
+		i := 0;
+		WHILE r.s[i] # 0X DO
+			Fonts.GetChar(nFnt, r.s[i], dx, x, y, z, z, pat);
+			Display.CopyPattern(LedaSys.fg, pat, X+x, Y+y, Display.paint);
+			INC(X, dx); INC(i)
+		END
+	END DrawName;
+	
+	PROCEDURE DrawGroup(VAR g: Group);
+		VAR i, X, dx, x, y, w, h: INTEGER;	pat: LONGINT;
+	BEGIN
+		IF g.w > 0 THEN
+			i := 0; X := g.x;
+			WHILE g.icnId[i] # 0X DO
+				LedaSys.GetIcon(g.icnId[i], dx, x, y, w, h, pat);
+				INC(X, x); Display.CopyPattern(LedaSys.fg, pat, X, g.y+y, Display.paint);
+				IF i = g.sel THEN Display.ReplConst(InvCol, X, g.y, w, g.h, Display.invert) END;
+				INC(X, w+DX); INC(i)
+			END
+		END
+	END DrawGroup;
+	
+	PROCEDURE DrawScale;
+		VAR x, y, h, mm: INTEGER;
+	BEGIN
+		y := r.y+1+PatH;
+		Display.ReplConst(LedaSys.fg, r.x+1, y, r.w-2, 1, Display.paint);	(* separation for scale *)
+		INC(y); mm := 0;
+		LOOP
+			x := SHORT((mm * LedaBase.MM) DIV LedaSys.scnUnit);
+			IF x >= r.w THEN EXIT END;	(*###*)
+			IF mm MOD 10 = 0 THEN h := SclH ELSE h := SclH DIV 3 END;
+			Display.ReplConst(LedaSys.fg, r.x+1+x, y, 1, h, Display.paint);
+			INC(mm, 2)
+		END
+	END DrawScale;
+	
+	PROCEDURE DrawMark(VAR p: Pattern);
+		VAR px: INTEGER;
+	BEGIN
+		ScalePosToScn(p.X, px);
+		Display.ReplConst(LedaSys.fg, r.x+1+px, r.y+1+RulH+1, 1, SclH DIV 3, Display.paint);
+		p.nr := -1
+	END DrawMark;
+	
+	PROCEDURE InvertPattern(VAR p: Pattern; clip: BOOLEAN);
+		VAR px, dx, x, y, w, h, cx, cy, cw, ch: INTEGER;	pat: LONGINT;
+	BEGIN
+		IF p.nr # -1  THEN
+			IF clip THEN Display.GetClip(cx, cy, cw, ch); Display.SetClip(r.vx, r.vy, r.vw, r.vh) END;
+			ScalePosToScn(p.X, px);
+			LedaSys.GetIcon(r.patId[p.nr], dx, x, y, w, h, pat);
+			IF px + x < r.w - 1 THEN	(* draw pattern close to ruler [r.y+PatH-h] *)
+				Display.CopyPattern(InvCol, pat, r.x + 1 + px + x, r.y + PatH - h, Display.invert) 
+			END;
+			IF clip THEN Display.SetClip(cx, cy, cw, ch) END
+		END
+	END InvertPattern;
+	
+	PROCEDURE DisplayRuler(F: LedaFrames.Frame);
+	(* display ruler; marks [selection, focus] unhighlighted; clipping set *)
+		VAR i, cx, cy, cw, ch, col: INTEGER;
+	BEGIN
+		Oberon.RemoveMarks(r.vx, r.vy, r.vw, r.vh);	(* remove system marks [mouse, pointer] *)
+		Display.GetClip(cx, cy, cw, ch); Display.SetClip(r.vx, r.vy, r.vw, r.vh);	(* set clipping *)
+		IF r.vx >= Display.ColLeft THEN col := Col ELSE col := Display.BG END;
+		Display.ReplConst(col, r.vx, r.vy, r.vw, r.vh, Display.replace);	(* background *)
+		Display.ReplConst(LedaSys.fg, r.x, r.y, r.w, 1, Display.replace);	(* bottom *)
+		Display.ReplConst(LedaSys.fg, r.x, r.y+1+RulH, r.w, 1, Display.replace);	(* middle *)
+		Display.ReplConst(LedaSys.fg, r.x, r.y+r.h-1, r.w, 1, Display.replace);	(* top *)
+		Display.ReplConst(LedaSys.fg, r.x, r.y+1, 1, r.h-2, Display.replace);	(* left *)
+		Display.ReplConst(LedaSys.fg, r.x+r.w-1, r.y+1, 1, r.h-2, Display.replace);	(* right *)
+		DrawName(r.x + DX + 1, r.g[0].y);
+		i := 0; WHILE i < GroupRange DO DrawGroup(r.g[i]); INC(i) END;
+		DrawScale; i := 0; 
+		WHILE i < PatRange DO
+			IF r.p[i].nr = -2 THEN DrawMark(r.p[i]) ELSE InvertPattern(r.p[i], FALSE) END;
+			INC(i)
+		END;
+		Display.SetClip(cx, cy, cw, ch);	(* reset clipping *)
+	END DisplayRuler;
+	
+	PROCEDURE RestoreScreen(F: LedaFrames.Frame);
+	BEGIN
+		Oberon.FadeCursor(Oberon.Mouse);
+		Display.ReplConst(LedaSys.bg, r.vx, r.vy, r.vw, r.vh, Display.replace);	(* erase ruler area *)
+		LedaFrames.UpdateArea(F, r.vx, r.vy, r.vw, r.vh, FALSE, FALSE, NIL, NIL)	(* restore screen *)
+	END RestoreScreen;
+	
+	PROCEDURE LocateIcon(VAR g: Group; X: INTEGER; VAR i: INTEGER);
+		VAR dx, x, y, w, h: INTEGER;	pat: LONGINT;
+	BEGIN	(* g.w > 0 *)
+		i := 0; DEC(X, g.x);
+		LOOP
+			IF g.icnId[i] = 0X THEN i := -1; EXIT
+			ELSE
+				LedaSys.GetIcon(g.icnId[i], dx, x, y, w, h, pat);
+				DEC(X, x);
+				IF X < 0 THEN i := -1; EXIT
+				ELSIF X < w THEN EXIT	(* icon found *)
+				END;
+				DEC(X, w+DX); INC(i)
+			END
+		END
+	END LocateIcon;
+	
+	PROCEDURE InvertIcon(VAR g: Group; nr: INTEGER);
+		VAR i, X, dx, x, y, w, h: INTEGER;	pat: LONGINT;
+	BEGIN
+		i := 0; X := g.x;
+		WHILE i < nr DO
+			LedaSys.GetIcon(g.icnId[i], dx, x, y, w, h, pat);
+			INC(X, x+w+DX); INC(i)
+		END;
+		LedaSys.GetIcon(g.icnId[i], dx, x, y, w, h, pat);
+		INC(X, x); Display.ReplConst(InvCol, X, g.y, w, g.h, Display.invert)
+	END InvertIcon;
+	
+	PROCEDURE SelectIcon(VAR g: Group; i: INTEGER);
+		VAR cx, cy, cw, ch: INTEGER;
+	BEGIN	(* i = defined icon in group *)
+		Display.GetClip(cx, cy, cw, ch); Display.SetClip(r.vx, r.vy, r.vw, r.vh);	(* set clipping *)
+		IF g.sel # -1 THEN InvertIcon(g, g.sel) END;	(* unhighlight *)
+		IF (i = g.sel) & g.noSel THEN g.sel := -1
+		ELSE g.sel := i; InvertIcon(g, g.sel)	(* highlight *)
+		END;
+		Display.SetClip(cx, cy, cw, ch)	(* reset clipping *)
+	END SelectIcon;		
+	
+	PROCEDURE InGroup(x, y: INTEGER; VAR g: Group): BOOLEAN;
+	BEGIN RETURN (g.x <= x) & (x < g.x+g.w) & (g.y <= y) & (y < g.y+g.h)
+	END InGroup;
+	
+	PROCEDURE HandleGroup(x, y: INTEGER);
+		VAR i, j: INTEGER;
+	BEGIN
+		i := 0; j := -1;
+		WHILE (j = -1) & (i < GroupRange) DO
+			IF InGroup(x, y, r.g[i]) THEN j := i ELSE INC(i) END
+		END;
+		IF j # -1 THEN
+			LocateIcon(r.g[j], x, i);
+			IF (i # -1) THEN SelectIcon(r.g[j], i) END
+		END
+	END HandleGroup;
+	
+	PROCEDURE InPattern(X: INTEGER; VAR p: Pattern): BOOLEAN;
+		VAR px, dx, x, y, w, h: INTEGER;	pat: LONGINT;
+	BEGIN	(* coordinates relative to ruler *)
+		px := SHORT(p.X DIV LedaSys.scnUnit);
+		LedaSys.GetIcon(r.patId[p.nr], dx, x, y, w, h, pat); 
+		INC(px, x);
+		DEC(px); INC(w, 2);	(* enlarge sensitive area *)
+		RETURN (px <= X) & (X < px + w)
+	END InPattern;
+		
+	PROCEDURE LocatePattern(x: INTEGER; VAR i: INTEGER);
+	BEGIN
+		i := 0; DEC(x, r.x + 1);
+		LOOP
+			IF i >= PatRange THEN i := -1; EXIT	(* pattern not found *)
+			ELSIF (r.p[i].nr # -1) & InPattern(x, r.p[i]) THEN EXIT	(* pattern found *)
+			ELSE INC(i)
+			END
+		END
+	END LocatePattern;
+	
+	PROCEDURE TrackPattern(mx: INTEGER; VAR keys: SET);
+		VAR i, x, y, dx, s: INTEGER;	X, oldX: LONGINT;	new, del: BOOLEAN;
+	BEGIN
+		LocatePattern(mx, i);
+		IF (keys = {MM, MR}) & (i # -1)  & r.rem THEN
+			del := TRUE; InvertPattern(r.p[i], TRUE);	(* unhighlight pattern *)
+			WHILE (keys # {MM}) & (keys # {}) DO	(* track mouse *)
+				LedaSys.Mouse(keys, x, y); Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, x, y);
+				IF (ML IN keys) & del THEN	(* cancel deletion *)
+					del := FALSE; InvertPattern(r.p[i], TRUE)	(* highlight pattern *)
+				END
+			END;
+			IF del THEN r.p[i].nr := -1 END	(* delete pattern *)
+		ELSIF (keys = {ML, MM}) & ((i # -1) OR ((i = -1) & r.add)) THEN
+			new := i = -1; DEC(mx, r.x + 1); ScaleScnToPos(mx, X);
+			IF new THEN	(* add new pattern *)
+				oldX := X; dx := 0;
+				i := 0; WHILE (i # PatRange) & (r.p[i].nr # -1) DO INC(i) END;
+				IF i = PatRange THEN i := -1; new := FALSE
+				ELSE
+					s := r.g[r.c].sel; IF r.patId[s] # 0X THEN r.p[i].nr := s ELSE r.p[i].nr := 0 END;	(* kind of pattern *)
+					r.p[i].X := X; InvertPattern(r.p[i], TRUE)	(* highlight pattern *)
+				END
+			ELSE
+				oldX := r.p[i].X; ScalePosToScn(oldX, x); dx := x - mx
+			END;
+			WHILE (keys # {MM}) & (keys # {}) DO	(* track mouse *)
+				LedaSys.Mouse(keys, x, y); Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, x, y);
+				IF i # -1 THEN
+					IF MR IN keys THEN		(* cancel moving *)
+						IF new THEN InvertPattern(r.p[i], TRUE); r.p[i].nr := -1	(* delete pattern *)
+						ELSIF oldX # r.p[i].X THEN		(* set pattern to oldX *)
+							InvertPattern(r.p[i], TRUE); r.p[i].X := oldX; InvertPattern(r.p[i], TRUE)
+						END;
+						i := -1
+					ELSIF ML IN keys THEN
+						DEC(x, r.x + 1); ScaleScnToPos(x+dx, X);
+						IF X # r.p[i].X THEN
+							InvertPattern(r.p[i], TRUE); r.p[i].X := X; InvertPattern(r.p[i], TRUE)
+						END
+					END
+				END	(* IF i # -1 *)
+			END
+		END
+	END TrackPattern;
+	
+	PROCEDURE TrackRuler(F: LedaFrames.Frame);
+	(* tracks the mouse and its keys [selection of group icons; handling of patterns] *)
+		VAR x, y: INTEGER;	keys: SET;
+	BEGIN
+		REPEAT
+			LedaSys.Mouse(keys, x, y); Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, x, y);
+			IF (r.vx <= x) & (x < r.vx + r.vw) & (r.vy <= y) & (y < r.vy + r.vh) THEN	(* in visible area *)
+				IF y <= r.y+1+PatH THEN	(* pattern area *)
+					IF (keys = {ML, MM}) OR (keys = {MM, MR}) THEN TrackPattern(x, keys) END
+				ELSIF r.y+1+RulH < y THEN	(* group area *)
+					IF keys = {ML, MM} THEN HandleGroup(x, y) END
+				END
+			END;
+			WHILE (keys # {MM}) & (keys # {}) DO
+				LedaSys.Mouse(keys, x, y); Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, x, y)
+			END
+		UNTIL keys = {}
+	END TrackRuler;
+	
+	PROCEDURE SetSel(sel: INTEGER; VAR g: Group);
+	BEGIN
+		g.sel := -1;
+		IF g.w > 0 THEN
+			IF LedaSys.InRange(sel, 0, IconRange) & (g.icnId[sel] # 0X) THEN g.sel := sel
+			ELSIF ~g.noSel THEN g.sel := 0
+			END
+		END
+	END SetSel;
+	
+	PROCEDURE SetPat(nr: INTEGER; X: LONGINT; VAR p: Pattern);
+	BEGIN
+		IF LedaSys.InRange(nr, 0, IconRange) & (r.patId[nr] # 0X) & (X >= 0) THEN p.nr := nr; p.X := X
+		ELSIF (nr = -2) & (X >= 0) THEN p.nr := nr; p.X := X	(* mark ruler *)
+		ELSE p.nr := -1	(* not defined *)
+		END
+	END SetPat;
+		
+	PROCEDURE SetRuler(VAR g, nr: ARRAY OF INTEGER; VAR pos: ARRAY OF LONGINT);
+	(* sets the ruler [selected icons  in groups, position and kind of patterns] *)
+		VAR i, j: INTEGER;
+	BEGIN
+		IF LEN(nr) # LEN(pos) THEN LedaSys.Halt("LEN(nr) # LEN(pos)") END;
+		i := 0; WHILE (i < GroupRange) & (i < LEN(g)) DO SetSel(g[i], r.g[i]); INC(i) END;
+		i := 0; j := 0;
+		WHILE (i < LEN(nr)) & (j < PatRange) DO SetPat(nr[i], pos[i], r.p[j]); INC(i); INC(j) END;
+		WHILE j < PatRange DO r.p[j].nr := -1; INC(j) END;	(* entries not used *)
+	END SetRuler;
+	
+	PROCEDURE NextPattern(X: LONGINT; VAR i: INTEGER);
+		VAR j: INTEGER;	iX: LONGINT;
+	BEGIN
+		j := 0; i := -1; iX := MAX(LONGINT);
+		WHILE j # PatRange DO
+			IF (r.p[j].nr # -1) & (r.p[j].X > X) & (r.p[j].X < iX) THEN i := j; iX := r.p[j].X END;
+			INC(j)
+		END
+	END NextPattern;
+	
+	PROCEDURE GetRuler(VAR g, nr: ARRAY OF INTEGER; VAR pos: ARRAY OF LONGINT);
+	(* gets the settings of the ruler [selected icons  in groups, position and kind of patterns] *)
+	(* and sets the parameters g, nr and pos accordingly *)
+		VAR i, j: INTEGER;
+	BEGIN
+		i := 0; WHILE (i < GroupRange) & (i < LEN(g)) DO g[i] := r.g[i].sel; INC(i) END;
+		i := 0; NextPattern(MIN(LONGINT), j);
+		WHILE (j # -1) & (i < LEN(nr)) DO	(* LEN(nr) = LEN(pos) *)
+			nr[i] := r.p[j].nr; pos[i] := r.p[j].X;
+			NextPattern(pos[i], j); INC(i)
+		END;
+		WHILE i < LEN(nr) DO nr[i] := -1; INC(i) END
+	END GetRuler;
+	
+	PROCEDURE Define*(s: ARRAY OF CHAR; add, rem: BOOLEAN; newGrp: INTEGER; patId: ARRAY OF CHAR);
+	(** defines a new ruler; has to be called before DefineGroup and Track *)
+	(** s: string displayed in ruler *)
+	(** add, rem: allow to add and remove patterns in ruler *)
+	(** newGrp: group that controls shape of added [new] patterns *)
+	(** patId: id's of used patterns [in leda font]; array has to terminated by 0X character *)
+		VAR i: INTEGER;
+	BEGIN
+		LedaSys.CopyStr(s, r.s);
+		i := 0; WHILE i < GroupRange DO r.g[i].w := 0; r.g[i].h := 0; INC(i) END;	(* mark groups unused *)
+		r.add := add; r.rem := rem;
+		IF add & LedaSys.InRange(newGrp, 0, GroupRange) THEN r.c := newGrp ELSE r.c := -1 END;
+		i := 0; WHILE (patId[i] # 0X) & (i < IconRange) DO r.patId[i] := patId[i]; INC(i) END;
+		WHILE i < IconRange DO r.patId[i] := 0X; INC(i) END
+	END Define;
+
+	PROCEDURE DefineGroup*(noSel: BOOLEAN; icnId: ARRAY OF CHAR);
+	(** defines a group in a ruler with the according icons *)
+	(** noSel: true if no selection allowed *)
+	(** icnId: id's of used patterns; array has to terminated by 0X character *)
+		VAR g: Group;	i, dx, x, y, w, h: INTEGER;	pat: LONGINT;
+	BEGIN
+		IF r.s = UnDefName THEN LedaSys.Halt("ruler not defined") END;
+		g.noSel := noSel; g.sel := -1;
+		i := 0; g.w := 0; g.h := 0;
+		WHILE (icnId[i] # 0X) & (i < IconRange) DO
+			IF i # 0 THEN INC(g.w, DX) END;
+			g.icnId[i] := icnId[i];
+			LedaSys.GetIcon(icnId[i], dx, x, y, w, h, pat);
+			INC(g.w, x + w); IF y + h > g.h THEN g.h := y + h END;
+			INC(i)
+		END;
+		WHILE i < IconRange DO g.icnId[i] := 0X; INC(i) END;
+		AddGroup(g)
+	END DefineGroup;
+	
+	PROCEDURE Track*(X, Y, W: LONGINT; VAR g, nr: ARRAY OF INTEGER; VAR pos: ARRAY OF LONGINT);
+	(** tracks the mouse in the previous defined ruler; all marks in document unhighlighted *)
+	(** in: X, Y, W: location and size of the ruler [document units] *)
+	(** 	 g: selected icons in the groups; nr, pos: kind and position of patterns in the ruler *)
+	(** out: g: selected icons in the groups; nr, pos: kind and position of patterns in the ruler *)
+	BEGIN
+		IF r.s = UnDefName THEN LedaSys.Halt("ruler not defined")
+		ELSIF (LedaFrames.editF = NIL) OR IconsNotAvail() THEN WaitNoKeys
+		ELSE
+			IF r.c # -1 THEN
+				IF r.g[r.c].w = 0 THEN r.add := FALSE; r.c := -1	(* group with index r.c not defined *)
+				ELSIF r.g[r.c].noSel THEN r.g[r.c].noSel := FALSE
+				END
+			END;
+			SizeRuler(LedaFrames.editF, X, Y, W);
+			ClipRuler(LedaFrames.editF);
+			IF (r.vw > 0) & (r.vh > 0) THEN 
+				SetRuler(g, nr, pos);
+				DisplayRuler(LedaFrames.editF);
+				TrackRuler(LedaFrames.editF);
+				RestoreScreen(LedaFrames.editF);
+				GetRuler(g, nr, pos)
+			ELSE WaitNoKeys
+			END
+		END;
+		r.s := UnDefName	(* ruler not defined *)
+	END Track;
+	
+	
+BEGIN
+	r.s := UnDefName;	(* ruler not defined *)
+	nFnt := Fonts.This(NameFont)
+END LedaRuler.

@@ -1,0 +1,149 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Cache;	(* w.ibl *)
+
+IMPORT Kernel,SYSTEM;
+
+CONST
+	CS = 128;	(* maximum cache size *)
+
+TYPE
+	Elem* = POINTER TO ElemDesc;
+	ElemDesc* = RECORD
+		dirty*: BOOLEAN;
+		ref,adr*: LONGINT;
+	END;
+
+	Pool* = POINTER TO PoolDesc;
+	PoolDesc* = RECORD
+		top*: INTEGER;
+		entry*: ARRAY CS OF Elem;
+		gets*,puts*,gethits*,puthits*: LONGINT;
+	END;
+
+VAR
+	this*: Pool;
+
+PROCEDURE Search(P: Pool; adr: LONGINT; VAR ndx: INTEGER): BOOLEAN;
+VAR
+	start,stop: INTEGER;
+BEGIN
+	start:= 0; stop:= P.top + 2;
+	LOOP
+		ndx:= (start + stop) DIV 2;
+		IF (ndx = start) THEN
+			RETURN(FALSE);
+		ELSIF (adr = P.entry[ndx-1].adr) THEN
+			DEC(ndx); RETURN(TRUE);
+		ELSIF (adr > P.entry[ndx-1].adr) THEN
+			start:= ndx;
+		ELSE
+			stop:= ndx;
+		END;
+	END;
+END Search;
+
+PROCEDURE InitPool*(P: Pool);
+VAR
+	i: INTEGER;
+BEGIN
+	P.top:= -1; P.gets:= 0; P.puts:= 0; P.gethits:= 0; P.puthits:= 0;
+	FOR i:= 0 TO CS-1 DO P.entry[i]:= NIL; END;
+	this:= P;
+END InitPool;
+
+PROCEDURE Get*(P: Pool; adr: LONGINT): Elem;
+VAR
+	ndx: INTEGER;
+BEGIN
+	INC(P.gets);
+	IF Search(P,adr,ndx) THEN
+		INC(P.gethits); INC(P.entry[ndx].ref); RETURN(P.entry[ndx]);
+	ELSE
+		RETURN(NIL);
+	END;
+END Get;
+
+PROCEDURE Put*(P: Pool; adr: LONGINT): Elem;
+VAR
+	ndx: INTEGER;
+BEGIN
+	INC(P.puts);
+	IF Search(P,adr,ndx) THEN
+		INC(P.puthits); INC(P.entry[ndx].ref); P.entry[ndx].dirty:= TRUE;
+		RETURN(P.entry[ndx]);
+		RETURN(NIL);
+	ELSE
+		RETURN(NIL);
+	END;
+END Put;
+
+PROCEDURE Add*(P: Pool; e: Elem);
+VAR
+	ndx: INTEGER;
+
+	PROCEDURE ShiftUp(start,len: LONGINT);
+	CODE
+		MOV ECX,len[EBP]
+		MOV EDI,start[EBP]
+		MOV EAX,ECX
+		SUB EAX,1
+		SHL EAX,2
+		ADD EDI,EAX
+		MOV ESI,EDI
+		ADD EDI,4
+		STD
+		REP
+		MOVSD
+	END ShiftUp;
+
+BEGIN
+	IF (P.top < CS-1) & ~Search(P,e.adr,ndx) THEN
+		ShiftUp(SYSTEM.ADR(P.entry[ndx]),P.top-ndx+1);		
+		P.entry[ndx]:= e; e.ref:= Kernel.GetTimer();
+		INC(P.top);
+	END;
+END Add;
+
+PROCEDURE Remove*(P: Pool): Elem;
+VAR
+	ndx,i: INTEGER;
+	elem: Elem;
+
+	PROCEDURE ShiftDn(start,len: LONGINT);
+	CODE
+		MOV ECX,len[EBP]
+		MOV ESI,start[EBP]
+		MOV EDI,ESI
+		ADD ESI,4
+		CLD
+		REP
+		MOVSD
+	END ShiftDn;
+
+BEGIN
+	IF (P.top < CS-1) THEN
+		elem:= NIL;
+	ELSE
+		ndx:= 0;
+		FOR i:= 0 TO P.top DO
+			IF (P.entry[i].ref < P.entry[ndx].ref) THEN ndx:= i; END;
+		END;
+		elem:= P.entry[ndx]; DEC(P.top);
+		ShiftDn(SYSTEM.ADR(P.entry[ndx]),P.top-ndx+1);
+	END;
+	RETURN(elem);
+END Remove;
+
+END Cache.

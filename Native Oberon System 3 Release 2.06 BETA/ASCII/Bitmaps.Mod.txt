@@ -1,0 +1,773 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Bitmaps;
+
+(* ARD, 08.12.94 *)
+(* pjm 08.02.96, ported to Native Oberon 2.05 *)
+
+IMPORT Display, SYSTEM;
+
+TYPE	
+	Bitmap* = POINTER TO BitmapDesc;
+	BitmapDesc* = RECORD
+		width*, height*, depth* : INTEGER;
+		wth*, address* : LONGINT;
+	END;
+
+PROCEDURE Define*(B: Bitmap; width, height, depth: INTEGER; address: LONGINT);
+BEGIN 
+	B.width := width;
+	B.wth := width;
+	B.height := height;
+	B.depth := depth;
+	B.address := address;
+END Define;
+
+PROCEDURE Get*(B: Bitmap; X, Y: INTEGER): INTEGER;
+VAR addr: LONGINT; ch: CHAR;
+BEGIN  
+	addr := B.address + Y*B.wth + X; SYSTEM.GET(addr, ch); 
+	RETURN ORD(ch)
+END Get;
+
+PROCEDURE Clear4(addr, size: LONGINT);
+CODE
+	CLD
+	MOV EDI, addr[EBP]
+	MOV ECX, size[EBP]
+	XOR EAX, EAX
+	REP
+	STOSD
+END Clear4;
+
+PROCEDURE Clear*(B: Bitmap);
+VAR addr, size: LONGINT;
+BEGIN 
+	size := B.height * B.wth; addr := B.address;
+	IF size > 3 THEN
+		Clear4(addr, size DIV 4);
+		INC(addr, size - size MOD 4);
+		size := size MOD 4
+	END;
+	WHILE size # 0 DO SYSTEM.PUT(addr, 0X); INC(addr); DEC(size) END
+END Clear;
+
+PROCEDURE Dot*(B: Bitmap; col, X, Y, mode: INTEGER);
+VAR addr: LONGINT; s: SET;
+BEGIN  
+	addr := B.address + Y*B.wth + X;
+	IF mode = Display.invert THEN SYSTEM.GET(addr, s); SYSTEM.PUT(addr, SYSTEM.VAL(CHAR, s/SYSTEM.VAL(SET, col))) 
+	ELSIF mode = Display.paint THEN SYSTEM.GET(addr, s); SYSTEM.PUT(addr, SYSTEM.VAL(CHAR, s+SYSTEM.VAL(SET, col))) 
+	ELSE SYSTEM.PUT(addr, CHR(col)) END;
+END Dot;
+
+PROCEDURE CopyBlock*(sB, dB: Bitmap; SX, SY, W, H, DX, DY, mode: INTEGER);
+VAR SourceWth, DestinationWth: LONGINT;
+CODE
+CBSource:
+	AND DWORD H[EBP], 0FFFFH
+	AND DWORD W[EBP], 0FFFFH
+	MOV ESI, sB[EBP]
+	MOV EAX, 8[ESI]
+	MOV SourceWth[EBP], EAX
+	MOVSX EBX, SY[EBP]
+	IMUL EAX, EBX
+	MOVSX ECX, SX[EBP]
+	ADD EAX, ECX
+	MOV ESI, 12[ESI]
+	ADD ESI, EAX				; source address
+CBDest:
+	MOV EDI, dB[EBP]
+	MOV EAX, 8[EDI]
+	MOV DestinationWth[EBP], EAX
+	MOVSX ECX, DY[EBP]
+	IMUL EAX, ECX 
+	MOVSX EDX, WORD 16[EBP]	; DX
+	ADD EAX, EDX
+	MOV EDI, 12[EDI]
+	ADD EDI, EAX				; destination address
+	MOVZX EAX, SX[EBP]
+	CMP BX,CX
+	JL CBTopDown				; jump if DY <= SY
+CBBottomUp:
+	CMP AX,DX
+	JGE LLCtoURC
+LRCtoULC:
+	MOV EAX, DWORD W[EBP]
+	ADD SourceWth[EBP], EAX
+	ADD DestinationWth[EBP], EAX
+	DEC EAX
+	ADD ESI, EAX
+	ADD EDI, EAX				; lower right corner
+	MOV EAX, -1				; from right to left
+	JMP CBMode
+LLCtoURC:
+	MOV EAX, DWORD W[EBP]
+	SUB SourceWth[EBP], EAX
+	SUB DestinationWth[EBP], EAX
+	MOV EAX, 1					; from left to right, default case
+	JMP CBMode
+CBTopDown:
+	CMP AX, DX
+	JGE ULCtoLRC				; jump if DX <= SX
+URCtoLLC:
+	MOV EAX, DWORD H[EBP]
+	DEC EAX
+	MOV ECX, EAX
+	MOV EDX, SourceWth[EBP]
+	MOV EBX, EDX
+	IMUL EAX, EDX 
+	ADD ESI, EAX
+	MOV EAX, DWORD W[EBP]
+	NEG EBX
+	ADD EBX, EAX
+	MOV SourceWth[EBP], EBX
+	MOV EDX, DestinationWth[EBP]
+	MOV EBX, EDX
+	NEG EBX
+	ADD EBX, EAX
+	MOV DestinationWth[EBP], EBX
+	DEC EAX
+	ADD ESI, EAX				; source : upper right corner
+	ADD EDI, EAX
+	MOV EAX, ECX
+	IMUL EAX, EDX
+	ADD EDI, EAX				; destination : upper right corner
+	MOV EAX, -1				; from right to left
+	JMP CBMode
+ULCtoLRC:
+	MOV EAX, DWORD H[EBP]
+	DEC EAX
+	MOV ECX, EAX
+	MOV EDX, SourceWth[EBP]
+	MOV EBX, EDX
+	IMUL EAX, EDX 
+	ADD ESI, EAX				; source : upper left corner
+	MOV EAX, DWORD W[EBP]
+	NEG EBX
+	SUB EBX, EAX
+	MOV SourceWth[EBP], EBX	; adjust offset to next row
+	MOV EDX, DestinationWth[EBP]
+	MOV EBX, EDX
+	NEG EBX
+	SUB EBX, EAX
+	MOV DestinationWth[EBP], EBX
+	MOV EAX, ECX
+	IMUL EAX, EDX 
+	ADD EDI, EAX				; destination : upper left coner
+	MOV EAX, 1					; from left to right
+CBMode:
+	CMP mode[EBP], 1
+	JG CBIMode	
+CBRMode:
+	CMP EAX, 0
+	JL RCBr2l						; from right to left...
+RCBl2r:
+	MOV BX, H[EBP]
+RCBl2rRowLoop:
+	JE CBEnd
+	SAL EAX, 2
+	MOV ECX, DWORD W[EBP]
+RCBl2rColLoop:
+	CMP ECX, 4
+	JL RCBl2rColRemain
+	MOV EDX, [ESI] 
+	MOV [EDI], EDX
+	ADD ESI, EAX
+	ADD EDI, EAX
+	SUB ECX,4
+	JMP RCBl2rColLoop
+RCBl2rColRemain:
+	SAR EAX, 2
+RCBl2rColRLoop:
+	CMP ECX,0
+	JE RCBl2rColEnd
+	MOV DL, [ESI] 
+	MOV [EDI], DL
+	ADD ESI, EAX
+	ADD EDI, EAX
+	DEC ECX
+	JMP RCBl2rColRLoop
+RCBl2rColEnd:
+	ADD ESI, SourceWth[EBP]
+	ADD EDI, DestinationWth[EBP]
+	DEC BX
+	JMP RCBl2rRowLoop
+
+RCBr2l:
+	MOV BX, H[EBP]
+RCBr2lRowLoop:
+	JE CBEnd
+	SAL EAX, 2
+	SUB ESI, 3
+	SUB EDI, 3
+	MOV ECX, DWORD W[EBP]
+RCBr2lColLoop:
+	CMP ECX, 4
+	JL RCBr2lColRemain
+	MOV EDX, [ESI] 
+	MOV [EDI], EDX
+	ADD ESI, EAX
+	ADD EDI, EAX
+	SUB ECX,4
+	JMP RCBr2lColLoop
+RCBr2lColRemain:
+	SAR EAX, 2
+	ADD ESI, 3
+	ADD EDI, 3
+RCBr2lColRLoop:
+	CMP ECX,0
+	JE RCBr2lColEnd
+	MOV DL, [ESI] 
+	MOV [EDI], DL
+	ADD ESI, EAX
+	ADD EDI, EAX
+	DEC ECX
+	JMP RCBr2lColRLoop
+RCBr2lColEnd:
+	ADD ESI, SourceWth[EBP]
+	ADD EDI, DestinationWth[EBP]
+	DEC BX
+	JMP RCBr2lRowLoop
+
+CBIMode:
+	CMP EAX, 0
+	JL ICBr2l						; from right to left...
+ICBl2r:
+	MOV BX, H[EBP]
+ICBl2rRowLoop:
+	JE CBEnd
+	SAL EAX, 2
+	MOV ECX, DWORD W[EBP]
+ICBl2rColLoop:
+	CMP ECX, 4
+	JL ICBl2rColRemain
+	MOV EDX, [ESI] 
+	XOR [EDI], EDX
+	ADD ESI, EAX
+	ADD EDI, EAX
+	SUB ECX,4
+	JMP ICBl2rColLoop
+ICBl2rColRemain:
+	SAR EAX, 2
+ICBl2rColRLoop:
+	CMP ECX,0
+	JE ICBl2rColEnd
+	MOV DL, [ESI] 
+	XOR [EDI], DL
+	ADD ESI, EAX
+	ADD EDI, EAX
+	DEC ECX
+	JMP ICBl2rColRLoop
+ICBl2rColEnd:
+	ADD ESI, SourceWth[EBP]
+	ADD EDI, DestinationWth[EBP]
+	DEC BX
+	JMP ICBl2rRowLoop
+
+ICBr2l:
+	MOV BX, H[EBP]
+ICBr2lRowLoop:
+	JE CBEnd
+	SAL EAX, 2
+	SUB ESI, 3
+	SUB EDI, 3
+	MOV ECX, DWORD W[EBP]
+ICBr2lColLoop:
+	CMP ECX, 4
+	JL ICBr2lColRemain
+	MOV EDX, [ESI] 
+	XOR [EDI], EDX
+	ADD ESI, EAX
+	ADD EDI, EAX
+	SUB ECX,4
+	JMP ICBr2lColLoop
+ICBr2lColRemain:
+	SAR EAX, 2
+	ADD ESI, 3
+	ADD EDI, 3
+ICBr2lColRLoop:
+	CMP ECX,0
+	JE ICBr2lColEnd
+	MOV DL, [ESI] 
+	XOR [EDI], DL
+	ADD ESI, EAX
+	ADD EDI, EAX
+	DEC ECX
+	JMP ICBr2lColRLoop
+ICBr2lColEnd:
+	ADD ESI, SourceWth[EBP]
+	ADD EDI, DestinationWth[EBP]
+	DEC BX
+	JMP ICBr2lRowLoop
+CBEnd:
+END CopyBlock;
+
+PROCEDURE CopyPattern*(B: Bitmap; col: INTEGER; pat: LONGINT; X, Y, mode: INTEGER);
+VAR BitmapWth, PatWth, DestAdr, PatHeight, DestinationWth: LONGINT;
+CODE
+	AND DWORD X[EBP], 0FFFFH
+	AND DWORD Y[EBP], 0FFFFH
+	MOV ESI, pat[EBP]
+	MOV EDI, B[EBP]
+	MOVZX ECX, BYTE 0[ESI]	; pattern width
+	MOV PatWth[EBP], ECX
+	MOV EDX, ECX
+	MOV EAX, DWORD X[EBP]
+	ADD EAX, ECX
+	MOV EBX,8[EDI]
+	MOV BitmapWth[EBP], EBX
+	CMP EAX, EBX
+	JLE CPClipV
+CPClipH:
+	MOV EDX, EBX
+	SUB EDX, DWORD X[EBP]
+CPClipV:
+	MOV DestAdr[EBP], EDX
+	MOVZX EAX, BYTE 1[ESI]	; pattern height
+	CMP EAX, 0
+	JE CopyPatEnd
+	MOV EDX, DWORD Y[EBP]
+	ADD EDX, EAX
+	MOV EBX, 2[EDI]
+	CMP EDX, EBX
+	JLE CPPrepare
+	MOV EAX, EBX
+	SUB EAX, DWORD Y[EBP]
+CPPrepare:
+	MOV PatHeight[EBP], EAX
+	ADD ESI, 2							; source index
+	MOV EBX, 8[EDI]
+	NEG ECX
+	ADD ECX, EBX
+	MOV DestinationWth[EBP], ECX	; offset to next row
+	MOVZX EAX, Y[EBP]
+	IMUL EAX, EBX 
+	ADD EAX, DWORD X[EBP]
+	MOV ECX, 12[EDI]
+	ADD EAX, ECX
+	MOV EDI, EAX					; destination index
+	MOV EBX, EAX
+	ADD EBX, DestAdr[EBP]
+CPMode:
+	MOV DX, mode[EBP]
+	CMP DX, 1
+	JE CPPaintMode
+	JG CPInvertMode
+CPReplaceMode:
+	MOV DH, BYTE col[EBP]
+	MOV ECX, PatHeight[EBP]
+RCPRowLoop:
+	JE CopyPatEnd
+	MOV AL, 1
+	MOV ECX, PatWth[EBP]
+RCPColLoop:
+	CMP CX,0
+	JE RCPColEnd
+	DEC CX
+	MOV DL, [ESI]
+	AND DL, AL
+	ROL AL, 1
+	CMP AL,1
+	JNE RCPDispl
+	INC ESI
+RCPDispl:
+	CMP DL,0
+	JE RCPClearPEL
+	CMP EDI, EBX
+	JGE RCPInc
+	MOV [EDI], DH
+RCPInc:
+	INC EDI
+	JMP RCPColLoop
+RCPClearPEL:
+	CMP EDI, EBX
+	JGE RCPInc
+	MOV BYTE [EDI], 0
+	INC EDI	
+	JMP RCPColLoop
+RCPColEnd:
+	ADD EBX, BitmapWth[EBP]
+	ADD EDI, DestinationWth[EBP]
+	CMP AL,1
+	JE RCPDecHeight
+	INC ESI									; ignore garbage
+RCPDecHeight:
+	DEC PatHeight[EBP]
+	JMP RCPRowLoop
+
+CPPaintMode:
+	MOV DH, BYTE col[EBP]
+	MOV ECX, PatHeight[EBP]
+PCPRowLoop:
+	CMP PatHeight[EBP], 0
+	JE CopyPatEnd
+	MOV AL, 1
+	MOV ECX, PatWth[EBP]
+PCPColLoop:
+	CMP CX,0
+	JE PCPColEnd
+	DEC CX
+	MOV DL, [ESI]
+	AND DL, AL
+	ROL AL, 1
+	CMP AL,1
+	JNE PCPDispl
+	INC ESI
+PCPDispl:
+	CMP DL,0
+	JE PCPClearPEL
+	CMP EDI, EBX
+	JGE PCPInc
+	MOV [EDI], DH 
+PCPInc:
+	INC EDI
+	JMP PCPColLoop
+PCPClearPEL:
+	INC EDI
+	JMP PCPColLoop
+PCPColEnd:
+	ADD EBX, BitmapWth[EBP]
+	ADD EDI, DestinationWth[EBP]
+	CMP AL,1
+	JE PCPDecHeight
+	INC ESI
+PCPDecHeight:
+	DEC PatHeight[EBP]
+	JMP PCPRowLoop
+
+CPInvertMode:
+	MOV DH, BYTE col[EBP]
+	MOV ECX, PatHeight[EBP]
+ICPRowLoop:
+	CMP PatHeight[EBP], 0
+	JE CopyPatEnd
+	MOV AL, 1
+	MOV ECX, PatWth[EBP]
+ICPColLoop:
+	CMP CX,0
+	JE ICPColEnd
+	DEC CX
+	MOV DL, [ESI]
+	AND DL, AL
+	ROL AL, 1
+	CMP AL,1
+	JNE ICPDispl
+	INC ESI
+ICPDispl:
+	CMP DL,0
+	JE ICPClearPEL
+	CMP EDI, EBX
+	JGE ICPInc
+	XOR [EDI], DH
+ICPInc:
+	INC EDI
+	JMP ICPColLoop
+ICPClearPEL:
+	INC EDI
+	JMP ICPColLoop
+ICPColEnd:
+	ADD EBX, BitmapWth[EBP]
+	ADD EDI, DestinationWth[EBP]
+	CMP AL,1
+	JE ICPDecHeight
+	INC ESI
+ICPDecHeight:
+	DEC PatHeight[EBP]
+	JMP ICPRowLoop
+CopyPatEnd:
+END CopyPattern;
+
+PROCEDURE ReplConst1(w, addr0, pat: LONGINT);
+CODE
+	MOV ECX, w[EBP]
+	SHR ECX, 2
+	MOV EDI, addr0[EBP]
+	MOV EDX, pat[EBP]
+RCinv:
+	XOR [EDI], EDX
+	ADD EDI, 4
+	LOOP RCinv
+END ReplConst1;
+
+PROCEDURE ReplConst2(w, addr0, pat: LONGINT);
+CODE
+	MOV ECX, w[EBP]
+	SHR ECX, 2
+	MOV EDI, addr0[EBP]
+	MOV EAX, pat[EBP]
+	REP
+	STOSD
+END ReplConst2;
+
+PROCEDURE ReplConst*(B: Bitmap; col, X, Y, W, H, mode: INTEGER);
+VAR addr, addr0, pat, w: LONGINT; s: SET;
+BEGIN 
+	addr := B.address + B.wth*Y + X;
+	pat := col + col*100H + col*10000H + col*1000000H;
+	IF mode = Display.invert THEN
+		WHILE H > 0 DO w := W; addr0 := addr;
+			WHILE w MOD 4 # 0 DO SYSTEM.GET(addr0, s); SYSTEM.PUT(addr0, SYSTEM.VAL(CHAR, s/SYSTEM.VAL(SET, col))); DEC(w); INC(addr0) END;
+			IF w > 0 THEN
+				ReplConst1(w, addr0, pat)
+			END;
+			INC(addr, B.wth); DEC(H)
+		END
+	ELSE
+		WHILE H > 0 DO w := W; addr0 := addr;
+			WHILE w MOD 4 # 0 DO SYSTEM.PUT(addr0, CHR(col)); DEC(w); INC(addr0) END;
+			IF w > 0 THEN
+				ReplConst2(w, addr0, pat)
+			END;
+			INC(addr, B.wth); DEC(H)
+		END
+	END;
+END ReplConst;
+
+PROCEDURE ReplPattern*(B: Bitmap; col: INTEGER; pat: LONGINT; X, Y, W, H, mode: INTEGER);
+VAR AreaHeight, PatWth, PatHeight, PatH, SourceAdr, DestinationWth: LONGINT;
+CODE
+	CMP W[EBP], 0
+	JE ReplPatEnd
+	CMP H[EBP], 0
+	JE ReplPatEnd
+ReplPattern:
+	AND DWORD W[EBP], 0FFFFH
+	AND DWORD X[EBP], 0FFFFH
+	MOVSX EAX, H[EBP]
+	MOV AreaHeight[EBP],EAX
+	MOV ESI, pat[EBP]
+	MOVZX ECX, BYTE 0[ESI]	; pattern width
+	MOV PatWth[EBP], ECX
+	MOVZX EAX, BYTE 1[ESI]	; pattern height
+	MOV PatHeight[EBP], EAX
+	ADD ESI, 2							; source index
+	MOVSX EBX, Y[EBP]
+	
+	MOV EDX, ECX					; Y-Offset
+RPLabel1:
+	CMP EBX, PatHeight[EBP]
+	JL RPLabel2
+	SUB EBX, PatHeight[EBP]
+	JMP RPLabel1
+RPLabel2:
+	SUB EAX, EBX
+	MOV PatH[EBP], EAX
+	SHR EDX, 3
+	IMUL EBX, EDX
+	MOV SourceAdr[EBP], ESI
+	ADD ESI, EBX
+	
+	MOV EDI, B[EBP]
+	MOV EDX, 8[EDI]
+	MOV EBX, EDX
+	SUB EDX, DWORD W[EBP]
+	MOV DestinationWth[EBP], EDX	; offset to next row
+	MOVZX EAX, Y[EBP]
+	IMUL EAX, EBX 
+	ADD EAX, DWORD X[EBP]
+	ADD EAX, 12[EDI]
+	MOV EDI, EAX					; destination index
+	
+RPMode:
+	CMP mode[EBP], 1
+	JE RPPaintMode
+	JG RPInvertMode
+	
+RPReplaceMode:
+	MOV BL, BYTE col[EBP]
+
+RRPRowLoop:
+	CMP AreaHeight[EBP], 0			; X-Offset
+	JLE ReplPatEnd
+	
+	CMP PatH[EBP],0
+	JE RRPpatRowEnd
+RRPpatRowLoop:
+	CMP PatWth[EBP], 16
+	JE RPR16
+	MOV EDX, [ESI]
+	ADD ESI, 4
+	JMP RPRCont
+RPR16:
+	MOV DX, [ESI]
+	SHL EDX, 16
+	MOV DX, [ESI]
+	ADD ESI, 2
+RPRCont:
+	MOV ECX, DWORD X[EBP]
+	ROR EDX, CL
+	MOV ECX, DWORD W[EBP]
+	
+	MOV EAX, 1
+	CMP ECX, 0
+RRPColLoop:
+	JE RRPColEnd
+	TEST EDX, EAX
+	JNE RRPSet
+	MOV BYTE [EDI], 0
+	JMP RRPLabel3
+RRPSet:
+	MOV [EDI], BL
+RRPLabel3:
+	ROL EAX, 1
+	INC EDI
+	DEC ECX
+	JMP RRPColLoop
+RRPColEnd:
+	DEC PatH[EBP]
+	ADD EDI, DestinationWth[EBP]
+	DEC AreaHeight[EBP]
+	JMP RRPRowLoop
+RRPpatRowEnd:
+	MOV ESI, SourceAdr[EBP]
+	MOV EAX, PatHeight[EBP]
+	MOV PatH[EBP], EAX
+	JMP RRPpatRowLoop
+
+RPPaintMode:
+	MOV BL, BYTE col[EBP]
+	
+PRPRowLoop:
+	CMP AreaHeight[EBP], 0			; X-Offset
+	JE ReplPatEnd
+	
+	CMP PatH[EBP],0
+	JLE PRPpatRowEnd
+PRPpatRowLoop:
+	CMP PatWth[EBP], 16
+	JE PPR16
+	MOV EDX, [ESI]
+	ADD ESI, 4
+	JMP PPRCont
+PPR16:
+	MOV DX, [ESI]
+	SHL EDX, 16
+	MOV DX, [ESI]
+	ADD ESI, 2
+PPRCont:
+	MOV ECX, DWORD X[EBP]
+	ROR EDX, CL
+	MOV ECX, DWORD W[EBP]
+	
+	MOV EAX, 1
+	CMP ECX, 0
+PRPColLoop:
+	JE PRPColEnd
+	TEST EDX, EAX
+	JE PRPnotSet
+	MOV [EDI], BL
+PRPnotSet:
+	ROL EAX, 1
+	INC EDI
+	DEC ECX
+	JMP PRPColLoop
+PRPColEnd:
+	DEC PatH[EBP]
+	ADD EDI, DestinationWth[EBP]
+	DEC AreaHeight[EBP]
+	JMP PRPRowLoop
+PRPpatRowEnd:
+	MOV ESI, SourceAdr[EBP]
+	MOV EAX, PatHeight[EBP]
+	MOV PatH[EBP], EAX
+	JMP PRPpatRowLoop
+
+RPInvertMode:
+	MOV BL, BYTE col[EBP]
+
+IRPRowLoop:
+	CMP AreaHeight[EBP], 0			; X-Offset
+	JLE ReplPatEnd
+	
+	CMP PatH[EBP],0
+	JE IRPpatRowEnd
+IRPpatRowLoop:
+	CMP PatWth[EBP], 16
+	JE IPR16
+	MOV EDX, [ESI]
+	ADD ESI, 4
+	JMP IPRCont
+IPR16:
+	MOV DX, [ESI]
+	SHL EDX, 16
+	MOV DX, [ESI]
+	ADD ESI, 2
+IPRCont:
+	MOV ECX, DWORD X[EBP]
+	ROR EDX, CL
+	MOV ECX, DWORD W[EBP]
+	
+	MOV EAX, 1
+	CMP ECX, 0
+IRPColLoop:
+	JE IRPColEnd
+	TEST EDX, EAX
+	JE IRPnotSet
+	XOR [EDI], BL
+IRPnotSet:
+	ROL EAX, 1
+	INC EDI
+	DEC ECX
+	JMP IRPColLoop
+IRPColEnd:
+	DEC PatH[EBP]
+	ADD EDI, DestinationWth[EBP]
+	DEC AreaHeight[EBP]
+	JMP IRPRowLoop
+IRPpatRowEnd:
+	MOV ESI, SourceAdr[EBP]
+	MOV EAX, PatHeight[EBP]
+	MOV PatH[EBP], EAX
+	JMP IRPpatRowLoop
+
+ReplPatEnd:
+END ReplPattern;
+
+PROCEDURE DisplayBlock*(B: Bitmap; SX, SY, W, H, DX, DY, mode: INTEGER);
+BEGIN 
+	Display.DisplayBlock(SYSTEM.VAL(LONGINT, B), SX, SY, W, H, DX, DY, mode);
+END DisplayBlock;
+
+PROCEDURE GetPix*(VAR addr: LONGINT; VAR buf: SYSTEM.BYTE; depth: INTEGER);
+VAR s1, s2, s3: SHORTINT;
+BEGIN 
+	IF depth = 8 THEN SYSTEM.GET(addr, buf); INC(addr)
+	ELSIF depth = 4 THEN 
+		SYSTEM.GET(addr, s1); INC(addr); SYSTEM.GET(addr, s2); INC(addr); buf := s2*16 + (s1 MOD 16)
+	ELSE (* depth = 1 *)
+		s1 := 0; s2 := 0;
+		WHILE s1 < 8 DO SYSTEM.GET(addr, s3); INC(addr); INC(s1); s2 := s2*2 + s3 MOD 2 END; buf := s2
+	END;
+END GetPix;
+
+PROCEDURE PutPix*(VAR addr: LONGINT; border: LONGINT; buf: SYSTEM.BYTE; depth: INTEGER);
+VAR s1: SHORTINT;
+BEGIN 
+	IF (depth = 8) & (addr < border) THEN SYSTEM.PUT(addr, buf); INC(addr)
+	ELSIF depth = 4 THEN 
+		IF addr < border THEN SYSTEM.PUT(addr, SYSTEM.VAL(SHORTINT, buf) MOD 16); INC(addr) END; 
+		IF addr < border THEN SYSTEM.PUT(addr, SYSTEM.VAL(SHORTINT, buf) DIV 16 MOD 16); INC(addr) END; 
+	ELSE (* depth = 1 *)
+		s1 := 0;
+		WHILE s1 < 8 DO 
+			IF addr < border THEN 
+				IF ODD(SYSTEM.VAL(SHORTINT, buf)) THEN SYSTEM.PUT(addr, 15) ELSE SYSTEM.PUT(addr, 0) END
+			END;
+			INC(s1); INC(addr); buf := SYSTEM.VAL(SHORTINT, buf) DIV 2;
+		END
+	END;
+END PutPix;
+
+END Bitmaps.

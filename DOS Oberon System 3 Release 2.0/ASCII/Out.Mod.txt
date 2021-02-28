@@ -1,0 +1,38 @@
+MODULE Out;	(* Stream-oriented text output, MR 1992, NW 12.1.93, JG 26.7.93 *)
+  IMPORT Texts, Oberon;
+
+  VAR W: Texts.Writer;
+
+PROCEDURE Open*;
+  VAR t, d: LONGINT;
+BEGIN Texts.WriteString(W, "Out.Open");
+  Oberon.GetClock(t, d); Texts.WriteDate(W, t, d); Texts.WriteLn(W);
+  Texts.Append(Oberon.Log, W.buf)
+END Open;
+
+PROCEDURE Char* (ch: CHAR);
+BEGIN Texts.Write(W, ch); Texts.Append(Oberon.Log, W.buf)
+END Char;
+
+PROCEDURE String* (str: ARRAY OF CHAR);
+BEGIN Texts.WriteString(W, str); Texts.Append(Oberon.Log, W.buf)
+END String;
+
+PROCEDURE Int* (i, n: LONGINT);
+BEGIN Texts.WriteInt(W, i, n); Texts.Append(Oberon.Log, W.buf)
+END Int;
+
+PROCEDURE Real* (x: REAL; n: INTEGER);
+BEGIN Texts.WriteRealFix(W, x, n, 2, 0); Texts.Append(Oberon.Log, W.buf)
+END Real;
+
+PROCEDURE LongReal* (x: LONGREAL; n: INTEGER);
+BEGIN Texts.WriteLongRealFix(W, x, n, 2, 0); Texts.Append(Oberon.Log, W.buf)
+END LongReal;
+
+PROCEDURE Ln*;
+BEGIN Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+END Ln;
+
+BEGIN Texts.OpenWriter(W)
+END Out.

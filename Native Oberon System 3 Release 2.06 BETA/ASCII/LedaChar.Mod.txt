@@ -1,0 +1,1375 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaChar;	(* uh, Sun, 24-Oct-1993 *)
+
+	IMPORT LedaBase, LedaSys, LedaCtrl, Display;
+	
+CONST
+	UnNamed = "unnamed";	Anon = "anonymous";	NotDef = -1;
+	
+	(*--- id's for LedaBase.CtrlMsg ---*)
+	FileId = 4;	(* defined in LedaBase *)
+	
+	(*--- format control ---*)
+	LF = 0AX;	(* line feed *)
+	
+	(*--- tabulator control ---*)
+	TabRange* = 32;	ColMiddle = -2;	ColRight = -3;
+	
+	(*--- inset control ---*)
+	RedIns = 012X;  (* CTRL - R [reduce] *)	EnlIns = 05X;  (* CTRL - E [enlarge] *)
+	DefMargName = "marginal";
+	
+	(*--- line control ---*)
+	LineCh = 0CX;	(* CTRL - L *)
+	MinThick* = LedaBase.Point * 72 DIV 300;
+	
+	(*--- filler control ---*)
+	FilCh = 06X;	(* CTRL - D *)
+	DefFilW = 12;	(* screen units *)
+	
+	(*--- wrap control ---*)
+	WrapCh = 17X;	(* CTRL - W *)
+	DefWdt = 5;	DefWrap = 2;	MaxWrap = 24;
+	
+	(*--- predefined control kinds ---*)		
+	FormatId = 4;	TabPosId = 9;	TabulatorId = 10;	InsSpecId = 11;	InsetId = 12;
+	LineSpecId = 13;	LineId = 14;	FillerId = 20;	WrapId = 21;
+		(* predefined controls in LedaBase:  id's 1..3 [not used: 5]  *)
+		(* predefined controls in LedaCtrl: id's 7..8 [not used: 6] *)
+		(* predefined controls in LedaChar: id's 4, 9..14, 20..21 [not used: 22..31] *)
+		(* predefined controls in LedaBox: id's 15..16  [not used: 17..19] *)
+
+TYPE
+	(*--- format control ---*)
+	Format* = POINTER TO FormatDsc;
+	FormatDsc* = RECORD 
+		(LedaBase.PieceCtrlDsc)
+		rtId*: LONGINT;	(* runtime identification *)
+		name*: LedaSys.Name;
+		var*: LedaBase.FormatDsc
+	END;
+	
+	(*--- tabulator control ---*)
+	TabData* = RECORD
+		name*: LedaSys.Name;
+		pos*: ARRAY TabRange OF LONGINT;	(* tab stops; sorted *)
+		typ*: ARRAY TabRange OF CHAR;	(* format kind of stop ["L"/"C"/"R"] *)
+	END;
+	
+	TabPos = POINTER TO TabPosDsc;
+	TabPosDsc = RECORD
+		(LedaBase.ControlDsc)
+		rtId: LONGINT;	(* runtime identification *)
+		data: TabData
+	END;
+		
+	Tabulator* = POINTER TO TabulatorDsc;
+	TabulatorDsc* = RECORD
+		(LedaBase.PieceCtrlDsc)
+		W*: LONGINT;	(* width to tabulator stop in document units *)
+		w*: INTEGER;	(* width to tabulator stop in screen units *)
+		stops: TabPos;	(* reference to tabulator positions *)
+	END;
+	
+	(*--- inset control ---*)
+	InsData* = RECORD
+		name*: LedaSys.Name;
+		margin*: LONGINT
+	END;
+	
+	InsSpec = POINTER TO InsSpecDsc;
+	InsSpecDsc = RECORD
+		(LedaBase.ControlDsc)
+		rtId: LONGINT;	(* runtime identification *)
+		data: InsData
+	END;
+	
+	Inset* = POINTER TO InsetDsc;
+	InsetDsc* = RECORD
+		(LedaBase.PieceCtrlDsc)
+		W*: LONGINT;	(* width of control in document units *)
+		w*: INTEGER;	(* width of control in screen units *)
+		spec: InsSpec;
+		mrg: LONGINT	(* margin; temporary used in InsWidth *)
+	END;
+
+	(*--- line control ---*)
+	LinDat* = RECORD
+		name*: LedaSys.Name;
+		width*: LONGINT;	(* line width; 0 -> column width *)
+		thick*: LONGINT;	(* thickness of line *)
+		dy*: LONGINT;	(* vertical offset *)
+		clr*: INTEGER	(* color of line *)
+	END;
+	
+	LineSpec = POINTER TO LineSpecDsc;
+	LineSpecDsc = RECORD
+		(LedaBase.ControlDsc)
+		rtId: LONGINT;	(* runtime identification *)
+		data: LinDat
+	END;
+	
+	Line* = POINTER TO LineDsc;
+	LineDsc* = RECORD
+		(LedaBase.PieceCtrlDsc)
+		W*: LONGINT;	(* width of control in document units *)
+		w*: INTEGER;	(* width of control in screen units *)
+		spec: LineSpec
+	END;
+	
+	(*--- filler control ---*)
+	Filler* = POINTER TO FillerDsc;
+	FillerDsc* = RECORD
+		(LedaBase.PieceCtrlDsc)
+		W*: LONGINT;
+		w*: INTEGER;
+		scale*: INTEGER	(* percent value *)
+	END;
+	
+	(*--- wrap control ---*)
+	Wrap* = POINTER TO WrapDsc;
+	WrapDsc* = RECORD
+		(LedaBase.PieceCtrlDsc)
+		rtId*: LONGINT;	(* runtime identification *)
+		name*: LedaSys.Name;
+		wrap*: LONGINT;
+		style*: LedaBase.Style
+	END;
+	
+	
+VAR
+	(*--- format control ---*)
+	formRTId: LONGINT;	(* run time id for format controls *)
+	formDoOp: LedaBase.CtrlProc;	(* control handle for format control *)
+	(*--- tabulator control ---*)
+	tabRTId: LONGINT;	(* run time id for tab stops control *)
+	tabPosDoOp: LedaBase.CtrlProc;	(* control handle for tab stops control *)
+	tabDoOp: LedaBase.CtrlProc;	(* control handle for tabulator control *)
+	(*--- inset control ---*)
+	insRTId: LONGINT;	(* run time id for inset control *)
+	insSpecDoOp: LedaBase.CtrlProc;	(* control handle for inset specification *)
+	insDoOp: LedaBase.CtrlProc;	(* control handle for inset control *)
+	defInset: Inset;	(* default control *)
+	(*--- line control ---*)
+	lineRTId: LONGINT;	(* run time id *)
+	lineSpecDoOp: LedaBase.CtrlProc;		(* specification handle *)
+	lineDoOp: LedaBase.CtrlProc;		(* control handle *)
+	(*--- filler control ---*)
+	filDoOp: LedaBase.CtrlProc;		(* control handle *)
+	(*--- wrap control ---*)
+	wrapRTId: LONGINT;	(* run time id for wrap controls *)
+	wrapDoOp: LedaBase.CtrlProc;	(* control handle for wrap control *)
+	
+
+	(*--- notes on LedaBase.CtrlMsg with id = LedaBase.ReplaceId:
+		- messages is sent to controls in buffer [before adding to text]
+			or to controls in piece list of text
+		- purpose of message:
+			can the control receiving this message be replaced by the control
+			given in the message m.ctrl
+		- field m.ch specifies condition of replacement:
+			m.ch = "X": no special conditions
+			m.ch = "=": control of same type and kind [normally same name]
+			m.ch = "I": identic control
+		- note on condition m.ch = "I":
+			controls are identical if they are the same instance [ctrl0 = ctrl1]; 
+			unique controls can never be identical even if they reference the same data;
+			controls implementing an anonymous style are identical too if the have the same settings
+		- the control receiving this message determines if a replacement is possible;
+			if the m.ctrlId field is set to 1 the replacement of the control with 
+			the control given in the message is allowed
+			--> m.ctrlId = 1:  replace control with m.ctrl 
+		- general condition of replacement:
+			- multiple referenced controls: 
+				ch = "X" -> exchange okay if of same control type
+				ch = "=" -> exchange okay if of same control type and of same control kind [same style name]
+			- unique controls referencing controls:
+				important: control is not exchanged directly [because its a unique control];
+					referenced control is exchanged and returned control is set to control itself: m.ctrl := ctrl
+				ch = "X" -> exchange okay if of same control type
+				ch = "=" -> exchange okay if of same control type and referenced control is identical [same style name]
+			- controls implementing an anonymous style:
+				important: control may not be exchanged by an other control of anonymous type;
+					only attributes of controls implementing an anonymous style may be exchanged
+				ch = "X" -> exchange okay if of same control type; if control in message is of
+								anonymous type copy attributes and set m.ctrl to ctrl
+				ch = "=" -> no exchange possible
+	---*)
+
+	PROCEDURE InvertIcon(id: CHAR; X, Y: INTEGER): BOOLEAN;
+		VAR dx, x, y, w, h: INTEGER;	pat: LONGINT;
+	BEGIN
+		LedaSys.GetIcon(id, dx, x, y, w, h, pat);
+		IF pat # 0 THEN Display.CopyPattern(LedaSys.inv, pat, X + x, Y + y, Display.invert) END;
+		RETURN pat # 0
+	END InvertIcon;
+	
+(*--- format control ---*)
+
+(*---
+	- format control is a predefined control with instance data;
+		there can exist many instances
+	- a format control named "anonymous" is considered as unique control;
+		however a named format control is a multiple referenced control
+	- the format control specifies variations of the
+		standard format information [--> FormatVar]
+	- the line space should be defined as a multiple of LedaSys.scnUnit
+		to avoid rounding effects in the line placing
+---*)
+
+	PROCEDURE *IsFormat(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN stop := (ctrl # NIL) & (ctrl IS Format); RETURN stop
+	END IsFormat;
+
+	PROCEDURE FormatAdjust(VAR f0, f1: LedaBase.FormatDsc);
+	(** adjust the format  f0 according f1 *)
+		VAR gap, wrap, v: LONGINT;
+	BEGIN
+		IF f1.lt # -1 THEN f0.lt := f1.lt END;
+		IF f1.rt # -1 THEN f0.rt := f1.rt END;
+		IF f1.gap > 0 THEN
+			gap := f1.gap MOD 100H; wrap := (f1.gap DIV 100H) MOD 100H; v := f1.gap DIV 10000H;
+			IF gap = 0 THEN gap := f0.gap MOD 100H; v := f0.gap DIV 10000H END;
+			IF wrap = 0 THEN wrap := (f0.gap DIV 100H) MOD 100H END;
+			f0.gap := gap + wrap * 100H + v * 10000H;
+		END;
+		IF f1.lsp # -1 THEN f0.lsp := f1.lsp END;
+		IF f1.adj # 0X THEN f0.adj := f1.adj END
+	END FormatAdjust;
+	
+	PROCEDURE *FormatWidth(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		W := 5 * LedaSys.scnUnit; w := 5; sepKind := LedaBase.LEnd;
+		IF I # NIL THEN	(* formatting *)
+			I.newFrm := TRUE; FormatAdjust(I.var, ctrl(Format).var)
+		END	(* format control has default width *)
+	END FormatWidth;
+	
+	PROCEDURE *FormatDraw(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		sepKind := LedaBase.LEnd	(* no drawing and no increment of x *)
+	END FormatDraw;
+		
+	PROCEDURE NewFormat*(name: LedaSys.Name): Format;
+		VAR fCtrl: Format;
+	BEGIN
+		IF name = "" THEN name := Anon END;
+		NEW(fCtrl); LedaBase.InitControl(fCtrl, formDoOp);
+		fCtrl.width := FormatWidth; fCtrl.height := LedaBase.DefHeight; fCtrl.draw := FormatDraw;
+		fCtrl.rtId := formRTId; INC(formRTId);
+		fCtrl.name := name;
+		fCtrl.var.lt := -1; fCtrl.var.rt := -1; fCtrl.var.gap := 0; fCtrl.var.lsp := 0; fCtrl.var.adj := "d";
+		(* LedaBase.InitFormat(fCtrl.var); *)
+		RETURN fCtrl
+	END NewFormat;
+	
+	PROCEDURE FormatCopy(f: Format): Format;
+		VAR nf: Format;
+	BEGIN
+		IF f.name # Anon THEN RETURN f	(* reference copy *)
+		ELSE nf := NewFormat(""); nf.var := f.var; RETURN nf	(* deep copy *)
+		END
+	END FormatCopy;
+	
+	PROCEDURE *FormatDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for format control [= predefined control]; multiple references *)
+		VAR fCtrl: Format;
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN
+			WITH m: LedaBase.PrintMsg DO m.id := 3; m.W := 0; m.sepKind := LedaBase.LEnd END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := FormatCopy(ctrl(Format))
+				| LedaBase.RegisterId:  LedaBase.PutToList(ctrl, m.ctrlId)
+				| LedaBase.StoreId:  fCtrl := ctrl(Format);
+						LedaBase.StoreName(m.r, fCtrl.name); LedaBase.StoreVal(m.r, fCtrl.var.lt);
+						LedaBase.StoreVal(m.r, fCtrl.var.rt); LedaBase.StoreVal(m.r, fCtrl.var.gap);
+						LedaBase.StoreVal(m.r, fCtrl.var.lsp); LedaBase.Store(m.r, fCtrl.var.adj)
+				| LedaBase.LoadId:  fCtrl := NewFormat(""); m.ctrl := fCtrl;
+						LedaBase.LoadName(m.r, fCtrl.name); LedaBase.LoadVal(m.r, fCtrl.var.lt);
+						LedaBase.LoadVal(m.r, fCtrl.var.rt); LedaBase.LoadVal(m.r, fCtrl.var.gap);
+						LedaBase.LoadVal(m.r, fCtrl.var.lsp); LedaBase.Load(m.r, fCtrl.var.adj)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("format control error")
+				| FileId:  ctrl.kindId := FormatId
+				| LedaBase.CheckId:  LedaBase.CheckFormat(ctrl(Format).var)
+				| LedaBase.ReplaceId:	(* replacement of ctrl by m.ctrl possible ? *)
+						IF m.ctrl IS Format THEN fCtrl := ctrl(Format);
+							IF m.ch = "X" THEN m.ctrlId := 1;	(* exchange okay *)
+								IF m.ctrl(Format).name = Anon THEN
+									IF fCtrl.name = Anon THEN fCtrl.var := m.ctrl(Format).var; m.ctrl := fCtrl	(* copy attributes *)
+									ELSE m.ctrl := FormatCopy(m.ctrl(Format))	(* create new instance *)
+									END
+								END
+							ELSIF m.ch = "=" THEN
+								IF (fCtrl.name # Anon) & (fCtrl.name = m.ctrl(Format).name) THEN m.ctrlId := 1 END	(* substitution okay *)
+							END
+						END
+				| LedaBase.UpdateId:
+						IF ctrl = m.ctrl THEN m.ctrlId := LedaCtrl.PourThis ELSE ctrl.stamp := LedaBase.CurStamp() END	(* line format changed *)
+				| LedaBase.InvertSepId:  
+						IF InvertIcon("E", m.x, m.y) THEN INCL(m.s, LedaBase.InvertSepId) END
+				ELSE
+				END
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.NameId THEN
+					m.name := ctrl(Format).name; m.b :=  m.ctrl = ctrl
+				END
+			END
+		END
+	END FormatDoOp;
+
+(*--- tabulator control ---*)
+
+(*---
+	- there exist two tabulator controls: 
+		-> TabPos handles the tab positions [tab stops]
+		-> Tabulator determines the width to the next tab position in the text
+				it refers to a TabPos control and can be regarded as an instance thereoff
+	- for every Tab key in the text there exists an unique Tabulator control
+		specifying the width to the next tab position; therefore Tabulator controls
+		perform deep copies [not reference copies]
+---*)
+
+	PROCEDURE *IsTab(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN stop := (ctrl # NIL) & (ctrl IS Tabulator); RETURN stop
+	END IsTab;
+	
+	PROCEDURE TabEnumAll*(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	(** enumerator for tabulator styles; lists all different tabulator stop styles *)
+		VAR tabPos: TabPos;
+	BEGIN
+		IF (ctrl # NIL) & (ctrl IS Tabulator) THEN
+			tabPos := ctrl(Tabulator).stops;
+			IF (tabPos.data.name # Anon) & LedaBase.Unstamped(tabPos.stamp) THEN
+				tabPos.stamp := LedaBase.CurStamp(); RETURN TRUE
+			ELSE RETURN FALSE
+			END
+		ELSE RETURN FALSE
+		END
+	END TabEnumAll;
+	
+	PROCEDURE InitTabData(VAR td: TabData);
+		VAR i: INTEGER;
+	BEGIN
+		td.name := UnNamed; i := 0;
+		WHILE i < TabRange DO td.pos[i] := NotDef; td.typ[i] := 0X; INC(i) END
+	END InitTabData;
+	
+	PROCEDURE NewTabPos(): TabPos;
+		VAR tabPos: TabPos;
+	BEGIN
+		NEW(tabPos); LedaBase.InitControl(tabPos, tabPosDoOp);
+		tabPos.rtId := tabRTId; INC(tabRTId); InitTabData(tabPos.data);
+		RETURN tabPos
+	END NewTabPos;
+	
+	PROCEDURE CopyTabPos(tabPos: TabPos): TabPos;
+		VAR nTabPos: TabPos;
+	BEGIN
+		IF tabPos.data.name # Anon THEN RETURN tabPos	(* reference copy *)
+		ELSE nTabPos := NewTabPos(); nTabPos.data := tabPos.data; RETURN nTabPos	(* deep copy *)
+		END
+	END CopyTabPos;
+	
+	PROCEDURE *TabPosDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for TabPos control [=predefined control]; multiple references *)
+	(* main purpose -> storing and loading *)
+		VAR tabPos: TabPos;	v: LONGINT;	i: INTEGER;
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := CopyTabPos(ctrl(TabPos))
+				| LedaBase.RegisterId:  LedaBase.PutToList(ctrl, m.ctrlId)
+				| LedaBase.StoreId:
+						tabPos := ctrl(TabPos); i := 0; LedaBase.StoreName(m.r, tabPos.data.name);
+						WHILE (i < TabRange) & (tabPos.data.pos[i] # NotDef) DO
+							LedaBase.StoreVal(m.r, tabPos.data.pos[i]); LedaBase.Store(m.r, tabPos.data.typ[i]); INC(i)
+						END;
+						LedaBase.StoreVal(m.r, NotDef)	(* value NotDef *)
+				| LedaBase.LoadId:  tabPos := NewTabPos();
+						LedaBase.LoadName(m.r, tabPos.data.name);
+						i := 0; LedaBase.LoadVal(m.r, v);
+						WHILE (v # NotDef) DO
+							tabPos.data.pos[i] := v; LedaBase.Load(m.r, tabPos.data.typ[i]); INC(i);
+							 LedaBase.LoadVal(m.r, v)
+						END;
+						m.ctrl := tabPos
+				| LedaBase.StoreModCmd:  LedaSys.Halt("tabulator stops control error")
+				| FileId:  ctrl.kindId := TabPosId
+				| LedaBase.CheckId:
+				ELSE
+				END
+			END
+		END
+	END TabPosDoOp;
+				
+	PROCEDURE NextTabPos(tabPos: TabPos; width, X: LONGINT; VAR pos: LONGINT; VAR typ: CHAR);
+	(* searches the next tabulator position after coordinate X and returns it in pos, typ *)
+		VAR i: INTEGER;
+	BEGIN	(* tab stops are sorted *)
+		typ := 0X; IF tabPos = NIL THEN pos := NotDef; RETURN END;	(*###*)
+		i := 0;
+		LOOP
+			IF (i = TabRange) OR (tabPos.data.pos[i] = NotDef) THEN pos := NotDef; EXIT	(*###*)	(* no tab stop found *)
+			ELSE
+				pos := tabPos.data.pos[i];
+				IF pos = ColMiddle THEN pos := width DIV 2 ELSIF pos = ColRight THEN pos := width END;
+				IF pos > X THEN typ := tabPos.data.typ[i]; EXIT END	(*###*)	(* tab stop found *)
+			END;
+			INC(i)
+		END
+	END NextTabPos;
+	
+	PROCEDURE SetTabWidth(tab: Tabulator; width, tabX, X, W: LONGINT; x, w: INTEGER;  VAR sep: CHAR);
+		VAR tabP, L: LONGINT;	l: INTEGER;	tabT: CHAR;
+	BEGIN
+		LOOP
+			NextTabPos(tab.stops, width, tabX, tabP, tabT);
+			IF tabP = NotDef THEN L := 20 * LedaSys.scnUnit; l := 20		(* return default values *)
+			ELSIF (tabT = "C") OR (tabT = "R") THEN
+				IF sep = "^" THEN	(* second call; W, w: width of following unit *)
+					IF tabT = "C" THEN L := W DIV 2; l := w DIV 2 ELSE L := W; l := w END;
+					L := tabP - L - X; l := SHORT(tabP DIV LedaSys.scnUnit) - l - x
+				ELSE L := 0; l := 0; sep := "^"; EXIT	(*###*)	(* second call needed *)
+				END
+			ELSE L := tabP - X; l := SHORT(tabP DIV LedaSys.scnUnit) - x
+			END;
+			IF (L > 0) & (l > 0) THEN sep := LedaCtrl.TabSep; EXIT END;	(*###*)
+			tabX := tabP + 1
+		END;
+		tab.W := L; tab.w := l
+	END SetTabWidth;
+	
+	PROCEDURE *TabDraw(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		INC(x, ctrl(Tabulator).w)	(* increment x-coordinate *)
+	END TabDraw;
+	
+	PROCEDURE *TabWidth(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR tab: Tabulator;	tabX: LONGINT;
+	BEGIN
+		tab := ctrl(Tabulator);
+		IF (I # NIL) & (I.uX # -1) THEN	(* check width of pair ch/ctrl *)
+			tabX := I.ux * LedaSys.scnUnit; IF tabX < I.uX THEN tabX := I.uX END;
+			SetTabWidth(tab, I.width, tabX, I.uX, I.uW, I.ux, I.uw, sepKind)	(* sets tab.W, tab.w *)
+		ELSE sepKind := LedaCtrl.TabSep
+		END;
+		W := tab.W; w := tab.w
+	END TabWidth;
+	
+	PROCEDURE NewTabulator*(tab: Tabulator): Tabulator;
+		VAR nTab: Tabulator;
+	BEGIN
+		NEW(nTab); LedaBase.InitControl(nTab, tabDoOp);
+		nTab.width := TabWidth; nTab.height := LedaBase.DefHeight; nTab.draw := TabDraw;
+		nTab.W := 20 * LedaSys.scnUnit; nTab.w := 20;
+		IF (tab = NIL) OR (tab.stops = NIL) THEN nTab.stops := NIL
+		ELSE nTab.stops := CopyTabPos(tab.stops)	(* deep or reference copy *)
+		END;
+		RETURN nTab
+	END NewTabulator;
+	
+	PROCEDURE CheckTabData(VAR td: TabData);
+		VAR v: LONGINT;	i: INTEGER;	ch: CHAR;
+	BEGIN
+		IF td.name = "" THEN td.name := UnNamed END;
+		i := 0; v := 0;
+		WHILE i < TabRange DO
+			IF v = NotDef THEN td.pos[i] := NotDef; td.typ[i] := 0X; INC(i)
+			ELSIF (td.pos[i] >= v) OR (td.pos[i] = ColMiddle) OR (td.pos[i] = ColRight) THEN
+				IF td.pos[i] > v THEN v := td.pos[i] END;
+				ch := td.typ[i]; IF ~ LedaSys.EqualCh("LCR", ch) THEN td.typ[i] := "L" END;
+				INC(i)
+			ELSE v := NotDef 
+			END
+		END
+	END CheckTabData;
+	
+	PROCEDURE TabulatorData*(op: INTEGER; tab: Tabulator; VAR td: TabData);
+	(** op < 0 -> returns the tabulator data of tab in td *)
+	(** op > 0 -> adjusts the tabulator data of tab according td *)
+	BEGIN
+		IF op > 0 THEN
+			IF tab.stops = NIL THEN tab.stops := NewTabPos() END;
+			CheckTabData(td); tab.stops.data := td;
+		ELSIF op < 0 THEN
+			IF tab.stops # NIL THEN td := tab.stops.data ELSE InitTabData(td) END
+		END
+	END TabulatorData;
+	
+	PROCEDURE DefTabulator(): LedaBase.PieceCtrl;
+		VAR tab: Tabulator;	td: TabData;
+	BEGIN
+		tab := NewTabulator(NIL);
+		InitTabData(td);
+		td.pos[0] := 6 * LedaBase.MM; td.typ[0] := "L";
+		td.pos[1] := 12 * LedaBase.MM; td.typ[1] := "L";
+		TabulatorData(1, tab, td);	(* set tabulator data *)
+		RETURN tab
+	END DefTabulator;
+	
+	PROCEDURE PutTab(tab: Tabulator; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		cM.id := LedaBase.RegisterId; tab.stops.doOp(tab.stops, cM);  LedaBase.PutToList(tab, refId)
+	END PutTab;
+	
+	PROCEDURE *TabDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for tabulator control [= predefined control]; unique reference *)
+		VAR tab: Tabulator;
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN
+			WITH m: LedaBase.PrintMsg DO
+				m.id := 3; m.sepKind := LedaCtrl.TabSep;
+				IF m.last THEN m.W := 0 ELSE m.W := ctrl(Tabulator).W END
+			END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := NewTabulator(ctrl(Tabulator))	(* deep copy *)
+				| LedaBase.RegisterId:  PutTab(ctrl(Tabulator), m.ctrlId)
+				| LedaBase.StoreId:
+						tab := ctrl(Tabulator); LedaBase.StoreVal(m.r, tab.W);
+						LedaBase.StoreI(m.r, tab.w); LedaBase.StoreCtrl(m.r, tab.stops)
+				| LedaBase.LoadId:  tab := NewTabulator(NIL); m.ctrl := tab;
+						LedaBase.LoadVal(m.r, tab.W); LedaBase.LoadI(m.r, tab.w);
+						LedaBase.LoadCtrl(m.r, ctrl); tab.stops := ctrl(TabPos)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("tabulator control error")
+				| FileId:  ctrl.kindId := TabulatorId
+				| LedaBase.CheckId:  CheckTabData(ctrl(Tabulator).stops.data)
+				| LedaBase.ReplaceId:	(* replacement of ctrl by m.ctrl possible ? *)
+						IF m.ctrl IS Tabulator THEN tab := ctrl(Tabulator);
+							IF m.ch = "X" THEN
+								IF (m.ctrl(Tabulator).stops.data.name = Anon) & (tab.stops.data.name = Anon) THEN
+									tab.stops.data := m.ctrl(Tabulator).stops.data	(* exchange stop list data *)
+								ELSE tab.stops := CopyTabPos(m.ctrl(Tabulator).stops)	(* copy stop list [exchange or deep copy] *)
+								END;
+								m.ctrlId := 1; m.ctrl := tab	(* stop list exchanged *)
+							ELSIF m.ch = "=" THEN
+								IF (tab.stops.data.name # Anon) & (tab.stops.data.name = m.ctrl(Tabulator).stops.data.name) THEN
+									tab.stops := m.ctrl(Tabulator).stops; m.ctrlId := 1; m.ctrl := tab	(* exchange stop list *)
+								END
+							END
+						END
+				| LedaBase.UpdateId:
+						IF (m.ctrl IS Tabulator) & (m.ctrl(Tabulator).stops = ctrl(Tabulator).stops) THEN	(* stop list changed *)
+							m.ctrlId := LedaCtrl.PourThis
+						ELSE ctrl.stamp := LedaBase.CurStamp()
+						END	
+				| LedaBase.InvertSepId:   
+						IF InvertIcon("F", m.x, m.y) THEN INCL(m.s, LedaBase.InvertSepId) END
+				ELSE
+				END
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.NameId THEN
+					m.name := ctrl(Tabulator).stops.data.name; m.b := FALSE;
+					IF (m.ctrl # NIL) & (m.ctrl IS Tabulator) THEN m.b :=  m.ctrl(Tabulator).stops = ctrl(Tabulator).stops END
+				END
+			END
+		END
+	END TabDoOp;
+	
+(*--- inset control ---*)
+
+	(*---
+		- a inset specification is a multiple referenced control
+		- a inset control is a unique control; it specifies a calculated width (W, w) and an inset
+		- there are two kinds of inset controls depending on character belonging to the control:
+			-> ch = RedIns: 
+					reduces the width of the following lines; calculates its own width so
+					that the rest width of the line equals the reduced line width if possible
+			-> ch = EnlIns:
+					enlarges the width of the following lines; terminates the current line
+		- inset size changes only executed for standard named inset controls
+	---*)
+	
+	PROCEDURE *IsInset(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN stop := (ctrl # NIL) & (ctrl IS Inset); RETURN stop
+	END IsInset;
+
+	PROCEDURE InsetEnumAll*(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	(** enumerator for inset styles; lists all different inset specification styles *)
+		VAR iS: InsSpec;
+	BEGIN
+		IF (ctrl # NIL) & (ctrl IS Inset) THEN
+			iS := ctrl(Inset).spec;
+			IF (iS.data.name # Anon) & LedaBase.Unstamped(iS.stamp) THEN
+				iS.stamp := LedaBase.CurStamp(); RETURN TRUE
+			ELSE RETURN FALSE
+			END
+		ELSE RETURN FALSE
+		END
+	END InsetEnumAll;
+	
+	PROCEDURE InitInsData(VAR id: InsData);
+	BEGIN
+		id.name := UnNamed; id.margin := 0
+	END InitInsData;
+	
+	PROCEDURE NewInsSpec(): InsSpec;
+		VAR insSpec: InsSpec;
+	BEGIN
+		NEW(insSpec); LedaBase.InitControl(insSpec, insSpecDoOp);
+		insSpec.rtId := insRTId;  INC(insRTId); InitInsData(insSpec.data);
+		RETURN insSpec
+	END NewInsSpec;
+	
+	PROCEDURE CopyInsSpec(insSpec: InsSpec): InsSpec;
+		VAR nInsSpec: InsSpec;
+	BEGIN
+		IF insSpec.data.name # Anon THEN RETURN insSpec	(* reference copy *)
+		ELSE nInsSpec := NewInsSpec(); nInsSpec.data := insSpec.data; RETURN nInsSpec	(* deep copy *)
+		END
+	END CopyInsSpec;
+	
+	PROCEDURE InsSpecChangeSize(insSpec: InsSpec; margin: LONGINT);
+	(* changes the margin size to margin of a inset specification named DefMargName *)
+	BEGIN
+		IF (insSpec.data.name = DefMargName) & LedaBase.Unstamped(insSpec.stamp) THEN
+			IF margin > LedaSys.scnUnit THEN insSpec.data.margin := margin END;
+			insSpec.stamp := LedaBase.CurStamp()	(* to prevent further change *)
+		END
+	END InsSpecChangeSize;
+	
+	PROCEDURE *InsSpecDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for InsSpec control [=predefined control]; multiple references *)
+	(* main purpose -> loading and storing of inset data *)
+		VAR insSpec: InsSpec;
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := CopyInsSpec(ctrl(InsSpec))
+				| LedaBase.RegisterId:  LedaBase.PutToList(ctrl, m.ctrlId)
+				| LedaBase.StoreId:  insSpec := ctrl(InsSpec);
+						LedaBase.StoreName(m.r, insSpec.data.name); LedaBase.StoreVal(m.r, insSpec.data.margin)
+				| LedaBase.LoadId:  insSpec := NewInsSpec(); m.ctrl := insSpec;
+						LedaBase.LoadName(m.r, insSpec.data.name); LedaBase.LoadVal(m.r, insSpec.data.margin);
+				| LedaBase.StoreModCmd:  LedaSys.Halt("inset specification control error")
+				| FileId:  ctrl.kindId := InsSpecId
+				| LedaBase.CheckId:
+				ELSE
+				END
+			END
+		END
+	END InsSpecDoOp;
+	
+	PROCEDURE InsetMargin(VAR margin: LONGINT; dX: LONGINT);
+	(* for incremantal change of margin make value of margin odd *)
+	BEGIN	(* dX is even *)
+		IF margin # -1 THEN INC(margin, dX)	(* adjust setting of margin [incremental or absolute change] *)
+		ELSE margin := dX + 1	(* make margin odd [for incremental change] *)
+		END
+	END InsetMargin;
+	
+	PROCEDURE *InsDraw(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		IF ch # EnlIns THEN INC(x, ctrl(Inset).w) END	(* increment x-coordinate *)
+	END InsDraw;
+	
+	PROCEDURE *InsWidth(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR ins: Inset;	scnX: LONGINT;
+	BEGIN
+		ins := ctrl(Inset);
+		IF I = NIL THEN		(* return stored width *)
+			W := ins.W; w := ins.w; sepKind := ch;
+			IF ch = EnlIns THEN sepKind := LedaCtrl.EndSep END
+		ELSE		(* calculate width of pair ch/ctrl *)
+			W := 5 * LedaSys.scnUnit; w := 5;	(* default width *)
+			IF ch = EnlIns THEN	(* enlarge line width *)
+				InsetMargin(I.var.lt, -ins.spec.data.margin); sepKind := LedaCtrl.EndSep; I.newFrm := TRUE 
+			ELSE	(* ch = RedIns; reduce line width *)
+				sepKind := ch;
+				IF I.uX = -1 THEN	(* first call *)
+					InsetMargin(I.var.lt, ins.spec.data.margin); I.newFrm := TRUE;
+					ins.mrg := I.var.lt; IF ODD(ins.mrg) THEN DEC(ins.mrg) END	(* save margin setting *)
+				ELSE 	(* second call: calculate width *)
+					scnX := I.ux * LedaSys.scnUnit; IF scnX < I.uX THEN scnX := I.uX END;
+					IF scnX < ins.mrg THEN W := ins.mrg - I.uX; w := SHORT(ins.mrg DIV LedaSys.scnUnit) - I.ux END;
+					ins.mrg := 0;	(* reset temporary field *)
+				END
+			END;
+			ins.W := W; ins.w := w
+		END
+	END InsWidth;
+			
+	PROCEDURE NewInset*(ins: Inset): Inset;
+		VAR nIns: Inset;
+	BEGIN
+		NEW(nIns); LedaBase.InitControl(nIns, insDoOp);
+		nIns.width := InsWidth; nIns.height := LedaBase.DefHeight; nIns.draw := InsDraw;
+		IF (ins = NIL) OR (ins.spec = NIL) THEN nIns.spec := NIL
+		ELSE nIns.spec := CopyInsSpec(ins.spec)	(* deep or reference copy *)
+		END;
+		nIns.W := 5 * LedaSys.scnUnit; nIns.w := 5; nIns.mrg := 0;
+		RETURN nIns
+	END NewInset;
+	
+	PROCEDURE CheckInsetData(VAR id: InsData);
+	BEGIN
+		IF id.name = "" THEN id.name := UnNamed END;
+		IF id.margin < LedaSys.scnUnit THEN id.margin := LedaSys.scnUnit END
+	END CheckInsetData;
+	
+	PROCEDURE InsetData*(op: INTEGER; ins: Inset; VAR id: InsData);
+	(** op < 0: return inset data of inset ins in id *)
+	(** op > 0: adjust inset data of inset ins according id *)
+	BEGIN
+		IF op > 0 THEN
+			IF ins.spec = NIL THEN ins.spec := NewInsSpec() END;
+			CheckInsetData(id); ins.spec.data := id
+		ELSIF op < 0 THEN
+			IF ins.spec # NIL THEN id := ins.spec.data ELSE InitInsData(id) END
+		END
+	END InsetData;
+	
+	PROCEDURE DefInset(): Inset;
+		VAR ins: Inset;	id: InsData;
+	BEGIN
+		ins := NewInset(NIL);
+		InitInsData(id); InsetData(1, ins, id);	(* set inset data *)
+		RETURN ins
+	END DefInset;
+	
+	PROCEDURE PutInset(ins: Inset; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		cM.id := LedaBase.RegisterId; ins.spec.doOp(ins.spec, cM);  LedaBase.PutToList(ins, refId)
+	END PutInset;
+	
+	PROCEDURE *InsDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for inset control ; unique reference *)
+		VAR ins: Inset;	id: CHAR;
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN
+			WITH m: LedaBase.PrintMsg DO
+				m.id := 3; m.sepKind := m.ch;
+				IF m.last THEN m.W := 0 ELSE m.W := ctrl(Inset).W END
+			END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := NewInset(ctrl(Inset))	(* deep copy *)
+				| LedaBase.RegisterId:  PutInset(ctrl(Inset), m.ctrlId)
+				| LedaBase.StoreId:
+						ins := ctrl(Inset); LedaBase.StoreCtrl(m.r, ins.spec);
+						LedaBase.StoreVal(m.r, ins.W); LedaBase.StoreI(m.r, ins.w)
+				| LedaBase.LoadId:  ins := NewInset(NIL); m.ctrl := ins;
+						LedaBase.LoadCtrl(m.r, ctrl); ins.spec := ctrl(InsSpec);
+						LedaBase.LoadVal(m.r, ins.W); LedaBase.LoadI(m.r, ins.w)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("inset control error")
+				| FileId:  ctrl.kindId := InsetId
+				| LedaBase.CheckId:  CheckInsetData(ctrl(Inset).spec.data)
+				| LedaBase.ReplaceId:	(* replacement with m.ctrl okay ? *)
+						IF m.ctrl IS Inset THEN ins := ctrl(Inset);
+							IF m.ch = "X" THEN
+								IF (m.ctrl(Inset).spec.data.name = Anon) & (ins.spec.data.name = Anon) THEN
+									ins.spec.data := m.ctrl(Inset).spec.data 	(* exchange specification data *)
+								ELSE ins.spec := CopyInsSpec(m.ctrl(Inset).spec)	(* copy specification [exchange or deep copy] *)
+								END;
+								m.ctrlId := 1; m.ctrl := ins	(* specification exchanged *)
+							ELSIF m.ch = "=" THEN
+								IF (ins.spec.data.name # Anon) & (ins.spec.data.name = m.ctrl(Inset).spec.data.name) THEN
+									ins.spec := m.ctrl(Inset).spec; m.ctrlId := 1; m.ctrl := ins	(* exchange specification *)
+								END
+							END
+						END
+				| LedaBase.UpdateId:
+						IF (m.ctrl IS Inset) & (m.ctrl(Inset).spec = ctrl(Inset).spec) THEN	(* specification changed *)
+							m.ctrlId := LedaCtrl.PourThis
+						ELSE ctrl.stamp := LedaBase.CurStamp()
+						END
+				| LedaBase.InvertSepId:   
+						IF m.ch = EnlIns THEN id := "H" ELSE id := "G" END;
+						IF InvertIcon(id, m.x, m.y) THEN INCL(m.s, LedaBase.InvertSepId) END
+				ELSE
+				END
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.NameId THEN
+					m.name := ctrl(Inset).spec.data.name; m.b := FALSE;
+					IF (m.ctrl # NIL) & (m.ctrl IS Inset) THEN m.b :=  m.ctrl(Inset).spec = ctrl(Inset).spec END
+				ELSIF m.id = LedaBase.SizeId THEN
+					IF m.b THEN InsSpecChangeSize(ctrl(Inset).spec, m.l2) END
+				END
+			END
+		END
+	END InsDoOp;
+
+(*--- line control ---*)
+	
+	(*---
+		- a line specification is a multiple referenced control
+		- a line control is a unique control and displays a line specifed by a line specification
+	---*)
+	
+	PROCEDURE *IsLine(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN stop := (ctrl # NIL) & (ctrl IS Line); RETURN stop
+	END IsLine;
+
+	PROCEDURE LineEnumAll*(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+		VAR ls: LineSpec;
+	BEGIN
+		IF (ctrl # NIL) & (ctrl IS Line) THEN
+			ls := ctrl(Line).spec;
+			IF (ls.data.name # Anon) & LedaBase.Unstamped(ls.stamp) THEN
+				ls.stamp := LedaBase.CurStamp(); RETURN TRUE
+			ELSE RETURN FALSE
+			END
+		ELSE RETURN FALSE
+		END
+	END LineEnumAll;
+
+	PROCEDURE InitLinDat(VAR ld: LinDat);
+	BEGIN
+		ld.name := Anon; ld.width := LedaBase.CM;
+		ld.thick := LedaSys.scnUnit; ld.dy := 0; ld.clr := LedaSys.fg
+	END InitLinDat;
+
+	PROCEDURE NewLineSpec(): LineSpec;
+		VAR lineSpec: LineSpec;
+	BEGIN
+		NEW(lineSpec); LedaBase.InitControl(lineSpec, lineSpecDoOp);
+		lineSpec.rtId := lineRTId; INC(lineRTId); InitLinDat(lineSpec.data);
+		RETURN lineSpec
+	END NewLineSpec;
+	
+	PROCEDURE CopyLineSpec(ls: LineSpec): LineSpec;
+		VAR nls: LineSpec;
+	BEGIN
+		IF ls.data.name # Anon THEN RETURN ls	(* reference copy *)
+		ELSE nls := NewLineSpec(); nls.data := ls.data; RETURN nls	(* deep copy *)
+		END
+	END CopyLineSpec;
+	
+	PROCEDURE *LineSpecDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for LineSpec control; multiple references *)
+	(* main purpose -> loading and storing of line data *)
+		VAR ls: LineSpec;
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := CopyLineSpec(ctrl(LineSpec))
+				| LedaBase.RegisterId:  LedaBase.PutToList(ctrl, m.ctrlId)
+				| LedaBase.StoreId:  ls := ctrl(LineSpec);
+						LedaBase.StoreName(m.r, ls.data.name); LedaBase.StoreVal(m.r, ls.data.width);
+						LedaBase.StoreVal(m.r, ls.data.thick); LedaBase.StoreVal(m.r, ls.data.dy);
+						LedaBase.StoreI(m.r, ls.data.clr)
+				| LedaBase.LoadId:  ls := NewLineSpec(); m.ctrl := ls;
+						LedaBase.LoadName(m.r, ls.data.name); LedaBase.LoadVal(m.r, ls.data.width);
+						LedaBase.LoadVal(m.r, ls.data.thick); LedaBase.LoadVal(m.r, ls.data.dy);
+						LedaBase.LoadI(m.r, ls.data.clr)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("line specification error")
+				| FileId:  ctrl.kindId := LineSpecId
+				| LedaBase.CheckId: 
+				ELSE
+				END
+			END
+		END
+	END LineSpecDoOp;
+	
+	PROCEDURE LineSetW(line: Line; defW: LONGINT);
+		VAR W: LONGINT;
+	BEGIN
+		IF line.spec # NIL THEN
+			W := line.spec.data.width; IF W < LedaSys.scnUnit THEN W := defW END;
+			line.w := SHORT(W DIV LedaSys.scnUnit)
+		ELSE line.w := 5
+		END;
+		line.W := line.w * LedaSys.scnUnit
+	END LineSetW;
+	
+	PROCEDURE *LineHeight(ctrl: LedaBase.PieceCtrl; VAR H, bH: LONGINT);
+		VAR ls: LineSpec;	dsr, asr: LONGINT;
+	BEGIN
+		ls := ctrl(Line).spec;
+		IF ls = NIL THEN dsr := 0; asr := 8
+		ELSE
+			H := ls.data.thick DIV LedaSys.scnUnit; IF H < 1 THEN H := 1 END;
+			dsr := 0; asr := 0;
+			IF ls.data.dy < 0 THEN
+				dsr := ABS(ls.data.dy) DIV LedaSys.scnUnit;
+				IF H > dsr THEN asr := H - dsr END
+			ELSE
+				IF ls.data.dy > 0 THEN asr := ls.data.dy DIV LedaSys.scnUnit END;
+				INC(asr, H)
+			END
+		END;
+		H := (dsr + asr) * LedaSys.scnUnit;
+		bH := - (dsr * LedaSys.scnUnit)
+	END LineHeight;
+	
+	PROCEDURE *LineWidth(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR line: Line;
+	BEGIN
+		line := ctrl(Line);
+		IF I # NIL THEN
+			LineSetW(line, I.width);
+			IF line.W > I.width THEN line.w := SHORT(I.width DIV LedaSys.scnUnit); line.W := line.w * LedaSys.scnUnit END;
+		END;
+		W := line.W; w := line.w
+	END LineWidth;
+	
+	PROCEDURE *LineDraw(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+		VAR ls: LineSpec;	dy, w, h: INTEGER;
+	BEGIN
+		ls := ctrl(Line).spec; w := ctrl(Line).w;
+		IF ls = NIL THEN dy := 0; h := 1
+		ELSE
+			IF ls.data.dy = 0 THEN dy := 0
+			ELSIF ls.data.dy > 0 THEN dy := SHORT(ls.data.dy DIV LedaSys.scnUnit)
+			ELSE dy := - SHORT(ABS(ls.data.dy) DIV LedaSys.scnUnit)
+			END;
+			h := SHORT(ls.data.thick DIV LedaSys.scnUnit)
+		END;
+		IF h < 1 THEN
+			Display.ReplPattern(ls.data.clr, LedaSys.scrPat[LedaSys.Grey3], x, y + dy, w, 1, mode)
+		ELSE Display.ReplConst(ls.data.clr, x, y + dy, w, h, mode)
+		END;
+		INC(x, w)
+	END LineDraw;
+	
+	PROCEDURE LinePrint(ls: LineSpec; W: LONGINT; x, y, mode: INTEGER; P: LedaSys.PrtPort);
+		VAR w ,h, dy: INTEGER;
+	BEGIN
+		w := SHORT(W DIV P.unit);
+		IF ls = NIL THEN dy := 0; h := SHORT(LedaSys.scnUnit DIV P.unit)
+		ELSE
+			IF ls.data.dy = 0 THEN dy := 0
+			ELSIF ls.data.dy > 0 THEN dy := SHORT(ls.data.dy DIV P.unit)
+			ELSE dy := - SHORT(ABS(ls.data.dy) DIV P.unit)
+			END;
+			h := SHORT(ls.data.thick DIV P.unit)
+		END;
+		INC(y, dy);
+		IF h < 1 THEN h := 1 END;
+		IF (x >= P.fX + P.fW) OR (y >= P.fY + P.fH) OR (x + w <= P.fX) OR (y + h <= P.fY) THEN RETURN END;	(*###*)
+		IF y < P.fY THEN DEC(h, P.fY - y); y := P.fY END;
+		IF y + h > P.fY + P.fH THEN h := P.fY + P.fH - y END;
+		IF x < P.fX THEN DEC(w, P.fX - x); x := P.fX END;
+		IF x + w > P.fX + P.fW THEN w := P.fX + P.fW - x END;
+		IF (w > 0) & (h > 0) THEN P.out.replConst(P.out, x, y, w, h, ls.data.clr, mode) END
+	END LinePrint;
+	
+	PROCEDURE NewLine*(line: Line): Line;
+		VAR nLine: Line;
+	BEGIN
+		NEW(nLine); LedaBase.InitControl(nLine, lineDoOp);
+		nLine.width := LineWidth; nLine.height := LineHeight; nLine.draw := LineDraw;
+		IF (line = NIL) OR (line.spec = NIL) THEN nLine.spec := NIL
+		ELSE nLine.spec := CopyLineSpec(line.spec)	(* reference or deep copy *)
+		END;
+		LineSetW(nLine, LedaBase.CM);
+		RETURN nLine
+	END NewLine;
+	
+	PROCEDURE CheckLineData(VAR ld: LinDat);
+	BEGIN
+		IF ld.name = "" THEN ld.name := Anon END;
+		IF ld.width < LedaSys.scnUnit THEN ld.width := 0 END;
+		IF ld.thick < MinThick THEN ld.thick := MinThick
+		ELSIF ld.thick > 2 * LedaBase.CM THEN ld.thick := 2 * LedaBase.CM
+		END;
+		IF ld.dy < - LedaBase.CM THEN ld.dy := - LedaBase.CM
+		ELSIF ld.dy > 15 * LedaBase.MM THEN ld.dy := 15 * LedaBase.MM
+		END;
+		IF ld.clr < 0 THEN ld.clr := 0 END;
+	END CheckLineData;
+		
+	PROCEDURE LineData*(op: INTEGER; line: Line; VAR ld: LinDat);
+	(** op < 0: return line data of line line in ld *)
+	(** op > 0: adjust line data of line line iaccording ld *)
+	BEGIN
+		IF op > 0 THEN
+			IF line.spec = NIL THEN line.spec := NewLineSpec() END;
+			CheckLineData(ld); line.spec.data := ld; LineSetW(line, LedaBase.CM)
+		ELSIF op < 0 THEN 
+			IF line.spec # NIL THEN ld := line.spec.data ELSE InitLinDat(ld) END
+		END
+	END LineData;
+		
+	PROCEDURE DefLine(): Line;
+		VAR line: Line;	ld: LinDat;
+	BEGIN
+		line := NewLine(NIL);
+		InitLinDat(ld); ld.name := Anon; ld.width := 0; ld.dy := 8 * LedaSys.scnUnit;
+		LineData(1, line, ld);	(* set line data *)
+		RETURN line
+	END DefLine;
+	
+	PROCEDURE PutLine(line: Line; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		cM.id := LedaBase.RegisterId; line.spec.doOp(line.spec, cM); LedaBase.PutToList(line, refId)
+	END PutLine;
+	
+	PROCEDURE *LineDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for line control; unique reference *)
+		VAR line: Line;	W: LONGINT;
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN
+			WITH m: LedaBase.PrintMsg DO
+				IF m.id = 0 THEN	(* return print specification *)
+					m.id := 2; m.W := ctrl(Line).W; m.sepKind := m.ch
+				ELSIF m.id = 2 THEN	(* print line *)
+					IF (m.p # NIL) & (m.p IS LedaSys.PrtPort) THEN
+						LinePrint(ctrl(Line).spec, ctrl(Line).W, m.x, m.y, m.mode, m.p(LedaSys.PrtPort))
+					END
+				END
+			END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := NewLine(ctrl(Line))	(* deep copy *)
+				| LedaBase.RegisterId:  PutLine(ctrl(Line), m.ctrlId)
+				| LedaBase.StoreId:  LedaBase.StoreCtrl(m.r, ctrl(Line).spec)
+				| LedaBase.LoadId:  line := NewLine(NIL); m.ctrl := line;
+						LedaBase.LoadCtrl(m.r, ctrl);
+						IF ctrl # NIL THEN line.spec := ctrl(LineSpec) END;
+						LineSetW(line, LedaBase.CM)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("line control error")
+				| FileId:  ctrl.kindId := LineId
+				| LedaBase.CheckId:  line := ctrl(Line);
+						CheckLineData(line.spec.data); LineSetW(line, LedaBase.CM)
+				| LedaBase.ReplaceId:	(* replacement with m.ctrl okay ? *)
+						IF m.ctrl IS Line THEN line := ctrl(Line);
+							IF m.ch = "X" THEN
+								IF (m.ctrl(Line).spec.data.name = Anon) & (line.spec.data.name = Anon) THEN
+									line.spec.data := m.ctrl(Line).spec.data	(* exchange line data *)
+								ELSE line.spec := CopyLineSpec(m.ctrl(Line).spec)	(* copy specification [exchange or deep copy] *)
+								END;
+								m.ctrlId := 1; m.ctrl := ctrl	(* specification exchanged *)
+							ELSIF m.ch = "=" THEN
+								IF (line.spec.data.name # Anon) & (line.spec.data.name = m.ctrl(Line).spec.data.name) THEN
+									line.spec := m.ctrl(Line).spec; m.ctrlId := 1; m.ctrl := ctrl	(* exchange specification *)
+								END
+							END
+						END
+				| LedaBase.UpdateId:
+						IF (m.ctrl IS Line) & (m.ctrl(Line).spec = ctrl(Line).spec) THEN	(* specification changed *)
+							m.ctrlId := LedaCtrl.PourThis
+						ELSE ctrl.stamp := LedaBase.CurStamp()
+						END
+				| LedaBase.InvertSepId:  INCL(m.s, LedaBase.InvertSepId);	(* standard handling *)
+						Display.ReplPattern(LedaSys.inv, LedaSys.scrPat[LedaSys.Grey2], m.x, m.y, ctrl(Line).w, m.ctrlId, Display.invert)
+						(* m.ctrlId -> height of line *)
+				ELSE
+				END
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.NameId THEN
+					m.name := ctrl(Line).spec.data.name; m.b := FALSE;
+					IF (m.ctrl # NIL) & (m.ctrl IS Line) THEN m.b :=  m.ctrl(Line).spec = ctrl(Line).spec END
+				END
+			END
+		END
+	END LineDoOp;
+	
+(*--- filler control ---*)
+
+(*---
+	- a filler control is a unique control
+	- the actual size [width] of the control is get by width calls;
+		it depends on the font size of the following character
+---*)
+
+	PROCEDURE *IsFiller(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN stop := (ctrl # NIL) & (ctrl IS Filler); RETURN stop
+	END IsFiller;
+
+	PROCEDURE SetFilWidth(fil: Filler; checkTxt: BOOLEAN);
+		VAR text: LedaCtrl.Text;	pos, W: LONGINT;	w: INTEGER;	fName: LedaSys.String;
+			R: LedaCtrl.Reader;	cnt: LedaBase.Control;	ctrl: LedaBase.PieceCtrl;	ch: CHAR;
+	BEGIN
+		W := DefFilW * LedaSys.scnUnit; w := DefFilW;
+		IF checkTxt THEN
+			LedaCtrl.TextGet(fil, text, pos);
+			IF text # NIL THEN
+				LedaCtrl.InitReader(R, text); LedaCtrl.SetReader(R, pos + 1);
+				LedaCtrl.ReadChar(R, ch, ctrl);
+				IF (ctrl = NIL) OR ~ (ctrl IS LedaBase.Style) THEN
+					LedaCtrl.TextBasics(text, LedaCtrl.GetId, 0, cnt);	(* get default styles *)
+					IF (cnt # NIL) & (cnt IS LedaCtrl.List) THEN
+						ctrl := cnt(LedaCtrl.List).seq.ctrl(LedaBase.PieceCtrl)
+					END
+				END;
+				IF (ctrl # NIL) & (ctrl IS LedaBase.Style) THEN
+					LedaBase.FntInfo(ctrl(LedaBase.Style).font, 2, fName, w);	(* get screen font height *)
+					W := w * LedaSys.scnUnit
+				END
+			END
+		END;
+		fil.W := W; IF fil.scale # 100 THEN fil.W := fil.W * fil.scale DIV 100 END;
+		fil.w := w; IF fil.scale # 100 THEN fil.w := fil.w * fil.scale DIV 100 END
+	END SetFilWidth;
+
+	PROCEDURE *FilWidth(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR fil: Filler;
+	BEGIN
+		fil := ctrl(Filler);
+		IF I # NIL THEN
+			SetFilWidth(fil, TRUE);
+			IF fil.W < LedaSys.scnUnit THEN fil.W := LedaSys.scnUnit; fil.w := 1
+			ELSIF fil.W > I.width THEN fil.w := SHORT(I.width DIV LedaSys.scnUnit); fil.W := fil.w * LedaSys.scnUnit
+			END
+		END;
+		W := fil.W; w := fil.w
+	END FilWidth;
+
+	PROCEDURE *FilDraw(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+	BEGIN
+		INC(x, ctrl(Filler).w);	(* increment x-coordinate *)
+	END FilDraw;
+	
+	PROCEDURE NewFiller*(fil: Filler): Filler;
+		VAR nFil: Filler;
+	BEGIN
+		NEW(nFil); LedaBase.InitControl(nFil, filDoOp);
+		nFil.width := FilWidth; nFil.height := LedaBase.DefHeight; nFil.draw := FilDraw;
+		IF fil = NIL THEN nFil.scale := 100 ELSE nFil.scale := fil.scale END;
+		SetFilWidth(nFil, FALSE);
+		RETURN nFil
+	END NewFiller;
+	
+	PROCEDURE CheckFilData(fil: Filler);
+	BEGIN
+		IF fil.scale < 10 THEN fil.scale := 10
+		ELSIF fil.scale > 3000 THEN fil.scale := 3000
+		END
+	END CheckFilData;
+	
+	PROCEDURE *FilDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for filler control; unique reference *)
+		VAR fil: Filler;
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN
+			WITH m: LedaBase.PrintMsg DO
+				m.id := 3; m.sepKind := m.ch;		(* 3 = do not print character *)
+				m.W := ctrl(Filler).W
+			END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := NewFiller(ctrl(Filler))	(* deep copy *)
+				| LedaBase.RegisterId:  LedaBase.PutToList(ctrl, m.ctrlId)
+				| LedaBase.StoreId:  fil := ctrl(Filler);
+						LedaBase.StoreVal(m.r, fil.W); LedaBase.StoreI(m.r, fil.w); LedaBase.StoreI(m.r, fil.scale)
+				| LedaBase.LoadId:  fil := NewFiller(NIL); m.ctrl := fil;
+						LedaBase.LoadVal(m.r, fil.W); LedaBase.LoadI(m.r, fil.w); LedaBase.LoadI(m.r, fil.scale)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("filler control error")
+				| FileId:  ctrl.kindId := FillerId
+				| LedaBase.CheckId:  CheckFilData(ctrl(Filler))
+				| LedaBase.ReplaceId:	(* replacement with m.ctrl okay ? *)
+						IF (m.ctrl IS Filler) & (m.ch = "X") THEN
+							ctrl(Filler).scale := m.ctrl(Filler).scale; m.ctrlId := 1; m.ctrl := ctrl
+							(* styles not supported -> set same attributes *)
+						END
+				| LedaBase.UpdateId:  ctrl.stamp := LedaBase.CurStamp()	(* no updates possible *)
+				| LedaBase.InvertSepId:   (* standard handling *)
+				ELSE
+				END
+			END
+		END
+	END FilDoOp;
+	
+(*--- wrap control ---*)
+
+(*---
+	- wrap control is a predefined control with instance data;
+		there can exist many instances
+	- a wrap control can cause a column brack after the line it is contained;
+	- a wrap control behaves as a space
+---*)
+
+	PROCEDURE *IsWrap(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN stop := (ctrl # NIL) & (ctrl IS Wrap); RETURN stop
+	END IsWrap;
+	
+	PROCEDURE WrapSetStyle(wrap: Wrap);
+		VAR R: LedaCtrl.Reader;	text: LedaCtrl.Text;	pos: LONGINT;
+			cnt: LedaBase.Control;	ctrl: LedaBase.PieceCtrl;	ch: CHAR;
+	BEGIN
+		LedaCtrl.TextGet(wrap, text, pos);
+		IF text # NIL THEN
+			LedaCtrl.InitReader(R, text); LedaCtrl.SetReader(R, pos + 1);
+			LedaCtrl.ReadChar(R, ch, ctrl);
+			IF (ctrl = NIL) OR ~ (ctrl IS LedaBase.Style) THEN
+				LedaCtrl.TextBasics(text, LedaCtrl.GetId, 0, cnt);	(* get default styles *)
+				IF (cnt # NIL) & (cnt IS LedaCtrl.List) THEN
+					ctrl := cnt(LedaCtrl.List).seq.ctrl(LedaBase.PieceCtrl)
+				END
+			END;
+			IF (ctrl # NIL) & (ctrl IS LedaBase.Style) THEN wrap.style := ctrl(LedaBase.Style); RETURN END	(*###*)
+		END;
+		wrap.style := NIL
+	END WrapSetStyle;
+	
+	PROCEDURE WrapAdjustGap(wrap: LONGINT; VAR gap: LONGINT);
+		VAR gp, v: LONGINT;
+	BEGIN	(* wrap < 100H *)
+		IF wrap > 0 THEN
+			gp := gap MOD 100H; v := gap DIV 10000H;
+			gap := gp + wrap * 100H + v * 10000H
+		END
+	END WrapAdjustGap;
+	
+	PROCEDURE *WrapWidth(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR wCtrl: Wrap;
+	BEGIN
+		wCtrl := ctrl(Wrap);
+		IF I # NIL THEN
+			WrapSetStyle(wCtrl);
+			I.newFrm := TRUE; WrapAdjustGap(wCtrl.wrap, I.var.gap)
+		END;
+		IF wCtrl.style # NIL THEN wCtrl.style.width(wCtrl.style, LedaBase.Space, I, W, w, sepKind)
+		ELSE W := DefWdt * LedaSys.scnUnit; w := DefWdt; sepKind := LedaBase.Space
+		END
+	END WrapWidth;
+	
+	PROCEDURE *WrapDraw(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+		VAR wCtrl: Wrap;
+	BEGIN
+		wCtrl := ctrl(Wrap);
+		IF wCtrl.style # NIL THEN wCtrl.style.draw(wCtrl.style, LedaBase.Space, y, mode, last, x, sepKind)
+		ELSE INC(x, DefWdt); sepKind := LedaBase.Space
+		END
+	END WrapDraw;
+		
+	PROCEDURE WrapPrint(wCtrl: Wrap; VAR M: LedaBase.PrintMsg);
+	BEGIN
+		IF wCtrl.style # NIL THEN wCtrl.style.doOp(wCtrl.style, M)
+		ELSE
+			M.W := DefWdt * LedaSys.scnUnit; M.id := 3;		(* do not print *)
+			M.sepKind := LedaBase.Space
+		END
+	END WrapPrint;
+	
+	PROCEDURE NewWrap*(name: LedaSys.Name): Wrap;
+		VAR wCtrl: Wrap;
+	BEGIN
+		IF name = "" THEN name := Anon END;
+		NEW(wCtrl); LedaBase.InitControl(wCtrl, wrapDoOp);
+		wCtrl.width := WrapWidth; wCtrl.height := LedaBase.DefHeight; wCtrl.draw := WrapDraw;
+		wCtrl.rtId := wrapRTId; INC(wrapRTId);
+		wCtrl.name := name; wCtrl.wrap := DefWrap; wCtrl.style := NIL;
+		RETURN wCtrl
+	END NewWrap;
+	
+	PROCEDURE CopyWrap(wrap: Wrap): Wrap;
+		VAR nwrap: Wrap;
+	BEGIN
+		IF wrap.name # Anon THEN RETURN wrap	(* reference copy *)
+		ELSE nwrap := NewWrap(""); nwrap.wrap := wrap.wrap; RETURN nwrap	(* deep copy *)
+		END
+	END CopyWrap;
+	
+	PROCEDURE *WrapDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for wrap control [= predefined control]; multiple references *)
+		VAR wCtrl: Wrap;
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN WrapPrint(ctrl(Wrap), m(LedaBase.PrintMsg))
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := CopyWrap(ctrl(Wrap))
+				| LedaBase.RegisterId:  LedaBase.PutToList(ctrl, m.ctrlId)
+				| LedaBase.StoreId:  wCtrl := ctrl(Wrap);
+						LedaBase.StoreName(m.r, wCtrl.name); LedaBase.StoreVal(m.r, wCtrl.wrap)
+				| LedaBase.LoadId:  wCtrl := NewWrap(""); m.ctrl := wCtrl;
+						LedaBase.LoadName(m.r, wCtrl.name); LedaBase.LoadVal(m.r, wCtrl.wrap)
+				| LedaBase.StoreModCmd:  LedaSys.Halt("wrap control error")
+				| FileId:  ctrl.kindId := WrapId
+				| LedaBase.CheckId:  wCtrl := ctrl(Wrap);
+						IF (wCtrl.wrap < 1) OR (wCtrl.wrap > MaxWrap) THEN wCtrl.wrap := DefWrap END
+				| LedaBase.ReplaceId:	(* replacement of ctrl by m.ctrl possible ? *)
+						IF m.ctrl IS Wrap THEN wCtrl := ctrl(Wrap);
+							IF m.ch = "X" THEN m.ctrlId := 1;	(* exchange okay *)
+								IF m.ctrl(Wrap).name = Anon THEN
+									IF wCtrl.name = Anon THEN wCtrl.wrap := m.ctrl(Wrap).wrap; m.ctrl := wCtrl	(* copy attributes *)
+									ELSE m.ctrl := CopyWrap(m.ctrl(Wrap))	(* create new instance *)
+									END
+								END
+							ELSIF m.ch = "=" THEN
+								IF (wCtrl.name # Anon) & (wCtrl.name = m.ctrl(Wrap).name) THEN m.ctrlId := 1 END	(* substitution okay *)
+							END
+						END
+				| LedaBase.UpdateId:
+						IF ctrl = m.ctrl THEN m.ctrlId := LedaCtrl.PourThis ELSE ctrl.stamp := LedaBase.CurStamp() END	(* line format changed *)
+				| LedaBase.InvertSepId:  
+						IF InvertIcon("I", m.x, m.y) THEN INCL(m.s, LedaBase.InvertSepId) END
+				ELSE
+				END
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.NameId THEN
+					m.name := ctrl(Wrap).name; m.b :=  m.ctrl = ctrl
+				END
+			END
+		END
+	END WrapDoOp;
+	
+
+BEGIN
+	(*--- format control ---*)
+	formRTId := 0;	(* run time id for format control *)
+	formDoOp := FormatDoOp;	(* formDoOp -> used by NewFormat *)
+	LedaBase.RPC(NewFormat(""), FormatId);	(* register type *)
+	LedaCtrl.DefChCtrl(LF, "format", FALSE, FALSE, NIL, NewFormat(""), "", "");	(* register for key input *)
+	(* LedaCtrl.DefChCtrl(LF, "format", TRUE, FALSE, IsFormat, NewFormat(""), "", "");	 register for key input *)
+	(*--- tabulator control ---*)
+	tabRTId := 0;	(* run time id for tab stops control *)
+	tabPosDoOp := TabPosDoOp;	(* tabPosDoOp -> used by NewTabPos *)
+	tabDoOp := TabDoOp;	(* tabDoOp -> used by NewTabulator *)
+	LedaBase.RPC(NewTabPos(), TabPosId);		(* register type *)
+	LedaBase.RPC(NewTabulator(NIL), TabulatorId);			(* register type *)
+	LedaCtrl.DefChCtrl(LedaBase.Tab, "tabulator", TRUE, TRUE, IsTab, DefTabulator(), "", "");	(* tabulator control *)
+	(*--- inset control ---*)
+	insRTId := 0;	(* run time id for inset control *)
+	insSpecDoOp := InsSpecDoOp;	(* insSpecDoOp -> used by NewInsSpec *)
+	insDoOp := InsDoOp;	(* insDoOp -> used by NewInset *)
+	defInset := DefInset();
+	LedaBase.RPC(NewInsSpec(), InsSpecId);		(* register type *)
+	LedaBase.RPC(NewInset(NIL), InsetId);		(* register type *)
+	LedaCtrl.DefChCtrl(RedIns, "enumeration.head", TRUE, TRUE, IsInset, defInset, "", "");	(* reduce inset *)
+	LedaCtrl.DefChCtrl(EnlIns, "enumeration.tail", TRUE, TRUE, IsInset, defInset, "", "");	(* enlarge inset *)
+	(*--- line control ---*)
+	lineRTId := 0;
+	lineSpecDoOp := LineSpecDoOp;
+	lineDoOp := LineDoOp;
+	LedaBase.RPC(NewLineSpec(), LineSpecId);	(* register type *)
+	LedaBase.RPC(NewLine(NIL), LineId);	(* register type *)
+	LedaCtrl.DefChCtrl(LineCh, "line", TRUE, FALSE, IsLine, DefLine(), "", "");		(* register for key input *)
+	(*--- filler control ---*)
+	filDoOp := FilDoOp;
+	LedaBase.RPC(NewFiller(NIL), FillerId);	(* register type *)
+	LedaCtrl.DefChCtrl(FilCh, "filler", TRUE, FALSE, IsFiller, NewFiller(NIL), "", "");		(* register for key input *)
+	(*--- wrap control ---*)
+	wrapDoOp := WrapDoOp;
+	LedaBase.RPC(NewWrap(""), WrapId);	(* register type *)
+	LedaCtrl.DefChCtrl(WrapCh, "wrap", TRUE, FALSE, IsWrap, NewWrap(""), "", "");	(* register for key input *)
+END LedaChar.

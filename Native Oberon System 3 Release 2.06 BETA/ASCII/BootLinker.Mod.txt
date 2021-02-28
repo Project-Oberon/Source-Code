@@ -1,0 +1,1743 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE BootLinker;		(** JdV / dVdW / pjm *)
+
+(*
+	Static linker for Native Oberon using OP2
+	by De Villiers de Wet, Stellenbosch University (dewe@cs.sun.ac.za)
+	and Johan de Villiers, Datafusion (devil@dfs.stb.co.za)
+	Native Oberon version by Pieter Muller, ETH (muller@inf.ethz.ch)
+
+This program is distributed in the hope that it will be useful, 
+but WITHOUT ANY WARRANTY; without even the implied warranty of 
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+	pjm 15.01.96
+		started porting to Native Oberon
+	pjm 04.03.96
+		merged in ref block changes from dVdW
+		module descriptor is now a recblk, not a sysblk
+*)
+
+IMPORT
+	SYSTEM, Files, Texts, Oberon, In, Out;
+	
+CONST
+	Boundary = 32;	(* boundaries on which Oberon GC allocates blocks (=32) *)
+	ExtTabWordSize = 16;
+	
+TYPE
+	Name = ARRAY 32 OF CHAR;
+	Object = POINTER TO ObjectDesc;
+	
+	CommandDesc = RECORD
+		name : Name;
+		entry : LONGINT
+	END;
+	Commands = POINTER TO ARRAY OF CommandDesc;
+
+	ImportRec = RECORD
+		key : LONGINT;
+		name : Name;
+		object : Object
+	END;
+	Imports = POINTER TO ARRAY OF ImportRec;
+	
+	DataLinkDesc = RECORD
+		mod : CHAR;
+		entryNo, nofFixups : INTEGER;
+		offsets : POINTER TO ARRAY OF LONGINT
+	END;
+	DataLinks = POINTER TO ARRAY OF DataLinkDesc;
+	
+	LinkDesc = RECORD
+		modNo, entryNo : CHAR;
+		offset : LONGINT
+	END;
+	Links = POINTER TO ARRAY OF LinkDesc;
+	
+	Constants = POINTER TO ARRAY OF CHAR;
+	Code = POINTER TO ARRAY OF CHAR;
+	
+	NewMethod = RECORD
+		methodNo, entryNo : INTEGER
+	END;
+	
+	TypeDesc = POINTER TO RECORD tag : LONGINT; word : POINTER TO ARRAY OF LONGINT END;
+	
+	Type = RECORD
+		recordSize : LONGINT;
+		typedescEntry, basetypModNo, basetypEntry,
+		nofMethods, nofInheritedMeths, nofNewMethods, nofPointers : INTEGER;
+		name : Name;
+		newMethods : POINTER TO ARRAY OF NewMethod;
+		ptrOffset : POINTER TO ARRAY OF LONGINT;
+		td : TypeDesc;
+		root, tdSize, padSize*(*padding after td*) : LONGINT;
+		init : BOOLEAN
+	END;
+	
+	(* Reference block *)
+	VarRef = POINTER TO VarRefDesc;
+	VarRefDesc = RECORD
+		mode,
+		form : CHAR;
+		offset : LONGINT;
+		name : ARRAY 64 OF CHAR;
+		next : VarRef
+	END;
+
+	ProcRef  = POINTER TO ProcRefDesc;
+	ProcRefDesc = RECORD
+		procedureName : ARRAY 64 OF CHAR;
+		procedureOffset : LONGINT;
+		list : VarRef;
+		next : ProcRef
+	END;
+
+	ObjectDesc = RECORD
+		(* info from header *)
+		nofDataEntries, nofEntries, nofCommands, nofPointers, nofTypes, nofImports,
+		nofDataLinks, nofLinks : INTEGER;
+		constSize,
+		refSize, dataSize, codeSize,
+		key : LONGINT;
+		name : Name;
+		(* other *)
+		init : BOOLEAN;
+		refcnt,
+		SB : LONGINT;
+		varEntries : POINTER TO ARRAY OF LONGINT;
+		entries : POINTER TO ARRAY OF LONGINT;
+		commands : Commands;
+		pointers : POINTER TO ARRAY OF LONGINT;
+		tdescs: POINTER TO ARRAY OF LONGINT;
+		imports : Imports;
+		dataLinks : DataLinks;
+		links : Links;
+		constants : Constants;
+		code : Code;
+		types : POINTER TO ARRAY OF Type;
+		refs : ProcRef;
+		refBlock : POINTER TO ARRAY OF CHAR;
+		(* for linking *)
+		typeTablePadding, typeTableAdr, typeTableSize,
+		base, codeBase,
+		imageSize : LONGINT
+	END;
+	
+(* This what the actual type descriptor looks like:
+	TypeDesc = RECORD	(word)
+		tdsize,	0	
+		sentinel,	1
+		self,	2
+		extlev : LONGINT;	3
+		name : Name;	4
+		mdesc : LONGINT;	12
+		newMethods : ARRAY ? OF LONGINT;	13
+		tagTable : ARRAY ExtTabWordSize OF LONGINT;
+		tag,	root-1
+		recsize : LONGINT;	root
+		ptrOffset : ARRAY ? OF LONGINT	root+1
+	END;
+*)
+	
+CONST
+	PaddingSize = 64;
+	PageSize = 4096;
+	
+	Tag0WordOffset = -2;
+	Mth0WordOffset = Tag0WordOffset - ExtTabWordSize;
+	
+TYPE
+	String = ARRAY 256 OF CHAR;
+
+	ObjectList = POINTER TO ObjectListNode;
+	ObjectListNode = RECORD
+		object : Object;
+		next : ObjectList
+	END;
+
+	InitPoint = POINTER TO InitPointNode;
+	InitPointNode = RECORD
+		entryPoint : LONGINT;
+		object : Object;
+		next : InitPoint
+	END;
+
+	(* The following type is necessary for building the module descriptors
+		 before they are dumped to disk. The record is not allowed to have any 
+		 pointer variables, otherwise they are (incorrectly) garbage collected
+		 afterwards. The type is the equivalent of  ModuleDesc. *)
+	DumpModule = POINTER TO DumpModuleDesc;
+	DumpModuleDesc = RECORD
+		next: LONGINT;
+		name :  Name;
+		init : BOOLEAN;
+		key, refcnt, sb,
+		varEntries, entries, cmds, ptrTab, tdescs, imports,
+		data, code, refs, term : LONGINT;
+	END;
+	
+VAR
+	logWriter : Texts.Writer;
+	logName : ARRAY 32 OF CHAR;
+
+	objectList : ObjectList;
+	initPointList : InitPoint;
+	generateList, includeRefs : BOOLEAN;
+	moduleDescSize,
+	mDescPadSize,
+	mDescTag,
+	nofEntryPoints,
+	newAdr, sysnewAdr, arrnewAdr : LONGINT;
+	padding : ARRAY PaddingSize OF SYSTEM.BYTE;
+
+	NEWmod, NEWproc,
+	SYSNEWmod, SYSNEWproc,
+	NEWARRmod, NEWARRproc,
+	listMod, listVar,
+	commandMod, commandProc : String;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE Length(s: ARRAY OF CHAR): INTEGER;
+VAR i : INTEGER;
+BEGIN (* Pre: s[i] = 0X, 0 <= i < LEN(s) *)
+	i := 0;
+	WHILE (s[i] # 0X) DO INC(i) END;
+	RETURN i
+END Length;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE Concat (s1, s2 : ARRAY OF CHAR; VAR s3 : ARRAY OF CHAR);
+VAR
+	i, len, max : INTEGER;
+BEGIN (* Pre: s1[i] := 0X, 0 <= i < LEN(s1)
+						s2[j] := 0X, 0 <= j < LEN(s2) *)
+	max := SHORT(LEN(s3))-1;
+	COPY(s1, s3);
+	len := Length(s3);
+	i := 0;
+	WHILE ((len + i) < max) & (s2[i] # 0X) DO
+		s3[len + i] := s2[i];
+		INC(i)
+	END;
+	s3[len + i] := 0X
+END Concat;
+
+PROCEDURE LogOpen(name : ARRAY OF CHAR);
+BEGIN
+	COPY(name, logName);
+	Texts.OpenWriter(logWriter)
+END LogOpen;
+
+PROCEDURE LogClose;
+VAR
+	len : LONGINT;
+	res : INTEGER;
+	text : Texts.Text;
+	file : Files.File;
+BEGIN
+	Files.Delete(logName, res);
+	file := Files.New(logName);
+	NEW(text); Texts.Open(text, "");
+	Texts.Append(text, logWriter.buf);
+	Texts.Store(text, file, 0, len);
+	Files.Register(file);
+	file := NIL;
+	text := NIL
+END LogClose;
+
+PROCEDURE LogPreempt;
+BEGIN
+	Texts.WriteLn(logWriter);
+	Texts.Append(Oberon.Log, logWriter.buf)
+END LogPreempt;
+
+PROCEDURE LogHex(i: LONGINT);
+BEGIN
+	Texts.WriteHex(logWriter, i);
+	Texts.Write(logWriter, "H")
+END LogHex;
+
+PROCEDURE LogLn;
+BEGIN
+	Texts.WriteLn(logWriter)
+END LogLn;
+
+PROCEDURE LogString(s: ARRAY OF CHAR);
+BEGIN
+	Texts.WriteString(logWriter, s)
+END LogString;
+
+PROCEDURE Halt(msg : ARRAY OF CHAR);
+BEGIN
+	LogClose;
+	Out.Ln;
+	Out.String("Error: "); Out.String(msg); Out.Ln;
+	HALT(100)
+END Halt;
+
+PROCEDURE ReadUnsigned(VAR R: Files.Rider; VAR u: LONGINT);
+	(* read unsigned, 16 bit, little endian value *)
+	VAR lowByte, highByte: CHAR;
+BEGIN
+	Files.Read(R, lowByte); Files.Read(R, highByte);
+	u := 256*LONG(ORD(highByte)) + ORD(lowByte)
+END ReadUnsigned;	
+
+PROCEDURE ReadHeader(VAR r : Files.Rider; VAR o : Object) : BOOLEAN;
+VAR ch : CHAR; res : BOOLEAN; int : INTEGER;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 0F8X) THEN
+		Files.Read(r, ch);
+		IF (ch = 036X) THEN
+			Files.ReadLInt(r, o.refSize);
+			Files.ReadInt(r, o.nofDataEntries);
+			Files.ReadInt(r, o.nofEntries);
+			Files.ReadInt(r, o.nofCommands);
+			Files.ReadInt(r, o.nofPointers);
+			Files.ReadInt(r, o.nofTypes);
+			Files.ReadInt(r, o.nofImports);
+			Files.ReadInt(r, o.nofDataLinks);
+			Files.ReadInt(r, o.nofLinks);
+			Files.ReadLInt(r, o.dataSize);
+			Files.ReadInt(r, int);
+			o.constSize := int;
+			ReadUnsigned(r, o.codeSize);
+			Files.ReadLInt(r, o.key);
+			Files.ReadString(r, o.name);
+			res := TRUE
+		END
+	END;
+	RETURN res
+END ReadHeader;
+
+PROCEDURE ReadVarEntries(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR; k : LONGINT;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 08CX) THEN
+		IF (o.nofDataEntries > 0) THEN
+			NEW(o.varEntries, o.nofDataEntries);
+			FOR k := 0 TO (o.nofDataEntries - 1) DO
+				Files.ReadLInt(r, o.varEntries[k])
+			END;
+		ELSE
+			o.varEntries := NIL
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadVarEntries;
+
+PROCEDURE ReadEntries(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR; k : LONGINT;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 082X) THEN
+		IF (o.nofEntries > 0) THEN
+			NEW(o.entries, o.nofEntries);
+			FOR k := 0 TO (o.nofEntries - 1) DO
+				ReadUnsigned(r, o.entries[k])
+			END
+		ELSE
+			o.entries := NIL
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadEntries;
+
+PROCEDURE ReadCommands(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR; k : LONGINT;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 083X) THEN
+		IF (o.nofCommands > 0) THEN
+			NEW(o.commands, o.nofCommands);
+			FOR k := 0 TO (o.nofCommands - 1) DO
+				Files.ReadString(r, o.commands[k].name);
+				ReadUnsigned(r, o.commands[k].entry)
+			END
+		ELSE
+			o.commands := NIL
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadCommands;
+
+PROCEDURE ReadPointers(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR; k : LONGINT;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 084X) THEN
+		IF (o.nofPointers > 0) THEN
+			NEW(o.pointers, o.nofPointers);
+			FOR k := 0 TO (o.nofPointers - 1) DO
+				Files.ReadLInt(r, o.pointers[k])
+			END
+		ELSE
+			o.pointers := NIL
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadPointers;
+
+PROCEDURE ReadImports(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR; k : LONGINT;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 085X) THEN
+		NEW(o.imports, o.nofImports + 1);
+		o.imports[0].object := o;
+		IF (o.nofImports > 0) THEN
+			FOR k := 1 TO o.nofImports DO
+				Files.ReadLInt(r, o.imports[k].key);
+				Files.ReadString(r, o.imports[k].name);
+				o.imports[k].object := NIL
+			END
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadImports;
+
+PROCEDURE ReadDataLinks(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR; k, m : LONGINT;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 08DX) THEN
+		IF (o.nofDataLinks > 0) THEN
+			NEW(o.dataLinks, o.nofDataLinks);
+			FOR k := 0 TO (o.nofDataLinks - 1) DO
+				Files.Read(r, o.dataLinks[k].mod);
+				Files.ReadInt(r, o.dataLinks[k].entryNo);
+				Files.ReadInt(r, o.dataLinks[k].nofFixups);
+				IF o.dataLinks[k].nofFixups > 0 THEN
+					NEW(o.dataLinks[k].offsets, o.dataLinks[k].nofFixups);
+					FOR m := 0 TO (o.dataLinks[k].nofFixups - 1) DO
+						ReadUnsigned(r, o.dataLinks[k].offsets[m])
+					END
+				ELSE
+					o.dataLinks[k].offsets := NIL
+				END
+			END
+		ELSE
+			o.dataLinks := NIL
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadDataLinks;
+
+PROCEDURE ReadLinks(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR; k : LONGINT;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 086X) THEN
+		IF (o.nofLinks > 0) THEN
+			NEW(o.links, o.nofLinks);
+			FOR k := 0 TO (o.nofLinks - 1) DO
+				Files.Read(r, o.links[k].modNo);
+				Files.Read(r, o.links[k].entryNo);
+				ReadUnsigned(r, o.links[k].offset)
+			END
+		ELSE
+			o.links := NIL
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadLinks;
+
+PROCEDURE ReadConst(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 087X) THEN
+		IF (o.constSize > 0) THEN
+			NEW(o.constants, o.constSize);
+			Files.ReadBytes(r, o.constants^, o.constSize)
+		ELSE
+			o.constants := NIL
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadConst;
+
+PROCEDURE ReadCode(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR res : BOOLEAN; ch : CHAR;
+BEGIN
+	res := FALSE;
+	Files.Read(r, ch);
+	IF (ch = 088X) THEN
+		IF (o.codeSize > 0) THEN
+			NEW(o.code, o.codeSize);
+			Files.ReadBytes(r, o.code^, o.codeSize)
+		ELSE
+			o.code := NIL
+		END;
+		res := TRUE
+	END;
+	RETURN res
+END ReadCode;
+
+PROCEDURE ReadTypes(VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR
+	res : BOOLEAN;
+	ch : CHAR;
+	root, i, k : LONGINT;
+	type : Type;
+BEGIN
+	res := FALSE;
+	o.typeTableSize := 0;
+	Files.Read(r, ch);
+	IF (ch = 089X) THEN
+		IF (o.nofTypes > 0) THEN
+			NEW(o.types, o.nofTypes);
+			FOR k := 0 TO (o.nofTypes - 1) DO
+				Files.ReadLInt(r, type.recordSize);
+				Files.ReadInt(r, type.typedescEntry);
+				Files.ReadInt(r, type.basetypModNo);
+				Files.ReadInt(r, type.basetypEntry);
+				Files.ReadInt(r, type.nofMethods);
+				Files.ReadInt(r, type.nofInheritedMeths);
+				Files.ReadInt(r, type.nofNewMethods);
+				Files.ReadInt(r, type.nofPointers);
+				Files.ReadString(r, type.name);
+				IF type.nofNewMethods > 0 THEN
+					NEW(type.newMethods, type.nofNewMethods);
+					FOR i := 0 TO (type.nofNewMethods-1) DO
+						Files.ReadInt(r, type.newMethods[i].methodNo);
+						Files.ReadInt(r, type.newMethods[i].entryNo)
+					END
+				ELSE
+					type.newMethods := NIL
+				END;
+				IF type.nofPointers > 0 THEN
+					NEW(type.ptrOffset, type.nofPointers);
+					FOR i := 0 TO (type.nofPointers-1) DO
+						Files.ReadLInt(r, type.ptrOffset[i])
+					END
+				ELSE
+					type.ptrOffset := NIL
+				END;
+				root := 13 (* fields tdsize..mdesc *) + type.nofMethods + ExtTabWordSize + 1 (* tag *);
+				INC(root, (-root+2) MOD 4);	(* ADR(td.word[root]) MOD 16 = 8 *)
+				type.tdSize := (root + 1 (*recsize*) + type.nofPointers + 1 (*sentinel*)) * 4;
+				type.padSize := (-type.tdSize-4(*tag*)) MOD Boundary;
+				type.root := root;
+				type.init := FALSE;
+				o.types[k] := type;
+				INC(o.typeTableSize, 4(*tag*) + type.tdSize + type.padSize)
+			END; (* FOR *)
+			ASSERT(o.typeTableSize MOD Boundary = 0);
+			res := TRUE
+		ELSE
+			o.types := NIL;
+			res := TRUE
+		END
+	END;
+	RETURN res
+END ReadTypes;
+
+PROCEDURE ReadReferences(f : Files.File; VAR r : Files.Rider; o : Object) : BOOLEAN;
+VAR
+	res : BOOLEAN;
+	ch, typeForm : CHAR;
+	offset, refStart: LONGINT;
+	name: ARRAY 64 OF CHAR;
+	procRef : ProcRef;
+	varRef : VarRef;
+BEGIN (* Pre: o.refSize correct *)
+	res := TRUE;
+	Files.Read(r, ch);
+	IF (ch = 08BX) THEN
+		IF includeRefs THEN
+			refStart := Files.Pos(r);
+			NEW(o.refBlock, o.refSize);
+			Files.ReadBytes(r, o.refBlock^, o.refSize-1);
+			IF r.res # 0 THEN Halt("Error reading reference block") END;
+			Files.Set(r, f, refStart)
+		ELSE
+			o.refBlock := NIL
+		END;
+		o.refs := NIL;
+		Files.Read(r, ch);
+		WHILE ~r.eof & res DO
+			IF ch # 0F8X THEN
+				Out.String("Error in reference block.");
+				res := FALSE
+			ELSE
+				NEW(procRef);
+				Files.ReadNum(r, procRef.procedureOffset);
+				Files.ReadString(r, procRef.procedureName);
+				procRef.list := NIL;
+				procRef.next := o.refs; o.refs := procRef;
+				Files.Read(r, ch);
+				WHILE (ch = 1X) OR (ch = 3X) DO
+					NEW(varRef);
+					varRef.mode := ch;
+					Files.Read(r, varRef.form);
+					ASSERT(ORD(varRef.form) IN {1,2,3,4,5,6,7,8,9,13,15});
+					Files.ReadNum(r, varRef.offset);
+					Files.ReadString(r, varRef.name);
+					varRef.next := procRef.list; procRef.list := varRef;
+					Files.Read(r, ch)
+				END
+			END
+		END (* WHILE *)
+	ELSE
+		res := FALSE
+	END;
+	RETURN res
+END ReadReferences;
+
+PROCEDURE ReadObject(name : ARRAY OF CHAR; VAR o : Object);
+VAR r : Files.Rider; f : Files.File; res : BOOLEAN;
+BEGIN
+	res := FALSE;
+	f := Files.Old(name);
+	IF f # NIL THEN
+		Files.Set(r, f, 0);
+		NEW(o);
+		res :=
+			ReadHeader(r, o)
+			& ReadVarEntries(r, o)
+			& ReadEntries(r, o)
+			& ReadCommands(r, o)
+			& ReadPointers(r, o)
+			& ReadImports(r, o)
+			& ReadDataLinks(r, o)
+			& ReadLinks(r, o)
+			& ReadConst(r, o)
+			& ReadCode(r, o)
+			& ReadTypes(r, o)
+			& ReadReferences(f, r, o);
+		Files.Close(f)
+	ELSE
+		Out.String("file not found : "); Out.String(name); Out.Ln
+	END;
+	IF ~res THEN HALT(100) END
+END ReadObject;
+
+(*-----------------------------------------------------------*)
+(* Returns num rounded up to the nearest multiple of boundary *)
+PROCEDURE Align(num, boundary : LONGINT) : LONGINT;
+BEGIN
+		RETURN num + (-num) MOD boundary
+END Align;
+
+(*-----------------------------------------------------------*)
+PROCEDURE ExtractNames(string : ARRAY OF CHAR; VAR module, procedure : ARRAY OF CHAR);
+(* Extracts the module and procedure from a <module>.<procedure> string.
+	Can also be used to extract the name and extension from a file name. *)
+VAR
+  i, length, mlength : INTEGER;
+BEGIN
+  i := 0;
+   length := Length(string);
+   WHILE (i < length) & (string[i] # ".") DO
+      module[i] := string[i];
+      INC(i)
+   END (* WHILE *);
+   mlength := i + 1;
+   module[i] := 0X;		(* terminate string *)
+   INC(i);			(* skip over "." *)
+   WHILE (i < length) DO
+      procedure[i-mlength] := string[i];
+      INC(i)
+   END (* WHILE *);
+   procedure[i-mlength] := 0X
+END ExtractNames;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE Remember(object : Object);
+(* New objects are appended at the BACK of the list *)
+VAR
+	t, new : ObjectList;
+BEGIN
+	NEW(new);
+	new.object := object;
+	new.next := NIL;
+	IF (objectList # NIL) THEN
+		t := objectList;
+		WHILE (t.next # NIL) DO t := t.next END;
+		t.next := new
+	ELSE
+	  objectList := new
+	END
+END Remember;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE Loaded(name : ARRAY OF CHAR) : BOOLEAN;
+VAR tmp : ObjectList;
+BEGIN
+	tmp := objectList;
+	WHILE (tmp # NIL) & (tmp.object.name # name) DO
+		tmp := tmp.next
+	END;
+	RETURN (tmp # NIL)
+END Loaded;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE GetDWord(VAR code : ARRAY OF SYSTEM.BYTE; idx  : LONGINT) : LONGINT;
+VAR tmp : LONGINT;
+BEGIN
+	SYSTEM.GET(SYSTEM.ADR(code[idx]), tmp);
+	RETURN tmp
+END GetDWord;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE PutDWord(VAR code : ARRAY OF SYSTEM.BYTE; idx, value : LONGINT);
+BEGIN
+	SYSTEM.PUT(SYSTEM.ADR(code[idx]), value)
+END PutDWord;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE AddInitPoint(entryPoint : LONGINT; object : Object);
+VAR
+	t, new : InitPoint;
+BEGIN
+	NEW(new);
+	new.entryPoint := entryPoint;
+	new.object := object;
+	new.next := NIL;
+	IF (initPointList # NIL) THEN
+		t := initPointList;
+		WHILE (t.next # NIL) DO t := t.next END;
+		t.next := new;
+	ELSE
+		initPointList := new
+	END;
+	INC(nofEntryPoints)
+END AddInitPoint;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE FixTypes(object : Object);
+(* More or less does the work of procedures ReadTypes and
+	 InitTypes in the Oberon loader. The aim is to do behave EXACTLY like
+	 Modules.ReadTypes, taking into account how Kernel.NewSys works as
+	 well. *)
+VAR
+	i, j, tdAdr, root, mDescAdr, extlev(*extension level*), entry, tag : LONGINT;
+	td :  TypeDesc;
+	type, baseType :  Type;
+	baseTypMod : Object;
+BEGIN	(* Pre: entry points have been fixed,  type table address and size have been calculated *)
+	tdAdr := object.typeTableAdr + 4(*tag*); 
+	IF generateList THEN
+		IF object.nofTypes > 0 THEN
+			NEW(object.tdescs, object.nofTypes);
+			(* Calculate address of this module's module descriptor *)
+			mDescAdr := tdAdr - 4 + object.typeTableSize + 4; (* extra 4 bytes for tag in front of module desc *)
+		END
+	ELSE
+		object.tdescs := NIL; mDescAdr := 0
+	END;
+	FOR i := 0 TO (object.nofTypes - 1) DO
+		type := object.types[i];
+		root := type.root;
+		NEW(td);
+		NEW(td.word, type.tdSize DIV 4);
+		(* invariant: tdAdr = future address of td.word[0] *)
+		ASSERT(tdAdr MOD  Boundary = 0);
+		object.types[i].td := td;
+		type.td := td;
+		td.tag := tdAdr;
+		td.word[0] := type.tdSize;
+		td.word[1] := -4 (* sentinel *);
+		td.word[2] := tdAdr + root*4; (* self - points to td.word[root] *)
+		td.word[3] := 0; (* extlev *)
+		td.word[4] := 0;
+		SYSTEM.MOVE(SYSTEM.ADR(type.name[0]), SYSTEM.ADR(td.word[4]), SIZE(Name));
+		td.word[12] := mDescAdr;	(* mdesc *)
+		(* copy entry points of new methods into descriptor *)
+		FOR j := 0 TO (type.nofNewMethods - 1) DO
+			td.word[root + Mth0WordOffset - type.newMethods[j].methodNo] :=
+				object.entries[type.newMethods[j].entryNo]
+		END;
+		td.word[root-1] := tdAdr; (* tag of subobj *)
+		td.word[root] := type.recordSize;
+		PutDWord(object.constants^, object.varEntries[type.typedescEntry] - object.SB, td.word[2]);
+		IF generateList THEN
+			object.tdescs[i] := td.word[2]
+		END;
+		FOR j := 0 TO (type.nofPointers - 1) DO
+			td.word[root + 1 + j] := type.ptrOffset[j]
+		END;
+		td.word[root + 1 + type.nofPointers] := -(type.nofPointers + 1)*4; (* sentinel *)
+		
+		(* Initialise tags and methods - procedure InitTypes() in bootlinker *)
+		extlev := 0;
+		IF type.basetypModNo # -1 THEN
+			baseTypMod := object.imports[type.basetypModNo].object;
+			j := 0;
+			WHILE (j < baseTypMod.nofTypes)
+			& (baseTypMod.types[j].typedescEntry # type.basetypEntry) DO INC(j) END;
+			ASSERT(j < baseTypMod.nofTypes);
+			baseType := baseTypMod.types[j];
+			ASSERT(baseType.init);
+			(* copy base type tags *)
+			tag := baseType.td.word[baseType.root + Tag0WordOffset];
+			WHILE tag # 0 DO
+				td.word[root + Tag0WordOffset - extlev] := tag;
+				INC(extlev);
+				tag := baseType.td.word[baseType.root + Tag0WordOffset - extlev]
+			END;
+			(* copy non-overwritten methods *)
+			FOR j := (type.nofInheritedMeths-1) TO 0 BY -1 DO
+				entry := td.word[root + Mth0WordOffset - j];
+				IF entry = 0 THEN
+					td.word[root + Mth0WordOffset - j] :=
+						baseType.td.word[baseType.root + Mth0WordOffset - j]
+				END
+			END (* FOR *)
+		END; (* IF *)
+		td.word[3] := extlev;
+		td.word[root + Tag0WordOffset - extlev] := td.word[2];	(* own type tag *)
+		object.types[i].init := TRUE;
+		INC(tdAdr, type.tdSize + type.padSize + 4)
+	END (* FOR *);
+	IF generateList & (object.name = listMod) THEN
+		i := 0;
+		WHILE (i < object.nofTypes) & (object.types[i].name # "ModuleDesc") DO INC(i) END;
+		ASSERT(i < object.nofTypes);
+		mDescTag := object.types[i].td.word[2]
+	END
+END FixTypes;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE FixEntryPoints(object : Object);
+VAR i : LONGINT;
+BEGIN (* Pre: SB and codeBase has been calculated. *)
+	(* Fix data entry points *)
+	FOR i := 0 TO (object.nofDataEntries - 1) DO
+		INC(object.varEntries[i], object.SB)
+	END;
+	(* Fix entry points *)
+	FOR i := 0 TO (object.nofEntries - 1) DO
+		INC(object.entries[i], object.codeBase)
+	END;
+	(* Fix commands *)
+	FOR i := 0 TO (object.nofCommands - 1) DO
+		INC(object.commands[i].entry, object.codeBase)
+	END
+END FixEntryPoints;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE FixPointers(object : Object);
+VAR i : LONGINT;
+BEGIN
+	(* Pre: SB has been calculated. *)
+	FOR i := 0 TO (object.nofPointers - 1) DO
+		INC(object.pointers[i], object.SB)
+	END
+END FixPointers;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE FindObject(name : ARRAY OF CHAR) : Object;
+VAR t : ObjectList;
+BEGIN
+	t := objectList;
+	WHILE (t # NIL) & (t.object.name # name) DO
+		t := t.next
+    END;
+    IF t # NIL THEN
+		RETURN t.object
+	ELSE
+		RETURN NIL
+	END
+END FindObject;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE FindProcAddress(object : Object; name : String) : LONGINT;
+(* Pre-condition: object's code base has been calculated *)
+(* Finds procedure name's offset by using the reference block and the  entry block of object.
+	 The entry in the reference block gives the offset of the procedure's code.
+	 Returns the absolute address the procedure will have in memory at run-time.
+	 If procedure is not found, 0 is returned. No procedure will have an address of 0. *)
+VAR t :  ProcRef;
+BEGIN
+	(*IF ~object.init THEN HALT(100) END;*) (* module must have been patched already *)
+	t := object.refs;
+	(* Search for procedure in reference block *)
+	WHILE (t # NIL) & (t.procedureName # name) DO t := t.next END;
+	IF t # NIL THEN
+		RETURN object.codeBase + t.procedureOffset
+	ELSE
+		RETURN 0
+	END
+END FindProcAddress;
+
+(* ---------------------------------------------------------- *)
+(* Finds the offset of global variable *name* from SB of module *object*.
+	This is intended to be used to find the offset of the module list variable,
+	therefore it must be a pointer or a LONGINT. *)
+PROCEDURE FindVarOffset(object : Object; name : ARRAY OF CHAR; form : SET) : LONGINT;
+VAR
+	tmp :  ProcRef;
+	var :  VarRef;
+BEGIN
+	tmp := object.refs;
+	WHILE (tmp # NIL) & (tmp.procedureName # "$$") DO
+		tmp:= tmp.next
+	END;
+	ASSERT(tmp # NIL);
+	var := tmp.list;
+	WHILE (var # NIL) & (var.name # name) DO var := var.next END;
+	IF (var # NIL) & (var.mode = 01X (* VarTag *))
+	& (ORD(var.form) IN form)
+	& (var.offset < 0) THEN
+		RETURN var.offset
+	ELSE
+		RETURN 0
+	END	
+END FindVarOffset;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE FixVariables(object : Object); 
+VAR
+	dataLinks :  DataLinks;
+	code :  Code;
+	nofLinks, nofFixups, i, j : LONGINT;
+	modNo, entryNo : INTEGER;
+	from : Object;
+	
+(*	SB = start of constant block
+		 	= Static Base (m.SB)
+		Variables have a negative, and constants a positive offset from SB.*)
+
+BEGIN
+	dataLinks := object.dataLinks;
+	code := object.code;
+	nofLinks := object.nofDataLinks;
+	FOR i := 0 TO (nofLinks - 1) DO
+		modNo := ORD(dataLinks[i].mod);
+		nofFixups := dataLinks[i].nofFixups;
+		IF modNo = 0 THEN (* global variable *)
+			FOR j := 0 TO (nofFixups - 1) DO
+				PutDWord(code^, dataLinks[i].offsets[j],
+									GetDWord(code^, dataLinks[i].offsets[j]) + object.SB)
+			END
+		ELSE
+			from := object.imports[modNo].object;
+			entryNo := dataLinks[i].entryNo;
+			FOR j := 0 TO (nofFixups - 1) DO
+				PutDWord(code^, dataLinks[i].offsets[j],
+								  GetDWord(code^, dataLinks[i].offsets[j]) + from.varEntries[entryNo])
+			END
+		END
+	END (* FOR *)
+END FixVariables;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE LSW(x : LONGINT) : LONGINT;
+BEGIN (* least significant word (unsigned) *)
+	RETURN SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET, x) * SYSTEM.VAL(SET, 0FFFFH))
+END LSW;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE MSW(x : LONGINT) : LONGINT;
+BEGIN (* most significant word (unsigned) *)
+	RETURN SYSTEM.LSH(x, -16)
+END MSW;
+
+(* ---------------------------------------------------------- *)
+(* Fix case table, local procedure assignments, GC calls and calls to imported procedures *)
+PROCEDURE FixCalls(object : Object);
+VAR
+	links :  Links;
+	i, noflinks, codeBase, offset, val, entryNo : LONGINT;
+	code :  Code;
+	constants :  Constants;
+	from : Object;
+BEGIN
+	links := object.links;
+	code := object.code;
+	codeBase := object.codeBase;
+	constants := object.constants;
+	noflinks := object.nofLinks;
+	FOR i := 0 TO (noflinks-1) DO
+		offset := links[i].offset;
+		IF ORD(links[i].modNo) = 0 THEN
+			CASE ORD(links[i].entryNo) OF
+				 255 : (* case table in constant area *)
+				 	WHILE offset # 0FFFFH DO
+				 		val := GetDWord(constants^, offset);
+				 		PutDWord(constants^, offset, codeBase + LSW(val));
+				 		offset := MSW(val)
+				 	END
+			|	254 : (* local procedure assignment *)
+					WHILE offset # 0FFFFH DO
+				 		val := GetDWord(code^, offset);
+				 		PutDWord(code^, offset, object.entries[LSW(val)]);
+				 		offset := MSW(val)
+				 	END
+			|	253 : (* Kernel.NewRec *)
+					WHILE offset # 0FFFFH DO
+						val := GetDWord(code^, offset);
+						IF newAdr # 0 THEN
+							PutDWord(code^, offset, newAdr - (codeBase + offset + 4))
+						ELSE
+							Halt("Call to NEW could not be patched.")
+						END;
+						offset := MSW(val)
+				 	END
+			|	252 : (* Kernel.NewSys *)
+					WHILE offset # 0FFFFH DO
+						val := GetDWord(code^, offset);
+						IF sysnewAdr # 0 THEN
+							PutDWord(code^, offset, sysnewAdr - (codeBase + offset + 4))
+						ELSE
+							Halt("Call to SYSTEM.NEW/NEW could not be patched.")
+						END;
+						offset := MSW(val)
+				 	END
+			|	251 : (* Kernel.NewArr *)
+					WHILE offset # 0FFFFH DO
+						val := GetDWord(code^, offset);
+						IF arrnewAdr # 0 THEN
+							PutDWord(code^, offset, arrnewAdr - (codeBase + offset + 4))
+						ELSE
+							Halt("Call to NEW for open array could not be patched.")
+						END;
+						offset := MSW(val)
+				 	END
+			END (* CASE *)
+		ELSE	(* call to imported procedure *)
+			from := object.imports[ORD(links[i].modNo)].object;
+			entryNo := ORD(links[i].entryNo);
+			WHILE offset # 0FFFFH DO
+				val := GetDWord(code^, offset);
+				IF LSW(val) = 0FFFFH THEN	(* absolute address *)
+					PutDWord(code^, offset, from.entries[entryNo])
+				ELSE (* relative address *)
+					PutDWord(code^, offset, from.entries[entryNo] - (codeBase + offset + 4))
+				END;
+				offset := MSW(val)
+			END
+		END
+	END
+END FixCalls;
+
+(* ---------------------------------------------------------- *)
+(* Computes the number of bytes which will be required for the blocks which
+	are included in the object if the module list is generated. *)
+PROCEDURE ExtraBlocksSize(object : Object) : LONGINT;
+BEGIN
+	RETURN 28(* memory block header, simulates SYSTEM.NEW header *)
+				  + 16 * ((object.nofDataEntries*4 + 35) DIV 16 
+					 		+ (object.nofEntries*4 + 35) DIV 16
+					 		+ (object.nofCommands*36 + 35) DIV 16
+					 		+ (object.nofPointers*4 + 35) DIV 16
+					 		+ (object.nofTypes*4 + 35) DIV 16
+					 		+ ((object.nofImports+1)*4 + 35) DIV 16)
+						 		(* imports are one more because imports[0] points to module itself *)
+END ExtraBlocksSize;
+
+(* ---------------------------------------------------------- *)
+(* Calculates important addresses and sizes. *)
+PROCEDURE ComputeNumbers(object : Object; base : LONGINT);
+VAR adr, extra : LONGINT;
+BEGIN
+	ASSERT((base + 4) MOD  Boundary = 0);
+	object.base := base;
+	object.dataSize := Align(object.dataSize, 8);
+	IF generateList THEN
+		extra := ExtraBlocksSize(object);
+		object.imageSize := extra + moduleDescSize
+	ELSE
+		extra := 4; object.imageSize := 4 
+	END;
+	object.SB := base + extra + 16(*data of open array*) + object.dataSize;
+	object.codeBase := base + extra + ((object.dataSize + object.constSize + 35) DIV 16) * 16
+									+ 16(* open array header *);
+	IF includeRefs THEN
+		adr := object.codeBase + (((object.codeSize + 35) DIV 16) * 16) + object.refSize
+	ELSE
+		adr := object.codeBase + object.codeSize
+	END;
+	(* now:, adr = first byte after code/refs and possible address for type table *)
+	object.typeTableAdr := Align(adr + 4,  Boundary) - 4;
+	object.typeTablePadding := object.typeTableAdr - adr;
+	INC(object.imageSize, ((object.dataSize + object.constSize + 35) DIV 16) * 16
+										+ 16 (* open array header in before code block *)
+										+ object.typeTablePadding
+										+ object.typeTableSize);
+	IF includeRefs THEN
+		INC(object.imageSize, (((object.codeSize + 35) DIV 16) * 16) + object.refSize)
+	ELSE
+		INC(object.imageSize, object.codeSize)
+	END;
+	ASSERT(object.SB MOD 8 = 0)
+END ComputeNumbers;
+
+(* ---------------------------------------------------------- *)
+(* Do all the linking for module name.
+	Pre: base = the start address for the module's info in memory
+	Post: base = the start address for the next module's info in memory *)
+PROCEDURE Module(VAR object : Object;
+											name : ARRAY OF CHAR;
+									VAR base : LONGINT);
+VAR
+	fileName : String;
+	nextBase, i : LONGINT;
+	newObject : Object;
+	readRefs : BOOLEAN;
+BEGIN
+	IF ~Loaded(name) THEN
+		Concat(name, ".Obj", fileName);
+		ReadObject(fileName, object);
+		Remember(object);
+		object.init := FALSE; (* to check for cyclic imports *)
+		ComputeNumbers(object, base);
+		nextBase := base + object.imageSize;
+		(* First import table record in Oberon points to module itself *)
+		IF (object.nofImports > 0) THEN
+		    FOR i := 1 TO object.nofImports DO
+			    Module(newObject, object.imports[i].name, nextBase);
+				IF (newObject.key # object.imports[i].key) THEN
+					Out.String(" error : key mismatch : ");
+					Out.String(object.name); Out.String(" importing ");
+					Out.String(newObject.name); Out.Ln;
+					HALT(100)
+				ELSE
+					object.imports[i].object := newObject;
+					INC(newObject.refcnt)
+				END
+		    END (* FOR *)
+		END;
+		(* Do the linking stuff *)
+		FixEntryPoints(object);
+		FixPointers(object);
+		FixTypes(object);
+		AddInitPoint(object.codeBase, object);
+		FixVariables(object);
+		IF name = NEWmod THEN newAdr := FindProcAddress(object, NEWproc) END;
+		IF name = SYSNEWmod THEN sysnewAdr := FindProcAddress(object, SYSNEWproc) END;
+		IF name = NEWARRmod THEN arrnewAdr := FindProcAddress(object, NEWARRproc) END;
+		FixCalls(object);
+		object.init := TRUE; (* used to check for cyclic imports *)
+		base := nextBase
+	ELSE
+		object := FindObject(name);
+		IF ~object.init THEN
+			Halt("Cyclic import")
+		END
+	END
+END Module;
+
+(* ---------------------------------------------------------- *)
+(* Dumps a pointer header of 28 bytes, like Kernel.NewSys would do 
+	 during dynamic memory allocation *)
+PROCEDURE DumpPtrHeader(
+						VAR rider : Files.Rider;
+								address,
+								size		: LONGINT;
+						VAR adrPad,
+								sizePad	: LONGINT);
+VAR header : ARRAY 7 OF LONGINT; (* 28 bytes = 7 words *)
+BEGIN
+	adrPad := Align(address + 4,  Boundary) - 4 - address;
+	sizePad := Align(size + 28,  Boundary) - size;
+	header[0] := (address + adrPad) + 4;	 (* tag field *)
+	header[1] := (size + sizePad) - 4;			(* size *)
+	header[2] := - 4;									(* sentinel *)
+	header[3] := 0;
+	header[4] := 0;
+	header[5] := 0;
+	header[6] := header[0];								(* tag *)
+	IF adrPad > 0 THEN
+		Files.WriteBytes(rider, padding, adrPad);
+	END;
+	Files.WriteBytes(rider, header, 28);
+	DEC(sizePad, 28)					(* header already dumped - was included *)
+END DumpPtrHeader;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE DumpModules(VAR rider : Files.Rider);
+VAR
+	o : ObjectList;
+	type :  Type;
+	m : DumpModule;
+	imports : POINTER TO ARRAY OF LONGINT;
+	data : POINTER TO ARRAY OF CHAR;
+	tmp : Object;
+	thisModule, i,j, size, pointer, num, tag, base, next, padSize, offset : LONGINT;
+	arrHdr : RECORD a, b, c, len : LONGINT END;
+	initPoint : InitPoint;
+BEGIN
+	arrHdr.a := 0; arrHdr.b := 0; arrHdr.c := 0;
+	o := objectList;
+	base := o.object.base;
+	WHILE (o # NIL) DO
+		next := o.object.base;
+		LogString("Dumping ");
+		LogString(o.object.name);
+		LogString("  Code base = ");
+		LogHex(o.object.codeBase); 
+		LogString("  Code size = "); LogHex(o.object.codeSize); LogLn;
+		LogString("  SB = "); LogHex(o.object.SB);
+		LogString("  Data base =  00000000H"); 
+		LogString("  Base = ");  LogHex(o.object.base);
+		LogString("  Size = ");  LogHex(o.object.imageSize);
+		LogLn;
+
+		tag := next + 4;
+		IF generateList THEN
+			(* initialise module descriptor that will be written to object file *)
+			NEW(m);
+			m.name := o.object.name;
+			m.init := o.object.init;
+			m.key := o.object.key;
+			m.refcnt := o.object.refcnt;
+			m.sb := o.object.SB;
+			m.refs := 0;
+			m.term := 0;
+			
+			(* header like Kernel.NewSys *)
+			ASSERT((next + 4) MOD  Boundary = 0);
+			size := o.object.imageSize
+						- moduleDescSize
+						- o.object.typeTableSize
+						- 28;
+			DumpPtrHeader(rider, next, size, i, j);
+			INC(next, 28);
+			ASSERT((i=0) & (j=0));
+
+			(* varEntries *)
+			m.varEntries := next;
+			num := o.object.nofDataEntries;
+			arrHdr.len := num;
+			Files.WriteBytes(rider, arrHdr, 16); (* bytes for open array *)
+			IF num > 0 THEN Files.WriteBytes(rider, o.object.varEntries^, num*4) END;
+			padSize := 20 + num*4;
+			padSize := ((padSize + 15) DIV 16) * 16 - padSize;
+			Files.WriteBytes(rider, padding, padSize);
+			INC(next, 20 + num*4 + padSize);
+
+			(* entries *)
+			m.entries := next;
+			Files.WriteLInt(rider, tag);
+			num := o.object.nofEntries;
+			arrHdr.len := num;
+			Files.WriteBytes(rider, arrHdr, 16); (* bytes for open array *)
+			IF num > 0 THEN Files.WriteBytes(rider, o.object.entries^, num*4) END;
+			padSize := 20 + o.object.nofEntries*4;
+			padSize := ((padSize + 15) DIV 16) * 16 - padSize;
+			Files.WriteBytes(rider, padding, padSize);
+			INC(next, 20 + num*4 + padSize);
+
+			(* commands *)
+			m.cmds := next;
+			Files.WriteLInt(rider, tag);
+			num := o.object.nofCommands;
+			arrHdr.len := num;
+			Files.WriteBytes(rider, arrHdr, 16); (* bytes for open array *)
+			IF num > 0 THEN Files.WriteBytes(rider, o.object.commands^, num*36) END;
+			padSize := 20 + num*36;
+			padSize := ((padSize + 15) DIV 16) * 16 - padSize;
+			Files.WriteBytes(rider, padding, padSize);
+			INC(next, 20 + num*36 + padSize);
+
+			(* ptrTab *)
+			m.ptrTab := next;
+			Files.WriteLInt(rider, tag);
+			num := o.object.nofPointers;
+			arrHdr.len := num;
+			Files.WriteBytes(rider, arrHdr, 16); (* bytes for open array *)
+			IF num > 0 THEN Files.WriteBytes(rider, o.object.pointers^, num*4) END;
+			padSize := 20 + num*4;
+			padSize := ((padSize + 15) DIV 16) * 16 - padSize;
+			Files.WriteBytes(rider, padding, padSize);
+			INC(next, 20 + num*4 + padSize);
+
+			(* tdescs *)
+			m.tdescs := next;
+			Files.WriteLInt(rider, tag);
+			num := o.object.nofTypes;
+			arrHdr.len := num;
+			Files.WriteBytes(rider, arrHdr, 16); (* bytes for open array *)
+			IF num > 0 THEN Files.WriteBytes(rider, o.object.tdescs^, num*4) END;
+			padSize := 20 + num*4;
+			padSize := ((padSize + 15) DIV 16) * 16 - padSize;
+			Files.WriteBytes(rider, padding, padSize);
+			INC(next, 20 + num*4 + padSize);
+
+			(* imports *)
+			m.imports := next;
+			Files.WriteLInt(rider, tag);
+			num := o.object.nofImports + 1;
+			arrHdr.len := num;
+			Files.WriteBytes(rider, arrHdr, 16); (* bytes for open array *)
+			NEW(imports, num);
+			FOR i := 0 TO num-1 DO
+				tmp := o.object.imports[i].object;
+				(* Calculate correct pointer value of module descriptor when program is loaded. *)
+				imports[i] := tmp.typeTableAdr + tmp.typeTableSize + 4
+			END;
+			Files.WriteBytes(rider, imports^, num*4);
+			padSize := 20 + num*4;
+			padSize := ((padSize + 15) DIV 16) * 16 - padSize;
+			Files.WriteBytes(rider, padding, padSize);
+			INC(next, 20 + num*4 + padSize)
+		ELSE (* ~generateList *)
+			i := 0;
+			Files.WriteLInt(rider, i);
+			INC(next, 4)
+		END (* IF *);
+
+		(* global module data *)
+		num := o.object.dataSize;
+		IF num > 0 THEN
+			NEW(data, num);
+			IF (o.object.name = listMod) THEN (* generateList = TRUE *)
+				(* Loader cannot be unloaded - ensure that refcnt >= 1 *)
+				INC(m.refcnt);
+				LogString("Fixing module list pointer. Pointer = ");
+				(* Let the pointer to the list of loaded modules point to the module descriptor of the
+					last module in the init point list. The last entry may be the entry from the /command
+					option, and in that case the second to last entry is the correct object. The init point
+					list is the inverse sequence of the module list. *)
+				initPoint := initPointList;
+				WHILE (initPoint.next # NIL) & (initPoint.next.object # NIL) DO
+					initPoint := initPoint.next
+				END;
+				pointer := initPoint.object.typeTableAdr + initPoint.object.typeTableSize + 4;
+				LogHex(pointer); LogLn;
+				offset := FindVarOffset(o.object, listVar, {6, 13} (* LONGINT, POINTER *));
+				IF offset = 0 THEN
+					Halt("/list variable not found in module")
+				ELSIF (offset < 0) & ((-offset) <= num) THEN
+					PutDWord(data^, num + offset, pointer)
+				ELSE
+					Halt("Module pointer offset invalid")
+				END
+			END
+		END;
+		IF generateList THEN m.data := next END;
+		Files.WriteLInt(rider, tag);
+		arrHdr.len := num + o.object.constSize + 3;
+		Files.WriteBytes(rider, arrHdr, 16); (* bytes for open array *)
+		IF num > 0 THEN Files.WriteBytes(rider, data^, num) END;
+		INC(next, 16 + num);
+
+		(* constants *)
+		ASSERT(o.object.SB = next);
+		IF o.object.constSize > 0 THEN
+			Files.WriteBytes(rider, o.object.constants^, o.object.constSize)
+		END;
+		padSize := 20 + o.object.dataSize + o.object.constSize;
+		padSize := ((padSize + 15) DIV 16) * 16 - padSize;
+		Files.WriteBytes(rider, padding, padSize);
+		INC(next, o.object.constSize + padSize + 4);
+
+		(* code *)
+		ASSERT(next + 16 = o.object.codeBase);
+		IF generateList THEN m.code := next END;
+		Files.WriteLInt(rider, tag);
+		num := o.object.codeSize;
+		arrHdr.len := num;
+		Files.WriteBytes(rider, arrHdr, 16);
+		IF num > 0 THEN Files.WriteBytes(rider, o.object.code^, num) END;
+		INC(next, 20 + num);
+		
+		(* reference block *)
+		IF includeRefs THEN
+			padSize := 20 + num;
+			padSize := ((padSize + 15) DIV 16) * 16 - padSize;
+			Files.WriteBytes(rider, padding, padSize);
+			INC(next, padSize);
+			IF generateList THEN m.refs := next END;
+			Files.WriteLInt(rider, tag);
+			num := o.object.refSize;
+			arrHdr.len := num;
+			Files.WriteBytes(rider, arrHdr, 16);
+			Files.WriteBytes(rider, o.object.refBlock^, num);
+			INC(next, 20 + num)
+		END;
+		
+		DEC(next, 4);
+		(* Even if there are no types, these padding bytes are necessary to ensure that next module
+		is correctly aligned to 4 bytes before a  Boundary multiple. *)
+		Files.WriteBytes(rider, padding, o.object.typeTablePadding);
+		INC(next, o.object.typeTablePadding);
+		ASSERT((next + 4) MOD  Boundary = 0);
+		
+		(* TYPE TABLE *)
+		LogString("Types "); LogHex(o.object.nofTypes); LogLn;
+		IF generateList THEN
+			thisModule := next + o.object.typeTableSize + 4
+		ELSE
+			thisModule := 0
+		END;
+		FOR i := 0 TO (o.object.nofTypes - 1) DO
+			type := o.object.types[i];
+			ASSERT(next + 4 = type.td.tag);
+			ASSERT(type.td.word[12] = thisModule);
+			ASSERT(type.td.word[type.root-1] = type.td.tag);
+			Files.WriteLInt(rider, type.td.tag);
+			Files.WriteBytes(rider, type.td.word^, type.tdSize);
+			Files.WriteBytes(rider, padding, type.padSize);
+			LogHex(type.typedescEntry); LogString(" ");
+			LogHex(type.td.word[2]); LogLn; (* self *)
+			INC(next, 4 + type.tdSize + type.padSize)
+		END (* FOR *);
+
+		IF generateList THEN
+			(* Module descriptor *)
+			ASSERT((next + 4) MOD  Boundary = 0);
+			
+			(* Build the list of loaded modules - this list is the inverse sequence of the init point list *)
+			initPoint := initPointList;
+			IF initPoint.object = o.object THEN
+				(* first in init point list will be last in module list *)
+				m.next := 0
+			ELSE
+				(* find object preceding this object in init point list *)
+				WHILE (initPoint.next # NIL) & (initPoint.next.object # o.object) DO
+					initPoint := initPoint.next
+				END;
+				IF (initPoint.next # NIL) THEN
+					m.next := initPoint.object.typeTableAdr + initPoint.object.typeTableSize + 4
+				ELSE
+					HALT(100)
+				END
+			END;
+			Files.WriteBytes(rider, mDescTag, 4);
+			Files.WriteBytes(rider, m^, moduleDescSize - mDescPadSize - 4);
+			Files.WriteBytes(rider, padding, mDescPadSize);
+			INC(next, moduleDescSize)
+		END;
+		
+		o := o.next
+	END
+END DumpModules;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE DumpInitCalls(VAR rider : Files.Rider; VAR entry : LONGINT);
+VAR
+	i : InitPoint;
+	code : ARRAY 5 OF CHAR;
+	relCallValue, adrPad, sizePad, base : LONGINT;
+BEGIN
+	LogString("Init block at ");
+	LogHex(entry); LogLn;
+	(* header like Kernel.NewSys *)
+	ASSERT((entry + 4) MOD  Boundary = 0);
+	DumpPtrHeader(rider, entry, nofEntryPoints*5 + 4, adrPad, sizePad);
+	INC(entry, 28);	(* skip header *)
+	ASSERT(adrPad = 0);
+
+	LogString("Init code at ");
+	LogHex(entry); LogLn;
+	i := initPointList;  base := entry;
+	code[0] := 0E8X; (* CALL *)
+	WHILE (i # NIL) DO
+		relCallValue := (i.entryPoint - (base + 5));
+		PutDWord(code, 1, relCallValue);
+		Files.WriteBytes(rider, code, 5);         (* CALL <initcode> *)
+		INC(base, 5);
+		IF (i.next = NIL) THEN
+			LogString("Main code at ");
+			LogHex(i.entryPoint); LogLn
+		END;
+		i := i.next
+	END;
+	code[0] := 0FBX;	(* STI *)
+	code[1] := 090X;  (*0F4X;*)	(* HLT *)
+	code[2] := 0EBX;	(* JMP *)
+	code[3] := 0FDX;	(* -3 *)
+	Files.WriteBytes(rider, code, 4);
+	IF sizePad > 0 THEN
+		Files.WriteBytes(rider, padding, sizePad)
+	END
+END DumpInitCalls;
+
+PROCEDURE PatchHeader(f: Files.File;  base, entry, size: LONGINT);
+VAR r: Files.Rider;
+BEGIN
+	Files.Set(r, f, 0);  Files.Write(r, 0E8X);  Files.WriteLInt(r, entry-(base+5));
+	Files.Set(r, f, 6);  Files.WriteLInt(r, base);	(* LinkBase *)
+	Files.Set(r, f, 22);  Files.WriteLInt(r, base+size);	(* HeapStart *)
+	Files.Set(r, f, 30);  Files.WriteLInt(r, 0)	(* PatchSize *)
+END PatchHeader;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE BuildImage(fileName : ARRAY OF CHAR;  entryPoint, imageBase : LONGINT);
+VAR
+	OutputFile : Files.File;
+	rider : Files.Rider;
+BEGIN
+	LogString("Building image : ");
+	LogString(fileName); LogString("  ");
+	LogHex(imageBase); LogLn;
+	OutputFile := Files.New(fileName);
+	Files.Set(rider, OutputFile, 0);
+	Files.WriteBytes(rider, padding, 28+32); (* for Oberon GC aligment & header *)
+		(* modules *)
+	DumpModules(rider);
+		(* calls to module init procedures *)
+	DumpInitCalls(rider, entryPoint);	(* entryPoint VAR *)
+	PatchHeader(OutputFile, imageBase, entryPoint, Files.Length(OutputFile));
+	Files.Register(OutputFile);
+	Out.Char(" ");
+	Out.Int(Files.Length(OutputFile), 0); Out.Ln
+END BuildImage;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE Initialise;
+VAR i : LONGINT;
+BEGIN
+	moduleDescSize := SIZE(DumpModuleDesc) + 4; (* 4 = size of pointer block tag *)
+	mDescPadSize := Align(moduleDescSize,  Boundary) - moduleDescSize;
+	mDescTag := 0;
+	INC(moduleDescSize, mDescPadSize);
+	FOR i := 0 TO PaddingSize-1 DO
+		padding[i] := 0
+	END;
+	generateList := FALSE;
+	includeRefs := FALSE;
+	objectList := NIL;
+	initPointList := NIL;  nofEntryPoints := 0;
+	newAdr := 0; sysnewAdr := 0; arrnewAdr := 0;
+	NEWmod := ""; NEWproc := "";
+	SYSNEWmod := ""; SYSNEWproc := "";
+	NEWARRmod := ""; NEWARRproc := "";
+	listMod := ""; listVar := "";
+	commandMod := ""; commandProc := "";
+END Initialise;
+
+(* ---------------------------------------------------------- *)
+PROCEDURE Link*;
+VAR
+	outputFile, logFile : String;
+	imageBase,
+	base, imageSize,
+	i : LONGINT;
+	S : Texts.Scanner;
+	object: Object;
+BEGIN
+	Out.String(" linking ");
+	Initialise;
+	imageSize := 0; imageBase := -1;
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(S);
+	(* Output filename *)
+	IF (S.class = Texts.Name) THEN
+		COPY(S.s, outputFile);
+		Texts.Scan(S);
+		Out.String(outputFile); Out.Char(" ");
+		Concat(outputFile, ".Link", logFile);
+		LogOpen(logFile)
+	ELSE
+		Out.String(" Couldn't read output file name");
+		RETURN
+	END;
+	(* Read options, if any *)
+	WHILE (S.class = Texts.Char) & (S.c = Oberon.OptionChar) DO
+		Texts.Scan(S);
+		IF (S.class = Texts.Name) & (S.s # "integrate") THEN
+			IF (S.s = "new") THEN
+				Texts.Scan(S);
+				IF (S.class = Texts.Name) THEN
+					ExtractNames(S.s, NEWmod, NEWproc);
+					Texts.Scan(S)
+				ELSE
+					Halt("Couldn't read 'new' parameter")
+				END
+			ELSIF (S.s = "sysnew") THEN
+				Texts.Scan(S);
+				IF S.class = Texts.Name THEN
+					ExtractNames(S.s, SYSNEWmod, SYSNEWproc);
+					Texts.Scan(S)
+				ELSE
+					Halt("Couldn't read 'sysnew' parameter")
+				END
+			ELSIF (S.s = "newarr") THEN
+				Texts.Scan(S);
+				IF S.class = Texts.Name THEN
+					ExtractNames(S.s, NEWARRmod, NEWARRproc);
+					Texts.Scan(S)
+				ELSE
+					Halt("Couldn't read 'newarr' parameter")
+				END
+			ELSIF (S.s = "list") THEN
+				generateList := TRUE;
+				Texts.Scan(S);
+				IF S.class = Texts.Name THEN
+					ExtractNames(S.s, listMod, listVar);
+					Texts.Scan(S)
+				ELSE
+					Halt("Couldn't read 'list' parameter")
+				END (* IF *)
+			ELSIF (S.s = "refs") THEN
+				includeRefs := TRUE;
+				Texts.Scan(S)
+			ELSIF (S.s = "command") THEN
+				Texts.Scan(S);
+				IF S.class = Texts.Name THEN
+					ExtractNames(S.s, commandMod, commandProc);
+					Texts.Scan(S)
+				ELSE
+					Halt("Couldn't read 'command' parameter")
+				END (* IF *)
+			ELSE
+				Halt("Unknown option on command line")
+			END (* IF *)
+		ELSIF (S.s # "integrate") THEN
+			Halt("Wrong symbol after '/'")
+		END (* IF *)
+	END (* WHILE *);
+	IF (S.class = Texts.Name) & (S.s = "integrate") THEN
+		Texts.Scan(S);
+		(* Link base address *)
+		IF (S.class = Texts.Int) THEN
+			imageBase := S.i;
+			Texts.Scan(S);
+			IF (imageBase MOD PageSize # 0) THEN
+				Halt("Image base must be a multiple of machine memory page size")
+			END
+		ELSE
+			Halt("Couldn't read 'integrate' parameter (link base)")
+		END;
+		base := imageBase + 28+32; (* for Oberon GC aligment & header *)
+		WHILE (S.class = Texts.Name) DO
+			Module(object, S.s, base);
+			Texts.Scan(S)
+		END;
+	END;
+	IF ~((S.class = Texts.Char) & (S.c = "~") OR S.eot) THEN
+		Halt("Error in parameter list.")
+	END;
+	IF commandMod # "" THEN
+		object := FindObject(commandMod);
+		IF object # NIL THEN
+			i := 0;
+			WHILE (i < object.nofCommands)
+			& (object.commands[i].name # commandProc) DO INC(i) END;
+			IF i < object.nofCommands THEN
+				AddInitPoint(object.commands[i].entry, NIL)
+			ELSE
+				Halt("Procedure in 'command' option not found")
+			END
+		ELSE
+			Halt("Module in 'command' option not included in image")
+		END
+	END;
+	BuildImage(outputFile, base, imageBase);
+	LogClose;
+	objectList := NIL;  initPointList := NIL	(* so that memory can be reclaimed by GC *)
+END Link;
+
+(* ========================================================== *)
+
+PROCEDURE ReadHex(VAR R: Texts.Reader;  VAR x: LONGINT);
+VAR ch: CHAR;
+BEGIN
+	REPEAT Texts.Read(R, ch) UNTIL R.eot OR (ch # " ");
+	x := 0;
+	LOOP
+		IF R.eot THEN EXIT END;
+		IF (ch >= "0") & (ch <= "9") THEN
+			x := 16*x + (ORD(ch)-ORD("0"))
+		ELSIF (ch >= "a") & (ch <= "f") THEN
+			x := 16*x + (ORD(ch)-ORD("a")+10)
+		ELSIF (ch >= "A") & (ch <= "F") THEN
+			x := 16*x + (ORD(ch)-ORD("A")+10)
+		ELSE
+			EXIT
+		END;
+		Texts.Read(R, ch)
+	END
+END ReadHex;
+
+PROCEDURE Find*;	(* logname ^ (selection is hex EIP) *)
+VAR
+	adr, sb, base, beg, end, time: LONGINT;
+	S: Texts.Scanner;  T: Texts.Text;  R: Texts.Reader;
+	name: ARRAY 32 OF CHAR;
+BEGIN
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);  Texts.Scan(S);
+	IF S.class = Texts.Name THEN
+		COPY(S.s, name);  Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "^") THEN
+			Oberon.GetSelection(T, beg, end, time);
+			IF time >= 0 THEN
+				Texts.OpenReader(R, T, beg);  ReadHex(R, adr);
+				NEW(T);  Texts.Open(T, name);
+				IF T.len # 0 THEN
+					Texts.OpenScanner(S, T, 0);
+					WHILE ~S.eot DO
+						Texts.Scan(S);
+						IF (S.class = Texts.Name) & (S.s = "Dumping") THEN
+								(* "Dumping xxxx Code base = yyyyyyyyH Code size = zzzzzzzzH" *)
+							Texts.Scan(S);  COPY(S.s, name);
+							Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+							IF S.class = Texts.Int THEN
+								beg := S.i;  Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+								end := S.i;  INC(end, beg);  Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+								sb := S.i;  Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+								Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+								base := S.i;
+								IF (adr >= beg) & (adr < end) THEN
+									Out.String(name);  Out.String(".Mod");
+									Out.String("  PC = ");  Out.Int(adr-beg, 1); Out.Ln;
+									RETURN
+								ELSIF (adr >= base) & (adr < beg) THEN
+									Out.String(name);  Out.String(".Mod");
+									Out.String("  PC = SB + ");  Out.Int(adr-sb, 1);  Out.Ln;
+									RETURN
+								END
+							END
+						END
+					END
+				END
+			END
+		END
+	END
+END Find;
+
+BEGIN
+	Out.String("Static Linker dVdW 13.02.96 / pjm 18.03.96"); Out.Ln
+END BootLinker.
+
+FDInstall.CreateBootFloppy test /~
+
+Trace.Mod TestLink0.Mod TestLink.Mod TestLink.obj test.Link
+
+BootLinker.Link test /integrate 1000H Trace ~	Does not work without /list switch!
+BootLinker.Link test /list TestLink2.xx /integrate 0 TestLink2 ~
+
+BootLinker.Link test /list Trace.xx /integrate 1000H Trace ~
+
+BootLinker.Link test /list Trace.xx /new TestLink0.NewRec /sysnew TestLink0.NewSys /newarr TestLink0.NewArr 
+	/integrate 1000H TestLink ~
+
+BootLinker.Find Core.Bin.Link ^ 00003BEDH

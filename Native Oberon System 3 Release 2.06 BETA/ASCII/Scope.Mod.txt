@@ -1,0 +1,3100 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+(*
+ * Cybernetic entomology!
+ * de Villiers de Wet
+ *)
+
+(* Changes:
+	20.11.95 Fixed error in CheckCache, as well in ShowString
+	08.03.96 pjm, ported to Native Oberon 2.05
+*)
+
+MODULE Scope;
+
+IMPORT
+	Modules, In, Out, Files, Texts, Viewers, Oberon, Desktops, TextGadgets, Gadgets,
+	TextGadgets0, BasicGadgets, Fonts, Objects, iOPT, iOPL, Compiler, Decoder, SYSTEM,
+	Input;
+
+CONST
+    StandardMenu = "Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.Store[Store]";
+
+	cGetCacheSize = 512;
+	(* Maximum number of bytes dereferenced for arrays and ShowMemory command. *)
+	MaxLen = 4000;
+	DefaultLen = 64;
+	
+	(* Offset from start of main module's code, or the command that is
+		executed, where a breakpoint is put by Scope, so that the user may
+		choose to Step/Execute from there.
+		This value is 9, so that the first three instructions which initialise the
+		stack can be executed. This is necessary, so that
+		ShowStack() can check for this breakpoint, so that it is not shown as if
+		execution was halted at a user breakpoint. *)
+	cStartOffset = 9;
+	
+	(*object and item modes for OP2 compiler*)
+	Var = 1; VarPar = 2; Con = 3; Fld = 4; Typ = 5; LProc = 6; XProc = 7;
+	SProc = 8; CProc = 9; IProc = 10; Mod = 11; Head = 12; TProc = 13;
+
+	(*structure forms *)
+	Undef = 0; Byte = 1; Bool = 2; Char = 3; SInt = 4; Int = 5; LInt = 6;
+	Real = 7; LReal = 8; Set = 9; String = 10; NilTyp = 11; NoTyp = 12;
+	cPointer = 13; ProcTyp = 14; Comp = 15;
+
+	(* composite structure forms *)
+	Basic = 1; cArray = 2; DynArr = 3; Record = 4; OpenArr = 5;
+	
+	MaxMap = 10000;
+
+TYPE
+	StateDesc* = RECORD
+		INT*, EDI*, ESI*, EBP*, EBX*, EDX*, ECX*, EAX*,
+		ErrorCode*, EIP*, EFLAGS*, ESP*, CR2*, DR6* : LONGINT;
+		CS*, SS* : INTEGER;
+		StackOrg*, StackLimit* : LONGINT;
+	END;
+	
+	RDIGetMachines* = PROCEDURE(VAR machines : ARRAY OF ARRAY OF CHAR; VAR num: LONGINT);
+	RDIGetState* = PROCEDURE(VAR state : StateDesc) : LONGINT;
+	RDISetState* = PROCEDURE(state: StateDesc): LONGINT;
+	RDIRead* = PROCEDURE(adr : LONGINT; VAR val : ARRAY OF SYSTEM.BYTE;
+											  len : LONGINT) : LONGINT;
+	RDIWrite* = PROCEDURE(adr : LONGINT; VAR val : ARRAY OF SYSTEM.BYTE;
+											  len : LONGINT) : LONGINT;
+	RDIInit* = PROCEDURE(machine, object : ARRAY OF CHAR;
+											 mainCode : LONGINT) : LONGINT;
+	RDISetBreakPoint* = PROCEDURE(pc : LONGINT) : LONGINT;
+	RDIClearBreakPoint* = PROCEDURE(pc : LONGINT) : LONGINT;
+	RDIStep* = PROCEDURE() : LONGINT;
+	RDIExecute* = PROCEDURE() : LONGINT;
+	RDITerminate* = PROCEDURE() : LONGINT;
+
+	BreakPoint = POINTER TO BreakPointDesc;
+	BreakPointDesc = RECORD
+		idx,
+		begPos : LONGINT;
+		col : SHORTINT;
+		link : BreakPoint
+	END;
+	
+	TypeInfo = ARRAY 32 OF RECORD entry, tag : LONGINT END;
+		
+	Module = POINTER TO ModuleDesc;
+	ModuleDesc = RECORD
+		name: ARRAY 32 OF CHAR;
+		code,
+		codeSize,
+		SB : LONGINT;
+		globals : iOPT.Object;	(* pointer to the entries in symbol table of
+													 compiler if module can be compiled *)
+		vwr, globalsVwr, assVwr : Viewers.Viewer;
+		map : iOPL.Map;
+		mapSize : LONGINT;
+		breaks : BreakPoint;
+		types : TypeInfo;
+		numTypes : LONGINT;
+		entry : ARRAY 128 (*DOCC.EntryLength*) OF LONGINT;
+		entno : INTEGER;	(* # of entry points *)
+		link : Module
+	END;
+	
+	TypName = ARRAY 256 OF CHAR;
+	
+	(* A list of objects has to kept, so that pointers to dummy objects are not
+		accidentally collected during the debugging process. Dummy objects
+		are passed to LocalVars() when pointers are dereferenced and arrays
+		are displayed. *)
+	Object = POINTER TO ObjectDesc;
+	ObjectDesc = RECORD
+		name : ARRAY 96 OF CHAR;
+		type : TypName;
+		form : SHORTINT;(*used by Struct() to distinguish between arrays and dereferenced pointers*)
+		mod : Module;
+		obj : iOPT.Object;
+		base,
+		elemBase : LONGINT; (* used for dynamic and open arrays; a dynamic array may be nested
+												inside another; in that case base still points to the base of of the 
+												array, so that it can be used to get information about the array,
+												while elemBase is the offset to the first element of the nested
+												array, e.g. array[3][0] *)
+		lib : Objects.Library;
+		next : Object
+	END;
+	
+	Node = POINTER TO NodeDesc;
+	NodeDesc = RECORD
+		obj : iOPT.Object;
+		next : Node
+	END;
+
+	Viewer = POINTER TO ViewerDesc;
+	ViewerDesc = RECORD
+		vwr : Viewers.Viewer;
+		next : Viewer
+	END;
+	
+VAR
+	W : Texts.Writer;
+	gObjectName,
+	gMachineName : ARRAY 100 OF CHAR;
+	gModuleList : Module;
+	gLinkTime, gLinkDate,
+	gObjectBase,					(* address of object in memory *)
+	gObjectSize,
+	gMainCode : LONGINT;	(* address of main module's code *)
+	gGetCache : ARRAY cGetCacheSize OF SYSTEM.BYTE;
+	gCacheStart, gCacheEnd : LONGINT;
+	gState : StateDesc;
+	gCurrentBP : BreakPoint;
+	gStackVwr, gRegsVwr, gMachinesVwr,
+	gModulesVwr, gMemVwr : Viewers.Viewer;
+	gStructVwrList : Viewer;
+	gActive, gInit,
+	gHex, gShowTypes : BOOLEAN;
+	gBreakPointColour, gButtonCol, gTypeCol : SHORTINT;
+	gTick : INTEGER;
+	gObjects : Object;
+	gCompileOptions : ARRAY 32 OF CHAR;
+	caret, period : ARRAY 2 OF CHAR;
+	path : ARRAY 128 OF CHAR;
+	
+	rdiGetMachines : RDIGetMachines;
+	rdiGetState : RDIGetState;
+	rdiSetState : RDISetState;
+	rdiRead : RDIRead;
+	rdiWrite : RDIWrite;
+	rdiInit : RDIInit;
+	rdiSetBreakPoint : RDISetBreakPoint;
+	rdiClearBreakPoint : RDIClearBreakPoint;
+	rdiStep : RDIStep;
+	rdiExecute : RDIExecute;
+	rdiTerminate : RDITerminate;
+	
+PROCEDURE ^ LocalVars(mod : Module; obj : iOPT.Object;
+									  name : ARRAY OF CHAR;
+									  base, endAdr, indent, elemBase, elemSize : LONGINT;
+									  isDummy, isArrElem : BOOLEAN);
+
+PROCEDURE WrStr(s : ARRAY OF CHAR);
+BEGIN
+	Texts.WriteString(W, s)
+END WrStr;
+
+PROCEDURE WrInt(i, n : LONGINT);
+BEGIN
+	Texts.WriteInt(W, i, n)
+END WrInt;
+
+PROCEDURE WrChar(c : CHAR);
+BEGIN
+	Texts.Write(W, c)
+END WrChar;
+
+PROCEDURE WrLn;
+BEGIN
+	Texts.WriteLn(W)
+END WrLn;
+
+PROCEDURE WrHex(i : LONGINT);
+BEGIN
+	Texts.WriteHex(W, i)
+END WrHex;
+
+PROCEDURE NewText(name: ARRAY OF CHAR): Texts.Text;
+VAR T: Texts.Text;
+BEGIN
+	NEW(T); Texts.Open(T, name); RETURN T
+END NewText;
+
+PROCEDURE Delay(ms : LONGINT);
+VAR t: LONGINT;
+BEGIN
+	t := Input.Time() + (ms*Input.TimeUnit DIV 1000);
+	REPEAT UNTIL Input.Time() > t
+END Delay;
+
+PROCEDURE NewFrame(T : Texts.Text) : TextGadgets.Frame;
+VAR F : TextGadgets.Frame;
+BEGIN
+	NEW(F); TextGadgets.Init(F, T, FALSE);
+	RETURN F
+END NewFrame;
+
+(* Scrolls a frame so that the line at pos in the text is the top line. If pos is not the start of a 
+	line, the next line is put at the top of the frame. *)
+PROCEDURE ScrollTo(F : TextGadgets.Frame; pos : LONGINT);
+VAR
+	R : Texts.Reader;
+	i : LONGINT;
+	c : CHAR;
+BEGIN
+	i := -1;
+	Texts.OpenReader(R, F.text, pos-1);
+	REPEAT Texts.Read(R, c); INC(i) UNTIL R.eot OR (c = 0DX);
+	TextGadgets0.ScrollTo(F, pos + i)
+END ScrollTo;
+
+(* Get the name in the menu bar of a DovViewer *)
+PROCEDURE GetMenuName(menuF : Gadgets.Frame; VAR name : ARRAY OF CHAR;
+												VAR res : INTEGER);
+VAR
+	M : Objects.AttrMsg;
+BEGIN
+	M.id := Objects.get; M.name := "Name";
+	menuF.handle(menuF, M);
+	COPY(M.s, name);
+	res := M.res
+END GetMenuName;
+
+(* Store the text in a viewer opened by Scope. Can only be invoked from a menu bar *)
+PROCEDURE Store*;
+VAR
+	V : Viewers.Viewer;
+	file : Files.File;
+	name : ARRAY 64 OF CHAR;
+	len : LONGINT;
+	res : INTEGER;
+BEGIN
+	V := Oberon.Par.vwr;
+	IF (V IS Desktops.DocViewer) & (V.dsc IS Gadgets.Frame)
+	& (V.dsc = Oberon.Par.frame) (* called from menu? *)
+	& (V.dsc.next IS TextGadgets.Frame) THEN
+		GetMenuName(V.dsc(Gadgets.Frame), name, res);
+		IF res = 0 THEN
+			file := Files.New(name);
+			IF file # NIL THEN
+				Texts.Store(V.dsc.next(TextGadgets.Frame).text, file, 0, len);
+				IF len > 0 THEN
+					Files.Register(file);
+					Out.String("Store "); Out.Char(22X); Out.String(name); Out.Char(22X); Out.Ln
+				END
+			END
+		END;
+		IF (res # 0) OR (file = NIL) OR (len <= 0) THEN
+			Out.String("  could not store "); Out.Char(22X); Out.String(name); Out.Char(22X); Out.Ln
+		END
+	END
+END Store;
+
+PROCEDURE LNRList(obj : iOPT.Object) : Node;
+VAR list, new : Node;
+	PROCEDURE Insert(obj : iOPT.Object);
+	BEGIN
+		IF obj # NIL THEN
+			Insert(obj.right);
+			NEW(new); new.obj := obj; new.next := list; list := new;
+			Insert(obj.left)
+		END
+	END Insert;
+BEGIN
+	list := NIL;
+	Insert(obj);
+	RETURN list
+END LNRList;
+
+PROCEDURE LinkList(obj : iOPT.Object) : Node;
+VAR list, new : Node;
+	PROCEDURE Insert(obj : iOPT.Object);
+	BEGIN
+		IF obj # NIL THEN
+			Insert(obj.link);
+			NEW(new); new.obj := obj; new.next := list; list := new
+		END
+	END Insert;
+BEGIN
+	list := NIL;
+	Insert(obj);
+	RETURN list
+END LinkList;
+
+PROCEDURE ClearCache;
+BEGIN
+	gCacheStart := MAX(LONGINT);
+	gCacheEnd := MIN(LONGINT)
+END ClearCache;
+
+(* CheckCache tries to cache a stretch of memory so that at least
+	[adr, adr+len) will be cached. If len > cache size, only part of the required
+	stretch will be cached.
+	CheckCache does not know where the heap area is, but it does know where
+	the start of the object is, and where the stack of the process is. (The latter
+	info comes from gState, which must contain the current state of the target
+	machine. Memory is only cached if adr > start address of object.
+	Normally heaps start just after an object in memory, but
+	because CheckCache does not know where that heap ends, it makes no
+	assumptions and only read the memory up to address (adr + len -1) when
+	adr is not inside object or the stack.. 
+	If a read is done at an address which is not in the stack and which is higher
+	than the end of the object, precisely [adr, adr+len) is cached.
+	Scope assumes that the user then knows what he's doing.
+	The caller must test again afterwards if the cache contains the desired
+	range, because CheckCache does not return an explicit error code. *)
+PROCEDURE CheckCache(adr, len : LONGINT);
+VAR res : LONGINT;
+BEGIN
+	(* Pre: adr >= 0, len >= 0;
+				gState = current state on remote machine *)
+	(* Check for range overflow, and whether address lies within cache *)
+	IF (adr - 1 <= MAX(LONGINT) - len)
+	& ((adr < gCacheStart) OR ((adr + len - 1) > gCacheEnd)) THEN
+		gCacheStart := adr - (cGetCacheSize DIV 2);
+		(* Check that cache does not go over stack limits if address is on stack *)
+		IF (adr >= gState.StackLimit) & (adr < gState.StackOrg) THEN
+			(* Pre: gState.ESP >= gState.StackLimit *)
+			IF (adr >= gState.ESP) & (gCacheStart < gState.ESP) THEN
+				gCacheStart := gState.ESP
+			ELSIF (gCacheStart < gState.StackLimit) THEN
+				gCacheStart := gState.StackLimit
+			END
+		(* Check that cache start is not before start of object *)
+		ELSIF (adr >= gObjectBase) THEN
+			IF (adr < gObjectBase + gObjectSize) THEN
+				IF (gCacheStart < gObjectBase) THEN
+					gCacheStart := gObjectBase
+				END
+			ELSE (* adr  >= gObjectBase + gObjectSize *)
+				gCacheStart := adr
+			END
+		ELSE
+			gCacheStart := MAX(LONGINT)
+		END;
+		IF (gCacheStart <= MAX(LONGINT) - cGetCacheSize + 1) THEN
+			gCacheEnd := gCacheStart + cGetCacheSize - 1
+		ELSE
+			gCacheEnd := MAX(LONGINT)
+		END;
+		(* Check that cache does not go over stack limits if address is on stack *)
+		IF (adr >= gState.StackLimit) & (adr < gState.StackOrg) THEN
+			IF (gCacheEnd >= gState.StackOrg) THEN
+				gCacheEnd := gState.StackOrg - 1
+			END
+		ELSIF (adr >= gObjectBase) THEN
+			IF (adr < gObjectBase + gObjectSize) THEN
+				IF (gCacheEnd >= gObjectBase + gObjectSize) THEN
+					gCacheEnd := gObjectBase + gObjectSize - 1
+				END
+			ELSE (* adr  >= gObjectBase + gObjectSize *)
+				(* Trust the caller to know what he's doing. *)
+				ASSERT(gCacheStart = adr);
+				IF (len < cGetCacheSize) THEN
+					gCacheEnd := gCacheStart + len - 1
+				END
+			END
+		ELSE
+			gCacheEnd := MIN(LONGINT)
+		END;
+		IF (gCacheStart <= gCacheEnd) THEN
+			res :=rdiRead(gCacheStart, gGetCache,
+											  gCacheEnd - gCacheStart + 1);
+			IF (res # 0) THEN 
+				Out.String("  Run-time error: target memory read failed."); Out.Ln;
+				HALT(100)
+			END
+		END
+	END	
+END CheckCache;
+
+(* ---------------------------------------------------- *)
+(* Reads values from the address space of the object that crashed.    *)
+PROCEDURE Get(adr : LONGINT; VAR val : ARRAY OF SYSTEM.BYTE);
+VAR len, res : LONGINT;
+BEGIN
+	ASSERT(adr >= 0);
+	len := LEN(val);
+	CheckCache(adr, len);
+	ASSERT((gCacheEnd - gCacheStart) < cGetCacheSize);
+	IF (adr >= gCacheStart)
+	& (adr - 1 <= MAX(LONGINT) - len) & (adr + len - 1 <= gCacheEnd) THEN
+		SYSTEM.MOVE(SYSTEM.ADR(gGetCache[adr - gCacheStart]),
+								SYSTEM.ADR(val), len)
+	ELSE
+		res := rdiRead(adr, val, len);
+		IF (res # 0) THEN 
+			Out.String("  Run-time error: target memory read failed."); Out.Ln;
+			HALT(100)
+		END
+	END
+END Get;
+
+PROCEDURE Length (s: ARRAY OF CHAR): INTEGER;
+VAR
+	i : INTEGER;
+BEGIN (* Pre: s[i] = 0X, 0 <= i < LEN(s) *)
+	i := 0;
+	WHILE (s[i] # 0X) DO INC(i) END;
+	RETURN i
+END Length;
+
+PROCEDURE Concat(s1, s2 : ARRAY OF CHAR; VAR s3 : ARRAY OF CHAR);
+VAR
+	i, len, max : INTEGER;
+BEGIN (* Pre: s1[i] := 0X, 0 <= i < LEN(s1)
+						s2[j] := 0X, 0 <= j < LEN(s2) *)
+	max := SHORT(LEN(s3))-1;
+	COPY(s1, s3);
+	len := Length(s3);
+	i := 0;
+	WHILE ((len + i) < max) & (s2[i] # 0X) DO
+		s3[len + i] := s2[i];
+		INC(i)
+	END;
+	s3[len + i] := 0X
+END Concat;
+
+(* Writes a hex number into the W global writer.
+	w = the number of hex digits that must be written *)
+PROCEDURE WriteHex(x, w: LONGINT);
+VAR
+	buf: ARRAY 9 OF CHAR;
+	i : LONGINT;
+BEGIN
+	FOR i := w-1 TO 0 BY -1 DO
+		buf[i] := CHR(x MOD 10H + 48);
+		IF buf[i] > "9" THEN
+			buf[i] := CHR(ORD(buf[i]) - 48 + 65 - 10)
+		END;
+		x := x DIV 10H
+	END;
+	ASSERT((x = 0) OR (x = -1));
+	buf[w] := 0X;
+	WrStr(buf)
+END WriteHex;
+
+PROCEDURE IntToString(n : LONGINT; VAR s : ARRAY OF CHAR);
+VAR
+	str : ARRAY 32 OF CHAR;
+	i, last : LONGINT;
+BEGIN
+	ASSERT(n >= 0);
+	IF (n = 0) THEN
+		s[0] := "0"; s[1] := 0X; (* if n=0 *)
+	ELSE
+		i := 0;
+		WHILE (n > 0) DO
+			str[i] := CHR((n MOD 10) + 48); n := n DIV 10; INC(i)
+		END;
+		DEC(i); last := i;
+		WHILE (i >= 0) DO s[last-i] := str[i]; DEC(i) END;
+		s[last+1] := 0X
+	END
+END IntToString;
+
+(* Returns the module corresponding to name. The VAR parameter is for
+	performance, so that the actual string is not copied. *)
+PROCEDURE ThisMod(VAR name : ARRAY OF CHAR) : Module;
+VAR mod : Module;
+BEGIN
+	mod := gModuleList;
+	WHILE (mod # NIL) & (mod.name # name) DO mod := mod.link END;
+	RETURN mod
+END ThisMod;
+
+(* Returns the position in the text where the Oberon statement at pos ends,
+	as well as the text colour of the statement. *)
+PROCEDURE GetStatementInfo(
+				T : Texts.Text;
+				pos, prevPos : LONGINT;
+		VAR  begPos : LONGINT;
+		VAR  col : SHORTINT);
+VAR
+	S : Texts.Scanner;
+	cur : LONGINT;
+	
+	PROCEDURE ScanComment;
+	(* Eats up comment, so that strings/characters in comment are not mistaken for as 
+		keywords or part of language constructs *)
+	BEGIN	(* Pre: S.c = "(" and S.nextCh = "*" *)
+		Texts.Scan(S);
+		REPEAT
+			Texts.Scan(S);
+			IF (S.c = "(") & (S.nextCh = "*") THEN ScanComment END
+		UNTIL S.eot OR (S.class = Texts.Char) & (S.c = "*") & (S.nextCh = ")")
+	END ScanComment;
+	
+BEGIN
+	begPos := prevPos + 1; cur := 0;
+	Texts.OpenScanner(S, T, pos);
+	col := S.col;	(* save colour of original text *)
+	Texts.OpenScanner(S, T, begPos);
+	REPEAT
+		(* Scan for symbols that precede statements *)
+		Texts.Scan(S);
+		IF (S.c = "(") & (S.nextCh = "*") THEN ScanComment END;
+		IF (S.class = Texts.Char) THEN
+			(* Characters that precede statements *)
+			IF (S.c = ";") OR ((S.c = ":") & (S.nextCh # "=")) THEN begPos := Texts.Pos(S)
+			ELSIF (S.c = "*") & (S.nextCh = ")") & (Texts.Pos(S)+1<pos) THEN begPos := Texts.Pos(S) + 1
+			END
+		ELSIF (S.class = Texts.Name) THEN
+			(* Strings  that precede statements *)
+			IF (S.s = "THEN") OR (S.s = "ELSE") OR (S.s = "DO") 
+			OR (S.s = "REPEAT") OR (S.s = "BEGIN") OR (S.s = "LOOP") OR (S.s = "FOR")
+			(* Strings that precede expressions *)
+			OR (S.s = "IF") OR (S.s = "ELSIF") OR (S.s = "CASE") OR (S.s = "WHILE") THEN
+				begPos := Texts.Pos(S)
+			ELSIF (S.s = "END") OR (S.s = "UNTIL") THEN
+				(* The first instructions of an IF and a REPEAT-UNTIL is mapped to the text position of
+					the END/UNTIL by the compiler. *)
+				begPos := Texts.Pos(S) - Length(S.s) -1
+			END
+		END
+	UNTIL S.eot OR (Texts.Pos(S) > pos)
+END GetStatementInfo;
+
+(* Loads the map of the module. Allocate just the amount of memory needed.*)
+PROCEDURE LoadMap(mod : Module; map : iOPL.Map; size : LONGINT);
+VAR i : LONGINT;
+BEGIN
+	IF (map # NIL) THEN
+		NEW(mod.map, size);
+		mod.mapSize := size;
+		mod.map[0] := map[0];
+		FOR i := 1 TO size-2 DO
+			(* Assert that pc increases monotonically *)
+			ASSERT((map[i].pc >= map[i-1].pc) & (map[i].pos >= 0));
+			mod.map[i] := map[i]
+		END;
+		ASSERT(size > 0);
+		mod.map[size-1] := map[size-1]
+	END
+END LoadMap;
+
+PROCEDURE SearchFile(VAR name: ARRAY OF CHAR);
+VAR
+	try: ARRAY 32 OF CHAR;
+	i, j, k: LONGINT;
+BEGIN
+	i := 0;
+	WHILE path[i] # 0X DO
+		j := 0;
+		WHILE (path[i] # 0X) & (path[i] # " ") DO
+			try[j] := path[i];  INC(i);  INC(j)
+		END;
+		k := 0;
+		WHILE name[k] # 0X DO
+			try[j] := name[k];  INC(j);  INC(k)
+		END;
+		try[j] := 0X;
+		IF Files.Old(try) # NIL THEN
+			COPY(try, name);
+			RETURN
+		END;
+		IF path[i] = " " THEN INC(i) END
+	END
+END SearchFile;
+
+(* Gets symbol table, map and entry point (procedures) info of the module
+	by invoking the compiler to compile the module's source. *)
+PROCEDURE GetCompileInfo(mod : Module);
+VAR
+	W : Texts.Writer;
+	T, log : Texts.Text;
+	sourceR : Texts.Reader;
+    fileName, options : ARRAY 32 OF CHAR;
+    i : LONGINT;
+    error : BOOLEAN;
+BEGIN
+	ASSERT(mod # NIL);
+	IF (mod.globals = NIL) THEN
+		Concat(mod.name, ".Mod", fileName);
+		SearchFile(fileName);
+		Out.String("  load "); Out.String(fileName);
+		IF (Files.Old(fileName) = NIL) THEN
+			Out.String(" - file does not exist"); Out.Ln;
+			RETURN
+		ELSE
+			Out.String(" (compile)"); Out.Ln;
+			NEW(T); Texts.Open(T, fileName);
+			NEW(log); Texts.Open(log, "");
+			Texts.OpenReader(sourceR, T, 0);
+			NEW(iOPL.map, MaxMap);  iOPL.mapSize := 1;
+			iOPL.map[0].pos := 0;  iOPL.map[0].pc := 0;
+			Concat(gCompileOptions, "n", options);
+			Compiler.Module(sourceR, options, 0, log, error);
+			IF ~error THEN
+				mod.globals := iOPT.globals;
+				LoadMap(mod, iOPL.map, iOPL.mapSize)
+			END;
+			iOPL.map := NIL
+		END
+	END
+END GetCompileInfo;
+
+PROCEDURE ShowMap*;
+VAR
+	i : LONGINT;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	FOR i := 0 TO iOPL.mapSize-1 DO
+		Out.Int(iOPL.map[i].pos, 0); Out.Int(iOPL.map[i].pc, 10); Out.Ln
+	END
+END ShowMap;
+
+PROCEDURE GetSymTable(mod : Module) : iOPT.Object;
+BEGIN
+	GetCompileInfo(mod);
+	RETURN mod.globals
+END GetSymTable;
+
+(* Loads the Oberon source file of one of the linked modules, together with
+	 the map file for that module, and opens a viewer with the source code.
+	 Input: 	the name of a module *)
+PROCEDURE ShowSourceCode(name : ARRAY OF CHAR);
+VAR
+	mod : Module;
+    X, Y : INTEGER;
+    break : BreakPoint;
+    fileName : ARRAY 32 OF CHAR;
+BEGIN
+	mod := ThisMod(name);
+	IF (mod = NIL) THEN
+		Out.String("  module "); Out.String(name);
+		Out.String(" not part of loaded object"); Out.Ln;
+		RETURN
+	END;
+	Concat(name, ".Mod", fileName);
+	SearchFile(fileName);
+	Out.String("  load "); Out.String(fileName);
+	IF (Files.Old(fileName) = NIL) THEN
+		Out.String("  file does not exist"); Out.Ln;
+		RETURN
+	END;
+	Out.Ln;
+	Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+	mod.vwr :=
+		Desktops.NewDocViewer(Desktops.NewMenuFrame(fileName,
+		"Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.SetBreak[Set] Scope.ClearBreak[Clear] Scope.ShowAssembly[DisAss] Scope.Store[Store]"),
+			  NewFrame(NewText(fileName)),
+          	Desktops.menuH, X, Y);
+ 	GetCompileInfo(mod);	(* get map *)
+	(* Check if breakpoints exist - must be highlighted *)
+	break := mod.breaks.link;
+	WHILE (break # NIL) DO
+		Texts.ChangeLooks(mod.vwr.dsc.next(TextGadgets.Frame).text,
+									break.begPos, mod.map[break.idx].pos,
+									{1}, NIL, gBreakPointColour, 0);
+		break := break.link
+	END
+END ShowSourceCode;
+
+(* Show the Oberon statement at which the program is halted in the source
+	viewer of the module specified. If the assembly source viewer for that
+	module is open, the assembly instruction at which the program is halted
+	is shown. *)
+PROCEDURE Locate(mod : Module; pc : LONGINT);
+VAR
+	S : Texts.Scanner;
+	frame : TextGadgets.Frame;
+	col : SHORTINT;
+	pos, endSel, line, j : LONGINT;
+	tmp : Module;
+BEGIN
+	(* Remove caret/selection from a source/assembly viewers, if it is set *)
+	tmp := gModuleList;
+	WHILE (tmp # NIL) DO
+		IF (tmp.vwr # NIL) & (tmp.vwr.state > 1)
+		& (tmp.vwr.dsc.next(TextGadgets.Frame).car) THEN
+			TextGadgets0.RemoveCaret(tmp.vwr.dsc.next(TextGadgets.Frame))
+		END;
+		IF (tmp.assVwr # NIL) THEN
+			TextGadgets0.RemoveSelection(tmp.assVwr.dsc.next(TextGadgets.Frame))
+		END;
+		tmp := tmp.link
+	END;
+	(* Mark the OBERON statement that corresponds to pc, if source viewer is open *)
+	IF (mod # NIL) & (mod.map # NIL) & (mod.vwr # NIL) & (mod.vwr.state > 1) THEN
+		frame := mod.vwr.dsc.next(TextGadgets.Frame);
+		TextGadgets0.RemoveCaret(frame);
+		TextGadgets0.RemoveSelection(frame);
+		Oberon.RemoveMarks(frame.X, frame.Y, frame.W, frame.H);
+		j := 1;	(* Start at 1 so that (j-1) can always be taken as the answer *)
+		(* Look for the first entry in the map which is the nearest
+			from the front of the map to the machine instruction at pc..
+			Assume: mod.map[j].pc increases monotonically, 0 <= j < mod.mapSize. *)
+		WHILE (j < mod.mapSize) & (mod.map[j].pc <= pc) DO INC(j) END;
+		(* if two consecutive instructions have the same pc, take the first one *)
+		(* Post: - mod.map[j-1].pos is the text position of the instruction. *)
+		(*GetStatementInfo(frame.text, mod.map[j-1].pos+1, pos, col);*)
+		pos := mod.map[j-1].pos;
+		IF pos = -1 THEN (* map was too small *)
+			Out.String("  pc not found - compiler map too small"); Out.Ln;
+			RETURN
+		END;
+		(* Scroll viewer until statement is visible *)
+		TextGadgets0.Locate(frame, pos);
+		TextGadgets0.SetCaret(frame, pos)
+	END;
+	
+	(* Show the ASSEMBLY statement at which program is halted,
+		 if assembly viewer is open *)
+	IF (mod # NIL) & (mod.map # NIL) & (mod.assVwr # NIL) & (mod.assVwr.state > 1) THEN
+		frame := mod.assVwr.dsc.next(TextGadgets.Frame);
+		TextGadgets0.RemoveCaret(frame);
+		TextGadgets0.RemoveSelection(frame);
+		Oberon.RemoveMarks(frame.X, frame.Y, frame.W, frame.H);
+		(* Scan for assembly statement *)
+		Texts.OpenScanner(S, frame.text, 0);
+		(* Scan for start of code in the disassembly text *)
+   	 REPEAT Texts.Scan(S)
+    	UNTIL (S.eot) OR (S.class = Texts.Name) & (S.s = "Code:");
+    	IF (S.s # "Code:") THEN RETURN END;
+    	(* Scan for the correct pc value at the start of a line *)
+    	REPEAT 
+    		line := S.line;
+    		(* Scan for beginning of next line *)
+    		WHILE ~S.eot & (S.line = line) DO Texts.Scan(S) END
+    	UNTIL (S.eot) OR ((S.class = Texts.String) & (S.s = "Type:")) OR (S.i >= pc);
+    	IF (S.class = Texts.Int) THEN
+		   pos := Texts.Pos(S);
+		   (* Scan for end of line *)
+       	line := S.line; WHILE ~S.eot & (S.nextCh # 0DX) DO Texts.Scan(S) END;
+       	endSel := Texts.Pos(S);
+   		(* Scroll viewer until statement is visible *)
+   		TextGadgets0.Locate( frame, pos );
+   		TextGadgets0.RemoveCaret(frame);
+   		TextGadgets0.SetSelection(frame, pos - 6, endSel)
+   	END
+	END
+END Locate;
+
+PROCEDURE Show*;
+VAR
+	S : Texts.Scanner;
+	T : Texts.Text;
+	name : ARRAY 32 OF CHAR;
+	pc, j,
+	selBeg, selEnd, selTime : LONGINT;
+	line : INTEGER;
+	mod : Module;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	Oberon.GetSelection(T, selBeg, selEnd, selTime);
+	IF (selTime >  0) THEN  (* selection exists? *)
+   	(* Scan line in Scope.Stack window e.g. Embed.Try PC = 00000306H *)
+		Texts.OpenScanner(S, T, selBeg);
+    	Texts.Scan(S);
+    	line := S.line;
+    	REPEAT
+			IF (S.class = Texts.Name) THEN
+				COPY(S.s, name);
+				IF ((Length(name) > 0) & (name[Length(name)-1] = ".")) THEN
+					(* info of initialization code, e.g. Embed.$$ *)
+					Texts.Scan(S); Texts.Scan(S)
+				END
+			END;
+			Texts.Scan(S)
+		UNTIL S.eot OR (S.line > line) OR (S.class = Texts.Name) & (S.s = "PC");
+		IF ~((S.class = Texts.Name) & (S.s = "PC")) THEN RETURN END;
+    	Texts.Scan(S);
+		IF ~((S.class = Texts.Char) & (S.c = "=")) THEN RETURN END;
+		Texts.Scan(S);
+		IF (S.class = Texts.Int) THEN pc := S.i ELSE RETURN END;
+    ELSE
+    	RETURN
+	END;
+	
+	(* Extract module name from the string *)
+	j := 0; WHILE (j < 32) & (name[j] # ".") DO INC(j) END;
+	IF (j < 32) THEN name[j] := 0X END;
+	
+	mod := ThisMod(name);
+	IF (mod # NIL) & ((mod.vwr = NIL) OR (mod.vwr.state <= 1)) THEN
+		ShowSourceCode(mod.name)
+	END;
+	Locate(mod, pc)
+END Show;
+
+PROCEDURE GetMod(pc : LONGINT) : Module;
+VAR p : Module;
+BEGIN
+	p := gModuleList;
+	WHILE (p # NIL) & ((pc < p.code) OR (pc >= (p.code + p.codeSize))) DO
+		p := p.link
+	END;
+	RETURN p
+END GetMod;
+
+(* Finds the object in the module's symbol table (obj^), of the procedure in
+	which the instruction designated by pc falls. 
+	When called, proc must be equal to NIL. *)
+PROCEDURE FindProc(codeStart, pc : LONGINT; obj : iOPT.Object; VAR proc : iOPT.Object);
+BEGIN
+	IF (obj # NIL) THEN
+		FindProc(codeStart, pc, obj.left, proc);
+		IF obj.mode IN {LProc, XProc, IProc} THEN
+			FindProc(codeStart, pc, obj.scope.right, proc);
+			(* obj.linkadr = offset in code *)
+			IF (pc >= codeStart + obj.linkadr) THEN 
+				IF (proc = NIL) OR (obj.linkadr > proc.linkadr) THEN proc := obj END
+			END (* IF *)
+		END (* IF *);
+		FindProc(codeStart, pc, obj.right, proc)
+	END (* IF *)
+END FindProc;
+
+PROCEDURE FindRecordTyp(VAR typ : iOPT.Struct);
+BEGIN
+	IF typ.comp IN {cArray, DynArr} THEN
+		WHILE typ.comp IN {cArray, DynArr} DO typ := typ.BaseTyp END;
+		FindRecordTyp(typ)
+	ELSIF (typ.form = cPointer) & (typ.BaseTyp.comp IN {cArray..Record}) THEN
+		typ := typ.BaseTyp;
+		FindRecordTyp(typ)
+	END
+END FindRecordTyp;
+
+(* Finds the symbol table structure of the type of which the type descriptor
+	varentry number is *entry*, if name = "", else the structure of the type with name *name*.
+	Of course, the type looked for must have a name, otherwise the first unnamed type will be
+	returned, e.g. in the case of POINTER TO RECORD END; *)
+PROCEDURE FindTyp(obj : iOPT.Object; VAR typ : iOPT.Struct; entry : LONGINT;
+									name : ARRAY OF CHAR);
+VAR
+	tdAdr : LONGINT;
+	tmp : iOPT.Struct;
+BEGIN
+	IF (obj # NIL) & (typ = NIL) THEN
+		FindTyp(obj.left, typ, entry, name);
+		IF (obj.mode IN {LProc, XProc, IProc}) THEN
+			FindTyp(obj.scope.right, typ, entry, name)
+		END (* IF *);
+		IF (obj.typ # NIL) THEN
+			tmp := obj.typ;
+			FindRecordTyp(tmp);
+			IF tmp.comp = Record THEN
+				IF name = "" THEN
+					IF tmp.tdadr DIV 10000H = 0 THEN tdAdr := tmp.tdadr
+					ELSE tdAdr := tmp.tdadr DIV 10000H - 1									(* see iOPL.OutCode *)
+					END;
+					IF tdAdr = entry THEN typ := tmp END
+				ELSIF (tmp.strobj # NIL) & (tmp.strobj.name = name) THEN typ := tmp END
+			END
+		END;
+		FindTyp(obj.right, typ, entry, name)
+	END
+END FindTyp;
+
+(* Find a global variable and return its address.  Returns adr = 0 if not found. *)
+PROCEDURE FindGlobalVar(obj : iOPT.Object;  VAR name: ARRAY OF CHAR;  VAR adr: LONGINT);
+BEGIN
+	IF obj # NIL THEN
+		IF name < obj.name THEN
+			FindGlobalVar(obj.left, name, adr)
+		ELSIF name > obj.name THEN
+			FindGlobalVar(obj.right, name, adr)
+		ELSIF obj.mode = Var THEN
+			adr := obj.linkadr
+		ELSE
+			adr := 0
+		END
+	ELSE
+		adr := 0
+	END
+END FindGlobalVar;
+
+(* Finds the name of an imported module corresponding to mno, in the 
+	symbol table entries of a module *mod*. *)
+PROCEDURE FindModName(mod : Module; mno : INTEGER; VAR name : ARRAY OF CHAR);
+	PROCEDURE Find(obj : iOPT.Object);
+	BEGIN
+		IF (obj # NIL) & (name = "") THEN
+			Find(obj.left);
+			IF (obj.mode = Mod) & (obj.mnolev = -mno) THEN COPY(obj.name, name) END;
+			Find(obj.right)
+		END
+	END Find;
+BEGIN
+	Find(mod.globals)
+END FindModName;
+
+(* Produces a string containg the full name of the type designated by *typ*.
+	*mod* is the module in which the type was declared. *)
+PROCEDURE TypeName(typ : iOPT.Struct; mod : Module; VAR s : ARRAY OF CHAR);
+
+	(* When Name is called the first time, s must be a null string. *)
+	PROCEDURE Name(typ : iOPT.Struct; mod : Module; VAR s : ARRAY OF CHAR);
+	VAR
+		str : ARRAY 32 OF CHAR;
+		tmp : iOPT.Object;
+	BEGIN
+		IF (typ.strobj # NIL) THEN
+			(* A named type, e.g. Viewers.Frame *)
+			IF (typ.mno # 0) THEN
+				(* Type declared in another module. *)
+				str := "";
+				FindModName(mod, typ.mno, str);
+				IF (str = "") THEN HALT(100) END;
+				Concat(s, str, s); Concat(s, period, s)
+			ELSIF (typ.form IN {ProcTyp, cPointer}) OR (typ.comp IN {cArray, Record}) THEN
+			 	(* Structured type declared in this module. *)
+				Concat(s, mod.name, s); Concat(s, period, s)
+			END;
+			Concat(s, typ.strobj.name, s)
+		ELSE (* An anonymous type, e.g. RECORD a : CHAR END *)
+			IF (typ.form = cPointer) THEN
+				Concat(s, "POINTER TO ", s);
+				Name(typ.BaseTyp, mod, s)
+			ELSIF (typ.comp = cArray) THEN
+				Concat(s, "ARRAY ", s);
+				IntToString(typ.n, str);
+				Concat(s, str, s);
+				Concat(s, " OF ", s);
+				Name(typ.BaseTyp, mod, s)
+			ELSIF (typ.comp IN {DynArr, OpenArr}) THEN
+				Concat(s, "ARRAY OF ", s);
+				Name(typ.BaseTyp, mod, s)
+			ELSIF (typ.form = ProcTyp) THEN
+				Concat(s, "PROCEDURE(", s);
+				tmp := typ.link;
+				WHILE (tmp # NIL) DO
+					Concat(s, tmp.name, s); Concat(s, " : ", s);
+					Name(tmp.typ, mod, s);
+					tmp := tmp.link;
+					IF (tmp # NIL) THEN Concat(s, "; ", s) END
+				END;
+				Concat(s, ") ", s);
+				IF (typ.BaseTyp # NIL) & (typ.BaseTyp.form # NoTyp) THEN
+					Concat(s, ": ", s); Name(typ.BaseTyp, mod, s)
+				END
+			ELSIF (typ.comp = Record) THEN
+				Concat(s, "anonymous RECORD", s)
+			ELSE
+				HALT(100)
+			END
+		END
+	END Name;
+	
+BEGIN
+	COPY("", s);
+	Name(typ, mod, s)
+END TypeName;
+
+(* Writes the type name to the global writer *W*, if cond = TRUE. *)
+PROCEDURE WriteType(s : ARRAY OF CHAR; cond : BOOLEAN);
+VAR col : SHORTINT;
+BEGIN
+	IF cond THEN
+		WrStr(" : ");
+		col := W.col; Texts.SetColor(W, gTypeCol);
+		WrStr(s);
+		Texts.SetColor(W, col)
+	END
+END WriteType;
+
+(* Adds an object for ShowStruct() to the global list, and print a button for it. *)
+PROCEDURE RegisterObject(object : Object);
+VAR
+	col, voff : SHORTINT;
+	fnt : Objects.Library;
+	button : BasicGadgets.Button;
+	attrMsg : Objects.AttrMsg;
+	bindMsg : Objects.BindMsg;
+	command, adr : ARRAY 64 OF CHAR;
+BEGIN
+	WrStr("  ");
+	IF (gObjects # NIL) & (gObjects.lib.maxref < 255) THEN
+		object.lib := gObjects.lib
+	ELSE
+		NEW(object.lib); Objects.OpenLibrary(object.lib)
+	END;
+	object.next := gObjects; gObjects := object;
+	(* Store attributes *)
+	col := W.col; fnt := W.lib; voff := W.voff;
+	(* Initialize button *)
+	command := "Scope.ShowStruct ";
+	IntToString(SYSTEM.VAL(LONGINT, object), adr);
+	Concat(command, adr, command);
+	NEW(button); BasicGadgets.InitButton(button);
+	button.caption := "Struct"; button.W := 40; button.H := 14;
+	attrMsg.id := Objects.set; attrMsg.name := "Cmd";
+	attrMsg.class := Objects.String; COPY(command, attrMsg.s);
+	button.handle(button, attrMsg);
+	ASSERT(attrMsg.res = 0);
+	bindMsg.lib := object.lib; button.handle(button, bindMsg);
+	ASSERT((button.lib # NIL) & (button.ref < 256));
+	(* Write button to writer *)
+	Texts.SetFont(W, button.lib); Texts.SetOffset(W, Oberon.CurOff);
+	Texts.Write(W, CHR(button.ref));
+	(* Restore attributes *)
+	Texts.SetColor(W, col); Texts.SetOffset(W, voff); Texts.SetFont(W, fnt)
+END RegisterObject;
+
+(* Writes the string at memory address *adr* to the global writer W *)
+PROCEDURE ShowString(adr, maxLen : LONGINT);
+VAR
+	i : LONGINT;
+	ch : CHAR;
+BEGIN
+	CheckCache(adr, maxLen); (* pre-load cache for best read performance *)
+	i := 0; WrChar(22X);
+	LOOP
+		Get(adr+i, ch);
+		IF (ch < " ") OR (ch >= 90X) OR (i = 64) THEN EXIT END;
+		WrChar(ch); INC(i)
+	END;
+	WrChar(22X);
+	IF gHex THEN
+		i := 0; WrStr(" [");
+		LOOP
+			(* Don't stop at 0X, because user may be using ARRAY OF CHAR for
+				something other than a text string. *)
+			IF (i = maxLen) OR (i = 64) THEN EXIT END;
+			Get(adr+i, ch);
+			WriteHex(ORD(ch), 2); WrChar(" ");
+			INC(i)
+		END;
+		WrChar("]")
+	END
+END ShowString;
+
+(* Determines the type of a variable from the tag address given. 
+	Returns a pointer to the symbol table structure describing the type,
+	as well as the module in which it is declared. *)
+PROCEDURE TagToType(tag : LONGINT; VAR typ : iOPT.Struct; VAR mod : Module);
+VAR
+	i : LONGINT;
+	found : BOOLEAN;
+BEGIN
+	(* Pre: tag is a valid tag *)
+	(* Find module to which type of tag belongs. Do not read the module name from the type
+		descriptor itself (via mdesc field), because it would then not work if the garbage collector
+		is not linked together with the application *)
+	mod := gModuleList; found := FALSE;
+	WHILE (mod # NIL) & ~found DO
+		IF mod.numTypes > 0 THEN
+			i := 0;
+			WHILE (i < mod.numTypes) & (mod.types[i].tag # tag) DO INC(i) END;
+			found := (i < mod.numTypes)
+		END;
+		IF ~found THEN mod := mod.link END
+	END;
+	ASSERT(mod # NIL);
+	typ := NIL;
+	FindTyp(GetSymTable(mod), typ, mod.types[i].entry, "");
+	ASSERT(typ # NIL)
+END TagToType;
+
+(* Checks if the value of a pointer variable points to a memory block with
+	a valid tag, and if so, determine the type of the record/array pointed to.
+	mod = module in which pointer was declared (static type) *)
+PROCEDURE HandlePointer(adr : LONGINT; name : ARRAY OF CHAR;
+											  obj : iOPT.Object; mod : Module;
+											  isArrElem : BOOLEAN);
+CONST
+	ArrayBit = 1;
+	MarkBit = 0;
+VAR
+	dummy : iOPT.Object;
+	ptrTyp, elTyp, typ, tmp : iOPT.Struct;
+	object : Object;
+	elMod : Module;
+	typName : TypName;
+	tdInfo : ARRAY 2 OF LONGINT;	(* tag, size *)
+	metaInfo : ARRAY 3 OF LONGINT;	(* tag, size, ptroffset *)
+	size,
+	tag,	(* double word before an allocated block of memory *)
+	tdTag, (* tag before the type descriptor *)
+	metaTag, (* tag before the meta type descriptor *)
+	metaOffset, (* first double word in ptroffset table *)
+	nofElems, elemBase, res : LONGINT;
+	col : SHORTINT;
+	showString, openArr : BOOLEAN;
+BEGIN
+	openArr := FALSE;
+	IF (obj.mode = Fld) THEN Concat(name, period, name) END;
+	Concat(name, obj.name, name);
+	showString := FALSE;
+	IF (adr = 0) THEN
+		IF ~isArrElem THEN
+			TypeName(obj.typ, mod, typName);
+			WriteType(typName, gShowTypes)
+		END;
+		WrStr(" = NIL");
+		RETURN
+	END;
+	IF (adr > 4) THEN
+		(* Get tags *)
+		res := rdiRead(adr-4, tag, 4); IF (tag <= 4) THEN res := 1 END;
+		IF (ArrayBit IN SYSTEM.VAL(SET, tag)) THEN
+			openArr := TRUE; (* array bit set *)
+			EXCL(SYSTEM.VAL(SET, tag), ArrayBit)
+		END;
+		EXCL(SYSTEM.VAL(SET, tag), MarkBit);
+		IF (res = 0) THEN res := rdiRead(tag-4, tdInfo, 8) END;
+		tdTag := tdInfo[0]; IF (tdTag <= 4) THEN res := 1 END;
+		EXCL(SYSTEM.VAL(SET, tdTag), MarkBit);
+		size := tdInfo[1];	(* record/array size *)
+		IF (res = 0) THEN res := rdiRead(tdTag-4, metaInfo, 12) END;
+		metaTag := metaInfo[0];
+		EXCL(SYSTEM.VAL(SET, metaTag), MarkBit);
+		metaOffset := metaInfo[2]
+	END;
+	(* If pointer is a valid pointer, i.e. allocated by NEW or SYSTEM.NEW, the tag of the meta type
+		descriptor will point to the meta type descriptor itself. See "DOS-Oberon" by A.R. Disteli. *)
+	IF (adr <= 4) OR (res # 0) OR (tdTag # metaTag) OR (metaOffset # -4 (* sentinel *))
+	OR (openArr & (obj.typ.BaseTyp.comp # DynArr)) THEN
+		(* invalid pointer *)
+		WrStr(" (invalid pointer) = "); WrHex(adr); WrChar("H")
+	ELSE
+		(* Pre: pointer is a valid Oberon pointer *)
+		(* Check if pointer points to array/block of memory *)
+		IF (tag = tdTag) THEN (* pointer that was allocated with Kernel.NewSys *)
+			DEC(size, 24)  (* See Kernel.NewSys *);
+			NEW(typ);
+			typ^ := obj.typ.BaseTyp^;
+			TypeName(obj.typ, mod, typName);
+			IF ((typ.comp = cArray) & (size < typ.size)) OR (typ.comp = Record) THEN
+				(* if typ.comp = DynArr, one cannot easily detect if was explicitly SYSTEM.NEWed *)
+				Concat(typName, " (SysBlk)", typName);
+				typ.size := size
+			END;
+			IF (typ.comp = cArray) & (typ.BaseTyp.form = Char) & (typ.size <= 64) THEN
+				showString := TRUE;
+				size := typ.size
+			END;
+			IF typ.comp = DynArr THEN
+				(* see iOPV.Statement(), iOPV.Dim(), iOPC.NewArr() and Kernel.NewArr() *)
+				typ.comp := OpenArr;
+				tmp := typ.BaseTyp;
+				WHILE (tmp.comp IN {cArray, DynArr}) DO tmp := tmp.BaseTyp END;
+				IF (tmp.form # cPointer) & (tmp.comp # Record) THEN
+					res := rdiRead(adr + 12 + typ.n*4, nofElems, 4);	(* number of elements *)
+					IF res # 0 THEN
+						WrStr("  target memory read failure "); WrInt(res, 0); WrLn;
+						RETURN
+					ELSIF (typ.BaseTyp.form = Char) & (nofElems <= 64) THEN
+						showString := TRUE;
+						IF nofElems <= size THEN size := nofElems
+						ELSE HALT(100)
+						END;
+						INC(adr, 16)
+					ELSE
+						elemBase := 16 + 8*((typ.n+1) DIV 2)
+					END
+				ELSE (* element is a record that does not contain pointers, see Kernel.NewArr *)
+					elemBase := 16 + 8*((typ.n+1) DIV 2)	(* see Kernel.NewArr *)
+				END
+			END
+		ELSIF openArr THEN	(* array bit in tag - open array with pointers in element type *)
+			TypeName(obj.typ, mod, typName);
+			NEW(typ);
+			typ^ := obj.typ.BaseTyp^;
+			typ.comp := OpenArr;
+			elemBase := 16 + 8*((typ.n+1) DIV 2)
+		ELSE (* pointer to record *)
+			TagToType(tag, typ, mod);	(* get type of record pointed to *)
+			NEW(ptrTyp); ptrTyp.form := cPointer;
+			ptrTyp.BaseTyp := typ; ptrTyp.strobj := NIL;
+			TypeName(ptrTyp, mod, typName)
+		END;
+		IF ~isArrElem THEN WriteType(typName, gShowTypes) END;
+		IF showString THEN	(* Pre: adr = address of first character, size = length of string *)
+			(* Pointer to an array that is a string *)
+			object := NIL;
+			WrStr(" = ");
+			ShowString(adr, size)
+		ELSE
+			NEW(dummy); dummy.name := "";
+			dummy.mode := Var; dummy.linkadr := 0; dummy.typ := typ;
+			NEW(object);
+			COPY(name, object.name);
+			object.type := typName; object.mod := mod; object.obj := dummy; object.base := adr;
+			IF (typ.comp IN {cArray, OpenArr}) THEN
+				object.form := cArray; object.elemBase := elemBase
+			ELSE (* Pointer to a record *)
+				object.form := cPointer
+			END;
+			RegisterObject(object)
+		END
+	END
+END HandlePointer;
+
+(* mod = the module in which the type of the variable is declared.
+	obj = the list of objects that must be displayed
+	desc = the Scope.Object which contains obj. This used firstly to propagate
+		the name of sub-objects, e.g. pointer^[3].field. The name field of the
+		obj records cannot be used, because it is too short.
+	base = the start address in memory where the instantiations of the objects
+		are located.
+	endAdr = the (exclusive) maximum address up to which the fields of a 
+		record type will be displayed. endAdr will be less than the end of the
+		last field when a record pointer was allocated with SYSTEM.NEW to be
+		smaller than the actual size of the record.
+		ALSO it denotes the end address of a structure referenced by a pointer
+		and passed to LocalVars() from ShowStruct().
+		ALSO, if the structure is an element of an array, endAdr should be the
+		end of the array, because this is sent on to LocalVars() again if the
+		elements are records.
+	indent = the number of spaces to be indented (used for record types).
+	if the objects are dynamic arrays which are in turn the elements of a
+		dynamic array, then isArrElem must be TRUE, and the form of the
+		objects must be = DynArr, and the following must be true:
+		elemBase = the offset of the first element of nested dynamic array, and
+		elemSize = the size of each element;
+		otherwise, elemBase MUST be equal to 0.
+	isDummy = TRUE if the object is a temporary, nameless object, e.g. the
+		object for the base type of a record. *)
+PROCEDURE LocalVars(mod : Module; obj : iOPT.Object;
+									  name : ARRAY OF CHAR;
+									  base, endAdr, indent, elemBase, elemSize : LONGINT;
+									  isDummy, isArrElem : BOOLEAN);
+VAR
+	adr, val,
+	offset (* used for elements of dynamic arrays *),
+	readLen (* number of bytes read for array/dynamic array *) : LONGINT;
+	sval, form, comp, col: SHORTINT;
+	ch: CHAR;
+	ival: INTEGER;
+	i : LONGINT;
+	rval: REAL;
+	lrval: LONGREAL;
+	dummy : iOPT.Object;
+	modName : ARRAY 32 OF CHAR;
+	tmp, tmpMod : Module;
+	object : Object;
+	str : ARRAY 96 OF CHAR;
+	typName : TypName;
+	typ : iOPT.Struct;
+	list : Node;
+BEGIN
+	offset := 0; readLen := 0;
+	IF (obj # NIL) & (obj.mode = Fld) THEN list := LinkList(obj)
+	ELSE list := LNRList(obj)
+	END;
+	LOOP
+		IF list # NIL THEN obj := list.obj END;
+		IF (list = NIL) OR ((obj.mode = Fld) & (base+obj.adr+obj.typ.size > endAdr)) THEN
+			EXIT
+		END;
+		IF (obj.mode IN {Var, VarPar, Fld}) & (obj.typ.form IN {Byte .. Set, cPointer .. Comp}) THEN
+			form := obj.typ.form;
+			comp := obj.typ.comp;
+			IF obj.mode = Fld THEN
+				adr := base + obj.adr
+			ELSIF comp = DynArr THEN
+				Get(base + obj.linkadr - 4 + obj.typ.offset, adr);
+				INC(adr, elemBase + offset);	(* adr only used if element is a string *)
+				Get(base + obj.linkadr - 4 + obj.typ.size, val)
+			ELSIF comp = OpenArr THEN
+				adr := base + elemBase + offset;	(* adr only used if element is a string *)
+				Get(base + 12 + obj.typ.n*4, val)
+			ELSE
+				adr := base + obj.linkadr
+			END;
+			IF isArrElem THEN
+				(* update readLen - this is used to limit the number of bytes that will be read from
+					target memory for one array *)
+				IF (form IN {Byte .. Set, cPointer, ProcTyp}) OR (comp = Record) THEN
+					INC(readLen, obj.typ.size);
+					IF (form = cPointer) & (obj.typ.BaseTyp.comp = cArray)
+					& (obj.typ.BaseTyp.BaseTyp.form = Char)
+					& (obj.typ.BaseTyp.size <= 64) THEN (* string *)
+						INC(readLen, obj.typ.BaseTyp.size)
+					END
+				ELSIF (comp IN {cArray, DynArr, OpenArr}) THEN
+					IF comp = cArray THEN val := obj.typ.size END;
+					IF (obj.typ.BaseTyp.form = Char) & (val <= 64) THEN (* string *)
+						INC(readLen, val)
+					ELSE
+						INC(readLen)
+					END					
+				END;
+				IF (readLen > MaxLen) THEN
+					(* Stop dereferencing - array too big *)
+					WrStr("Array too large. "); WrLn;
+					col := W.col; Texts.SetColor(W, gButtonCol);
+					WrStr("Scope.ShowMemory");
+					WrHex(adr); WrStr("H ");
+					WrInt(DefaultLen, 0); WrLn;
+					Texts.SetColor(W, col);
+					EXIT
+				END
+			END;
+			IF ~isDummy THEN
+				(* Not a dummy object *)
+				FOR i := 0 TO indent DO WrStr("    ") END;
+				IF (obj.mode = Fld) THEN WrChar(".") END;
+				WrStr(obj.name);
+				IF ~(form IN {cPointer .. Comp}) THEN WrStr(" = ") END
+			END;
+			(* Preload cache for optimum target read performance. *)
+			IF ~(comp IN {cArray, DynArr})
+			& ((adr < gCacheStart) OR (adr + obj.typ.size-1 > gCacheEnd)) THEN
+				CheckCache(adr, endAdr - adr)
+			END;
+			IF (comp # DynArr) & (obj.mode = VarPar) THEN
+				IF (comp = Record) THEN
+					Get(adr+4, val)	(* tag of VAR record parameter *)
+				END;
+				Get(adr, adr) (* VAR parameter *);
+			END;
+			CASE form OF
+			  Bool: Get(adr, sval);
+				  IF sval = 0 THEN WrStr("FALSE")
+				  ELSE WrStr("TRUE")
+				  END
+			| Byte, Char: Get(adr, ch);
+				IF (" " <= ch) & (ch <= "~") THEN
+					WrChar(22X); WrChar(ch); WrChar(22X);
+					IF gHex THEN
+				 		WrStr("  ("); WriteHex(ORD(ch), 2); WrStr("H)")
+					END
+				ELSE WriteHex(ORD(ch), 2); WrChar("X")
+				END
+			| SInt: Get(adr, sval); WrInt(sval, 1);
+					IF gHex THEN
+						WrStr("  ("); WriteHex(sval, 2); WrStr("H)")
+					END
+			| Int: Get(adr, ival); WrInt(ival, 1);
+					IF gHex THEN
+						WrStr("  ("); WriteHex(ival, 4); WrStr("H)")
+					END
+			| LInt: Get(adr, val); WrInt(val, 1);
+					IF gHex THEN
+						WrStr("  ("); WriteHex(val, 8); WrStr("H)")
+					END
+			| Real: Get(adr, rval); Texts.WriteReal(W, rval, 15)
+			| LReal: Get(adr, lrval); Texts.WriteLongReal(W, lrval, 24)
+			| Set: Get(adr, val); WrHex(val); WrChar("H")
+			| cPointer:
+				Get(adr, val);
+				HandlePointer(val, name, obj, mod, isArrElem)
+			| ProcTyp:
+				Get(adr, val);
+				tmp := GetMod(val);
+				IF (tmp # NIL) & (GetSymTable(tmp) # NIL) THEN
+					WrStr(" = ");
+					dummy := NIL;
+					FindProc(tmp.code, val, GetSymTable(tmp), dummy);
+					IF (dummy # NIL) & (tmp.code + dummy.linkadr = val) THEN
+						(* Exact match *)
+						WrStr(tmp.name); WrChar("."); WrStr(dummy.name)
+					ELSE
+						WrStr("unknown procedure in "); WrStr(tmp.name)
+					END;
+					WrStr(" ( PC = "); WrHex(val - tmp.code); WrStr("H )")
+				ELSE
+					IF ~isArrElem THEN
+						TypeName(obj.typ, mod, typName);
+						WriteType(typName, gShowTypes)
+					END;
+					WrStr(" = ");
+					IF (val = 0) THEN WrStr("NIL")
+					ELSE
+						WrHex(val); WrStr("H (unknown procedure)")
+					END
+				END
+			| Comp:
+				CASE comp OF
+				   Basic : HALT(100)
+				| cArray:
+					TypeName(obj.typ, mod, typName);
+					IF ~isArrElem THEN WriteType(typName, gShowTypes) END;
+					IF  (obj.typ.BaseTyp.form = Char) & (obj.typ.size <= 64) THEN
+						(*String*)
+						WrStr(" = ");
+						ShowString(adr, obj.typ.size)
+					ELSE
+						NEW(object);
+						COPY(name, object.name);
+						IF (obj.mode = Fld) THEN
+							Concat(object.name, period, object.name)
+						END;
+						Concat(object.name, obj.name, object.name);
+						object.type := typName;
+						object.form := cArray;
+						object.mod := mod; object.obj := obj; object.base := adr;
+						RegisterObject(object)
+					END
+				| DynArr:
+					TypeName(obj.typ, mod, typName);
+					IF ~isArrElem THEN WriteType(typName, gShowTypes) END;
+					IF (obj.typ.BaseTyp.form = Char) & (val <= 64) THEN (* string *)
+						WrStr(" = ");
+						ShowString(adr, val)
+					ELSE
+						NEW(object);
+						COPY(name, object.name);							
+						Concat(object.name, obj.name, object.name);
+						object.type := typName;
+						object.form := cArray;
+						object.mod := mod; object.obj := obj;
+						object.base := base + obj.linkadr;
+						object.elemBase := elemBase + offset;
+						RegisterObject(object)
+					END
+				| OpenArr:
+					TypeName(obj.typ, mod, typName);
+					IF ~isArrElem THEN WriteType(typName, gShowTypes) END;
+					IF (obj.typ.BaseTyp.form = Char) & (val <= 64) THEN (* string *)
+						WrStr(" = ");
+						ShowString(adr, val);
+					ELSE
+						NEW(object);
+						COPY(name, object.name);							
+						Concat(object.name, obj.name, object.name);
+						object.type := typName;
+						object.form := cArray;
+						object.mod := mod; object.obj := obj;
+						object.base := base + obj.linkadr;
+						object.elemBase := elemBase + offset;
+						RegisterObject(object)
+					END
+				| Record:
+					typ := obj.typ; tmpMod := mod;
+					IF ~isDummy THEN
+						IF ~isArrElem THEN
+							IF obj.mode = VarPar THEN (* Pre: val = the tag *)
+								TagToType(val, typ, tmpMod)
+							ELSIF (obj.mode # Var) & (obj.mode # Fld) THEN HALT(100)							
+							END;
+							TypeName(typ, tmpMod, typName);
+							WriteType(typName, gShowTypes)
+						END;
+						WrLn
+					END;
+					COPY(name, str);
+					IF (obj.mode = Fld) THEN
+						Concat(str, period, str)
+					END;
+					Concat(str, obj.name, str);
+					IF (typ.BaseTyp # NIL) THEN
+						NEW(dummy);
+						IF (typ.BaseTyp.mno # 0) THEN
+							(* Type declared in another module. *)
+							modName := "";
+							FindModName(tmpMod, typ.BaseTyp.mno, modName);
+							IF (modName = "") THEN HALT(100) END;
+							tmp := ThisMod(modName);
+							IF (tmp = NIL) THEN HALT(100) END;
+							dummy.typ := NIL;
+							IF typ.BaseTyp.strobj.name = "" THEN HALT(100) END;
+							FindTyp(GetSymTable(tmp), dummy.typ, -1, typ.BaseTyp.strobj.name);
+							IF (dummy.typ = NIL) THEN
+								ASSERT(tmp.globals = NIL);
+								tmp := tmpMod;
+								dummy.typ := typ.BaseTyp
+							END;
+						ELSE (* Type declared in tmpMod. *)
+							tmp := tmpMod;
+							dummy.typ := typ.BaseTyp
+						END;
+						IF (dummy.typ # NIL) THEN
+							dummy.name := "";
+							dummy.mode := Var; dummy.linkadr := 0;
+							LocalVars(tmp, dummy, str, adr, endAdr, indent, 0, 0, TRUE, FALSE)
+						END
+					END;
+					LocalVars(tmpMod, typ.link, str, adr, endAdr, indent+1, 0, 0, FALSE, FALSE)
+				END (* CASE *)
+			END (* CASE *);
+			IF isArrElem & (comp IN {DynArr, OpenArr}) THEN INC(offset, elemSize) END;
+			IF ~isDummy & (comp # Record) THEN WrLn END;
+		END (* IF *);
+		list := list.next
+	END (* LOOP *)
+END LocalVars;
+
+(* Displays the contents of an array, descibed by *object*. *)
+PROCEDURE ShowArray(object : Object);
+VAR
+	base, size, elemSize, i,
+	n (*number of elements*) : LONGINT;
+	obj, start, cur, dummy : iOPT.Object;
+	tmp, btyp : iOPT.Struct;
+	str : ARRAY 32 OF CHAR;
+	isDynArrElem : BOOLEAN;
+BEGIN
+	(* Pre: obj is of type ARRAY *)
+	isDynArrElem := FALSE;
+	obj := object.obj;
+	base := object.base;
+	IF obj.typ.comp = cArray THEN
+		elemSize := obj.typ.BaseTyp.size;
+		size := obj.typ.size;
+		n := obj.typ.n;
+		btyp := obj.typ.BaseTyp
+	ELSIF obj.typ.comp = DynArr THEN
+		(* Calculate the size of an element *)
+		elemSize := 1;
+		tmp := obj.typ.BaseTyp;
+		WHILE (tmp.comp = DynArr) DO
+			Get(base - 4 + tmp.size, i);
+			elemSize := elemSize * i;
+			tmp := tmp.BaseTyp
+		END;
+		(* Pre: tmp is the type of the dynamic array element *)
+		Get(base - 4 + obj.typ.size, n);
+		elemSize := elemSize * tmp.size;
+		size := elemSize * n;
+		btyp := obj.typ.BaseTyp;
+		isDynArrElem := obj.typ.BaseTyp.comp = DynArr;
+		IF ~isDynArrElem THEN
+			(* If the element of the dynamic array is not another dynamic array,
+				the address of the first element can be passed as base to LocalVars().
+				Otherwise the same base must be passed, because it is needed to
+				find the address of the dynamic array indirectly. *)
+			Get(base - 4 + obj.typ.offset, base);
+			INC(base, object.elemBase)
+		END
+	ELSIF (obj.typ.comp = OpenArr) THEN
+		(* Calculate the size of an element *)
+		elemSize := 1;
+		tmp := obj.typ.BaseTyp;
+		WHILE (tmp.comp = DynArr) DO
+			Get(base + 12 + tmp.n*4, i);
+			elemSize := elemSize * i;
+			tmp := tmp.BaseTyp
+		END;
+		(* Pre: tmp is the type of the open array element *)
+		elemSize := elemSize * tmp.size;
+		Get(base + 12 + obj.typ.n*4, n);
+		size := elemSize * n;
+		NEW(btyp); btyp^ := obj.typ.BaseTyp^;
+		isDynArrElem := btyp.comp = DynArr;
+		IF isDynArrElem THEN
+			btyp.comp := OpenArr
+		ELSE (* ~isDynArrElem *)
+			(* If the element of the open array is not another open array,
+				the address of the first element can be passed as base to LocalVars().
+				Otherwise the same base must be passed, because it is needed to
+				find the address of the open array indirectly. *)
+			INC(base, object.elemBase)
+		END
+	ELSE HALT(100)
+	END;
+	(* Pre: n = number of elements, elemSize = size of one element, size = total size of array,
+				btyp = type of element *)
+	NEW(start); cur := start;
+	i := 0;
+	WHILE (i < n) & ((i+1) * elemSize <= size) DO
+		NEW(dummy);
+		dummy.name[0] := "["; dummy.name[1] := 0X;
+		IntToString(i, str); Concat(dummy.name, str, dummy.name);
+		str[0] := "]"; str[1] := 0X; Concat(dummy.name, str, dummy.name);
+		dummy.mode := Var;
+		IF isDynArrElem THEN
+			(* (object.base + dummy.linkadr) will be used to calculate the address of
+				the address of the dynamic/open array. *)
+			dummy.linkadr := 0
+		ELSE (* element is not a dynamic/open array *)
+			dummy.linkadr := i * elemSize
+		END;
+		dummy.typ := btyp;
+		dummy.right := NIL; dummy.left := NIL;
+		cur.right := dummy; cur := dummy;
+		INC(i)
+	END;
+	LocalVars(object.mod, start.right, object.name, base, base + size,
+					 -1, object.elemBase, elemSize, FALSE, TRUE)
+END ShowArray;
+
+PROCEDURE ShowStruct*;
+VAR
+	adr, res : LONGINT;
+	object : Object;
+	state : StateDesc;
+	T : Texts.Text;
+	V : Viewers.Viewer;
+	vwr : Viewer;
+    X, Y : INTEGER;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	res := rdiGetState(state);
+    IF (res = 6605) THEN
+    	WrStr("No exception has occurred"); WrLn
+    ELSIF (res # 0) THEN
+    	WrStr("Remote communication failure "); WrInt(res, 0); WrLn
+	ELSE
+		In.Open;
+		In.LongInt(adr);
+		IF ~In.Done THEN RETURN END;
+		WrStr("Time = ");
+		WrInt(gTick, 0); WrLn;
+		object := SYSTEM.VAL(Object, adr);
+		WrStr(object.name);
+		WriteType(object.type, TRUE); WrLn;
+		IF (object.form = cArray) THEN
+			ShowArray(object)
+		ELSIF (object.form = cPointer) THEN
+			LocalVars(object.mod, object.obj, object.name, object.base,
+							object.base + object.obj.typ.size, -1, 0, 0, TRUE, FALSE)
+		ELSE HALT(100)
+		END
+	END;
+	T := NewText("");
+	Texts.Append(T, W.buf);
+	Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+	V := Desktops.NewDocViewer(Desktops.NewMenuFrame("Scope.Struct",
+			"Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.Show[Show] Scope.ShowGlobals[Globals] Scope.Store[Store]"), 
+			NewFrame(T), Desktops.menuH, X, Y);
+	NEW(vwr);
+	vwr.vwr := V; vwr.next := gStructVwrList;
+	gStructVwrList := vwr
+END ShowStruct;
+
+(* Does a hex dump of a stretch of memory. It takes two parameters: an
+	address and a length. If length is omitted, a default length is taken. The
+	number of bytes that will be dumped is limited to a certain maximum.
+	The address following the last one which is dumped, is written on the last
+	line, so that the user can mark that and display the next number of bytes. *)
+PROCEDURE ShowMemory*;
+VAR
+	T : Texts.Text;
+	S : Texts.Scanner;
+	beg, end, time : LONGINT;
+	F : TextGadgets.Frame;
+	state : StateDesc;
+    X, Y : INTEGER;
+	adr, len, i, j, res : LONGINT;
+	x, col: SHORTINT;
+	buf : POINTER TO ARRAY MaxLen OF SHORTINT;
+	font : Objects.Library;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	res := rdiGetState(state);
+    IF (res = 6605) THEN
+    	WrStr("No exception has occurred"); WrLn; WrLn
+    ELSIF (res # 0) THEN
+    	WrStr("Remote communication failure "); WrInt(res, 0); WrLn
+    ELSE
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+		Texts.Scan(S);
+		IF S.class = Texts.Int THEN
+			adr := S.i; Texts.Scan(S);
+			IF S.class = Texts.Int THEN len := S.i
+			ELSE len := DefaultLen
+			END
+		ELSE
+			Oberon.GetSelection(T, beg, end, time);
+			IF time >= 0 THEN
+				Texts.OpenScanner(S, T, beg);
+				Texts.Scan(S);
+				IF S.class = Texts.Int THEN
+					adr := S.i; Texts.Scan(S);
+					IF S.class = Texts.Int THEN len := S.i
+					ELSE len := DefaultLen
+					END
+				ELSE
+					RETURN
+				END
+			ELSE
+				RETURN
+			END
+		END;
+		(* Read whole block of memory in one go. *)
+		IF (len > MaxLen) THEN len := MaxLen END;
+		SYSTEM.NEW(buf, len);
+		res := rdiRead(adr, buf^, len);
+		IF (res # 0) THEN 
+			Out.String("  target memory read failure "); Out.Int(res, 0); Out.Ln;
+			RETURN
+		END;
+		WrStr("Time = "); WrInt(gTick, 0); WrLn;
+		(* Display contents of memory. *)
+		font := W.lib; Texts.SetFont(W, Fonts.This("Courier10.Scn.Fnt"));
+		i := 0;
+		WHILE (i < len) DO
+			WriteHex(adr+i, 8);  WrStr("H: ");
+			(* Do Hex dump. *)
+			j := i;
+			WHILE (j < i+8) & (j < len) DO
+				WriteHex(buf[j], 2); WrChar(" ");
+				INC(j)
+			END;
+			WHILE (j < i+8) DO WrStr("   "); INC(j) END;
+			WrStr("     ");
+			(* Do ASCII dump. *)
+			j := i;
+			WHILE (j < i+8) & (j < len) DO
+				x := buf[j];
+				IF (x > 01FH) & (x < 07FH) THEN WrChar(CHR(x))
+				ELSE WrChar(".") END;
+				INC(j)
+			END;
+			WrLn;
+			INC(i, 8)
+		END;
+		Texts.SetFont(W, font);
+		col := W.col; Texts.SetColor(W, gButtonCol);
+		WrStr("Scope.ShowMemory ");
+		WriteHex(adr+len, 8); WrStr("H ");
+		WrInt(DefaultLen, 0); WrLn;
+		Texts.SetColor(W, col)
+	END;
+	IF (gMemVwr # NIL) & (gMemVwr.state > 1) THEN
+		F := gMemVwr.dsc.next(TextGadgets.Frame);
+		T := F.text;
+		len := T.len;
+		Texts.Append(T, W.buf);
+		(* Ensure most of new dump is visible *)
+		TextGadgets0.RemoveCaret(F);
+		TextGadgets0.RemoveSelection(F);
+		Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+		ScrollTo(F, len)
+	ELSE
+		T := NewText("");
+		Texts.Append(T, W.buf);
+		Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+		gMemVwr := Desktops.NewDocViewer(Desktops.NewMenuFrame("Scope.Memory", 
+			"Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.ShowMemory[Mem] Scope.Store[Store]"), 
+			NewFrame(T), Desktops.menuH, X, Y)
+	END
+END ShowMemory;
+
+(* Displays global variables of module *name* and their values in text *t*. *)
+PROCEDURE OutState (name: ARRAY OF CHAR; t: Texts.Text);
+VAR
+	mod: Module;
+	res : LONGINT;
+	str : ARRAY 96 OF CHAR;
+BEGIN
+  res := rdiGetState(gState);
+  IF (res = 6605) THEN
+    WrStr("No exception has occurred"); WrLn
+  ELSIF (res # 0) THEN
+  	WrStr("Remote communication failure "); WrInt(res, 0)
+  ELSIF (gModuleList = NIL) THEN
+    WrStr("No linking information available")
+  ELSE
+    WrStr("Time = ");
+    WrInt(gTick, 0); WrLn;
+    WrStr(name);
+	mod := ThisMod(name);
+    IF mod # NIL THEN
+      COPY(name, str); Concat(str, period, str);
+      WrStr("  SB ="); WrHex(mod.SB); WrChar("H"); WrLn;
+      LocalVars(mod, GetSymTable(mod), str, mod.SB, MAX(LONGINT), 0, 0, 0, FALSE, FALSE)
+    ELSE WrStr(" not part of loaded object") END;
+  END;
+  WrLn; Texts.Append(t, W.buf)
+END OutState;
+
+PROCEDURE DisplayGlobals(name : ARRAY OF CHAR);
+VAR
+	T: Texts.Text;
+    V: Viewers.Viewer;
+    X, Y: INTEGER;
+    frame : TextGadgets.Frame;
+    tmp : Module;
+    org : LONGINT;
+    title : ARRAY 64 OF CHAR;
+BEGIN
+	T := NewText("");
+	OutState(name, T);
+	(* Check if a state viewer for this module is open *)
+	tmp := ThisMod(name);
+	IF (tmp # NIL) THEN
+		IF (tmp.globalsVwr # NIL) & (tmp.globalsVwr.state > 1) THEN
+			(* Update existing viewer *)
+			frame := tmp.globalsVwr.dsc.next(TextGadgets.Frame);
+			Texts.Save(T, 0, T.len, W.buf);	(* Assume W.buf is cleared. *)
+			(* Calculate org, so that viewer displays the same part of the state *) 
+    		org := frame.org + W.buf.len;
+    		IF (org < frame.text.len) THEN
+    			org := frame.text.len + 1
+    		END;
+    		Texts.Append(frame.text, W.buf);
+			TextGadgets0.RemoveCaret(frame);
+			TextGadgets0.RemoveSelection(frame);
+			Oberon.RemoveMarks(frame.X, frame.Y, frame.W, frame.H);
+			ScrollTo(frame, org)
+		ELSE
+			(* Open a new viewer *)
+			Concat(tmp.name, ".Globals", title);
+			Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+			V := Desktops.NewDocViewer(Desktops.NewMenuFrame(title,
+		  	"Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.Show[Show] Scope.ShowGlobals[Globals] Scope.ShowSource[Source] Scope.ShowAssembly[DisAss] Scope.ShowMemory[Mem] Scope.Store[Store]"),
+				  NewFrame(T), Desktops.menuH, X, Y);
+			(* Add viewer to list of Globals viewers *)
+			tmp.globalsVwr := V
+		END
+	ELSE (* module not in object *)
+		Out.String("  module "); Out.String(name);
+		Out.String(" not part of loaded object"); Out.Ln
+	END
+END DisplayGlobals;
+
+PROCEDURE ShowGlobals*;
+VAR
+	T: Texts.Text;
+	V : Viewers.Viewer;
+    S: Texts.Scanner;
+    beg, end, time, i: LONGINT;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	V := Oberon.Par.vwr;
+	Oberon.GetSelection(T, beg, end, time);
+	IF time >= 0 THEN
+		Texts.OpenScanner(S, T, beg); Texts.Scan(S)
+	ELSIF (V IS Desktops.DocViewer) & (V.dsc # NIL) & (V.dsc = Oberon.Par.frame) THEN
+		RETURN (* called from menu, but no selection *)
+	ELSE
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S)
+	END;
+	IF S.class = Texts.Name THEN
+		(* Extract module name *)
+		(* Assume: S.s is terminated by 0X *)
+		i := 0; WHILE (S.s[i] # 0X) & (S.s[i] # ".") DO INC(i) END;
+		IF (S.s[i] = ".") THEN S.s[i] := 0X END;
+		DisplayGlobals(S.s)
+	END
+END ShowGlobals;
+
+(* Displays the procedures, their paramters and local variables, which are on
+	the stack as they were invoked up to the trap. *)
+PROCEDURE ShowStack*;
+VAR V: Viewers.Viewer;
+    T: Texts.Text;
+    fp, pc, error, page: LONGINT;
+    X, Y : INTEGER;
+    mod: Module;
+    proc : iOPT.Object;
+    org, haltPC, res : LONGINT;
+    break : BreakPoint;
+    frame : TextGadgets.Frame;
+    haltMod : Module;
+    str : ARRAY 96 OF CHAR;
+    ch : CHAR;
+BEGIN
+	(* Pre: assume that argument of HALT in programs will never = -1 *);
+	IF ~gActive THEN RETURN END;
+    T := NewText("");
+    Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+    haltMod := NIL;
+    res := rdiGetState(gState);
+	IF (res = 6605) THEN
+		WrStr("No exception has occurred"); WrLn; WrLn
+	ELSIF (res # 0) THEN
+		WrStr("Remote communication failure "); WrInt(res, 0); WrLn
+    ELSIF (gModuleList = NIL) THEN
+    	WrStr("No linking information available");
+    	WrLn
+	ELSE
+	    fp := gState.EBP;
+	    pc := gState.EIP;
+	    page := gState.CR2;
+	    mod := GetMod(pc);
+	    IF gState.INT = 3 THEN 
+	    	IF (mod = NIL) THEN
+	    		(* INT 3 in object code outside any of the modules *)
+				error := 3
+			ELSE (* Oberon HALT()/user breakpoint *)
+				(* Check if halt was at a user breakpoint *)
+				break := mod.breaks.link;
+				WHILE (break # NIL)
+				& ((mod.map[break.idx].pc + mod.code) # pc-1) DO
+					break := break.link
+				END;
+				IF (break # NIL) THEN
+					(* halted at a breakpoint set by user *)
+					error := 3; DEC(pc)
+				ELSIF (gCurrentBP # NIL)
+				& ((mod.map[gCurrentBP.idx].pc + mod.code) = pc) THEN
+					(* currently halted at a breakpoint that's been removed since *)
+					error := 3
+				ELSIF (pc = gMainCode + cStartOffset) THEN
+					(* This should only be true just after object was loaded, when
+						 halted at start of main code/command *)
+					error := -1; mod := NIL; fp := 0
+				ELSE (* assume Oberon HALT() *)
+					Get(gState.ESP, error); DEC(pc)
+				END
+			END
+		ELSE
+			error := SHORT(gState.INT)
+		END (* CASE *);
+		
+	    (*Get(pc-1, ch);
+	    IF (ch = 0CCX) OR (ch = 0CEX) THEN DEC(pc) END;*)	(* INT 3 OR INTO *)
+	    
+		haltMod := mod; haltPC := pc;
+	    WrStr("Time = ");
+   	 WrInt(gTick, 0); WrLn;
+	    IF (error # -1) THEN 
+	    	WrStr("TRAP "); WrInt(error, 1);
+	    	WrChar(" ")
+	    END;
+		IF (error = -1) THEN
+			WrStr("Ready to execute main module/command")
+		ELSIF error = 0 THEN
+			WrStr("Division by zero")
+       ELSIF error = 1 THEN
+        	WrStr("Single step breakpoint");
+		ELSIF error = 3 THEN
+			WrStr("Breakpoint")
+		ELSIF error = 4 THEN
+			WrStr("Overflow")
+		ELSIF error = 6 THEN
+			WrStr("Invalid instruction")
+		ELSIF error = 7 THEN
+			WrStr("Index out of range")
+		ELSIF error = 13 THEN 
+			WrStr("General protection fault")
+		ELSIF error = 14 THEN
+			WrStr("Page fault at ");
+			WrHex(page);  WrChar("H")
+		ELSIF error = 16 THEN
+			IF gState.INT = 3 THEN
+				WrStr("Invalid case in CASE statement")
+			ELSE
+				WrStr("Floating-point error")
+			END
+		ELSIF error = 17 THEN
+			WrStr("Function without RETURN")
+		ELSIF error = 18 THEN
+			WrStr("Type guard failed")
+		ELSIF error = 19 THEN
+			WrStr("Type test failed")	(* VAR parameter *)
+		ELSIF error = 24 THEN
+			WrStr("Keyboard interrupt")
+		ELSIF error = 26 THEN
+			WrStr("Out of memory")
+		ELSIF error = MAX(INTEGER) THEN
+			WrStr("Compile-time breakpoint ")
+		END; 
+        WrLn;
+	    (* Throw away words on top of stack until get a valid stack frame, i.e.
+	         where the return address points into one of the modules *)
+	 	WHILE (fp < gState.StackOrg) & (fp >= gState.StackLimit) & (mod = NIL) DO
+			WrLn; WrStr("Unknown module  PC =");  WrHex(pc);
+			WrStr("H  FP =");  WrHex(fp); WrLn;
+			Get(fp+4, pc); Get(fp, fp);
+			mod:= GetMod(pc)
+	    END;
+		LOOP 
+			IF (mod = NIL) THEN EXIT END;
+			WrStr(mod.name);
+			IF (GetSymTable(mod) # NIL) THEN
+				proc := NIL;
+				FindProc(mod.code, pc, GetSymTable(mod), proc);
+				WrChar(".");
+				COPY(mod.name, str); Concat(str, period, str);
+	            IF (proc = NIL) THEN
+					WrStr("$$");
+					WrStr("  PC ="); WrHex(pc-mod.code);
+					WrChar("H"); WrLn;
+	            	(* pc in init code of module *)
+					LocalVars(mod, GetSymTable(mod), str, mod.SB, MAX(LONGINT), 0,
+									0, 0, FALSE, FALSE)
+				ELSE
+	            	Concat(str, proc.name, str); Concat(str, period, str);
+					WrStr(proc.name);
+					WrStr("  PC ="); WrHex(pc-mod.code);
+					WrChar("H"); WrLn;
+					LocalVars(mod, proc.scope.right, str, fp, MAX(LONGINT), 0, 0, 0, FALSE, FALSE)
+				END
+			ELSE
+				WrStr(" : information unavailable");
+				WrLn;
+				WrStr("  PC ="); WrHex(pc-mod.code);
+				WrChar("H"); WrLn
+			END;
+			Get(fp+4, pc); Get(fp, fp); (* return addr from stack *)
+			IF (fp >= gState.StackOrg) OR (fp < gState.StackLimit) THEN EXIT END; (* not called from stack *)
+			mod:= GetMod(pc)
+		END; (*LOOP*)
+		WrLn;
+		WrStr("Object base = ");
+		WrHex(gObjectBase); WrChar("H"); WrLn;
+		WrStr("Stack origin = ");
+		WrHex(gState.StackOrg); WrChar("H"); WrLn;
+		WrStr("Stack limit   = ");
+		WrHex(gState.StackLimit); WrChar("H");
+		WrLn; WrLn
+	END; (* IF *)
+	IF (gStackVwr # NIL) & (gStackVwr.state > 1) THEN
+    	(* Update existing viewer *)
+    	frame := gStackVwr.dsc.next(TextGadgets.Frame);
+    	(* Calculate org, so that viewer displays the same "view" of the stack, while "structure" of
+    		stack does not change, e.g. between iterations of a loop. *)
+    	org := frame.org + W.buf.len;
+    	IF (org < frame.text.len) THEN
+    		org := frame.text.len + 1
+    	END;
+    	Texts.Append(frame.text, W.buf);
+		TextGadgets0.RemoveCaret(frame);
+		TextGadgets0.RemoveSelection(frame);
+		Oberon.RemoveMarks(frame.X, frame.Y, frame.W, frame.H);
+		ScrollTo(frame, org)
+    ELSE
+		(* AllocateTrapViewer(X, Y); *)
+		Texts.Append(T, W.buf);
+		V := Desktops.NewDocViewer(Desktops.NewMenuFrame("Scope.Stack",
+			"Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.Show[Show] Scope.ShowGlobals[Globals] Scope.ShowSource[Source] Scope.ShowAssembly[DisAss] Scope.ShowMemory[Mem] Scope.Store[Store]"), 
+			NewFrame(T), Desktops.menuH, X, Y);
+		gStackVwr := V
+	END;
+	IF (haltMod # NIL) THEN
+		Locate(haltMod, haltPC-haltMod.code)
+	ELSE
+		Locate(NIL, 0)
+	END
+END ShowStack;
+
+PROCEDURE ShowMachines*;
+VAR
+	machines : ARRAY 40 OF ARRAY 20 OF CHAR;
+	num, i : LONGINT;
+	T : Texts.Text;
+    X, Y : INTEGER;
+BEGIN
+	IF ~gInit THEN
+		Out.String("  no remote debugging interface loaded"); Out.Ln;
+		RETURN
+	END;
+	rdiGetMachines(machines, num);
+	FOR i := 0 TO num-1 DO
+		WrStr(machines[i]); WrLn
+	END;
+	IF (gMachinesVwr # NIL) & (gMachinesVwr.state > 1) THEN
+		T := gMachinesVwr.dsc.next(TextGadgets.Frame).text;
+		Texts.Delete(T, 0, T.len);
+		Texts.Append(T, W.buf)
+	ELSE
+		T := NewText("");
+		Texts.Append(T, W.buf);
+		Oberon.AllocateSystemViewer(Oberon.Par.vwr.X, X, Y);
+		gMachinesVwr := Desktops.NewDocViewer(Desktops.NewMenuFrame("Scope.Machines", StandardMenu), 
+			NewFrame(T), Desktops.menuH, X, Y)
+	END
+END ShowMachines;
+
+(* ---------------------------------------------------------- *)	
+(* Reads the log file created when the object with name "name" was 
+    statically linked. Gets the name of all the modules contained in the 
+    object, plus their code offsets, data offsets, type desc addresses, etc.. *)
+PROCEDURE GetLinkInfo(name : ARRAY OF CHAR);
+VAR
+	file : Files.File;
+	T: Texts.Text;
+	S: Texts.Scanner;
+	logFile : ARRAY 64 OF CHAR;
+	newMod : Module;
+	i : LONGINT;
+BEGIN
+	Out.String("Load "); Out.String(name);
+	file := Files.Old(name);
+	IF (file = NIL) THEN
+		Out.String(" -  file does not exist"); Out.Ln;
+		RETURN
+	END;
+	Out.Ln;
+	gObjectSize := Files.Length(file);
+	gModuleList := NIL; gMainCode := -1; gObjectBase := 0;
+	Concat(name, ".Link", logFile);
+	Out.String("Load "); Out.String(logFile);
+	file := Files.Old(logFile);
+	IF (file = NIL) THEN
+		Out.String(" -  file does not exist"); Out.Ln;
+		RETURN
+	END;
+	Out.Ln;
+	Files.GetDate(file, gLinkTime, gLinkDate);
+	NEW(T);  Texts.Open(T, logFile);
+	Texts.OpenScanner(S, T, 0);
+	(* Get link base *) 
+	WHILE (~S.eot) & (gObjectBase = 0) DO
+		Texts.Scan(S);
+		IF (S.class = Texts.Name) & (S.s = "Building") THEN
+			(* "Building image : test  bbbbbbbbH" *)
+			Texts.Scan(S); Texts.Scan(S); Texts.Scan(S); Texts.Scan(S);
+			gObjectBase := S.i;
+			IF S.class # Texts.Int THEN RETURN END
+		END
+	END;
+	(* Get name of each module and the address of its code *)
+	WHILE ~S.eot DO
+		Texts.Scan(S);
+		IF (S.class = Texts.Name) & (S.s = "Dumping") THEN
+			(* "Dumping xxxx Code base = yyyyyyyyH Code size = ssssssssH
+				  SB = zzzzzzzzH Data base =  kkkkkkkkH"
+				  "Types n"
+				  aaaaaaaaH bbbbbbbbH*)
+			NEW(newMod);
+			Texts.Scan(S);  COPY(S.s, newMod.name);
+			Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+			newMod.code := S.i;
+			IF (S.class # Texts.Int) THEN gModuleList := NIL; RETURN END;
+			Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+			newMod.codeSize := S.i;
+			IF (S.class # Texts.Int) THEN gModuleList := NIL; RETURN END;
+			Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+			newMod.SB := S.i;
+			IF (S.class # Texts.Int) THEN gModuleList := NIL; RETURN END;
+			Texts.Scan(S); Texts.Scan(S);  Texts.Scan(S);  Texts.Scan(S);
+			(* ignore Data base *)
+			WHILE ~S.eot & ~((S.class = Texts.Name) & (S.s = "Types")) DO
+				Texts.Scan(S)
+			END;
+			Texts.Scan(S);
+			IF (S.class # Texts.Int) THEN gModuleList := NIL; RETURN END;
+			newMod.numTypes := S.i;
+			i := 0;	(* Read table of typedescaddress offsets and type tags *)
+			WHILE ~S.eot & (i < newMod.numTypes) DO
+				Texts.Scan(S); newMod.types[i].entry := S.i;
+				Texts.Scan(S); newMod.types[i].tag := S.i;
+				IF (S.class # Texts.Int) THEN gModuleList := NIL; RETURN END;
+				INC(i)
+			END;
+			NEW(newMod.breaks);
+			newMod.breaks.idx := -1;
+			newMod.link := gModuleList; gModuleList := newMod
+		ELSIF (S.class = Texts.Name) & (S.s = "Main") THEN
+			(* Main code at xxxxxxxx *)
+			Texts.Scan(S);
+			IF (S.class = Texts.Name) & (S.s = "code") THEN
+				Texts.Scan(S);	(* " at " *)
+				Texts.Scan(S);
+				IF (S.class # Texts.Int) THEN
+					gMainCode := -1;
+					gModuleList := NIL
+				ELSE
+					gMainCode := S.i
+				END
+			END
+		END
+	END;
+END GetLinkInfo;
+
+(* Extracts the module and procedure from a <module>.<procedure> string.
+	Can also be used to extract the name and extension from a file name. *)
+PROCEDURE ExtractNames(string : ARRAY OF CHAR; VAR module, procedure : ARRAY OF CHAR);
+VAR
+  i, length, mlength : INTEGER;
+BEGIN
+  i := 0;
+   length := Length(string);
+   WHILE (i < length) & (string[i] # ".") DO
+      module[i] := string[i];
+      INC(i)
+   END (* WHILE *);
+   mlength := i + 1;
+   module[i] := 0X;		(* terminate string *)
+   INC(i);			(* skip over "." *)
+   WHILE (i < length) DO
+      procedure[i-mlength] := string[i];
+      INC(i)
+   END (* WHILE *);
+   procedure[i-mlength] := 0X
+END ExtractNames;
+
+PROCEDURE GetModules*;	(* Kernel.modules *)
+TYPE
+	Tmp = POINTER TO ARRAY 100000H OF CHAR;
+VAR
+	res, p, i, num, j, k : LONGINT;
+	m: Module;
+	rm: RECORD	(* same as Kernel.ModuleDesc *)
+		next: LONGINT;
+		name: ARRAY 32 OF CHAR;
+		init, trapped: BOOLEAN;
+		key, refcnt, sb: LONGINT;
+		varEntries: LONGINT;
+		entries: LONGINT;
+		cmds: LONGINT;
+		ptrTab: LONGINT;
+		tdescs: LONGINT;
+		imports: LONGINT;
+		data, code: LONGINT;
+		refs: LONGINT;
+		term: LONGINT;
+		end: CHAR
+	END;
+	state : StateDesc;
+	tdescs, varEntries: POINTER TO ARRAY OF LONGINT;
+	tmp: Tmp;
+	error: BOOLEAN;
+	name: ARRAY 32 OF CHAR;
+	
+	PROCEDURE Read(adr : LONGINT;  VAR val : ARRAY OF SYSTEM.BYTE;  len : LONGINT): BOOLEAN;
+	VAR res: LONGINT;
+	BEGIN
+		IF len = 0 THEN RETURN TRUE END;
+		res := rdiRead(adr, val, len);
+		IF (res # 0) THEN 
+			Out.String("  target memory read failure ");
+			Out.Int(res, 0); Out.Ln;
+			RETURN FALSE
+		ELSE RETURN TRUE
+		END
+	END Read;
+	
+BEGIN
+	IF ~gActive THEN RETURN END;
+	res := rdiGetState(state);
+    IF (res = 6605) THEN
+    	WrStr("No exception has occurred"); WrLn
+    ELSIF (res # 0) THEN
+    	WrStr("Remote communication failure "); WrInt(res, 0); WrLn
+    ELSE
+    	In.Open;  In.Name(name);
+    	IF ~In.Done THEN RETURN END;
+    	ExtractNames(name, rm.name, name);
+    	m := ThisMod(rm.name);
+    	IF m = NIL THEN
+    		Out.String(rm.name);  Out.String(" not loaded");  Out.Ln;
+    		RETURN
+    	END;
+    	FindGlobalVar(GetSymTable(m), name, p);
+    	IF p = 0 THEN
+    		Out.String(rm.name);  Out.Char(".");  Out.String(name);
+    		Out.String(" not found");  Out.Ln;
+    		RETURN
+    	END;
+    	INC(p, m.SB);
+		IF ~Read(p, p, 4) THEN RETURN END;
+    	WHILE p # 0 DO
+    		IF ~Read(p, rm, SYSTEM.ADR(rm.end)-SYSTEM.ADR(rm)) THEN RETURN END;
+			Out.String(rm.name);
+			m := ThisMod(rm.name);
+			IF m = NIL THEN
+				Out.String(" new");
+				NEW(m);  COPY(rm.name, m.name);  m.code := rm.code+16;
+				IF ~Read(rm.code+12, m.codeSize, 4) THEN RETURN END;
+				m.SB := rm.sb;
+				IF ~Read(rm.tdescs+12, m.numTypes, 4) THEN RETURN END;
+				IF m.numTypes > 0 THEN
+					NEW(tdescs, m.numTypes);
+					tmp := SYSTEM.VAL(Tmp, SYSTEM.ADR(tdescs[0]));
+					IF ~Read(rm.tdescs+16, tmp^, m.numTypes*4) THEN RETURN END;
+					IF ~Read(rm.varEntries+12, num, 4) THEN RETURN END;
+					NEW(varEntries, num);
+					tmp := SYSTEM.VAL(Tmp, SYSTEM.ADR(varEntries[0]));
+					IF ~Read(rm.varEntries+16, tmp^, num*4) THEN RETURN END;
+					FOR i := 0 TO num-1 DO
+						IF varEntries[i] >= rm.sb THEN	(* constant area *)
+							IF ~Read(varEntries[i], varEntries[i], 4) THEN RETURN END
+						ELSE
+							varEntries[i] := 0
+						END;
+						Out.Char(".")
+					END
+				END;
+				error := FALSE;
+				FOR i := 0 TO m.numTypes-1 DO
+					j := 0;  k := -1;
+					WHILE j # num DO
+						IF varEntries[j] = tdescs[i] THEN
+							IF k = -1 THEN k := j
+							ELSE error := TRUE
+							END
+						END;
+						INC(j)
+					END;
+					IF k = -1 THEN error := TRUE END;
+					m.types[i].entry := k;  m.types[i].tag := tdescs[i]
+				END;
+				IF error THEN m.numTypes := 0 END;
+				NEW(m.breaks);  m.breaks.idx := -1;
+				m.link := gModuleList;  gModuleList := m
+			ELSE
+				Out.String(" old")
+			END;
+			Out.Ln;
+			p := rm.next
+		END
+	END
+END GetModules;
+
+PROCEDURE Initialize*;
+VAR
+	res : LONGINT;
+	state : StateDesc;
+BEGIN
+	IF gActive THEN
+		Out.String("  first terminate previous debugging session"); Out.Ln;
+		RETURN
+	ELSIF ~gInit THEN
+		Out.String("  no remote debugging interface loaded"); Out.Ln;
+		RETURN
+	END;
+	gMainCode := -1;
+	In.Open;
+	In.Name(gMachineName);
+	IF ~In.Done THEN RETURN END;
+	In.Name(gObjectName);
+	IF ~In.Done THEN RETURN END;
+	GetLinkInfo(gObjectName);
+	IF (gModuleList = NIL) OR (gMainCode - gObjectBase < 0) THEN
+		Out.String("  linking information unavailable or incorrect"); Out.Ln;
+		RETURN
+	ELSE
+		res := rdiInit(gMachineName, gObjectName, gMainCode - gObjectBase + cStartOffset)
+	END;
+	IF (res # 0) & (res # 6603) THEN
+		IF (res = 6600) THEN
+			Out.String("  object file does not exist")
+		ELSIF (res = 6601) THEN
+			Out.String("  machine not available")
+		ELSIF (res = 6602) THEN
+			Out.String("  object too big")
+		ELSIF (res = 6604) THEN
+			Out.String("  timed out while loading")
+		ELSIF (res = 6608) THEN
+			Out.String("  insufficient memory on target")
+		ELSE
+			HALT(100)
+		END;
+		Out.Ln;
+		RETURN
+	END;
+	IF (res = 6603) THEN
+		Out.String(" crash in init code"); Out.Ln
+	END;
+
+	ClearCache;
+	Out.String("Object "); Out.Char(22X);
+	Out.String(gObjectName); Out.Char(22X); Out.String(" on ");
+	Out.Char(22X); Out.String(gMachineName); Out.Char(22X); Out.Ln;
+	Out.String("  new debugging session"); Out.Ln;
+	gCurrentBP := NIL;
+	gStackVwr := NIL; gRegsVwr := NIL;
+	gMachinesVwr := NIL; gModulesVwr := NIL; gMemVwr := NIL; gStructVwrList := NIL;
+	gObjects := NIL;
+	gTick := 0;
+	gActive := TRUE
+END Initialize;
+
+(* Loads the Oberon source file of one of the linked modules, together with
+	 the map file for that module, and opens a viewer with the source code.
+	 Input: 	the name of a module *)
+PROCEDURE ShowSource*;
+VAR
+	S : Texts.Scanner;
+	V : Viewers.Viewer;
+	T : Texts.Text;
+	selBeg, selEnd, selTime, i : LONGINT;
+	name : ARRAY 32 OF CHAR;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	V := Oberon.Par.vwr;
+	Oberon.GetSelection(T, selBeg, selEnd, selTime);
+	IF (selTime >  0) THEN  (* selection exists? *)
+		Texts.OpenScanner(S, T, selBeg);
+    	Texts.Scan(S); 
+		IF (S.class = Texts.Name) THEN COPY(S.s, name) ELSE RETURN END
+	ELSIF (V IS Desktops.DocViewer) & (V.dsc # NIL) & (V.dsc = Oberon.Par.frame) THEN
+		RETURN (* called from menu, but no selection *)
+	ELSE
+		In.Open;
+		In.Name(name);
+		IF ~In.Done THEN RETURN END
+	END;
+	(* Extract module name from the string *)
+	i := 0; WHILE (i < 32) & (name[i] # ".") DO INC(i) END;
+	IF (i < 32) THEN name[i] := 0X END;
+	ShowSourceCode(name)
+END ShowSource;
+
+(* Loads the assembly code file of one of the linked modules, together with
+	 the map file for that module, and opens a viewer with the source code.
+	 Input: 	the name of a module *)
+PROCEDURE ShowAssemblyCode(name : ARRAY OF CHAR);
+VAR
+	F : Files.File;
+	T : Texts.Text;
+	S : Texts.Scanner;
+	fileName, title : ARRAY 64 OF CHAR;
+	mod : Module;
+    X, Y : INTEGER;
+    objDate, objTime,
+    assDate, assTime : LONGINT;
+BEGIN
+	mod := ThisMod(name);
+	IF (mod = NIL) THEN
+		Out.String("  module "); Out.String(name);
+		Out.String(" not part of loaded object"); Out.Ln;
+		RETURN
+	END;
+	Concat(name, ".obj", fileName);
+	Out.String("  load "); Out.String(fileName);
+	F := Files.Old(fileName);
+	IF (F # NIL) THEN
+		Files.GetDate(F, objTime, objDate);
+		IF (objDate > gLinkDate) OR
+        ((objDate = gLinkDate) & (objTime > gLinkTime)) THEN
+        	Out.String(" warning: file younger than loaded object. Re-link"); Out.Ln
+        END
+	ELSE
+		Out.String(" - file does not exist"); Out.Ln;
+		RETURN
+	END;
+	Out.String(" (disassemble)"); Out.Ln;
+	T := NIL;
+	Decoder.DecodeObjFile(fileName, T);
+	IF T # NIL THEN
+		Concat(name, ".Dec", title);
+		Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+		mod.assVwr :=
+			Desktops.NewDocViewer(Desktops.NewMenuFrame(title,
+				"Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.MapAssembly[Map] Scope.Store[Store]"),
+	          	 NewFrame(T), Desktops.menuH, X, Y);
+	    Texts.OpenScanner(S, T, 0);
+	    REPEAT Texts.Scan(S) UNTIL (S.eot) OR (S.class = Texts.Name) & (S.s = "Code:");
+	    IF (~S.eot) THEN
+	    	ScrollTo(mod.assVwr.dsc.next(TextGadgets.Frame), Texts.Pos(S) + 1)
+	    END;
+	    GetCompileInfo(mod)	(* get map *)
+	ELSE
+		Out.String("  could not disassemble "); Out.String(fileName); Out.Ln
+	END
+END ShowAssemblyCode;
+
+PROCEDURE ShowAssembly*;
+VAR
+	S : Texts.Scanner;
+	V : Viewers.Viewer;
+	T : Texts.Text;
+	selBeg, selEnd, selTime : LONGINT;
+	mod : Module;
+	name : ARRAY 32 OF CHAR;
+	i : LONGINT;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	V := Oberon.Par.vwr;
+	Oberon.GetSelection(T, selBeg, selEnd, selTime);
+	name := "";
+	IF (V IS Desktops.DocViewer) & (V.dsc # NIL)
+	& (V.dsc = Oberon.Par.frame) (* called from menu? *)
+	& (V.dsc.next IS TextGadgets.Frame) THEN
+		(* Check if this is a source code viewer. Find the module.*)
+		mod := gModuleList;
+		WHILE (mod # NIL)
+		& ((mod.vwr = NIL)
+			 OR (mod.vwr.dsc.next(TextGadgets.Frame).text # V.dsc.next(TextGadgets.Frame).text)) DO
+			(* Compare texts, because source viewer may be grown. *)
+			mod := mod.link
+		END;
+		IF mod # NIL THEN COPY(mod.name, name)
+		ELSIF (selTime <=  0) THEN RETURN	(* invoked from menu, but no selection set *)
+		END
+	END;
+	IF name = "" THEN
+		(* Not invoked from a source viewer menu *)
+		IF (selTime >  0) THEN  (* selection exists? *)
+			Texts.OpenScanner(S, T, selBeg);
+	    	Texts.Scan(S); 
+			IF (S.class = Texts.Name) THEN COPY(S.s, name) ELSE RETURN END
+		ELSE
+			In.Open;
+			In.Name(name);
+			IF ~In.Done THEN RETURN END
+		END
+	END;
+	(* Extract module name from the string *)
+	i := 0; WHILE (i < 32) & (name[i] # ".") DO INC(i) END;
+	IF (i < 32) THEN name[i] := 0X END;
+	ShowAssemblyCode(name)
+END ShowAssembly;
+
+(* Determine the module to which a viewer belong if invoked from a menu, or the
+	module in whose source viewer a caret is set, if not invoked from a menu.
+	 The map of that module is searched for the Oberon statement nearest to the caret in the
+	 source viewer. The pointer to that module descriptor and the index of the
+	 map entry is returned. *)
+PROCEDURE GetMapIndex(VAR mod : Module; VAR idx : LONGINT);
+VAR
+	V : Viewers.Viewer;
+	T : Texts.Text;
+	caretPos, i, pos : LONGINT;
+BEGIN
+	mod := NIL;
+	(* Check if command was called from a viewer with a caret set in it. *)
+	V := Oberon.Par.vwr;
+	IF (V IS Desktops.DocViewer) & (V.dsc # NIL)
+	& (V.dsc = Oberon.Par.frame) (* called from the menu? *)
+	& (V.dsc.next IS TextGadgets.Frame) THEN
+		T := V.dsc.next(TextGadgets.Frame).text;
+		(* Check if this is an assembly code viewer. Find the module.*)
+		mod := gModuleList;
+		WHILE (mod # NIL)
+		& ((mod.vwr = NIL) OR (mod.vwr.dsc.next(TextGadgets.Frame).text # T))
+		& ((mod.assVwr = NIL) OR (mod.assVwr.dsc.next(TextGadgets.Frame).text # T)) DO
+			(* Compare texts, because viewer may be grown. *)
+			mod := mod.link
+		END;
+		IF (mod # NIL) & (mod.vwr # NIL) & (mod.vwr.state > 1)
+		& (mod.vwr.dsc.next(TextGadgets.Frame).car) THEN
+			(* caret set in corresponding source viewer of module*)
+			caretPos := mod.vwr.dsc.next(TextGadgets.Frame).carpos.pos
+		ELSE
+			mod := NIL
+		END
+	ELSE
+		(* Search through original source viewers for one with a caret. *)
+		mod := gModuleList;
+		caretPos := -1;
+		WHILE (mod # NIL) & (caretPos = -1) DO
+			IF (mod.vwr # NIL) & (mod.vwr.state > 1)
+			& (mod.vwr.dsc.next(TextGadgets.Frame).car) THEN
+				caretPos := mod.vwr.dsc.next(TextGadgets.Frame).carpos.pos
+			ELSE
+				mod := mod.link
+			END
+		END
+	END;
+	IF (mod = NIL) OR (mod.map = NIL) OR (caretPos < 0) THEN
+		idx := -1;
+		RETURN
+	END;
+	(* Pre: mod is the module in whose viewer a caret is set at caretPos *)
+	(* Look for the first entry in the map which is the nearest from the back of the text to the
+		position of the caret. The pos field does not increase monotonically, therefore a linear
+		search of the whole map is necessary. *)
+	i := 0;
+	WHILE (i < mod.mapSize) & (mod.map[i].pos < caretPos) DO INC(i) END;
+	idx := i;
+	IF idx < mod.mapSize THEN pos := mod.map[idx].pos END;
+	WHILE (i < mod.mapSize) DO
+		IF (mod.map[i].pos <= pos) & (mod.map[i].pos >= caretPos) THEN
+			(* do = test also, so that will not select the entry code of a procedure/module, because the
+				 map is such that the entry code and the first statement have the same text pos. *)
+			idx := i; pos := mod.map[idx].pos
+		END;
+		INC(i)
+	END;
+	IF (idx = mod.mapSize) & (mod.map[mod.mapSize-1].pos = -1) THEN
+		Out.String("  compiler map too small - cannot find statement"); Out.Ln
+	END
+END GetMapIndex;
+
+(* Searches through the list of modules and if a source viewer is opened for
+	 that module, checks if the caret is set in that module. If so, the caret 
+	 the map of that module is searched for the Oberon statement nearest
+	 to the caret. A breakpoint is then set at the instruction. *)
+PROCEDURE SetBreak*;
+VAR
+	mod : Module;
+	breaks, new : BreakPoint;
+	idx, j, res : LONGINT;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	GetMapIndex(mod, idx);
+	IF (idx < 0) THEN
+		Out.String("  no caret in source"); Out.Ln;
+		RETURN
+	ELSIF (idx = mod.mapSize) THEN
+		RETURN
+	END;
+
+	(* Check if breakpoint already in list. *)
+	breaks := mod.breaks;
+	WHILE (breaks.link # NIL) & (breaks.link.idx # idx) DO
+		breaks := breaks.link
+	END;
+	IF (breaks.link # NIL) THEN RETURN END;
+	
+	res := rdiSetBreakPoint(mod.code + mod.map[idx].pc);
+	IF (res # 0) THEN
+		Out.String("  unable to set breakpoint - error "); Out.Int(res, 0); Out.Ln;
+		RETURN
+	END;
+	NEW(new); new.idx := idx; new.begPos := -1;
+	new.link := mod.breaks.link; mod.breaks.link := new;
+	j := idx-1; WHILE(mod.map[j].pos >= mod.map[idx].pos) DO DEC(j) END;
+	GetStatementInfo(mod.vwr.dsc.next(TextGadgets.Frame).text,
+								  mod.map[idx].pos, mod.map[j].pos, new.begPos, new.col);
+	ASSERT(new.begPos >= 0);
+	IF (mod.map[idx].pos - new.begPos  > 80) THEN
+		new.begPos := mod.map[idx].pos - 80
+	END;
+	Texts.ChangeLooks(mod.vwr.dsc.next(TextGadgets.Frame).text,
+									new.begPos, mod.map[idx].pos, {1}, NIL, gBreakPointColour, 0);
+	Locate(mod, mod.map[idx].pc)
+END SetBreak;
+
+PROCEDURE ClearBreak*;
+VAR
+	mod : Module;
+	break : BreakPoint;
+	idx, res : LONGINT;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	GetMapIndex(mod, idx);
+	IF (idx < 0) THEN
+		Out.String("  no caret in source"); Out.Ln;
+		RETURN
+	ELSIF (idx = mod.mapSize) THEN
+		RETURN
+	END;
+	
+	break := mod.breaks;
+	WHILE (break.link # NIL) & (break.link.idx # idx) DO
+		break := break.link
+	END;
+	IF (break.link # NIL) THEN
+		res := rdiClearBreakPoint(mod.code + mod.map[idx].pc);
+		IF (res = 0) OR (res = 6606) THEN
+			(* Assume text was white *)
+			Texts.ChangeLooks(mod.vwr.dsc.next(TextGadgets.Frame).text,
+											break.link.begPos, mod.map[idx].pos,
+											{1}, NIL, break.link.col, 0);
+			IF (res = 6606) THEN
+				(* Currently halted at this breakpoint *)
+				gCurrentBP := break.link
+			END;
+			break.link := break.link.link
+		ELSE
+			Out.String("  unable to remove breakpoint - error "); Out.Int(res, 0);
+			Out.Ln
+		END
+	END
+END ClearBreak;
+
+PROCEDURE MapAssembly*;
+VAR
+	mod : Module;
+	idx : LONGINT;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	GetMapIndex(mod, idx);
+	IF (idx < 0) OR (idx = mod.mapSize) THEN
+		Out.String("  unable to show mapping"); Out.Ln;
+		RETURN
+	END;
+	IF (mod.assVwr = NIL) OR (mod.assVwr.state <= 1) THEN
+		ShowAssemblyCode(mod.name)
+	END;
+	Locate(mod, mod.map[idx].pc)
+END MapAssembly;
+
+PROCEDURE ShowRegisters*;
+(* Display the registers of the remote machine. *)
+(* IF res = 6605, then an exception has not occurred. *)
+VAR
+	state : StateDesc;
+	T : Texts.Text;
+	V : Viewers.Viewer;
+	frame : TextGadgets.Frame;
+    X, Y : INTEGER;
+	len, org, res : LONGINT;
+	
+	PROCEDURE Register(name : ARRAY OF CHAR; x : LONGINT);
+	BEGIN
+		WrStr(name);
+		WrChar("=");
+		WrHex(x);
+		WrStr("H   ")
+	END Register;
+	
+BEGIN
+	IF ~gActive THEN RETURN END;
+	res := rdiGetState(state);
+    IF (res = 6605) THEN
+    	WrStr("No exception has occurred"); WrLn; WrLn
+    ELSIF (res # 0) THEN
+    	WrStr("Remote communication failure (cannot display registers) "); WrInt(res, 0); WrLn
+    ELSE
+		WrStr("Time = "); WrInt(gTick, 0); WrLn;
+		Register("Interrupt ", state.INT);
+		Register("Error code ", state.ErrorCode);
+		WrLn;
+		Register("EIP", state.EIP);
+		Register("EBP", state.EBP);
+		Register("ESP", state.ESP);
+		WrLn;
+		Register("EAX", state.EAX);
+		Register("EBX", state.EBX);
+		Register("ECX", state.ECX);
+		WrLn;
+		Register("EDX", state.EDX);
+		Register("ESI", state.ESI);
+		Register("EDI", state.EDI);
+		WrLn;
+		Register("CS ", state.CS);
+		Register("SS ", state.SS);
+		WrLn;
+		Register("CR2", state.CR2);
+		Register("EFLAGS", state.EFLAGS);
+		WrLn; WrLn
+	END;
+    IF (gRegsVwr # NIL) & (gRegsVwr.state > 1) THEN
+    	(* Update existing viewer *)
+    	frame := gRegsVwr.dsc.next(TextGadgets.Frame);
+    	(* Calculate org, so that viewer displays the same part of the stack *)
+    	org := frame.org + W.buf.len;
+    	IF (org < frame.text.len) THEN
+    		org := frame.text.len + 1
+    	END;
+    	len := frame.text.len;
+    	Texts.Append(frame.text, W.buf);
+    	Texts.ChangeLooks(frame.text, len, frame.text.len, {0},
+    									Fonts.This("Courier10.Scn.Fnt"), 0, 0);
+		TextGadgets0.RemoveCaret(frame);
+		TextGadgets0.RemoveSelection(frame);
+		Oberon.RemoveMarks(frame.X, frame.Y, frame.W, frame.H);
+		ScrollTo(frame, org)
+    ELSE
+    	T := NewText("");
+    	Texts.Append(T, W.buf);
+    	Texts.ChangeLooks(T, 0, T.len, {0}, Fonts.This("Courier10.Scn.Fnt"), 0, 0);
+    	Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+    	V := Desktops.NewDocViewer(Desktops.NewMenuFrame("Scope.Registers",
+    	"Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.ShowMemory[Mem] Scope.Store[Store]"), 
+      		NewFrame(T), Desktops.menuH, X, Y);
+    	gRegsVwr := V
+    END
+END ShowRegisters;
+
+PROCEDURE ShowModules*;
+(* Shows the Oberon modules contained in the object that is loaded. *)
+VAR
+	mod : Module;
+	T : Texts.Text;
+    X, Y : INTEGER;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	IF (gModuleList = NIL) THEN
+		WrStr("No linking information available");
+	ELSE
+		mod := gModuleList;
+		WHILE mod # NIL DO
+			WrStr(mod.name);
+			WrStr("   ");
+			WrStr("code=");
+			WrHex(mod.code); WrChar("H");
+			WrStr("   ");
+			WrStr("SB=");
+			WrHex(mod.SB); WrChar("H");
+			WrStr("   ");
+			WrStr("code size=");
+			WrHex(mod.codeSize); WrChar("H");
+			WrLn;
+			mod := mod.link
+		END (* WHILE *)
+	END (* IF *);
+	IF (gModulesVwr # NIL) & (gModulesVwr.state > 1) THEN
+		T := gModulesVwr.dsc.next(TextGadgets.Frame).text;
+		Texts.Replace(T, 0, T.len, W.buf)
+	ELSE
+		T := NewText("");
+	    Texts.Append(T, W.buf);
+	    Oberon.AllocateUserViewer(Oberon.Par.vwr.X, X, Y);
+	    gModulesVwr := Desktops.NewDocViewer(Desktops.NewMenuFrame("Scope.Modules", 
+	    "Desktops.Close[Close] System.Copy[Copy] Desktops.Grow[Grow] Scope.ShowGlobals[Globals] Scope.ShowSource[Source] Scope.ShowAssembly[DisAss] Scope.Store[Store"), 
+	      	NewFrame(T), Desktops.menuH, X, Y)
+	END
+END ShowModules;
+
+PROCEDURE UpdateViewers;
+VAR
+	state : StateDesc;
+	tmp : Module;
+	count, res : LONGINT;
+	Vopen : BOOLEAN;
+BEGIN
+	Vopen := FALSE;
+	(* Check if a state viewer is open *)
+	tmp := gModuleList;
+	WHILE (tmp # NIL) & (~Vopen) DO
+		IF ((tmp.globalsVwr # NIL) & (tmp.globalsVwr.state > 1))
+		OR ((tmp.assVwr # NIL) & (tmp.assVwr.state > 1)) THEN
+			Vopen := TRUE
+		END;
+		tmp := tmp.link
+	END;
+	
+	IF ((gStackVwr # NIL) & (gStackVwr.state > 1)) OR Vopen
+	OR ((gRegsVwr # NIL) & (gRegsVwr.state > 1)) THEN
+		res := 6605;
+		count := 100;
+		WHILE (res = 6605) & (count # 0) DO
+			(* Delay 200 milliseconds. *)
+			Delay(200);
+			res := rdiGetState(state);
+			IF (res # 0) & (res # 6605) THEN
+				Out.String("Remote communication failure (cannot update viewers) ");
+				Out.Int(res, 0); Out.Ln;
+				RETURN
+			END;
+			DEC(count)
+		END;
+		IF (res = 6605) THEN
+			Out.String("  timed out waiting for response - viewers not updated");
+			Out.Ln;
+			RETURN
+		END;
+		IF ((gStackVwr # NIL) & (gStackVwr.state > 1)) THEN ShowStack END;
+		IF ((gRegsVwr # NIL) & (gRegsVwr.state > 1)) THEN ShowRegisters END;
+		IF Vopen THEN
+			tmp := gModuleList;
+			WHILE (tmp # NIL) DO
+				IF (tmp.globalsVwr # NIL) & (tmp.globalsVwr.state > 1) THEN
+					DisplayGlobals(tmp.name)
+				END;
+				tmp := tmp.link
+			END (* WHILE *)
+		END
+	END
+END UpdateViewers;
+
+PROCEDURE Continue(step : BOOLEAN);
+VAR res : LONGINT;
+BEGIN
+	IF gActive THEN
+		ClearCache;
+		gCurrentBP := NIL;
+		IF step THEN res := rdiStep()
+		ELSE res := rdiExecute() END;
+		IF (res = 0) THEN
+			INC(gTick);
+			UpdateViewers
+		ELSIF (res = 6604) THEN
+			Out.String("  cannot execute - timed out waiting for single step"); Out.Ln
+		ELSIF (res = 6605) THEN
+			Out.String("  cannot execute - program not halted"); Out.Ln
+		ELSIF ( res = 6607) THEN
+			Out.String("  cannot execute - only after a breakpoint"); Out.Ln
+		ELSE
+			Out.String("Remote communication failure "); Out.Int(res, 0); Out.Ln
+		END
+	END		
+END Continue;
+
+PROCEDURE Step*;
+BEGIN
+	Continue(TRUE)
+END Step;
+
+PROCEDURE Execute*;
+BEGIN
+	Continue(FALSE)
+END Execute;
+
+PROCEDURE Terminate*;
+VAR
+	mod : Module;
+	vwr : Viewer;
+	res : LONGINT;
+BEGIN
+	IF ~gActive THEN RETURN END;
+	res := rdiTerminate();
+    IF (res  # 6605) THEN
+		mod := gModuleList;
+		WHILE (mod # NIL) DO
+			IF (mod.vwr # NIL) THEN Viewers.Close(mod.vwr) END;
+			IF (mod.globalsVwr # NIL) THEN Viewers.Close(mod.globalsVwr) END;
+			IF (mod.assVwr # NIL) THEN Viewers.Close(mod.assVwr) END;
+			mod := mod.link
+		END;
+		IF (gStackVwr # NIL) THEN Viewers.Close(gStackVwr) END;
+		IF (gRegsVwr # NIL) THEN Viewers.Close(gRegsVwr) END;
+		IF (gMachinesVwr # NIL) THEN Viewers.Close(gMachinesVwr) END;
+		IF (gModulesVwr # NIL) THEN Viewers.Close(gModulesVwr) END;
+		IF (gMemVwr # NIL) THEN Viewers.Close(gMemVwr) END;
+		vwr := gStructVwrList;
+		WHILE vwr # NIL DO
+			Viewers.Close(vwr.vwr);
+			vwr := vwr.next
+		END;
+		IF (res # 0) THEN
+			Out.String("  error terminating debugging "); Out.Int(res, 0); Out.Ln
+		END;
+		Out.String("  debugging session terminated"); Out.Ln;
+		gModuleList := NIL; gObjects := NIL;	(* free memory *)
+		gActive := FALSE
+    ELSIF (res = 6605 (* not halted*)) THEN
+    	Out.String("  cannot terminate - program not halted"); Out.Ln
+	END
+END Terminate;
+
+PROCEDURE SetBreakColour*;
+VAR
+	col : INTEGER;
+	mod : Module;
+	break : BreakPoint;
+BEGIN
+	In.Open;
+	In.Int(col);
+	IF In.Done THEN
+		gBreakPointColour := SHORT(col);
+		mod := gModuleList;
+		WHILE (mod # NIL) DO
+			break := mod.breaks.link;
+			WHILE (break # NIL) DO
+				Texts.ChangeLooks(mod.vwr.dsc.next(TextGadgets.Frame).text,
+												break.begPos, mod.map[break.idx].pos,
+												{1}, NIL, gBreakPointColour, 0);
+				break := break.link
+			END;
+			mod := mod.link
+		END
+	END
+END SetBreakColour;
+
+PROCEDURE SetButtonColour*;
+VAR col : INTEGER;
+BEGIN
+	In.Open;
+	In.Int(col);
+	IF In.Done THEN gButtonCol := SHORT(col) END
+END SetButtonColour;
+
+PROCEDURE SetTypeColour*;
+VAR col : INTEGER;
+BEGIN
+	In.Open;
+	In.Int(col);
+	IF In.Done THEN gTypeCol := SHORT(col) END
+END SetTypeColour;
+
+PROCEDURE SetHex*;
+VAR s : ARRAY 32 OF CHAR;
+BEGIN
+	In.Open;
+	In.Name(s);
+	IF In.Done THEN
+		IF (s = "on") THEN
+			Out.String("  hex values on"); Out.Ln; gHex := TRUE
+		ELSIF (s = "off") THEN
+			Out.String("  hex values off"); Out.Ln; gHex := FALSE
+		END
+	END
+END SetHex;
+
+PROCEDURE SetTypes*;
+VAR s : ARRAY 32 OF CHAR;
+BEGIN
+	In.Open;
+	In.Name(s);
+	IF In.Done THEN
+		IF (s = "on") THEN
+			Out.String("  display types"); Out.Ln; gShowTypes := TRUE
+		ELSIF (s = "off") THEN
+			Out.String("  do not display types"); Out.Ln; gShowTypes := FALSE
+		END
+	END
+END SetTypes;
+
+PROCEDURE SetPrefix*;	(* prefix {prefix} *)
+VAR s : ARRAY 32 OF CHAR;
+BEGIN
+	path := "";
+	In.Open;
+	In.Name(s);
+	WHILE In.Done DO
+		IF path # "" THEN Concat(path, " ", path) END;
+		Concat(path, s, path);
+		In.Name(s)
+	END;
+	IF path = "" THEN
+		Out.String("  no prefixes set")
+	ELSE
+		Out.String("  prefixes: ");  Out.String(path)
+	END;
+	Out.Ln
+END SetPrefix;
+
+(* Set options for compiler. This has to be used if user modules are compiled with swithes other
+	than the defaults, because it may influence the mapping between source and machine code. *)
+PROCEDURE SetCompileOptions*;
+VAR s : ARRAY 32 OF CHAR;
+BEGIN
+	In.Open;
+	In.String(s);
+	IF In.Done THEN
+		COPY(s, gCompileOptions);
+		Out.String("  compiler options set to "); Out.Char(22X);
+		Out.String(gCompileOptions); Out.Char(22X); Out.Ln
+	END
+END SetCompileOptions;
+
+(* Initializes the procedure variables that contain the RDI *)
+PROCEDURE InitRDI*(a : RDIGetMachines; b : RDIGetState; c : RDISetState;
+	d : RDIRead; e : RDIWrite; f : RDIInit; g : RDISetBreakPoint;
+	h : RDIClearBreakPoint; i : RDIStep; j : RDIExecute; k : RDITerminate);
+BEGIN
+	rdiGetMachines := a; rdiGetState := b; rdiSetState := c; rdiRead := d;
+	rdiWrite := e; rdiInit := f; rdiSetBreakPoint := g; rdiClearBreakPoint := h;
+	rdiStep := i; rdiExecute := j; rdiTerminate := k
+END InitRDI;
+
+(* Set the remote debugging interface module that must be used.
+	Scope will load the module, which in its init code must then set the values
+	of the Scope.RDI* procedure variables to its procedures. *)
+PROCEDURE InstallInterface(name : ARRAY OF CHAR);
+VAR
+	initCommand : Modules.Command;
+	rdiMod : Modules.Module;
+BEGIN
+	rdiMod := Modules.ThisMod(name);
+	IF (rdiMod # NIL) THEN
+		initCommand := Modules.ThisCommand(rdiMod, "Install")
+	END;
+	IF (rdiMod = NIL) OR (initCommand = NIL) THEN
+		Out.String(Modules.resMsg);  Out.Ln
+	ELSE
+		initCommand;
+		gInit := TRUE
+	END
+END InstallInterface;
+
+PROCEDURE InstallRDI*;
+VAR
+	name : ARRAY 32 OF CHAR;
+BEGIN
+	IF gActive THEN RETURN END;
+	In.Open;
+	In.Name(name);
+	IF In.Done THEN InstallInterface(name) END
+END InstallRDI;
+
+(* ========================================================== *)
+BEGIN
+	Out.String("Scope dVdW 13.02.96 / pjm 11.03.96"); Out.Ln;
+	Texts.OpenWriter(W);
+	caret[0] := "^"; caret[1] := 0X;
+	period[0] := "."; period[1] := 0X;
+	gModuleList := NIL;
+	gBreakPointColour := 1;
+	gButtonCol := 3;
+	gTypeCol := 15;
+	gHex := FALSE;
+	gShowTypes := TRUE;
+	gCompileOptions := "";
+	gInit := FALSE;
+	gActive := FALSE;
+	path := "";
+	InstallInterface("RDIserial") (* install default target debugging interface *)
+END Scope.
+	
+Compress.Add Scope.Arc ^
+Decoder.Obj RDIwin.Obj Scope.Obj  Scope.Tool Scope.Text ~
+iOPM.Obj iOPS.Obj iOPT.Obj iOPB.Obj iOPP.Obj  iOPO.Obj iOPL.Obj iOPC.Obj
+iOPV.Obj Compiler.Obj Builder.Obj Browser.Obj ~ Watson ?
+	
+Compress.Add Scope.Arc 
+	LinkTest3.Mod LinkTest4.Mod Arrays.Mod Decoder.Mod
+	RDIwin.Mod Scope.Mod  Scope.Tool Scope.Text ~
+		
+System.DeleteFiles Scope.Arc ~
+
+ToDo:
+	- make cache to only look at page boundaries
+	- do some integrity checking between object that runs, and local version
+	- show the length of dynamic array strings
+	- handle stack sizes decently
+	- handle type bound procs
+	- make RDIwin so that will handle the thread that excepted, when there are multiple threads
+	- implement search in text viewer 
+	- show CR2 register
+	- make Dump command a button
+	- update Struct viewers after an Execute/Continue ?
+	- remove Scope.SetButtonColour - no longer needed
+(* Errors to fix: somewhere with a pointer like this POINTER TO RECORD ... END there was 
+    a bug which I found on 16.12.95, but I cannot seem to let the error happen again ....
+*)

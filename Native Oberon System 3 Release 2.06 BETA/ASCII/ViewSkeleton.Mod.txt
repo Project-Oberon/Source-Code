@@ -1,0 +1,166 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE ViewSkeleton;	(* jt, 13.12.94 *)
+
+IMPORT Files, Display, Display3, Printer3, Fonts, Effects, Objects, Gadgets, Oberon;
+	
+TYPE
+	Frame* = POINTER TO FrameDesc;
+	FrameDesc* = RECORD (Gadgets.ViewDesc)
+		(* view is adjusted to model size, no border *)
+	END;
+
+PROCEDURE ToModel(F: Frame; x, y: INTEGER; VAR M: Display.FrameMsg);
+	VAR B: Display3.UpdateMaskMsg; obj: Display.Frame;
+BEGIN
+	IF (F.obj # NIL) & (F.obj IS Display.Frame) THEN
+		obj := F.obj(Display.Frame);
+		M.x := x - obj.X; M.y := y + F.H - (obj.Y + obj.H);
+		Gadgets.Send(F, x, y, obj, M)
+	END
+END ToModel;
+
+PROCEDURE Restore(F: Frame; x, y: INTEGER; dlink: Objects.Object);
+	VAR R: Display3.Mask; M: Display.DisplayMsg;
+BEGIN
+	Gadgets.MakeMask(F, x, y, dlink, R);	(* simplified *)
+	IF F.obj = NIL THEN Display3.ReplConst(R, Display3.green, x, y, F.W, F.H, Display.replace);
+		Display3.String(R, Display3.FG, x + 3, y + 3, Fonts.Default, "empty view", Display3.replace)
+	ELSE M.id := Display.frame; M.F := NIL; M.dlink := dlink; M.res := -1; ToModel(F, x, y, M)
+	END ;
+	IF Gadgets.selected IN F.state THEN
+		Display3.FillPattern(R, Display3.blue, Display3.selectpat, x, y, x, y, F.W, F.H, Display3.paint)
+	END
+END Restore;
+
+PROCEDURE Adjust(F: Frame; X, Y, W, H: INTEGER);
+	VAR MM: Display.ModifyMsg;
+BEGIN
+	MM.F := F; MM.mode := Display.display;
+	MM.dX := X - F.X; MM.dY := Y - F.Y; MM.dW := W - F.W; MM.dH := H - F.H;
+	MM.X := X; MM.Y := Y; MM.W := W; MM.H := H;
+	Display.Broadcast(MM)
+END Adjust;
+
+PROCEDURE Consume(F: Frame; x, y: INTEGER; VAR M: Display.ConsumeMsg);
+	VAR f: Objects.Object; CM: Display.ControlMsg; MM: Display.ModifyMsg;
+BEGIN f := M.obj;
+	IF (M.id = Display.drop) & (M.F = F) & (F.obj = NIL) & (f IS Gadgets.Frame) THEN
+		WITH f: Gadgets.Frame DO
+			f.slink := NIL;
+			CM.id := Display.remove; CM.F := f; Display.Broadcast(CM);
+			F.obj := f; f.X := 0; f.Y := 0; f.mask := NIL;
+			F.state := f.state*{Gadgets.transparent}; Adjust(F, F.X + M.u, F.Y + F.H - 1 + M.v, f.W, f.H); M.res := 0
+		END
+	ELSE ToModel(F, x, y, M)
+	END;
+END Consume;
+
+PROCEDURE UpdateMask(F: Frame; x, y: INTEGER; VAR M: Display3.UpdateMaskMsg);
+	VAR R: Display3.Mask; O: Display3.OverlapMsg;
+BEGIN
+	IF M.F = F.obj THEN
+		NEW(R); Display3.Open(R);
+		Display3.Add(R, 0, -F.obj(Display.Frame).H+1, F.obj(Display.Frame).W, F.obj(Display.Frame).H);
+		O.F := F.obj(Display.Frame); O.x := 0; O.y := 0; O.M := R; O.res := -1; O.dlink := NIL;
+		ToModel(F, x, y, O); M.res := 0
+	ELSIF M.F = F THEN
+		NEW(F.mask); Display3.Open(F.mask); Display3.Add(F.mask, 0, -F.H+1, F.W, F.H);
+		F.mask.x := 0; F.mask.y := 0
+	ELSE ToModel(F, x, y, M)
+	END
+END UpdateMask;
+
+PROCEDURE FrameHandler*(F: Objects.Object; VAR M: Objects.ObjMsg);
+	VAR x, y, u, v: INTEGER; F0: Frame;
+BEGIN
+	WITH F: Frame DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF (M.id = Objects.get) & (M.name = "Gen") THEN
+					M.s := "ViewSkeleton.NewFrame"; M.class := Objects.String; M.res := 0
+				ELSE Gadgets.framehandle(F, M)
+				END
+			END
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				IF M.stamp = F.stamp THEN M.obj := F.dlink
+				ELSE NEW(F0); F.stamp := M.stamp; F.dlink := F0; Gadgets.CopyFrame(M, F, F0); F0.border := F.border; M.obj := F0
+				END
+			END
+		ELSIF M IS Objects.FileMsg THEN Gadgets.framehandle(F, M)
+		ELSIF M IS Objects.BindMsg THEN Gadgets.framehandle(F, M)
+		ELSIF M IS Objects.LinkMsg THEN Gadgets.framehandle(F, M)
+		ELSIF M IS Objects.FindMsg THEN Gadgets.framehandle(F, M)
+		ELSIF M IS Display.FrameMsg THEN
+			WITH M: Display.FrameMsg DO
+				x := M.x + F.X; y := M.y + F.Y;
+				u := M.x; v := M.y; (* save *)
+				IF M IS Display.DisplayMsg THEN
+					WITH M: Display.DisplayMsg DO
+						IF (M.F = NIL) OR (M.F = F) THEN Restore(F, x, y, M.dlink)
+						ELSE ToModel(F, x, y, M)
+						END
+					END
+				ELSIF M IS Display.ConsumeMsg THEN Consume(F, x, y, M(Display.ConsumeMsg))
+				ELSIF M IS Gadgets.UpdateMsg THEN 
+					WITH M: Gadgets.UpdateMsg DO
+						IF M.obj = F.obj THEN Restore(F, x, y, M.dlink) ELSE ToModel(F, x, y, M) END
+					END
+				ELSIF M IS Oberon.InputMsg THEN
+					WITH M: Oberon.InputMsg DO
+						IF F.obj # NIL THEN
+							ToModel(F, x, y, M)
+						ELSE Gadgets.framehandle(F, M)
+						END
+					END
+				ELSIF M IS Oberon.ControlMsg THEN ToModel(F, x, y, M)
+				ELSIF M IS Display.LocateMsg THEN Gadgets.framehandle(F, M)
+				ELSIF M IS Display.SelectMsg THEN Gadgets.framehandle(F, M) (* should be more elaborate *)
+				ELSIF M IS Display.ModifyMsg THEN
+					WITH M: Display.ModifyMsg DO
+						IF M.F = F THEN Gadgets.framehandle(F, M)
+						ELSIF M.F = F.obj THEN ToModel(F, x, y, M); Adjust(F, F.X + M.dX, F.Y + M.dY, M.W, M.H)
+						ELSE ToModel(F, x, y, M)
+						END
+					END
+				ELSIF M IS Display.ControlMsg THEN
+					IF (M(Display.ControlMsg).id = Display.remove) & (M.F = F.obj) THEN
+						F.obj := NIL; Gadgets.Update(F)
+					END
+				ELSIF M IS Display3.OverlapMsg THEN Gadgets.framehandle(F, M);
+				ELSIF M IS Display3.UpdateMaskMsg THEN UpdateMask(F, x, y, M(Display3.UpdateMaskMsg))
+				ELSE ToModel(F, x, y, M)	
+				END;
+				M.x := u; M.y := v (* restore *)
+			END
+		ELSIF F.obj # NIL THEN F.obj.handle(F.obj, M)
+		END
+	END
+END FrameHandler;
+
+PROCEDURE InitFrame*(F: Frame);
+BEGIN F.W := 100; F.H := 100; F.border := 0; F.handle := FrameHandler
+END InitFrame;
+
+PROCEDURE NewFrame*;
+	VAR F: Frame;
+BEGIN NEW(F); InitFrame(F); Objects.NewObj := F;
+END NewFrame;
+
+END ViewSkeleton.
+
+System.Free ViewSkeleton~
+Gadgets.Insert ViewSkeleton.NewFrame ~
+

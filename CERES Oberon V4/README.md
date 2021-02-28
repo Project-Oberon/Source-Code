@@ -3,3 +3,5 @@
 Main developers, Niklaus Wirth and Jurg Gutknecht.
 
 **Text**: Oberon Text files.
+
+**ASCII**: ASCII Text Files.

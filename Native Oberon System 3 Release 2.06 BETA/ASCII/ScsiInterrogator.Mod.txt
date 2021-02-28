@@ -1,0 +1,801 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE ScsiInterrogator;	(* w.ibl *)
+
+IMPORT SYSTEM,Attributes,Desktops,Display,Documents,Gadgets,In,Lists,
+			  Oberon,Objects,Out,PanelDocs,Panels,SCSI := AHA1520,Strings;
+
+CONST
+	(* Program version *)
+	Version = "V 2.0";
+	Date = "June '96";
+
+	Lib = "ScsiInterrogator";	(* Library's name *)
+	ModeEntry = "MODEPAGE";	(* Modepage prefix *)
+
+	UnknownN = "UnknownDevice";	(* Unknown Device *)
+	DiskDriveN = "DiskDrive";	(* Disk drive *)
+	TapeDriveN = UnknownN;	(* Tape streamer *)
+	PrinterN = UnknownN;	(* Printer *)
+	ProcDeviceN = UnknownN;	(* Processor device *)
+	WormDriveN = UnknownN;	(* Write Once, Read Many *)
+	CDRomDriveN = "CDRomDrive";	(* Compact Disc *)
+	ScannerN = UnknownN;	(* Scanner *)
+	OpticalMemN = UnknownN;	(* Optical Memory *)
+	JukeBoxN = UnknownN;	(* Tape Juke Box *)
+	ComDeviceN = UnknownN;	(* Communication Device *)
+	NoDeviceN = "NoDevice";	(* No Device Connected *)
+	HostAdapterN = "HostAdapter";	(* Host Adapter Card *)
+
+	(* INQUIRY: Device Classes *)
+	DiskDrive = 00H;
+	TapeDrive = 01H;
+	Printer = 02H;
+	ProcDevice = 03H;
+	WormDrive = 04H;
+	CDRomDrive = 05H;
+	Scanner = 06H;
+	OpticalMem = 07H;
+	JukeBox = 08H;
+	ComDevice = 09H;
+	NoDevice = 1FH;
+
+	(* INQUIRY: Control Classes *)
+	SCSI1 = 00H;
+	CCS = 01H;
+	SCSI2 = 02H;
+
+TYPE
+	(* Device Panel *)
+	Panel = POINTER TO PanelDesc;
+	PanelDesc = RECORD(Panels.PanelDesc)
+		cnt,xofs,yofs: INTEGER;
+	END;
+
+	(* Bus Scanner Task *)
+	BusScanner = POINTER TO BusScannerDesc;
+	BusScannerDesc = RECORD(Oberon.TaskDesc)
+		from,to: SHORTINT;
+		panel: Panel;
+		cmd: ARRAY 6 OF CHAR;
+		data: ARRAY 36 OF CHAR;
+	END;
+
+VAR
+	requ: SCSI.Command;
+
+PROCEDURE HexStr(val: INTEGER; VAR str: ARRAY OF CHAR);
+	(* store hexadecimal value of val in str *)
+VAR
+	i: INTEGER;
+BEGIN
+	i:= SHORT(ASH(val,-4));
+	IF (i < 10) THEN str[0]:= CHR(ORD("0")+i); ELSE str[0]:= CHR(ORD("A")+i-10); END;
+	i:= SYSTEM.VAL(INTEGER,SYSTEM.VAL(SET,val) * {0..3});
+	IF (i < 10) THEN str[1]:= CHR(ORD("0")+i); ELSE str[1]:= CHR(ORD("A")+i-10); END;
+	str[2]:= 0X;
+END HexStr;
+
+PROCEDURE Mask(byte: CHAR; bits: SET): SHORTINT;
+	(* blank out bits not included in given set of byte *)
+VAR
+	ndx,val: SHORTINT;
+BEGIN
+	val:= 0; ndx:= 0;
+	val:= SYSTEM.VAL(SHORTINT,SYSTEM.VAL(SET,byte) * bits);
+	WHILE ~(ndx IN bits) DO val:= val DIV 2; INC(ndx); END;
+	RETURN(val);
+END Mask;
+
+PROCEDURE High(i: INTEGER; byte: CHAR): BOOLEAN;
+	(* blank out bits not included in given set of byte *)
+BEGIN
+	RETURN(i IN (SYSTEM.VAL(SET,byte) * {0..7}));
+END High;
+
+PROCEDURE SetIntValue(p: Panels.Panel; name: ARRAY OF CHAR; b0,b1: CHAR);
+VAR
+	obj: Objects.Object;
+	str: ARRAY 8 OF CHAR;
+BEGIN
+	obj:= Gadgets.FindObj(p,name);
+	IF (obj # NIL) THEN
+		Attributes.IntToStr(SYSTEM.LSH(ORD(b0),8) + ORD(b1),str);
+		Attributes.SetString(obj,"Value",str);
+	END;
+END SetIntValue;
+
+PROCEDURE SetLIntValue(p: Panels.Panel; name: ARRAY OF CHAR; b0,b1,b2,b3: CHAR);
+VAR
+	obj: Objects.Object;
+	str: ARRAY 8 OF CHAR;
+	val: LONGINT;
+BEGIN
+	obj:= Gadgets.FindObj(p,name);
+	IF (obj # NIL) THEN
+		val:= SYSTEM.LSH(LONG(ORD(b0)),24) +
+				 SYSTEM.LSH(LONG(ORD(b1)),16) +
+				 SYSTEM.LSH(ORD(b2),8) + ORD(b3);
+		Attributes.IntToStr(val,str);
+		Attributes.SetString(obj,"Value",str);
+	END;
+END SetLIntValue;
+
+PROCEDURE SetBitValue(p: Panels.Panel; name: ARRAY OF CHAR; b: CHAR; i: INTEGER);
+VAR
+	obj: Objects.Object;
+BEGIN
+	obj:= Gadgets.FindObj(p,name);
+	IF (obj # NIL) THEN
+		Attributes.SetBool(obj,"Value",High(i,b));
+	END;
+END SetBitValue;
+
+PROCEDURE SetNoValue(p: Panels.Panel; name: ARRAY OF CHAR);
+VAR
+	obj: Objects.Object;
+	str: ARRAY 16 OF CHAR;
+	ndx: INTEGER;
+BEGIN
+	ndx:= 0; obj:= Gadgets.FindObj(p,name);
+	IF (obj # NIL) THEN
+		Attributes.GetString(obj,"Value",str);
+		WHILE (ndx < LEN(str)) & (str[ndx] # 0X) DO
+			str[ndx]:= "-"; INC(ndx);
+		END;
+		Attributes.SetString(obj,"Value",str);
+	END;
+END SetNoValue;
+
+PROCEDURE Id(frame: Objects.Object; tgt: INTEGER);
+VAR
+	str: ARRAY 3 OF CHAR;
+BEGIN
+	Attributes.IntToStr(tgt,str);
+	Attributes.SetString(Gadgets.FindObj(frame,"ID"),"Value",str);
+END Id;
+
+PROCEDURE Ansi(frame: Objects.Object; data: ARRAY OF CHAR);
+VAR
+	val: SHORTINT;
+	obj: Objects.Object;
+BEGIN
+	val:= Mask(data[2],{0..2}); obj:= Gadgets.FindObj(frame,"ANSI");
+	CASE val OF
+	| SCSI1: Attributes.SetString(obj,"Value","SCSI-1");
+	| CCS: Attributes.SetString(obj,"Value","SCSI-1/CCS");
+	| SCSI2: Attributes.SetString(obj,"Value","SCSI-2");
+	ELSE
+		Attributes.SetString(obj,"Value","unknown");
+	END;
+END Ansi;
+
+PROCEDURE Manufacturer(frame: Objects.Object; data: ARRAY OF CHAR);
+VAR
+	str: ARRAY 9 OF CHAR;
+BEGIN
+	str[8]:= 00X; SYSTEM.MOVE(SYSTEM.ADR(data)+8,SYSTEM.ADR(str),8);
+	Attributes.SetString(Gadgets.FindObj(frame,"Manufacturer"),"Value",str);
+END Manufacturer;
+
+PROCEDURE Product(frame: Objects.Object; data: ARRAY OF CHAR);
+VAR
+	str: ARRAY 17 OF CHAR;
+BEGIN
+	str[16]:= 00X; SYSTEM.MOVE(SYSTEM.ADR(data)+16,SYSTEM.ADR(str),16);
+	Attributes.SetString(Gadgets.FindObj(frame,"Product"),"Value",str);
+END Product;
+
+PROCEDURE Revision(frame: Objects.Object; data: ARRAY OF CHAR);
+VAR
+	str: ARRAY 5 OF CHAR;
+BEGIN
+	str[4]:= 00X; SYSTEM.MOVE(SYSTEM.ADR(data)+32,SYSTEM.ADR(str),4);
+	Attributes.SetString(Gadgets.FindObj(frame,"Revision"),"Value",str);
+END Revision;
+
+PROCEDURE Retrieve(VAR frame: Display.Frame; name: ARRAY OF CHAR);
+VAR
+	obj: Objects.Object;
+	str: Objects.Name;
+BEGIN
+	str:= Lib; Strings.AppendCh(str,"."); Strings.Append(str,name);
+	frame:= NIL; obj:= Gadgets.CopyPublicObject(str, TRUE);
+	IF obj # NIL THEN WITH obj: Display.Frame DO frame:= obj; END; END
+END Retrieve;
+
+PROCEDURE Drop(P: Panel; frame: Display.Frame);
+VAR
+	C: Display.ConsumeMsg;
+BEGIN
+	C.id:= Display.drop; C.F:= P; C.obj:= frame; C.x:= 0; C.y:= 0;
+	C.u:= P.xofs; C.v:= P.yofs-frame.H;
+	C.res:= -1; P.handle(P,C);
+	IF (P.cnt = 4) THEN P.xofs:= 10; DEC(P.yofs,60); ELSE INC(P.xofs,60); END;
+	INC(P.cnt);
+END Drop;
+
+PROCEDURE VisUnknown(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+	C: Display.ConsumeMsg;
+BEGIN
+	Retrieve(frame,UnknownN); Drop(P,frame);
+END VisUnknown;
+
+PROCEDURE VisDiskDrive(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+	C: Display.ConsumeMsg;
+BEGIN
+	Retrieve(frame,DiskDriveN);
+	Id(frame,tgt); Ansi(frame,data);
+	Manufacturer(frame,data);
+	Product(frame,data); Revision(frame,data);
+	Drop(P,frame);
+END VisDiskDrive;
+
+PROCEDURE VisTapeDrive(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,TapeDriveN);
+	Id(frame,tgt); Drop(P,frame);
+END VisTapeDrive;
+
+PROCEDURE VisPrinter(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,PrinterN);
+	Id(frame,tgt); Drop(P,frame);
+END VisPrinter;
+
+PROCEDURE VisProcDevice(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,ProcDeviceN);
+	Id(frame,tgt); Drop(P,frame);
+END VisProcDevice;
+
+PROCEDURE VisWormDrive(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,WormDriveN);
+	Id(frame,tgt); Drop(P,frame);
+END VisWormDrive;
+
+PROCEDURE VisCDRomDrive(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,CDRomDriveN);
+	Id(frame,tgt); Ansi(frame,data);
+	Manufacturer(frame,data);
+	Product(frame,data); Revision(frame,data);
+	Drop(P,frame);
+END VisCDRomDrive;
+
+PROCEDURE VisScanner(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,ScannerN);
+	Id(frame,tgt); Drop(P,frame);
+END VisScanner;
+
+PROCEDURE VisOpticalMem(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,OpticalMemN);
+	Id(frame,tgt); Drop(P,frame);
+END VisOpticalMem;
+
+PROCEDURE VisJukeBox(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,JukeBoxN);
+	Id(frame,tgt); Drop(P,frame);
+END VisJukeBox;
+
+PROCEDURE VisComDevice(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,ComDeviceN);
+	Id(frame,tgt); Drop(P,frame);
+END VisComDevice;
+
+PROCEDURE VisNoDevice(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,NoDeviceN);
+	Id(frame,tgt); Drop(P,frame);
+END VisNoDevice;
+
+PROCEDURE VisHostAdapter(P: Panel; tgt: SHORTINT; data: ARRAY OF CHAR);
+VAR
+	frame: Display.Frame;
+BEGIN
+	Retrieve(frame,HostAdapterN);
+	Id(frame,tgt);
+	Attributes.SetString(Gadgets.FindObj(frame,"Signature"),"Value",SCSI.signature);
+	Drop(P,frame);
+END VisHostAdapter;
+
+PROCEDURE LogError(tgt,lun: INTEGER; cs: SHORTINT);
+VAR
+	cmd: ARRAY 6 OF CHAR;
+	data: ARRAY 18 OF CHAR;
+	str: ARRAY 3 OF CHAR;
+BEGIN
+	Out.String("Target "); Out.Int(tgt,0);
+	Out.String(", LUN "); Out.Int(lun,0);
+
+	IF (cs = SCSI.DriverError) THEN
+		Out.String("unexpected driver error "); Out.Int(SCSI.status,0); 
+	ELSE
+		cmd[0]:= 03X; cmd[1]:= SYSTEM.VAL(CHAR,SYSTEM.LSH(lun,5));
+		cmd[2]:= 00X; cmd[3]:= 00X; cmd[4]:= 12X; cmd[5]:= 00X;
+
+		requ.target:= SHORT(tgt); requ.lun:= SHORT(lun); requ.clen:= 6;
+		requ.cmd:= SYSTEM.ADR(cmd); requ.data:= SYSTEM.ADR(data);
+		SCSI.Initiate(requ); WHILE ~requ.done DO END;
+
+		IF (requ.status # SCSI.Good) THEN
+			Out.String(": request sense failed (drv ");
+			Out.Int(SCSI.status,0); Out.String("(, requ ");
+			Out.Int(requ.status,0); Out.Char(")");
+		ELSE
+			Out.String(": sense key "); Out.Int(ORD(data[2]),0);
+			Out.String(", code ");
+			HexStr(ORD(data[12]),str); Out.String(str); Out.Char(" ");
+			HexStr(ORD(data[13]),str); Out.String(str); Out.Char("H");
+		END;
+	END;
+	Out.Ln();
+END LogError;
+
+PROCEDURE InquModePage(tgt: INTEGER; no,len: CHAR; VAR data: ARRAY OF CHAR): SHORTINT;
+VAR
+	cmd: ARRAY 6 OF CHAR;
+BEGIN
+	cmd[0]:= 1AX; cmd[1]:= 08X; cmd[2]:= no;
+	cmd[3]:= 00X; cmd[4]:= len; cmd[5]:= 00X;
+
+	requ.target:= SHORT(tgt); requ.lun:= 00H; requ.clen:= 6;
+	requ.cmd:= SYSTEM.ADR(cmd); requ.data:= SYSTEM.ADR(data);
+	SCSI.Initiate(requ); WHILE ~requ.done DO END;
+
+	RETURN(requ.status);
+END InquModePage;
+
+PROCEDURE DisconReconPage(tgt: INTEGER; obj: Panels.Panel): SHORTINT;
+VAR
+	data: ARRAY 64 OF CHAR;
+	cs: SHORTINT;
+BEGIN
+	cs:= InquModePage(tgt,02X,40X,data);
+	IF (cs = SCSI.Good) THEN
+		Id(obj,tgt);
+		SetIntValue(obj,"Source",00X,data[4+2]);
+		SetIntValue(obj,"Drain",00X,data[4+3]);
+		SetIntValue(obj,"Inactivity",data[4+4],data[4+5]);
+		SetIntValue(obj,"Bus Free",data[4+6],data[4+7]);
+		SetIntValue(obj,"Connect",data[4+8],data[4+9]);
+		SetIntValue(obj,"Burst Size",data[4+10],data[4+11]);
+	END;
+	RETURN(cs);
+END DisconReconPage;
+
+PROCEDURE FormatPage(tgt: INTEGER; obj: Panels.Panel): SHORTINT;
+VAR
+	data: ARRAY 64 OF CHAR;
+	cs: SHORTINT;
+BEGIN
+	cs:= InquModePage(tgt,03X,40X,data);
+	IF (cs = SCSI.Good) THEN
+		Id(obj,tgt);
+		SetIntValue(obj,"Tracks/Zone",data[4+2],data[4+3]);
+		SetIntValue(obj,"Subsectors/Zone",data[4+4],data[4+5]);
+		SetIntValue(obj,"Subtracks/Zone",data[4+6],data[4+7]);
+		SetIntValue(obj,"Subsectors/Lun",data[4+8],data[4+9]);
+		SetIntValue(obj,"Sectors/Track",data[4+10],data[4+11]);
+		SetIntValue(obj,"Bytes/Sector",data[4+12],data[4+13]);
+		SetIntValue(obj,"Interleave",data[4+14],data[4+15]);
+		SetIntValue(obj,"Track Skew",data[4+16],data[4+17]);
+		SetIntValue(obj,"Cylinder Skew",data[4+18],data[4+19]);
+
+		SetBitValue(obj,"Soft Sectoring",data[4+20],7);
+		SetBitValue(obj,"Hard Sectoring",data[4+20],6);
+		SetBitValue(obj,"Removable",data[4+20],5);
+		SetBitValue(obj,"Surface",data[4+20],4);
+	END;
+	RETURN(cs);
+END FormatPage;
+
+PROCEDURE GeometryPage(tgt: INTEGER; obj: Panels.Panel): SHORTINT;
+VAR
+	data: ARRAY 64 OF CHAR;
+	cs: SHORTINT;
+BEGIN
+	cs:= InquModePage(tgt,04X,40X,data);
+	IF (cs = SCSI.Good) THEN
+		Id(obj,tgt);
+		SetLIntValue(obj,"Cylinders",00X,data[4+2],data[4+3],data[4+4]);
+		SetIntValue(obj,"Heads",00X,data[4+5]);
+		SetLIntValue(obj,"Start Precomp.",00X,data[4+6],data[4+7],data[4+8]);
+		SetLIntValue(obj,"Start red. Write",00X,data[4+9],data[4+10],data[4+11]);
+		SetIntValue(obj,"Steprate",data[4+12],data[4+13]);
+		SetLIntValue(obj,"Landing Zone",00X,data[4+14],data[4+15],data[4+16]);
+		SetIntValue(obj,"Rotational Offset",00X,data[4+18]);
+		SetIntValue(obj,"Turn Rate",data[4+20],data[4+21]);
+	END;
+	RETURN(cs);
+END GeometryPage;
+
+PROCEDURE CachePage(tgt: INTEGER; obj: Panels.Panel): SHORTINT;
+VAR
+	data: ARRAY 64 OF CHAR;
+	cs: SHORTINT;
+BEGIN
+	cs:= InquModePage(tgt,08X,40X,data);
+	IF (cs = SCSI.Good) THEN
+		Id(obj,tgt);
+		SetBitValue(obj,"Write Cache Enable",data[4+2],2);
+		SetBitValue(obj,"Multiply Factor",data[4+2],1);
+		SetBitValue(obj,"Read Cache Disable",data[4+2],0);
+		SetIntValue(obj,"Read Priority",00X,CHR(Mask(data[4+3],{4..7})));
+		SetIntValue(obj,"Write Priority",00X,CHR(Mask(data[4+3],{0..3})));
+		SetIntValue(obj,"PreFetch Transfer",data[4+4],data[4+4]);
+		SetIntValue(obj,"PreFetch Min",data[4+6],data[4+7]);
+		SetIntValue(obj,"PreFetch Max",data[4+8],data[4+9]);
+		IF High(1,data[4+2]) THEN
+			SetIntValue(obj,"Abs. PreFetch Max",data[4+9],data[4+10]);
+		ELSE
+			SetNoValue(obj,"Abs. PreFetch Max");
+		END;
+	END;
+	RETURN(cs);
+END CachePage;
+
+PROCEDURE NotchPage(tgt: INTEGER; obj: Panels.Panel): SHORTINT;
+VAR
+	data: ARRAY 64 OF CHAR;
+	list: Objects.Object;
+	ndx,bit: INTEGER;
+	str: ARRAY 4 OF CHAR;
+	sel: BOOLEAN;
+	cs: SHORTINT;
+BEGIN
+	cs:= InquModePage(tgt,0CX,40X,data);
+	IF (cs = SCSI.Good) THEN
+		Id(obj,tgt);
+		IF High(7,data[4+2]) THEN
+			SetIntValue(obj,"Amount of Notches",data[4+4],data[4+5]);
+			SetIntValue(obj,"Active Notch",data[4+6],data[4+7]);
+			IF High(6,data[4+2]) THEN
+				SetLIntValue(obj,"Start of active Notch Cyl",00X,data[4+8],data[4+9],data[4+10]);
+				SetIntValue(obj,"Start of active Notch Hd",00X,data[4+11]);
+				SetNoValue(obj,"Start of active Notch Blk");
+				SetLIntValue(obj,"End of active Notch Cyl",00X,data[4+12],data[4+13],data[4+14]);
+				SetIntValue(obj,"End of active Notch Hd",00X,data[4+15]);
+				SetNoValue(obj,"End of active Notch Blk");
+			ELSE
+				SetNoValue(obj,"Start of active Notch Cyl");
+				SetNoValue(obj,"Start of active Notch Hd");
+				SetLIntValue(obj,"Start of active Notch Blk",data[4+8],data[4+9],data[4+10],data[4+11]);
+				SetNoValue(obj,"End of active Notch Cyl");
+				SetNoValue(obj,"End of active Notch Hd");
+				SetLIntValue(obj,"End of active Notch Blk",data[4+12],data[4+13],data[4+14],data[4+15]);
+			END;
+			list:= Gadgets.FindObj(obj,"Notched Pages");
+			IF (list # NIL) THEN
+				WITH list: Lists.List DO
+					FOR ndx:= 4+16 TO 4+23 DO
+						FOR bit:= 0 TO 7 DO
+							IF High(bit,data[ndx]) THEN
+								HexStr(((4+23-ndx) * 8) + bit,str);
+								str[2]:= "H"; str[3]:= 0X;
+								Lists.InsertItem(list,str);
+							END;
+						END;
+					END;
+					list.beg:= list.items; Gadgets.Update(list);
+				END;
+			END;
+		ELSE
+			SetNoValue(obj,"Amount of Notches");
+			SetNoValue(obj,"Active Notch");
+			SetNoValue(obj,"Start of active Notch Blk");
+			SetNoValue(obj,"End of active Notch Blk");
+			SetNoValue(obj,"Start of active Notch Cyl");
+			SetNoValue(obj,"Start of active Notch Hd");
+			SetNoValue(obj,"End of active Notch Cyl");
+			SetNoValue(obj,"End of active Notch Hd");
+		END;
+	END;
+	RETURN(cs);
+END NotchPage;
+
+PROCEDURE CdRomPage(tgt: INTEGER; obj: Panels.Panel): SHORTINT;
+VAR
+	data: ARRAY 64 OF CHAR;
+	hold: CHAR;
+	txt: Objects.Object;
+	cs: SHORTINT;
+BEGIN
+	cs:= InquModePage(tgt,0DX,40X,data);
+	IF (cs = SCSI.Good) THEN
+		Id(obj,tgt);
+		txt:= Gadgets.FindObj(obj,"Inactivity Timeout");
+		IF (txt # NIL) THEN
+			hold:= SYSTEM.VAL(CHAR,SYSTEM.VAL(SET,data[4+3])*{0..3});
+			CASE hold OF
+			| 00X:	Attributes.SetString(txt,"Value:","Vendor specific");
+			| 01X:	Attributes.SetString(txt,"Value","125 mS");
+			| 02X:	Attributes.SetString(txt,"Value","250 mS");
+			| 03X:	Attributes.SetString(txt,"Value","500 mS");
+			| 04X:	Attributes.SetString(txt,"Value","1 Second");
+			| 05X:	Attributes.SetString(txt,"Value","2 Seconds");
+			| 06X:	Attributes.SetString(txt,"Value","4 Seconds");
+			| 07X:	Attributes.SetString(txt,"Value","8 Seconds");
+			| 08X:	Attributes.SetString(txt,"Value","16 Seconds");
+			| 09X:	Attributes.SetString(txt,"Value","32 Seconds");
+			| 0AX:	Attributes.SetString(txt,"Value","1 Minute");
+			| 0BX:	Attributes.SetString(txt,"Value","2 Minutes");
+			| 0CX:	Attributes.SetString(txt,"Value","4 Minutes");
+			| 0DX:	Attributes.SetString(txt,"Value","8 Minutes");
+			| 0EX:	Attributes.SetString(txt,"Value","16 Minutes");
+			| 0FX:	Attributes.SetString(txt,"Value","32 Minutes");
+			ELSE
+				Attributes.SetString(txt,"Value","undefined");
+			END;
+		END;
+
+		SetIntValue(obj,"Seconds/Minute",data[4+4],data[4+5]);
+		SetIntValue(obj,"Frames/Second",data[4+6],data[4+7]);
+	END;
+	RETURN(cs);
+END CdRomPage;
+
+PROCEDURE CdRomAudioPage(tgt: INTEGER; obj: Panels.Panel): SHORTINT;
+VAR
+	data: ARRAY 64 OF CHAR;
+	lba: CHAR;
+	txt: Objects.Object;
+	cs: SHORTINT;
+
+	PROCEDURE ChannelStr(name: ARRAY OF CHAR; b: CHAR);
+	VAR
+		txt: Objects.Object;
+		str: ARRAY 5 OF CHAR;
+		i: INTEGER;
+	BEGIN
+		txt:= Gadgets.FindObj(obj,name);
+		IF (txt # NIL) THEN
+			FOR i:= 0 TO 3 DO
+				IF High(i,b) THEN str[i]:= "X"; ELSE str[i]:= "-"; END;
+			END;
+			str[i]:= 0X;
+			Attributes.SetString(txt,"Value",str);
+		END;
+	END ChannelStr;
+
+BEGIN
+	cs:= InquModePage(tgt,0EX,40X,data);
+	IF (cs = SCSI.Good) THEN
+		Id(obj,tgt);
+		SetBitValue(obj,"Send Start Status",data[4+2],2);
+		SetBitValue(obj,"Stop on Track Boundaries",data[4+2],1);
+		txt:= Gadgets.FindObj(obj,"LBA Factor");
+		IF High(7,data[4+5]) & (txt # NIL) THEN
+			lba:= SYSTEM.VAL(CHAR,SYSTEM.VAL(SET,data[4+5])*{0..3});
+			IF (lba = 00X) THEN
+				Attributes.SetString(txt,"Value","1");
+			ELSIF (lba = 08X) THEN
+				Attributes.SetString(txt,"Value","1/256");
+			ELSE
+				Attributes.SetString(txt,"Value","unknown");
+			END;
+		END;
+		SetIntValue(obj,"LBAs/Second",data[4+6],data[4+7]);
+		ChannelStr("Channels-0",data[4+8]);
+		SetIntValue(obj,"Volume-0",00X,data[4+9]);
+		ChannelStr("Channels-1",data[4+10]);
+		SetIntValue(obj,"Volume-1",00X,data[4+11]);
+		ChannelStr("Channels-2",data[4+12]);
+		SetIntValue(obj,"Volume-2",00X,data[4+13]);
+		ChannelStr("Channels-3",data[4+14]);
+		SetIntValue(obj,"Volume-3",00X,data[4+15]);
+	END;
+	RETURN(cs);
+END CdRomAudioPage;
+
+PROCEDURE BusScannerHandler(me: Oberon.Task);
+VAR
+	dev: SHORTINT;
+
+	PROCEDURE TimeOut(cs,ds: SHORTINT): BOOLEAN;
+	BEGIN
+		RETURN((cs = SCSI.DriverError) & (ds = SCSI.drvNoConnect));
+	END TimeOut;
+
+BEGIN
+	WITH me: BusScanner DO
+		IF me.from > me.to THEN
+			Oberon.Remove(me);
+		ELSE
+			requ.lun:= 00H; requ.clen:= 6;
+			requ.cmd:= SYSTEM.ADR(me.cmd); requ.data:= SYSTEM.ADR(me.data);
+
+			IF (me.from = SCSI.target) THEN
+				VisHostAdapter(me.panel,me.from,SCSI.signature);
+			ELSE
+				requ.dlen:= 36; requ.target:= me.from;
+				SCSI.Initiate(requ); WHILE ~requ.done DO END;
+				IF (requ.status = SCSI.Good) THEN
+					dev:= Mask(me.data[0],{0..4});
+					CASE dev OF
+					| DiskDrive: VisDiskDrive(me.panel,requ.target,me.data);
+					| TapeDrive: VisTapeDrive(me.panel,requ.target,me.data);
+					| Printer: VisPrinter(me.panel,requ.target,me.data);
+					| ProcDevice: VisProcDevice(me.panel,requ.target,me.data);
+					| WormDrive: VisWormDrive(me.panel,requ.target,me.data);
+					| CDRomDrive: VisCDRomDrive(me.panel,requ.target,me.data);
+					| Scanner: VisScanner(me.panel,requ.target,me.data);
+					| OpticalMem: VisOpticalMem(me.panel,requ.target,me.data);
+					| JukeBox: VisJukeBox(me.panel,requ.target,me.data);
+					| ComDevice: VisComDevice(me.panel,requ.target,me.data);
+					ELSE
+						VisUnknown(me.panel,requ.target,me.data);
+					END;
+				ELSIF TimeOut(requ.status,SCSI.status) THEN
+					VisNoDevice(me.panel,requ.target,me.data);
+				ELSE
+					LogError(requ.target,requ.lun,requ.status);
+				END;
+			END;
+			INC(me.from);
+		END;
+	END;
+END BusScannerHandler;
+
+PROCEDURE DocHandler*(D: Objects.Object; VAR M: Objects.ObjMsg);
+BEGIN
+	WITH D: Documents.Document DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF (M.id = Objects.get) & (M.name = "Menu") THEN
+					M.class:= Objects.String; M.res:= 0; M.s:= "";
+				ELSE
+					Documents.Handler(D,M);
+				END;
+			END;
+		ELSE
+			Documents.Handler(D,M);
+		END;
+	END;
+END DocHandler;
+
+PROCEDURE LoadDocument(D: Documents.Document);
+VAR
+	pan: Panel;
+	scan: BusScanner;
+BEGIN
+	NEW(pan); Panels.InitPanel(pan); pan.handle:= Panels.PanelHandler;
+	pan.cnt:= 1; pan.xofs:= 10; pan.yofs:= -10;
+	NEW(scan); scan.handle:= BusScannerHandler;
+	scan.from:= 0; scan.to:= SCSI.Targets-1; scan.panel:= pan;
+	scan.cmd[0]:= 12X; scan.cmd[1]:= 00X; scan.cmd[2]:= 00X;
+	scan.cmd[3]:= 00X; scan.cmd[4]:= 24X; scan.cmd[5]:= 00X;
+	scan.handle:= BusScannerHandler;
+	Documents.Init(D,pan); Oberon.Install(scan);
+END LoadDocument;
+
+PROCEDURE StoreDocument(D: Documents.Document);
+END StoreDocument;
+
+PROCEDURE ModePage*;
+VAR
+	D: Documents.Document;
+	P: Panels.Panel;
+	tgt,page: INTEGER;
+	cs: SHORTINT;
+	ok: BOOLEAN;
+
+	PROCEDURE PagePanel(num: INTEGER): Panels.Panel;
+	VAR
+		str: Objects.Name;
+		obj: Objects.Object;
+		i: INTEGER;
+	BEGIN
+		COPY(Lib,str); Strings.AppendCh(str,".");
+		Strings.Append(str,ModeEntry);
+		i:= SHORT(ASH(num,-4));
+		IF (i < 10) THEN
+			Strings.AppendCh(str,CHR(ORD("0")+i));
+		ELSE
+			Strings.AppendCh(str,CHR(ORD("A")+i-10));
+		END;
+		i:= SYSTEM.VAL(INTEGER,SYSTEM.VAL(SET,num) * {0..3});
+		IF (i < 10) THEN
+			Strings.AppendCh(str,CHR(ORD("0")+i));
+		ELSE
+			Strings.AppendCh(str,CHR(ORD("A")+i-10));
+		END;
+		obj:= Gadgets.CopyPublicObject(str, TRUE);
+		IF obj # NIL THEN WITH obj: Panels.Panel DO RETURN(obj); END; END;
+		RETURN(NIL);
+	END PagePanel;
+
+BEGIN
+	ok:= TRUE;
+	In.Open(); In.Int(page);
+	IF In.Done THEN In.Int(tgt); END;
+	IF In.Done THEN
+		P:= PagePanel(page);
+		IF (P = NIL) THEN
+			Out.String("Mode Page "); Out.Int(page,0);
+			Out.String(" not supported"); ok:= FALSE;
+		ELSE
+			CASE page OF
+			| 02H: cs:= DisconReconPage(tgt,P);
+			| 03H: cs:= FormatPage(tgt,P);
+			| 04H: cs:= GeometryPage(tgt,P);
+			| 08H: cs:= CachePage(tgt,P);
+			| 0CH: cs:= NotchPage(tgt,P);
+			| 0DH: cs:= CdRomPage(tgt,P);
+			| 0EH: cs:= CdRomAudioPage(tgt,P);
+			ELSE
+				Out.String("Mode Page "); Out.Int(page,0);
+				Out.String(" not defined"); ok:= FALSE;
+			END;
+		END;
+		IF ok THEN
+			IF (cs = SCSI.Good) THEN
+				NEW(D); PanelDocs.InitDoc(D,P.W,P.H);
+				D.handle:= DocHandler; D.name:= "ModePage.Doc";
+				Documents.Init(D,P); Desktops.ShowDoc(D);
+			ELSE
+				LogError(tgt,00H,cs);
+			END;
+		END;
+	END;
+END ModePage;
+
+PROCEDURE NewDoc*;
+VAR
+	D: Documents.Document;
+BEGIN
+	NEW(D);
+	D.Load:= LoadDocument; D.Store:= StoreDocument;
+	D.W:= 315; D.H:= 215; D.handle:= DocHandler;
+	Objects.NewObj:= D;
+END NewDoc;
+
+BEGIN
+	(* What I wanted to say... *)
+	Out.String("SCSI Interrogator "); Out.String(Version);
+	Out.String(" by W. Ibl, "); Out.String(Date); Out.Ln();
+	Out.String("based on EZ-SCSI Lite, (c) by Adaptec, Inc."); Out.Ln();
+	NEW(requ);
+END ScsiInterrogator.
+
+Desktops.OpenDoc (ScsiInterrogator.NewDoc)~

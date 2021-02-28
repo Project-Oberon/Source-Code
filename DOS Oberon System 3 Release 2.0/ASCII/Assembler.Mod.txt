@@ -1,0 +1,775 @@
+MODULE Assembler; (* Harry Peter *)
+
+	IMPORT SYSTEM, Files, Ans, Texts, TextFrames, Viewers, Oberon;
+
+	CONST ConsSize = 2048; CodeSize = 12000; NofVars = 1000;
+		FixConst = 12; (* Start in Fixup-Teil im Object-File, wo die Constanten beginnen *)
+		FixVars = 0; (* Start in Fixup-Teil, wo die Variablen beginnen *)
+		FixUp = 0; (* Anzahl der vordefinierten Eintraege im Fixup-Teil (Floating Consts) *)
+		
+		(* OLD VERSION
+	CONST ConsSize = 2048; CodeSize = 8192; NofVars = 1000;
+		FixConst = 4; (* Start in Fixup-Teil im Object-File, wo die Constanten beginnen *)
+		FixVars = -52; (* Start in Fixup-Teil, wo die Variablen beginnen *)
+		FixUp = 14; (* Anzahl der vordefinierten Eintraege im Fixup-Teil (Floating Consts) *)
+		*)
+
+	(* Item.typ = 0: undefined	1: immediate	2: PC-rel	3: SB-rel *)
+
+	(* Argument.mode  gleich wie OpCode.type in Ans
+		Argument.opsize =	0 (undef) | 8 | 16 | 32
+		Argument.args =	0: no args	1: d8	2: d16	>=3: d32
+		Argument.inx =	0: EAX 1: ECX 2: EDX 3: EBX 4: no index 5: EBP 6: ESI 7: EDI  8: none
+		Argument.val =	0: AL|AX|EAX / ES / [BX+SI]|[BX+SI+d8]|[BX+SI+d16]|[EAX]|[EAX+d8]|[EAX+d32]|[EAX+scaled....
+									1: CL|CX|ECX / CS / [BX+DI]|...|[ECX]|...
+									2: DL|DX|EDX / SS / [BP+SI]|...|[EDX]|...
+									3: BL|BX|EBX / CS / [BP+DI]|...|[EBX]|...
+									4: AH|SP|ESP / FS / [SI]|[SI+d8]|[SI+d16]|[ESP+scaledIndex]|[ESP+d8+scaledIndex]|...
+									5: CH|BP|EBP / GS / [DI]|...|d32|[EBP+d8]|[EBP+d32]|[d32+scaled]|[EBP+scaled+d8]|...
+									6: DH|SI|ESI / / d16|[BP+d8]|[BP+d16]|[ESI]|[ESI+d8]|[ESI+d32]|[ESI+sc]|[ESI+sc+d8]|[ESI+sc+d32]
+									7: BH|DI|EDI / / [BX]|[BX+d8]|[BX+d16]|[EDI]|[EDI+d8]|[EDI+d32]|[EDI+sc]|...
+		Argument.disp =	displacement (8, 16 or 32 bit -> args) or immediate field
+		Argument.isize =	0 (x1) | 1(x2) | 2 (x4) | 3 (x8)
+		Argument.modrm = modrm-field, calculated from operand
+	*)
+
+	TYPE Item = RECORD
+							typ: INTEGER;
+							val: LONGINT;
+							obj: Ans.Object
+						END;
+
+		Argument = RECORD
+								mode: INTEGER;
+								opsize: INTEGER;
+								args: INTEGER;
+								inx: INTEGER;
+								val: LONGINT;
+								disp: LONGINT;
+								isize: INTEGER;
+								modrm: LONGINT (* MODRM-Feld, wird in Proc. 'getarg' schon ausgefuellt!! *)
+							END;
+
+		VarRec = RECORD
+							len: INTEGER; (* Groesse in Bytes *)
+							val: LONGINT (* Eintrag in Fixup-Liste des Obj-Files *)
+						END;
+
+
+	VAR W: Texts.Writer;
+		sym: INTEGER;
+		modname: Ans.Name;
+		pc, pc0, lastFix: LONGINT;
+		cadr, cinx, vadr: INTEGER;
+		needFix: BOOLEAN; (* wenn TRUE: Variable wurde referenziert, neue Fixup-Adresse := pc *)
+		carr: ARRAY NofVars OF VarRec;
+		modkey: LONGINT;
+		code: ARRAY CodeSize OF CHAR;
+		const: ARRAY ConsSize OF CHAR;
+
+	PROCEDURE PutByte(d: LONGINT);
+	BEGIN code[pc] := CHR(d); INC(pc)
+	END PutByte;
+
+	PROCEDURE PutWord(d: LONGINT);
+	BEGIN code[pc] := CHR(d); code[pc+1] := CHR(d DIV 256); pc := pc + 2
+	END PutWord;
+
+	PROCEDURE PutWordR(d: LONGINT);
+	BEGIN code[pc+1] := CHR(d); code[pc] := CHR(d DIV 256); pc := pc + 2
+	END PutWordR;
+
+	PROCEDURE PutDWord(d: LONGINT);
+	BEGIN PutWord(d MOD 65536); PutWord(d DIV 65536)
+	END PutDWord;
+
+	PROCEDURE err(e: INTEGER);
+	BEGIN Ans.err(e)
+	END err;
+
+	PROCEDURE* FixDisp(adr, len, pc: LONGINT);
+		VAR d: LONGINT;
+	BEGIN d := pc0 - 4 - adr; (* d >= 0, 4 weil: sicher ein Vorwaertssprung,  4Bytes Sprungdistanz  = 6! *)
+		IF len = 4 THEN code[adr] := CHR(d); code[adr+1] := CHR(d DIV 256);
+			code[adr+2] := CHR(d DIV 65536); code[adr+3] := CHR(d DIV 16777216)
+		ELSIF len = 1 THEN
+			IF (-128 <= d) & (d <= 127) THEN code[adr] := CHR(d) ELSE err(74) END
+		END
+	END FixDisp;
+
+	PROCEDURE CheckSym(s: INTEGER);
+	BEGIN IF sym # s THEN err(s) END;
+		Ans.Get(sym)
+	END CheckSym;
+
+	PROCEDURE factor(VAR x: Item);
+		VAR obj: Ans.Object;
+	BEGIN x.typ := 1; x.val := 0;
+		IF sym = Ans.ident THEN
+			Ans.find(Ans.name, obj);
+			IF obj # NIL THEN
+				x.typ := obj.typ; x.val := obj.val; x.obj := obj
+			ELSE err(0)
+			END
+		ELSIF sym = Ans.number THEN x.val := Ans.val
+		ELSIF sym = Ans.string THEN x.val := ORD(Ans.sval[0])
+		ELSE err(20)
+		END;
+		Ans.Get(sym)
+	END factor;
+
+	PROCEDURE term(VAR x: Item);
+		VAR y: Item; op: INTEGER;
+	BEGIN factor(x);
+		WHILE (sym = Ans.ast) OR (sym = Ans.slash) DO
+			op := sym; Ans.Get(sym); factor(y);
+			IF (x.typ = 1) & (y.typ = 1) THEN
+				IF op = Ans.ast THEN x.val := x.val*y.val ELSE x.val := x.val DIV y.val END
+			ELSE err(21)
+			END
+		END
+	END term;
+
+	PROCEDURE expression(VAR x: Item);
+		VAR y: Item; op: INTEGER;
+	BEGIN
+		IF sym = Ans.minus THEN Ans.Get(sym); term(x); x.val := -x.val
+		ELSIF sym = Ans.plus THEN Ans.Get(sym); term(x)
+		ELSE term(x)
+		END ;
+		WHILE (sym = Ans.plus) OR (sym = Ans.minus) DO
+			op := sym; Ans.Get(sym); term(y);
+			IF (0 < x.typ) & (x.typ < 4) THEN
+				IF x.typ = y.typ THEN x.typ := 1 ELSIF y.typ # 1 THEN err(22) END ;
+				IF op = Ans.plus THEN x.val := x.val+y.val ELSE x.val := x.val-y.val END
+			ELSE err(22)
+			END
+		END
+	END expression;
+
+	PROCEDURE dist(d: LONGINT; VAR size: INTEGER);
+	BEGIN
+		IF (-128 <= d) & (d <= 127) THEN size := 1
+		ELSIF (-32768 <= d) & (d <= 32767) THEN size := 2
+		ELSE size := 3
+		END
+	END dist;
+
+	PROCEDURE jdest(op1, op2: INTEGER; c: BOOLEAN);
+	(* op1: fuer kurze Spruenge, op2: fuer lange; c: TRUE fuer CALL, FALSE fuer Jmps *)
+		VAR obj: Ans.Object;
+
+		PROCEDURE PutOperand(o: INTEGER);
+		BEGIN
+			IF o > 256 THEN PutWordR(o) ELSE PutByte(o) END
+		END PutOperand;
+
+	BEGIN
+		IF sym = Ans.ident THEN
+			Ans.insert(Ans.name, obj);
+			IF obj.typ = 2 THEN (* Label schon definiert *)
+				IF ~c & (obj.val - pc0 >= -128) THEN PutOperand(op1); PutByte(obj.val-pc-1)
+				ELSE
+					IF op2 = 0 (* LOOP, etc *) THEN err(74)
+					ELSE PutOperand(op2); PutDWord(obj.val-pc-4)
+					END
+				END
+			ELSIF obj.typ = 0 THEN (* Label noch nicht definiert --> nimm op2 *)
+				IF op2 = 0 THEN PutOperand(op1);  Ans.EnterFixPnt(obj, pc, 1, pc0); PutByte(0)
+				ELSE PutOperand(op2); Ans.EnterFixPnt(obj, pc, 4, pc0); PutDWord(0)
+				END
+			ELSE err(23)
+			END
+		ELSE err(24)
+		END
+	END jdest;
+
+	PROCEDURE genadr(VAR a: Argument);
+		VAR t: Item; r: INTEGER;
+
+		PROCEDURE MODRM(size: INTEGER; VAR modrm: LONGINT);
+			VAR i, ss: INTEGER;
+		BEGIN modrm := 0;
+			IF (a.val = 5) & (a.args = 0) (* EBP *) THEN a.args := 1; a.disp := 0 (* d8 *)
+			ELSIF a.args = 2 (* d16 *) THEN a.args := 3 (* d32 *)
+			END;
+			ss := a.args; IF ss = 3 THEN DEC(ss) END;
+			IF size = 2 THEN
+				IF (a.val = 4) & (a.args = 0) (* ESP *) THEN a.disp := 0 END;
+				modrm := 00000400H + ss * LONG(4000H) + a.isize * 64;
+				modrm := modrm + a.inx * 8 + a.val
+			ELSE
+				modrm := ss * 64 + a.val
+			END
+		END MODRM;
+
+	BEGIN
+		Ans.Get(sym);
+		IF sym # Ans.reg THEN err(50); a.mode := 0; RETURN END;
+		IF Ans.val1 = 32 THEN (* [Exx ...] *)
+			r := SHORT(Ans.val); Ans.Get(sym);
+			IF sym = Ans.brR THEN (* [Exx] *)
+				IF r = 4 THEN (* [ESP] --> [ESP+Exx*1] with xx = 4 (no index reg) *)
+					a.inx := 4; a.isize := 0; a.val := 4; MODRM(2, a.modrm);
+				ELSE
+					a.val := r; MODRM(1, a.modrm)
+				END
+			ELSIF sym =  Ans.ast THEN (* [Exx * sc] *)
+				IF r = 4 THEN err(51);
+				ELSE a.inx := SHORT(r); Ans.Get(sym); expression(t); a.val := 5; (* d32[scaledIndex] *)
+					IF a.args # 3 THEN a.args := 3; a.disp := 0 END;
+					IF ~((t.typ = 1) & (t.val IN {1,2,4,8})) THEN err(52)
+					ELSE
+						IF t.val < 3 THEN a.isize := SHORT(t.val-1) ELSIF t.val = 4 THEN a.isize := 2 ELSE a.isize := 3 END;
+						IF sym # Ans.brR THEN err(53) END
+					END;
+					MODRM(1, a.modrm)
+				END
+			ELSIF sym = Ans.plus THEN (* [Exx + Eyy * sc] *)
+				Ans.Get(sym);
+				IF sym = Ans.reg THEN
+					IF Ans.val1 = 32 THEN
+						IF Ans.val # 4 THEN
+							a.inx := SHORT(Ans.val); a.val := r; Ans.Get(sym);
+							IF sym # Ans.ast THEN err(54); a.isize := 0
+							ELSE
+								Ans.Get(sym); expression(t);
+								IF ~((t.typ = 1) & (t.val IN {1,2,4,8})) THEN err(52)
+								ELSE
+									IF t.val < 3 THEN a.isize := SHORT(t.val - 1) ELSIF t.val = 4 THEN a.isize := 2 ELSE a.isize := 3 END;
+									IF sym # Ans.brR THEN err(53) END;
+									MODRM(2, a.modrm)
+								END
+							END
+						ELSE err(51)
+						END
+					ELSE err(55)
+					END
+				ELSE err(56)
+				END
+			ELSE err(53)
+			END
+		ELSIF Ans.val1 = 16 THEN err(33)
+		END
+	END genadr;
+				
+	PROCEDURE gen(VAR a: Argument; float: BOOLEAN);
+		VAR x: Item; i: INTEGER;
+	BEGIN a.mode := 0; a.opsize := 0; a.args := 0; a.inx := 8; a.disp := 0; a.modrm := 0;
+		CASE sym OF
+			Ans.at: 
+				Ans.Get(sym); expression(x);
+				IF x.typ # 1 THEN err(30) END;
+				a.mode := 4; a.val := 5; a.disp := x.val; a.args := 3; a.modrm := 05H;
+		| Ans.segReg:
+				a.mode := 5; a.opsize := 16; a.val := Ans.val; Ans.Get(sym);
+		| Ans.reg:
+				IF Ans.val = 0 THEN a.mode := 2 (* acc *) ELSE a.mode := 3 END;
+				a.opsize := SHORT(Ans.val1); (* size *)
+				a.val := Ans.val; a.modrm := Ans.val + 0C0H; (* mod = 11B, r/m = val *)
+				Ans.Get(sym)
+		| Ans.ident, Ans.number, Ans.minus, Ans.brL:
+				IF sym = Ans.brL THEN x.typ := 4; x.val := 0
+				ELSE expression(x)
+				END;
+				IF x.typ = 1 (* imm *) THEN a.mode := 1; a.disp := x.val; dist(x.val, a.args)
+				ELSIF x.typ = 3 (* SB-rel *) THEN a.mode := 4; a.disp := carr[x.val].val * 10000H + lastFix;
+					a.args := 3; a.val := 5; a.modrm := 05H; needFix := TRUE; a.opsize := carr[x.val].len * 8
+				ELSIF x.typ <= 2 THEN err(60) (* PC-rel ist nicht erlaubt *)
+				END;
+				IF sym = Ans.brL THEN genadr(a); Ans.Get(sym); a.mode := 6 END;
+				IF sym = Ans.colon THEN Ans.Get(sym);
+					IF sym = Ans.ident THEN
+						IF Ans.name = "byte" THEN a.opsize := 8
+						ELSIF Ans.name = "word" THEN a.opsize := 16
+						ELSIF Ans.name = "double" THEN a.opsize := 32
+						ELSE err(57)
+						END;
+						Ans.Get(sym)
+					ELSE err(57)
+					END
+				END
+		| Ans.cntReg, Ans.debReg, Ans.tstReg:
+				a.mode := sym - 8; a.val := Ans.val; Ans.Get(sym)
+		ELSE err(59) (* wrong argument *)
+		END;
+	END gen;
+
+	PROCEDURE instruction(label: Ans.Object);
+		VAR anz, class, d, ind, ops, os, sign, w: INTEGER; b: BOOLEAN;
+			mode, op, oplen, cod, modrm, TTT: INTEGER;
+			src, dest, help: Argument; x: Item; obj: Ans.Object;
+
+		PROCEDURE PutOp;
+			VAR o: LONGINT;
+		BEGIN
+			CASE cod OF
+				0: IF oplen = 1 THEN PutByte(op) ELSE PutWordR(op) END
+			|  1: IF (mode DIV 16 = 3) THEN o := op + w * 8 + dest.val ELSE o := op + w * 8 + src.val END;
+					IF oplen = 1 THEN PutByte(o) ELSE PutWordR(o) END
+			| 2:  IF (mode DIV 16 = 3) THEN o := op + dest.val ELSE o := op + src.val END;
+					IF oplen = 1 THEN PutByte(o) ELSE PutWordR(o) END
+			| 3:  IF oplen = 1 THEN PutByte(op + w) ELSE PutWordR(op + w) END
+			| 4:  IF oplen = 1 THEN PutByte(op + d * 2 + w) ELSE PutWordR(op + d * 2 + w) END
+			| 5:  IF (mode DIV 16 = 5) THEN o := op + dest.val * 8 ELSE o := op + src.val * 8 END;
+					IF oplen = 1 THEN PutByte(o) ELSE PutWordR(o) END
+			| 6:  IF oplen = 1 THEN PutByte(op + sign * 2 + w) ELSE PutWordR(op + sign * 2 + w) END
+			| 7:  IF oplen = 1 THEN PutByte(op + sign * 2) ELSE PutWordR(op + sign * 2) END
+			| 8:  IF ((mode DIV 16 = 5) OR (mode DIV 16 = 7)) THEN o := op + dest.val * 8 ELSE o := op + src.val * 8 END;
+					IF oplen = 1 THEN PutByte(o) ELSE PutWordR(o) END
+			END
+		END PutOp;
+
+		PROCEDURE PutDisp(size: INTEGER; val: LONGINT);
+		BEGIN
+			IF size = 1 THEN PutByte(val)
+			ELSIF size = 2 THEN PutWord(val)
+			ELSE PutDWord(val);
+				IF needFix THEN lastFix := pc - 4; needFix := FALSE; END;
+			END;
+		END PutDisp;
+
+		PROCEDURE PutModrm;
+
+			PROCEDURE PutM(mr, val: LONGINT);
+			BEGIN
+				IF mr > 256 (* two byte MODRM *) THEN
+					PutWordR(mr + val * 2048)
+				ELSE PutByte(mr + val * 8) (* one byte MODRM *)
+				END
+			END PutM;
+
+		BEGIN
+			CASE modrm OF
+				0: IF src.mode = 4 THEN PutDisp(src.args, src.disp)
+					ELSIF dest.mode = 4 THEN PutDisp(dest.args, dest.disp)
+					END
+			|  1: (* mod reg r/m *)
+					IF dest.mode <= 3 THEN PutM(src.modrm, dest.val);
+						IF (src.mode > 3) & (src.args # 0) THEN PutDisp(src.args, src.disp) END
+					ELSE PutM(dest.modrm, src.val);
+						IF (dest.mode > 3) & (dest.args # 0) THEN PutDisp(dest.args, dest.disp) END
+					END
+			|  2: (* mod TTT r/m *)
+					IF (dest.mode IN {2, 3, 4, 6}) THEN PutM(dest.modrm, TTT);
+						IF (dest.mode > 3) & (dest.args # 0) THEN PutDisp(dest.args, dest.disp) END
+					ELSE PutM(src.modrm, TTT);
+						IF (src.mode > 3) & (src.args # 0) THEN PutDisp(src.args, src.disp) END
+					END
+			|  3: (* mod sreg3 r/m *)
+					IF (dest.mode = 5) OR (dest.mode = 7) THEN PutM(src.modrm, dest.val);
+						IF (src.mode > 3) & (src.args # 0) THEN PutDisp(src.args, src.disp) END
+					ELSE PutM(dest.modrm, dest.val);
+						IF (dest.mode > 3) & (dest.args # 0) THEN PutDisp(dest.args, dest.disp) END
+					END
+			END
+		END PutModrm;
+
+		PROCEDURE Check(i, j: INTEGER; VAR s: INTEGER);
+		BEGIN
+			IF i = 0 THEN s := j; RETURN END;
+			IF j = 0 THEN s := i; RETURN END;
+			IF i = j THEN s := i ELSE s := 0 END
+		END Check;
+
+		PROCEDURE MakeCode(putdisp: BOOLEAN); (* gibt an, ob ein allfaelliges Immediate ausgegeben wird *)
+		BEGIN
+			d := mode DIV 256; mode := mode MOD 256;
+			IF Ans.codBef(ind, mode, op, oplen, cod, modrm, TTT) THEN
+				Check(src.opsize, dest.opsize, os);
+				IF os = 0 THEN err(70) END;
+				IF os # 0 THEN
+					IF os = 16 THEN PutByte(66H) END; (* operand size prefix *)
+					sign := 0; w := 1;
+					IF os = 8 THEN w := 0 END;
+					IF (src.mode=1) & (src.args=1) THEN sign := 1 END;
+					PutOp; PutModrm;
+					IF putdisp & (src.mode = 1) THEN
+						IF (sign = 1) & (cod DIV 2 = 3) THEN PutByte(src.disp)
+						ELSE PutDisp(os DIV 8, src.disp)
+						END
+					END
+				END
+			ELSE err(60)
+			END
+		END MakeCode;
+		
+		PROCEDURE PutSegprefix(val: LONGINT);
+		BEGIN
+			IF val = 0 THEN PutByte(26H)	(* ES *)
+			ELSIF val = 1 THEN PutByte(2EH)	(* CS *)
+			ELSIF val = 2 THEN PutByte(36H)	(* SS *)
+			ELSIF val = 3 THEN PutByte(3EH)	(* DS *)
+			ELSIF val = 4 THEN PutByte(64H)	(* FS *)
+			ELSIF val = 5 THEN PutByte(65H)	(* GS *)
+			ELSE err(41) END
+		END PutSegprefix;
+		
+		PROCEDURE SegmentOverride(VAR a: Argument);
+		BEGIN
+			IF sym # Ans.comma THEN 
+				PutSegprefix(a.val); CheckSym(Ans.colon); gen(a, FALSE) 
+			END
+		END SegmentOverride;
+
+	BEGIN Ans.GetOp(ind, ops, class); IF class # 3DH THEN Ans.Get(sym) END; (* REP, REPE, REPNE *)
+		IF ops = 2 THEN
+			gen(dest, FALSE); 
+			IF dest.mode = 5 THEN (* Segmentregister *) SegmentOverride(dest) END;
+			CheckSym(Ans.comma); gen(src, FALSE);
+			IF src.mode = 5 THEN (* Segmentregister *) PutSegprefix(src.val); Ans.Get(sym); gen(src, FALSE) END;
+			CASE class OF
+				1: (* MOV *)
+					IF (dest.mode > 6) OR (src.mode > 6) THEN
+						IF src.mode = 2 THEN src.mode := 3 END;
+						IF (src.mode = 10) OR (src.mode = 11) OR (src.mode = 12) THEN dest.mode := 3 END; (* ARD *)
+						mode := 16 * dest.mode + src.mode;
+						IF Ans.codBef(ind, mode, op, oplen, cod, modrm, TTT) THEN
+							PutWordR(op);
+							IF dest.mode > 6 THEN PutByte(0C0H + dest.val * 8 + src.val)
+							ELSE PutByte(0C0H + src.val * 8 + dest.val)
+							END
+						ELSE err(60)
+						END
+					ELSE mode := Ans.mat[0, dest.mode, src.mode]; MakeCode(TRUE)
+					END
+			|  2: (* ADC, ADD, ... *)
+					IF (dest.mode > 6) OR (src.mode > 6) THEN err(60)
+					ELSE mode := Ans.mat[1, dest.mode, src.mode]; MakeCode(TRUE)
+					END
+			|  3: (* MOVSX, MOVZX *)
+					IF src.opsize = 8 THEN w := 0 ELSIF src.opsize = 16 THEN w := 1 ELSE err(65) END;
+					IF dest.opsize = 16 THEN PutByte(66H)
+					ELSIF dest.opsize # 32 THEN err(64)
+					END;
+					mode := dest.mode * 16;
+					IF dest.mode = 2 THEN mode := mode + 10H END;
+					IF src.mode IN {2,3,4,6} THEN mode := mode + 6 END;
+					IF Ans.codBef(ind, mode, op, oplen, cod, modrm, TTT) THEN PutOp; PutModrm END
+			|  4, 8, 0CH: (* XCHG *) (* TEST *) (* BT, BTC, BTR, BTS *)
+					IF (dest.mode = 2) & (class = 4) & (src.mode IN {2,3}) & (dest.opsize >= 16) & (src.opsize = dest.opsize) THEN
+						IF dest.opsize = 16 THEN PutByte(66H) END;
+						PutByte(90H + src.val)
+					ELSE
+						IF (dest.mode = 2) & (class = 8) & (src.mode = 1) THEN mode := 21H
+						ELSE
+							IF dest.mode IN {2,3,4,6} THEN mode := 60H + src.mode END;
+							IF src.mode = 2 THEN INC(mode) END
+						END;
+						IF (class = 0CH) & (src.mode = 1) THEN
+							IF (src.disp < 256) & (src.opsize <= 8) THEN
+								src.opsize := dest.opsize; MakeCode(FALSE); PutByte(src.disp)
+							ELSE err(77)
+							END
+						ELSE MakeCode(TRUE)
+						END
+					END
+			|  5, 6: (* IN *) (* OUT *)
+					IF class = 6 THEN help := src; src := dest; dest := help END; (* vertausche src und dest *)
+					mode := dest.mode * 16 + src.mode;
+					IF src.mode = 1 THEN
+						IF src.disp > 255 THEN err(71) ELSE MakeCode(FALSE); PutByte(src.disp) END
+					ELSIF (src.mode = 3) & (src.val = 2) & (src.opsize = 16) THEN mode := mode + 6; (* src.mode = 9 *)
+						src.opsize := dest.opsize; MakeCode(FALSE)
+					ELSE err(57)
+					END
+			|  7, 0BH: (* LEA *) (* LDS, LES, ... *)
+					mode := dest.mode * 16 + src.mode;
+					IF dest.mode = 2 THEN mode := mode + 10H END;
+					IF src.mode = 4 THEN mode := mode + 2 END;
+					IF dest.opsize = 32 THEN src.opsize := 32; MakeCode(TRUE) ELSE err(64) END
+			|  0AH: (* RCL, RCR, ROL, ROR, SAL, SAR, SHL, SHR *)
+					IF src.mode = 1 THEN
+						IF src.disp = 1 THEN mode := 6CH; src.mode := 0 (* mem/reg, 1 *)
+						ELSE mode := 61H; src.args := 1
+						END
+					ELSIF (src.mode = 3) & (src.val = 1) & (src.opsize = 8) THEN mode := 68H
+					ELSE err(61)
+					END;
+					src.opsize := 0; MakeCode(FALSE);
+					IF mode = 61H THEN PutByte(src.disp) END
+			|  0DH: (* ENTER *)
+					mode := 16 * dest.mode + src.mode;
+					IF Ans.codBef(ind, mode, op, oplen, cod, modrm, TTT) THEN
+						PutByte(op); PutWord(dest.disp); PutByte(src.disp)
+					ELSE err(62)
+					END
+			|  0EH: (* BSF, BSR *)
+					IF dest.mode = 2 THEN mode := 30H ELSE mode := dest.mode * 16 END;
+					IF src.mode IN {2,3,4,6} THEN mode := mode + 6 END;
+					IF dest.opsize >= 16 THEN MakeCode(TRUE) ELSE err(64) END
+			|  0FH: (* BOUND *) mode := dest.mode * 16 + src.mode;
+					IF dest.mode = 2 THEN mode := mode + 10H END;
+					IF src.mode = 4 THEN mode := mode + 2 END;
+					IF dest.opsize >= 16 THEN MakeCode(TRUE) ELSE err(64) END
+			END
+		ELSIF ops = 1 THEN
+			CASE class OF
+				1FH: (* IMUL *) gen(dest, FALSE);
+					IF sym = Ans.comma THEN Ans.Get(sym); gen(src,FALSE);
+						IF ((dest.mode = 2) OR (dest.mode = 3)) & (dest.opsize > 8) THEN
+							IF dest.opsize = 16 THEN PutByte(66H) END;
+							IF (sym = Ans.comma) OR (src.mode = 1) THEN
+								IF sym = Ans.comma THEN Ans.Get(sym); gen(help,FALSE);
+									IF (help.mode # 1) OR (src.opsize # dest.opsize) THEN err(57) END
+								ELSE help := src; src := dest
+								END;
+								IF help.args = 1 THEN sign := 1 ELSE sign := 0; help.args := dest.opsize DIV 8 END;
+								cod := 7; oplen := 1; op := 69H; modrm := 1; PutOp;
+								IF src.mode IN {2,3,4,6} THEN PutModrm ELSE err(57) END;
+								PutDisp(help.args, help.disp)
+							ELSE cod := 0; oplen := 2; op := 0FAFH; modrm := 1; PutOp;
+								IF src.mode IN {2,3,4,6} THEN PutModrm ELSE err(57) END
+							END
+						ELSE err(67)
+						END
+					ELSIF dest.mode IN {2,3,4,6} THEN
+						mode := 60H; src.mode := 0; src.opsize := 0; MakeCode(TRUE)
+					ELSE err(57)
+					END
+			|  20H, 21H: (* PUSH, POP *) gen(dest, FALSE);
+					IF dest.mode = 2 THEN mode := 3
+					ELSIF dest.mode = 5 THEN
+						IF dest.val < 4 THEN mode := 5 ELSE mode := 7 END
+					ELSIF dest.mode = 4 THEN mode := 6
+					ELSE mode := dest.mode
+					END;
+					IF Ans.codBef(ind, mode, op, oplen, cod, modrm, TTT) THEN
+						IF dest.opsize = 0 THEN err(70)
+						ELSIF (dest.mode # 1) & (dest.opsize = 8) THEN err(64)
+						ELSE os := dest.opsize
+						END;
+						IF mode = 5 THEN PutByte(op+8*dest.val)
+						ELSIF mode = 7 THEN PutWordR(op+8*dest.val)
+						ELSE
+							IF os = 16 THEN PutByte(66H) END;
+							IF dest.mode = 1 THEN
+								IF dest.args = 1 THEN sign := 1 ELSE sign := 0 END
+							END;
+							mode := mode * 16; src.mode := 0; PutOp; PutModrm;
+							IF (class = 20H) & (dest.mode = 1) THEN PutDisp(dest.args, dest.disp) END
+						END
+					ELSE err(60)
+					END
+			|  23H: (* INC, DEC *) gen(dest, FALSE);
+					IF dest.mode = 2 THEN mode := 30H
+					ELSIF dest.mode = 4 THEN mode := 60H
+					ELSE mode := dest.mode*16
+					END;
+					IF dest.opsize = 8 THEN mode := 60H END; (* nur 16- bzw. 32-bit Register *)
+					src.mode := 0; src.opsize := 0; MakeCode(TRUE)
+			|  24H, 25H, 2BH: (* NEG, NOT *) (* MUL, DIV, IDIV *) (* SETcc *)
+					gen(dest, FALSE);
+					IF dest.mode IN {2,3,4,6} THEN
+						IF class = 2BH THEN
+							IF dest.opsize > 8 THEN err(75) END;
+							dest.opsize := 8
+						END; (* bei SETcc ist Groesse implizit ein Byte *)
+						mode := 60H; src.mode := 0; src.opsize := 0; MakeCode(TRUE)
+					ELSE err(60)
+					END
+			|  27H, 28H, 29H, 2AH: (* CALL *) (* JMP *) (* JO, JGE, JA, ... *) (* JCXZ, LOOP, LOOPZ, .. *)
+						IF sym = Ans.ident THEN Ans.find(Ans.name, obj) END;
+						IF (sym = Ans.ident) & ((obj = NIL) OR (obj.typ = 0) OR (obj.typ = 2)) THEN
+							IF Ans.codBef(ind, 01, op, oplen, cod, modrm, TTT) THEN
+								IF class = 27H THEN jdest(op, 00E8H, TRUE)
+								ELSIF class = 28H THEN jdest(op, 00E9H, FALSE)
+								ELSIF class = 29H THEN jdest(op, 0F10H + op, FALSE)
+								ELSE jdest(op, 0, FALSE)
+								END
+							ELSE err(60)
+							END
+						ELSIF class <= 28H THEN gen(dest, FALSE);
+							IF dest.mode IN {2, 3, 4, 6} THEN mode := 6 ELSE err(34) END;
+							src.mode := 0; src.opsize := 0; MakeCode(TRUE)
+						ELSE err(57)
+						END
+			|  2CH: (* INT *) gen(dest,FALSE);
+					IF (dest.mode = 1) & (dest.disp < 256) THEN
+						IF dest.disp = 3 THEN PutByte(0CCH) ELSE PutByte(0CDH); PutByte(dest.disp) END
+					ELSE err(66)
+					END;
+			|  2DH: (* RET *)
+					IF sym = Ans.number THEN
+						PutByte(0C2H); PutWord(Ans.val)
+					ELSE PutByte(0C3H)
+					END
+			|  42H: (* MODULE *)
+					IF sym = Ans.ident THEN
+						modname := Ans.name; Texts.WriteString(W, modname);
+						Texts.Append(Oberon.Log, W.buf); Ans.ReadSymFile(modkey)
+					ELSE err(17)
+					END
+			|  43H: (* EQU *)
+					expression(x);
+					IF label # NIL THEN label.typ := x.typ; label.val := x.val
+					ELSE err(35)
+					END
+			END
+		ELSIF ops = 3 THEN
+			IF class = 1EH THEN (* SHxD *)
+				gen(src, FALSE); CheckSym(Ans.comma); gen(dest, FALSE); CheckSym(Ans.comma); gen(help, FALSE);
+				IF dest.mode = 2 THEN dest.mode := 3 END;
+				IF (dest.opsize > 8) & (dest.mode = 3) & (src.mode IN {2,3,4,6}) THEN Check(src.opsize, dest.opsize, src.opsize);
+					IF src.opsize = 0 THEN err(69) END;
+					IF help.mode = 1 THEN mode := 61H; help.args := 1;
+					ELSIF (help.mode = 3) & (help.val = 1) & (help.opsize = 8) THEN mode := 68H
+					ELSE err(68)
+					END;
+					MakeCode(FALSE); IF mode = 61H THEN PutByte(help.disp) END;
+				ELSE err(57)
+				END
+			END
+		ELSIF ops = 4 THEN (* SBLKB, SBLKW, SBLKD, SBYTE, SWORD, SDOUBLE *)
+			CASE class OF
+				40H : (* SBLKx *)
+						expression(x); mode := 0; b := Ans.codBef(ind, mode, op, oplen, cod, modrm, TTT);
+						IF label # NIL THEN label.typ := 3; label.val := cinx END;
+						IF x.typ = 1 THEN carr[cinx].len := op; vadr := vadr + op * SHORT(x.val);
+							carr[cinx].val := -vadr; INC(cinx);
+						ELSE err(30)
+						END
+			|  41H: (* SBYTE, SWORD, SDOUBLE *)
+						mode := 0; b := Ans.codBef(ind, mode, op, oplen, cod, modrm, TTT);
+						IF label # NIL THEN label.typ := 3; label.val := cinx;
+							carr[cinx].len := op; carr[cinx].val := FixConst + cadr; INC(cinx)
+						END;
+						LOOP
+							IF sym = Ans.string THEN
+								SYSTEM.MOVE(SYSTEM.ADR(Ans.sval), SYSTEM.ADR(const)+cadr, Ans.val);
+								INC(cadr, SHORT(Ans.val)); Ans.Get(sym)
+							ELSE expression(x);
+								IF x.typ = 1 THEN
+									SYSTEM.MOVE(SYSTEM.ADR(x.val), SYSTEM.ADR(const)+cadr, op);
+									INC(cadr, op)
+								ELSE err(30)
+								END
+							END;
+							IF sym # Ans.comma THEN EXIT END;
+							Ans.Get(sym)
+						END
+			END (* case *)
+		ELSIF ops = 0 THEN
+			CASE class OF
+				3DH: (* REP, REPE, REPNE *)
+						b := Ans.codBef(ind, 0, op, oplen, cod, modrm, TTT); d := op; Ans.GetOp(ind, ops, class);
+						IF class = 3EH THEN
+							b := Ans.codBef(ind, 0, op, oplen, cod, modrm, TTT); PutByte(d);
+							IF oplen = 1 THEN PutByte(op) ELSE PutWordR(op) END
+						ELSE err(73)
+						END
+			|  3EH, 3FH:
+						IF Ans.codBef(ind, 0, op, oplen, cod, modrm, TTT) THEN
+							IF oplen = 1 THEN PutByte(op) ELSE PutWordR(op) END
+						ELSE err(41)
+						END
+			END (* case *)
+		END
+	END instruction;
+
+
+	PROCEDURE OutCode(VAR filename: ARRAY OF CHAR);
+		CONST ObjCode = 0F8X;
+		VAR F: Files.File; out: Files.Rider;
+		i: INTEGER; z: LONGINT; c: CHAR;
+
+		PROCEDURE WR(k: INTEGER);
+		BEGIN Files.Write(out, CHR(k)); Files.Write(out, CHR(k DIV 100H))
+		END WR;
+
+	BEGIN
+		F := Files.New(filename); Files.Set(out, F, 0);
+		Files.Write(out, ObjCode);
+		z := 0; Files.WriteBytes(out, z, 4); (* RefPos, wird am Ende richtig gesetzt *)
+		WR(Ans.entno); WR(0);	(*nofentries, comsize*)
+		WR(0); WR(0); WR(1); WR(0);
+			(*nofptrs, nofnofimps, noflinks, noftypdesc*)
+		z := vadr-FixVars; Files.WriteBytes(out, z, 4);	(*varsize*)
+		WR(cadr+FixConst); Files.WriteBytes(out, pc, 4); (*constsize, codesize*)
+		Files.WriteBytes(out, modkey, 4); i := 0;
+		REPEAT c := modname[i]; Files.Write(out, c); INC(i) UNTIL c = 0X;
+		Files.Write(out, 81X); Files.WriteBytes(out, Ans.entry, Ans.entno*4); (* EntryBlock *)
+		Files.Write(out, 82X); Files.Write(out, 83X); Files.Write(out, 84X); Files.Write(out, 85X);
+		Files.Write(out, 86X); Files.Write(out, 0X); Files.Write(out, 0FFX);
+		i := SHORT(lastFix); Files.WriteBytes(out, i, 2); (* Link *)
+		Files.Write(out, 87X); (* Fixup *)
+		Files.Write(out, 88X);
+		i := 0; WHILE i < FixConst DO Files.Write(out, 0X); INC(i) END;
+		Files.WriteBytes(out, const, cadr); Files.WriteBytes(out, code, pc);
+		Files.Write(out, 89X); z := Files.Pos(out); Files.Write(out, 8AX); Files.Write(out, ObjCode);
+		Files.WriteBytes(out, SHORT(pc), 2); Files.Write(out, "$"); Files.Write(out, 0X);
+		Files.Set(out, F, 1); Files.WriteBytes(out, z, 4); (* RefPos richtig setzen *)
+		Files.Register(F)
+	END OutCode;
+
+	PROCEDURE AssembleUnit (VAR name: ARRAY OF CHAR; source: Texts.Text);
+		VAR ch: CHAR; done: BOOLEAN;
+				i: INTEGER;
+				label: Ans.Object;
+				F: Files.File;
+				out: Files.Rider;
+	BEGIN
+		IF source.len # 0 THEN
+			needFix := FALSE; cinx := FixUp; lastFix := 0;
+			carr[0].val := 0; carr[1].val := 0; (* die ersten beiden Eintraege der Fixup-Tabelle immer 0! *)
+			pc := 0; cadr := 0; vadr := 0; modname[0] := 0X;
+			Texts.WriteString(W, "  assembling ");
+			Ans.Open(source); done := TRUE;
+			LOOP pc0 := pc; Ans.GetLabel(pc, label, FixDisp, done);
+				IF ~done THEN EXIT END ;
+				instruction(label); Ans.EndLine
+			END ;
+			i := 0;
+			IF modname[0] >= "A" THEN
+				WHILE modname[i] # 0X DO name[i] := modname[i]; INC(i) END
+			ELSE
+				REPEAT INC(i) UNTIL (name[i] = ".") OR (name[i] = 0X)
+			END ;
+			name[i] := "."; name[i+4] := 0X; Ans.CheckLabels; (* pruefe, ob undefinierte Labels *)
+			IF ~Ans.errs THEN
+				IF modname[0] >= "A" THEN
+					name[i+1] := "O"; name[i+2] := "b"; name[i+3] := "j";
+					OutCode(name);
+					Texts.WriteString(W, " CODE: "); Texts.WriteInt(W, pc, 1);
+					Texts.WriteString(W, " CONST: "); Texts.WriteInt(W, cadr, 1);
+					Texts.WriteString(W, " DATA: "); Texts.WriteInt(W, vadr, 1);
+				ELSE (*output rel-file*)
+					name[i+1] := "R"; name[i+2] := "e";
+					name[i+3] := "l"; name[i+4] := 0X;
+					Texts.Write(W, " "); Texts.WriteInt(W, pc, 1);
+					F := Files.New(name); Files.Set(out, F, 0);
+					Files.WriteBytes(out, code, pc); Files.Register(F)
+				END
+			END;
+			Ans.Close
+		ELSE  Texts.WriteString(W, " not found")
+		END ;
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END AssembleUnit;
+
+	PROCEDURE Assemble*;
+		VAR par: Oberon.ParList;
+			source: Texts.Text;
+			S: Texts.Scanner; ch: CHAR;
+			V: Viewers.Viewer;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "*") THEN
+			V := Oberon.MarkedViewer();
+			IF (V.dsc # NIL) & (V.dsc.next IS TextFrames.Frame) THEN
+				Texts.OpenScanner(S, V.dsc(TextFrames.Frame).text, 0); Texts.Scan(S);
+				IF S.class = Texts.Name THEN
+					AssembleUnit(S.s, V.dsc.next(TextFrames.Frame).text)
+				END
+			END
+		ELSE NEW(source);
+			WHILE S.class = Texts.Name DO
+				Texts.WriteString(W, S.s); Texts.Open(source, S.s);
+				AssembleUnit(S.s, source); Texts.Scan(S)
+			END
+		END
+	END Assemble;
+
+BEGIN Texts.OpenWriter(W);
+	Texts.WriteString(W, "Assembler   HP 23.1.92"); Texts.WriteLn(W);
+	Texts.Append(Oberon.Log, W.buf)
+END Assembler.

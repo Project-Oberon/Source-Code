@@ -1,0 +1,301 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Clocks; (* Fri, 23-Apr-1993*)
+
+IMPORT
+	Display, Display3, Printer3, Effects, Texts, Objects, Gadgets, Oberon, Attributes, Fonts, Dates, Math, Files;
+
+CONST 
+	ModName = "Clocks"; digital = 0; calendar = 1; new = 2;
+
+TYPE
+	Clock* = POINTER TO ClockDesc;
+	ClockDesc* = RECORD (Gadgets.FrameDesc)
+		time, timeDiff: Dates.DateTime;
+		state0: SET;
+		col: INTEGER;
+	END;
+	
+VAR 
+	syn8, syn8i, syn12m : ARRAY 2 OF Fonts.Font;
+	W : Texts.Writer;
+
+PROCEDURE ClockAttr(F: Clock; VAR M: Objects.AttrMsg);
+VAR x: LONGINT;
+BEGIN
+	IF M.id = Objects.get THEN
+		IF M.name = "Color" THEN M.class := Objects.Int; M.i := F.col; M.res := 0 
+		ELSIF M.name = "TimeDiff" THEN M.class := Objects.Int; M.i := F.timeDiff DIV  Dates.hour; M.res :=  0;
+		ELSE Gadgets.framehandle(F, M)
+		END;
+	ELSIF M.id = Objects.set THEN
+		IF M.name = "Color" THEN
+			IF M.class = Objects.Int THEN F.col := SHORT(M.i); M.res := 0 ; END;
+		ELSIF M.name = "TimeDiff" THEN F.timeDiff := M.i * Dates.hour; M.res := 0 ;
+		ELSE Gadgets.framehandle(F, M);
+		END;
+	ELSIF M.id = Objects.enum THEN
+		M.Enum("Color"); M.Enum("TimeDiff"); Gadgets.framehandle(F, M);
+	END;
+END ClockAttr;
+
+PROCEDURE Line2(M: Display3.Mask; ang: INTEGER; x0, y0, r1, r2, color: INTEGER);
+	VAR x1, y1, x2, y2: INTEGER; s,c,a : REAL;  
+BEGIN
+	ang := (15-ang) MOD 60;
+	a := 2 * Math.pi / 60 * ang; 
+	s := Math.sin(a); c := Math.cos(a);
+	x1 := SHORT(ENTIER(r1*c + 0.5));
+	y1 := SHORT(ENTIER(r1*s + 0.5));
+	x2 := SHORT(ENTIER(r2*c + 0.5));
+	y2 := SHORT(ENTIER(r2*s + 0.5));
+	Display3.Line(M,color,Display.solid,x0+x1, y0+y1, x0+x2, y0+y2,  1, Display.replace)
+END Line2;
+		
+PROCEDURE RestoreClock(F: Clock; M: Display3.Mask; x, y, w, h: INTEGER; alarm : BOOLEAN);
+	VAR rh, rm, rs, i ,x0, y0, r, hour,min,sec, year,month,day,dow,col,mode: INTEGER; s : ARRAY 32 OF CHAR;
+
+BEGIN
+	Oberon.RemoveMarks(x,y,w,h);
+	IF (calendar IN F.state0)  THEN
+		IF ~ alarm THEN  
+			dow := Dates.DayOfWeek(F.time + F.timeDiff);
+			IF dow = 6 THEN col := Display3.red ELSE col := Display3.textC END;
+			Dates.YearMonthDay(F.time+ F.timeDiff,year,month,day);
+			Dates.MonthToString(month,s); s[3] := 0X;
+			Display3.CenterString(M, col, x , y ,F.W,10, Fonts.This("Oberon8i.Scn.Fnt"),s,Display3.textmode);
+			Dates.IntToString(day,s);
+			Display3.CenterString(M, col, x, y + 7,F.W,20, Fonts.This("Oberon12b.Scn.Fnt"),s,Display3.textmode);
+			Dates.DayToString(dow,s);   
+			Display3.CenterString(M, col, x , y + 22,F.W,10, Fonts.This("Oberon8.Scn.Fnt"),s,Display3.textmode)
+		END
+	ELSIF digital IN F.state0 THEN
+		IF alarm THEN 
+			IF ODD(F.time) THEN col := Display3.red ELSE col := Display3.downC END;  
+			Display3.Circle(M,col,Display.solid,x+3, y+7, 3, 1, {Display3.filled}, Display3.textmode)
+		ELSE
+			Dates.TimeToString(F.time+ F.timeDiff, s);
+			i := 0; WHILE s[i] # 0X DO INC(i) END;
+			s[i-3] := 0X;
+			Display3.ReplConst(M,Display3.downC, x, y+3, w, h, Display.replace);
+			Display3.String(M, Display3.downC, x + 8, y + 3, Fonts.This("Oberon12b.Scn.Fnt"),s,Display3.invert);
+		END
+	ELSE
+		IF F.W < F.H THEN r := F.W DIV 2 -1 ELSE r := F.H DIV 2 -1 END;
+		x0 := x + w DIV 2; y0 := y + h DIV 2;
+		IF alarm THEN 
+			Dates.HourMinuteSecond((F.time + F.timeDiff) MOD Dates.day,hour,min,sec);
+			IF ODD(F.time) THEN col := Display3.red ELSE col := Display3.textbackC END; 
+			Display3.Circle(M,col,Display.solid,x0 - r  DIV 2, y0, 3, 1, {Display3.filled}, Display.replace)
+		ELSE
+			Dates.HourMinuteSecond((F.time + F.timeDiff) MOD Dates.day,hour,min,sec);
+			IF r >= 12 THEN
+				rh := 7*r DIV 11; rm := 9*r DIV 11; rs := 10*r DIV 11; i := 0;
+				Display3.Circle(M,Display3.textbackC,Display.solid,x0, y0, r, 1, {Display3.filled}, Display.replace);
+				WHILE i < 60 DO Line2(M, i, x0, y0, rm, r, F.col); INC(i, 5) END;
+				Line2(M, min, x0, y0, 0, rm, F.col);
+				Line2(M, SHORT((F.time + F.timeDiff)MOD (Dates.day DIV 2) DIV 720) , x0, y0, 0, rh, F.col);
+				Display3.Circle(M,F.col,Display.solid,x0, y0, r, 1, {}, Display.replace);
+			END;
+		END;
+		IF (hour = 12) & (min = 0) THEN s := "hn" 
+		ELSIF (hour = 0) & (min = 0) THEN s := "gh"
+		ELSIF hour < 12 THEN s := "am" ELSE s := "pm" END;
+		Display3.String(M, Display3.textC, x0 -r  DIV 2-4, y0-2 , Fonts.This("Oberon8.Scn.Fnt"), s, Display3.textmode)
+	END;
+	IF Gadgets.selected IN F.state THEN Display3.FillPattern(M, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint) END;
+END RestoreClock;
+
+PROCEDURE CopyClock*(VAR M: Objects.CopyMsg; from, to: Clock);
+BEGIN Gadgets.CopyFrame(M, from, to); to.time := from.time; to.state0 := from.state0; to.timeDiff := from.timeDiff;
+	to.col := from.col
+END CopyClock;
+
+PROCEDURE ClockHandler*(F: Objects.Object; VAR M: Objects.ObjMsg);
+VAR x, y, w, h, u, v: INTEGER; F0: Clock; R: Display3.Mask;
+BEGIN
+	WITH F: Clock DO
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO 
+				IF (M.name = "Gen") & (M.id = Objects.get) THEN
+					IF digital IN F.state0 THEN M.s := "Clocks.NewDigiClock"
+					ELSIF calendar IN F.state0 THEN M.s := "Clocks.NewCalendar"
+					ELSE M.s := "Clocks.NewClock"
+					END;
+					M.res := 0; M.class := Objects.String
+				ELSE
+					ClockAttr(F, M) 
+				END
+			END
+		ELSIF M IS Objects.FileMsg THEN
+			WITH M: Objects.FileMsg DO
+				IF M.id = Objects.store THEN
+					Files.WriteInt(M.R, 1);
+					Files.WriteSet(M.R,F.state0);
+					Files.WriteNum(M.R,F.timeDiff);
+					Files.WriteInt(M.R, F.col);
+					Gadgets.framehandle(F, M);
+				ELSIF M.id = Objects.load THEN
+					Files.ReadInt(M.R, x);
+					IF x # 1 THEN
+						Files.Set(M.R, Files.Base(M.R), Files.Pos(M.R) - 1);
+						Files.ReadSet(M.R,F.state0);
+						IF new IN F.state0 THEN Files.ReadNum(M.R,F.timeDiff) END;
+						INCL(F.state0,new);
+						Gadgets.framehandle(F, M)
+					ELSE
+						Files.ReadSet(M.R,F.state0);
+						IF new IN F.state0 THEN Files.ReadNum(M.R,F.timeDiff) END;
+						INCL(F.state0,new);
+						Files.ReadInt(M.R, F.col);
+						Gadgets.framehandle(F, M)
+					END
+				END
+			END;
+		ELSIF M IS Objects.CopyMsg THEN
+			WITH M: Objects.CopyMsg DO
+				IF M.stamp = F.stamp THEN
+					M.obj := F.dlink
+				ELSE
+					NEW(F0); F.stamp := M.stamp; F.dlink := F0; CopyClock(M, F, F0); M.obj := F0
+				END
+			END
+		ELSIF M IS Display.FrameMsg THEN
+			WITH M: Display.FrameMsg DO
+				x := M.x + F.X; y := M.y + F.Y; w := F.W; h := F.H; (* calculate display coordinates of this instance *)
+				u := M.x; v := M.y; (* store volatile info *)
+				IF M IS Display.DisplayMsg THEN
+					WITH M: Display.DisplayMsg  DO
+						IF (M.F  = NIL) OR ((M.id = Display.frame) & (M.F = F)) THEN
+							Gadgets.MakeMask(F, x, y, M.dlink, R);
+							RestoreClock(F, R, x, y, w, h, FALSE);
+						ELSIF (M.id = Display.area) & (M.F = F) THEN
+							Gadgets.MakeMask(F, x, y, M.dlink, R);
+							Display3.AdjustMask(R, x + M.u, y + h - 1 + M.v, M.w, M.h);
+							RestoreClock(F, R, x, y, w, h, FALSE);
+						END;
+					END;
+				ELSIF M IS Dates.TickMsg THEN
+					WITH M :  Dates.TickMsg DO
+						Gadgets.MakeMask(F, x, y, M.dlink, R);
+						F.time := M.now;
+						RestoreClock(F, R, x, y, w, h, M.id = Dates.alarm);
+					END
+				ELSIF M IS Display.ControlMsg THEN
+					WITH M :  Display.ControlMsg DO
+						IF M.id = Display.restore THEN
+							F.time := Dates.Now() + Dates.Today();
+						END
+					END;
+					Gadgets.framehandle(F, M);
+				ELSIF M IS Oberon.ControlMsg THEN
+					WITH M: Oberon.ControlMsg DO
+						Gadgets.framehandle(F, M);
+					END;
+				ELSIF M IS Display.SelectMsg THEN
+					WITH M: Display.SelectMsg DO
+						Gadgets.framehandle(F, M);
+					END;
+				ELSIF M IS Display.ConsumeMsg THEN
+					WITH M: Display.ConsumeMsg DO
+						Gadgets.framehandle(F, M);
+					END;
+				ELSIF M IS Oberon.InputMsg THEN
+					WITH M: Oberon.InputMsg DO
+						Gadgets.framehandle(F, M);
+						(*
+						IF (M.id = Oberon.track) & Gadgets.InActiveArea(F, M) THEN
+							Oberon.DrawCursor(Oberon.Mouse, Effects.PointHand, M.X, M.Y); M.res := 0;
+						ELSE
+							Gadgets.framehandle(F, M);
+						END;
+						*)
+					END;
+				ELSIF M IS Display.ModifyMsg THEN
+					WITH M: Display.ModifyMsg DO
+						Gadgets.framehandle(F, M);
+					END;
+				ELSE
+					Gadgets.framehandle(F, M);	
+				END;
+				M.x := u; M.y := v; (* restore volatile info *)
+			END;
+		ELSE
+			Gadgets.framehandle(F, M);
+		END;
+	END;
+END ClockHandler;
+
+PROCEDURE InsertDate*;
+	VAR date : Dates.DateTime; year,month,day : INTEGER; s : ARRAY 32 OF CHAR;  
+			M : Oberon.ConsumeMsg;
+BEGIN
+	date := Dates.Today() + Dates.Now();
+	IF Gadgets.executorObj IS Clock THEN date := date + Gadgets.executorObj(Clock).timeDiff END;
+	Dates.YearMonthDay(date, year,month,day);
+	Dates.DayToString(Dates.DayOfWeek(date),s); s[3] :=0X; Texts.WriteString(W,s); Texts.WriteString(W,", ");
+	Texts.WriteInt(W,day,0); Texts.Write(W,"-"); 
+	Dates.MonthToString(month,s); s[3] := 0X; Texts.WriteString(W,s); Texts.Write(W,"-"); Texts.WriteInt(W,year,0);
+	NEW(M.text); Texts.Open(M.text,"");Texts.Append(M.text,W.buf);
+	M.id :=Oberon.integrate; M.beg := 0; M.end := M.text.len; M.F := NIL; Display.Broadcast(M);
+END InsertDate;
+
+PROCEDURE InsertTime*;
+	VAR time : Dates.DateTime; s : ARRAY 32 OF CHAR;  
+			M : Oberon.ConsumeMsg;
+BEGIN
+	time := Dates.Now(); 
+	IF Gadgets.executorObj IS Clock THEN time := time + Gadgets.executorObj(Clock).timeDiff END;
+	Dates.TimeToString(time,s); Texts.WriteString(W,s);
+	NEW(M.text); Texts.Open(M.text,"");Texts.Append(M.text,W.buf);
+	M.id :=Oberon.integrate; M.beg := 0; M.end := M.text.len; M.F := NIL; Display.Broadcast(M);
+END InsertTime;
+
+PROCEDURE NewClock*;
+VAR F: Clock;
+BEGIN NEW(F); F.W := 40; F.H := 40; F.col := 1; F.handle := ClockHandler; 
+	F.state := {Gadgets.transparent};
+	F.state0 := {new};
+	Objects.NewObj := F; F.col := Display3.FG;
+	F.time := Dates.Now() + Dates.Today();
+END NewClock;
+
+PROCEDURE NewDigiClock*;
+VAR F: Clock;
+BEGIN NEW(F); F.W := 40; F.H := 20; F.col := 1; F.handle := ClockHandler; 
+	F.state := {Gadgets.transparent};
+	F.state0 := {digital,new};
+	Objects.NewObj := F; F.col := Display3.FG;
+	F.time := Dates.Now();
+END NewDigiClock;
+
+PROCEDURE NewCalendar*;
+VAR F: Clock;
+BEGIN NEW(F); F.W := 34; F.H := 34; F.col := 1; F.handle := ClockHandler; 
+	F.state := {Gadgets.transparent};
+	F.state0 := {calendar,new};
+	Objects.NewObj := F; F.col := Display3.FG;
+	F.time := Dates.Now()+ Dates.Today();
+END NewCalendar;
+
+BEGIN
+	syn8[0] := Fonts.This("Oberon8.Scn.Fnt");syn8[1] := Fonts.This("Oberon8.Md3.Fnt");
+	syn8i[0] := Fonts.This("Oberon8i.Scn.Fnt");syn8i[1] := Fonts.This("Oberon8i.Md3.Fnt");
+	syn12m[0] := Fonts.This("Oberon12b.Scn.Fnt");syn12m[1] := Fonts.This("Oberon12b.Md3.Fnt");
+	Texts.OpenWriter(W);
+END Clocks.
+
+System.Free Clocks ~
+Gadgets.Insert Clocks.NewCalendar ~ Gadgets.Insert Clocks.NewDigiClock ~  ~
+Gadgets.Insert Clocks.NewClock ~

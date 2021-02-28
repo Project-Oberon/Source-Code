@@ -1,0 +1,350 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE HTML; (* jm 26.8.94 *)
+
+IMPORT
+	Files, Objects, Texts, Oberon, Display, Gadgets, TextFrames, MenuViewers, Viewers, Fonts, Out;
+
+CONST
+(** possible values of the variable typ denoting the paragraph type *)
+	para* = 0;			(** Normal paragraph in Oberon12.Scn.Fnt or italic *)
+								(** Paragraphs are delimited by one or more empty lines *)
+	title* = 1;			 (** Title when first character is red *)
+	heading* = 2;	  (** Heading when in Oberon12b.Scn.Fnt *)
+	bullet* = 3;		  (** Bullet when "*" is first character on a line *)
+	line* = 4;			 (** Horizontal ruler when "-" is first character on a line *)
+	pre* = 5;			 (** pre-formatted when in Oberon10.Scn.Fnt *)
+
+	StandardMenu = "System.Close System.Copy System.Grow ET.Search ET.StoreAscii";
+
+	tab = 09X;
+
+VAR
+	out: Files.Rider;
+	italfont: Objects.Library;
+	sep: CHAR;
+
+PROCEDURE S(s: ARRAY OF CHAR);
+VAR i: INTEGER;
+BEGIN
+	i := 0;
+	WHILE s[i] # 0X DO Files.Write(out, s[i]); INC(i) END
+END S;
+
+PROCEDURE C(ch: CHAR); BEGIN Files.Write(out, ch) END C;
+
+PROCEDURE L; BEGIN Files.Write(out, sep); END L;
+
+(* Delimit a paragraph: begins at lastnl and ends at end *)
+PROCEDURE GetPara(VAR R: Texts.Reader; VAR beg, end: LONGINT; VAR typ: SHORTINT);
+VAR ch, firstch: CHAR; firstfnt: Objects.Library; firstcol: INTEGER; lastnl: LONGINT;
+BEGIN
+	beg := Texts.Pos(R); end := beg; lastnl := beg;
+	
+	(* skip empty lines *)
+	Texts.Read(R, ch);
+	WHILE ~R.eot & (ch <= " ") DO
+		INC(beg);
+		IF ch = 0DX THEN lastnl := beg END;
+		Texts.Read(R, ch)
+	END;
+	
+	IF ~R.eot THEN
+		firstch := ch; firstfnt := R.lib; firstcol := R.col;
+		LOOP
+			WHILE ~R.eot & (ch # 0DX) DO Texts.Read(R, ch) END; (* read till first nl *)
+			IF R.eot THEN EXIT END;
+			IF ch = 0DX THEN
+				end := Texts.Pos(R)-1;
+				Texts.Read(R, ch);
+				WHILE ~R.eot & (ch = " ") OR (ch = tab) DO Texts.Read(R, ch) END;
+				IF ch = 0DX THEN EXIT END;
+			END
+		END;
+		IF firstcol = 1 THEN (* red *) typ := title
+		ELSIF firstfnt.name = "Oberon12b.Scn.Fnt" THEN typ := heading
+		ELSIF firstfnt.name = "Oberon10.Scn.Fnt" THEN typ := pre; beg := lastnl;
+		ELSIF firstch = "*" THEN typ := bullet
+		ELSIF firstch = "-" THEN typ := line
+		ELSE typ := para
+		END
+	END
+END GetPara;
+
+PROCEDURE WriteStretch(T: Texts.Text; beg, end: LONGINT);
+VAR R: Texts.Reader; ch: CHAR; lastlib: Objects.Library;
+BEGIN
+	IF end > beg THEN 
+		Texts.OpenReader(R, T, beg);
+		Texts.Read(R, ch); lastlib := R.lib;
+		WHILE beg < end DO
+			IF R.lib # lastlib THEN
+				IF R.lib = italfont THEN S("<I>") ELSE S("</I>") END;
+				lastlib := R.lib
+			END;
+			IF ch = "…" THEN S("&uuml;")
+			ELSIF ch = "‚" THEN S("&Uuml;")
+			ELSIF ch = "ƒ" THEN S("&auml;")
+			ELSIF ch = "€" THEN S("&Auml;")
+			ELSIF ch = "„" THEN S("&ouml;")
+			ELSIF ch = "" THEN S("&Ouml;")
+			ELSIF ch = "" THEN S("&eacute;")
+			ELSIF ch = "Œ" THEN S("&egrave;")
+			ELSIF ch = 0DX THEN C(" "); C(sep)
+			ELSIF (ch >= " ") OR (ch = tab) OR (ch = "-") THEN
+				C(ch)
+			END;
+			Texts.Read(R, ch);
+			INC(beg)
+		END
+	END
+END WriteStretch;
+
+PROCEDURE WritePara(T: Texts.Text; beg, end: LONGINT; typ: SHORTINT);
+VAR R: Texts.Reader; ch: CHAR; col: INTEGER;
+	pos, lstart: LONGINT; anchor: ARRAY 512 OF CHAR; apos: INTEGER;
+BEGIN col := -1; pos := beg; anchor := "";
+	Texts.OpenReader(R, T, beg);
+	Texts.Read(R, ch); 
+	WHILE pos < end DO
+		IF (R.col = 3) & (col # 3) THEN (* start link *)
+			WriteStretch(T, beg, pos); beg := pos
+		END;
+		col := R.col;
+		 
+		IF ch = "{" THEN (* reading an anchor *)
+			lstart := pos;
+			INC(pos); Texts.Read(R, ch);
+			apos := 0;
+			WHILE ~R.eot & (apos < LEN(anchor)) & (ch # "}") DO
+				anchor[apos] := ch; INC(apos);
+				INC(pos);
+				Texts.Read(R, ch)
+			END;
+			anchor[apos] := 0X;
+			S("<A HREF="); C(22X); S(anchor); C(22X); C(">");
+			WriteStretch(T, beg, lstart); beg := pos+1;
+			S("</A>")
+		ELSE INC(pos); Texts.Read(R, ch)
+		END
+	END;
+	WriteStretch(T, beg, end)
+END WritePara;
+
+PROCEDURE GetPrefix(T: Texts.Text; VAR beg, end: LONGINT; VAR s: ARRAY OF CHAR);
+VAR R: Texts.Reader; old: LONGINT; ch: CHAR; i: INTEGER;
+BEGIN
+	old := beg; i := 0;
+	Texts.OpenReader(R, T, beg);
+	Texts.Read(R, ch);
+	WHILE ~R.eot & (ch # ":") & (beg < end) DO
+		IF (ch > " ") & (i < LEN(s) - 1) THEN s[i] := ch; INC(i) END;
+		INC(beg);
+		Texts.Read(R, ch)
+	END;
+	IF ch = ":" THEN s[i] := 0X; INC(beg)
+					 ELSE s[0] := 0X; beg := old
+	END
+END GetPrefix;
+
+PROCEDURE ConvertText(T: Texts.Text; start: LONGINT; VAR filename: ARRAY OF CHAR);
+VAR R: Texts.Reader; beg, end, nbeg, nend: LONGINT; typ, ntyp: SHORTINT;
+BEGIN
+	Texts.OpenReader(R, T, start);
+	GetPara(R, beg, end, typ);
+	S("<HTML>"); L;
+	S("<HEAD>"); L;
+	S("<TITLE>");
+	IF typ = title THEN
+		GetPrefix(T, beg, end, filename); (* Skip that file name, discarding it *)
+		WritePara(T, beg, end, typ)
+	ELSE
+		S("Untitled")
+	END;
+	S("</TITLE>"); L;
+	S("</HEAD>"); L;
+	S("<BODY>"); L;
+	WHILE ~R.eot DO
+		GetPara(R, nbeg, nend, ntyp);
+		IF typ = bullet THEN S("<LI>"); INC(beg) END;
+		IF typ = heading THEN S("<H2>") END;
+		IF typ = line THEN S("<HR>")					(* Horizontal Ruler *)
+		ELSIF typ # title THEN WritePara(T, beg, end, typ); (* write previous *)
+			IF typ = pre THEN C(0DX) END
+		END;
+		IF typ = heading THEN S("</H2>") END;
+		L;
+		
+		(* List *)
+		IF (ntyp = bullet) & (typ # bullet) THEN (* open list *)
+			S("<UL>")
+		ELSIF (ntyp # bullet) & (typ = bullet) THEN (* close list *)
+			S("</UL>"); L
+		END;
+		
+		(* Pre-formatted text *)
+		IF (ntyp = pre) & (typ # pre) THEN (* start pre-formatted text *)
+			S("<PRE>")
+		ELSIF (ntyp # pre) & (typ = pre) THEN
+			S("</PRE>"); L
+		END;
+		
+		(* Separate 2 consecutive "normal" paragraphs with a page break *)
+		IF (ntyp = para) & (typ = para) THEN S("<P>"); L END;
+		
+		end := nend; beg := nbeg; typ := ntyp;
+	END;
+	WritePara(T, beg, end, typ); (* write previous *)
+	IF (typ = bullet) THEN (* close list *)
+		S("</UL>"); L
+	END;
+	IF (typ = pre) THEN
+		S("</PRE>"); L
+	END;
+	S("</BODY>"); L;
+	S("</HTML>"); L
+END ConvertText;
+
+PROCEDURE GetText(VAR par: Display.Frame): Texts.Text;
+VAR u, v: INTEGER; M: Objects.LinkMsg; t: Texts.Text; V: Viewers.Viewer;
+BEGIN
+	t := NIL;
+	IF Oberon.Pointer.on THEN
+		Gadgets.ThisFrame(Oberon.Pointer.X, Oberon.Pointer.Y, par, u, v);
+		IF par # NIL THEN
+			IF par IS TextFrames.Frame THEN
+				WITH par: TextFrames.Frame DO t := par.text END
+			ELSE
+				M.id := Objects.get; M.name := "Model"; M.obj := NIL; M.res := -1; par.handle(par, M);
+				IF (M.obj # NIL) & (M.obj IS Texts.Text) THEN t := M.obj(Texts.Text) END
+			END
+		ELSE
+			V := Oberon.MarkedViewer();
+			IF (V.dsc.next # NIL) & (V.dsc.next IS TextFrames.Frame) THEN
+				par := V.dsc.next;
+				t := V.dsc.next(TextFrames.Frame).text
+			END
+		END
+	END;
+	RETURN t
+END GetText;
+
+(** Show a preview of the HTML text in a text viewer - Processes ONLY one text! *) 
+PROCEDURE Show*;
+VAR S: Texts.Scanner; T, t: Texts.Text; X, Y: INTEGER; par: Oberon.ParList; time, beg, end: LONGINT; V: Viewers.Viewer;
+	filename: ARRAY 64 OF CHAR; parF: Display.Frame; f: Files.File;
+BEGIN
+	sep := 0DX;
+	beg := 0;		(* Process from the beginning of the text. Modified if "@" used *)
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(S); T := NIL;
+	IF (S.class = Texts.Char) & (S.c = "*") THEN
+		T := GetText(parF)
+	ELSIF (S.class = Texts.Char) & (S.c = "^") THEN
+		Oberon.GetSelection(T, beg, end, time);
+		IF time >= 0 THEN
+			Texts.OpenScanner(S, T, beg);
+			Texts.Scan(S);
+			IF (S.class = Texts.Name) THEN
+				NEW(T); Texts.Open(T, S.s);
+				IF T.len = 0 THEN T := NIL END
+			END
+		ELSE T := NIL
+		END
+	ELSIF (S.class = Texts.Char) & (S.c = "@") THEN
+		Oberon.GetSelection(T, beg, end, time);
+		IF time < 0 THEN T := NIL END
+	END;
+	IF T # NIL THEN
+		f := Files.New("HTML.tmp");
+		Files.Set(out, f, 0);
+		ConvertText(T, beg, filename);
+		Files.Register(f);
+		NEW(t); Texts.Open(t, "HTML.tmp");
+		par := Oberon.Par;
+		Oberon.AllocateUserViewer(par.vwr.X, X, Y);
+		V := MenuViewers.New(
+				TextFrames.NewMenu(filename, StandardMenu),
+				TextFrames.NewText(t, 0),
+				TextFrames.menuH,
+				X, Y)
+	END
+END Show;
+
+PROCEDURE Compile*;
+	VAR S: Texts.Scanner; T: Texts.Text; filename: ARRAY 64 OF CHAR; f: Files.File; beg, end, time, len: LONGINT;
+			par: Display.Frame;
+
+	PROCEDURE CompileT();
+		VAR R: Texts.Reader; beg, end: LONGINT; typ: SHORTINT;
+				res, i: INTEGER; bak: ARRAY 64 OF CHAR;
+	BEGIN
+		IF T.len > 0 THEN
+		(* Get the file name from the source text, at the beginning i.e. pos 0 *)
+			Texts.OpenReader(R, T, 0);
+			GetPara(R, beg, end, typ);
+			IF typ = title THEN
+				GetPrefix(T, beg, end, filename)
+			END;
+		(* *)
+			IF filename # "" THEN
+				Out.String(filename);
+			(* Rename the file 'fileName.Bak' *)
+				i := 0;
+				WHILE filename[i] # 0X DO bak[i] := filename[i]; INC(i) END;
+				bak[i] := "."; bak[i+1] := "B"; bak[i+2] := "a"; bak[i+3] := "k"; bak[i+4] := 0X;
+				Files.Rename(filename, bak, res);
+			(* *)
+				f := Files.New(filename);
+				Files.Set(out, f, 0);
+				ConvertText(T, 0, filename);
+				Files.Register(f);
+				Out.Int(Files.Length(f), 10);
+			ELSE Out.String("no destination file name in text")
+			END
+		END;
+		Out.Ln
+	END CompileT;
+	
+BEGIN
+	sep := 0AX;
+	Out.String("HTML.Compile"); Out.Ln;
+	Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+	Texts.Scan(S);
+	IF (S.class = Texts.Char) & (S.c = "*") THEN
+		T := GetText(par);
+		IF T # NIL THEN
+			CompileT()
+		END
+	ELSE
+		end := MAX(LONGINT) - 100;
+		IF (S.class = Texts.Char) & (S.c = "^") THEN
+			Oberon.GetSelection(T, beg, end, time);
+			IF time >= 0 THEN Texts.OpenScanner(S, T, beg); Texts.Scan(S) END
+		END;
+		WHILE (S.class = Texts.Name) & (Texts.Pos(S) < end + S.len + 1) DO
+			Out.String(S.s); Out.String(" => ");
+			NEW(T); Texts.Open(T, S.s);
+			CompileT();
+			Texts.Scan(S)
+		END
+	END
+END Compile;
+
+BEGIN italfont := Fonts.This("Oberon12i.Scn.Fnt");
+END HTML.
+
+HTML.Compile ^	HTML.Compile *
+
+HTML.Show ^		HTML.Show *		HTML.Show @

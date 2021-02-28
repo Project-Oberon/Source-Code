@@ -1,0 +1,760 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaLines;	(* uh, Tue, 7-Dec-1993 *)
+
+	(*--- remarks:
+		- implements the basic line formatting for text boxes [format and update]
+		- the definition for text boxes is also here because the
+			information is used for the line formatting
+	---*)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaBox, LedaIO;
+	
+
+CONST
+	ColInset* = LedaBase.MM DIV 2;	(* inset of column width for each side *)
+	ColWInset* = 2 * ColInset;
+	
+	(*--- private flags for LedaCtr.BoxDsc ---*)	(* 12 <= private flags <= 30 *)
+	PlMask* = 16;	(* controls the creation of masks for a plane [SetFormatter] *)
+	
+	ModeTxt = LedaIO.Paint;
+	NotDef = -1;	FormatInd = 1;	(* used for LedaCtrl.TextBasics *)
+	
+	
+TYPE
+	(*--- box type ---*)
+	Location* = POINTER TO LocationDsc;
+	LocationDsc* = RECORD
+		blk*: LedaCtrl.Block;
+		org*: LONGINT;		(* text position of block blk *) 
+		pos*: LONGINT;		(* absolute text position in block blk *)
+		X*, W*: LONGINT	(* local x_coordinate of block blk and width *)
+	END;
+		
+	Box* = POINTER TO BoxDsc;
+	BoxDsc* = RECORD
+		(LedaBase.BoxDsc)
+		text*: LedaCtrl.Text;
+		lines*: LedaCtrl.Block;	(* list of blocks *)
+		asr*: LONGINT;		(* ascender of first line *)
+		colW*, colDX*: LONGINT;	(* used to draw column marks *)
+		bgClr*: INTEGER;	(* background color *)
+		carLoc*, selLoc*: Location;
+		selLen*: LONGINT
+	END;
+	
+	ColMarkMsg* = RECORD
+		(LedaBase.Msg)
+		pNr*, clr*: INTEGER	(* specifies column marks *)
+	END;
+	
+	(*--- format information ---*)
+	Formatter = RECORD
+		(LedaCtrl.Formatter)
+		(*- arranging lines [format vertical] -*)
+		filler*: BOOLEAN;
+		colX, colW, colDX, lsp: LONGINT;	(* basic settings *)
+		adj: CHAR;
+		cur: LedaBase.FormatDsc;	(* currrent specification *)
+		curX, curW: LONGINT;	(* calculated inset and width [optimization] *)
+		bL, firstBL: LONGINT;	(* baseline, first baseline *)
+		maxLH: LONGINT;	(* maximal height of a line *)
+		boxW, boxH: LONGINT;	(* width and height of box *)
+		eob, newCol: BOOLEAN;		(* end of box *)
+		plane: LedaBox.Plane;	(* image area [reserved] *)
+		(*- general -*)
+		fBeg, fLen, tBeg: LONGINT	(* formatted text; begin of text *)
+	END;
+	
+	(*--- own stuff ---*)
+	Format = RECORD
+		X, W, lsp: LONGINT;
+		adj: CHAR
+	END;	(* used in UpdateText for old format *)
+	
+	Block* = POINTER TO BlockDsc;
+	BlockDsc* = RECORD 
+		(LedaCtrl.BlockDsc)	(* used: Y, W, H, len [other fields undefined] *)
+		X*: LONGINT;	  		(* X: coordinate of lines [box relative, not column relativ] *)
+		cur: Format;				(* current format [old values] *)
+		newFrm: BOOLEAN;	(* newFrm = true -> format variation var is valid *)
+		var: LedaBase.FormatDsc	(* format variation *)
+	END;
+		(*--- remarks:
+			_ specifies x coordinate of the following lines
+			_ specifies format variations
+		---*)
+	
+	UpdDsc = RECORD
+		P: LedaSys.Port;	(* P = NIL -> do not display update *)
+		eX, eY, X, blkX, org, pos: LONGINT;
+		blk: LedaCtrl.Block;	(* first block *)
+		oneLine: BOOLEAN
+	END;
+	
+	DispDsc = RECORD
+		blk, endBlk: LedaCtrl.Block;
+		org, blkX: LONGINT
+	END;
+	
+
+VAR
+	disp: DispDsc;	(* used in DisplayUpdate; set in ColumnUpdate and ClearColumns *)
+	
+	
+(*---
+	PROCEDURE Traverse(blk: LedaCtrl.Block; org: LONGINT);
+	BEGIN
+		REPEAT
+			IF blk IS Block THEN LedaSys.OutT("Line", 0) END;
+			LedaSys.OutT("Block  org = ", 0); LedaSys.OutI(org, 0);
+			LedaSys.OutT("  len = ", 0); LedaSys.OutI(blk.len, 1);
+			INC(org, LONG(blk.len)); blk := blk.next
+		UNTIL blk = NIL
+	END Traverse;
+---*)
+
+	PROCEDURE BGColor*(tB: Box): INTEGER;
+	BEGIN
+		IF tB.bgClr # NotDef THEN RETURN tB.bgClr ELSE RETURN LedaSys.bg END
+	END BGColor; 
+
+(*--- text formatting and text updates ---*)
+
+	(*--- remarks:
+		_ the lines of a textbox are described
+			as a list of blocks [text and line blocks]
+		_ if the list is NIL the line structure is not built yet [delayed loading]
+		_ a circular trailer denotes an invalid text flow [tB.lines = tB.lines.next]
+		_ a normal block specifies a line:  Y, W, H, bH, len, ...
+		_ a line block specifies the x coordinate and
+			the format information for the following blocks;
+			these values remain valid until another line block appears
+	---*)
+	
+	PROCEDURE ValidateTexts*(tB: Box);
+		VAR M: LedaBox.PageMsg;	doc: LedaBase.Box;
+			eX, eY: LONGINT;	P: LedaSys.Port;
+	BEGIN
+		LedaSys.OutT("- exception: invalid text flows", 1);
+		doc := LedaBox.Root(tB);
+		INCL(doc.flags, LedaBox.Structure);	(* disable drawing [updates] *)
+		M.id := LedaBox.PgTexts; M.op := 1;	(* validate text flows *)
+		LedaBox.Broadcast(doc, {}, M);
+		EXCL(doc.flags, LedaBox.Structure);	(* enable drawing [updates] *)
+		LedaBox.GetPort(doc, P); LedaBox.ExtRef(doc, eX, eY);
+		LedaIO.out.update(P, eX, eY, doc.W, doc.H, NIL, NIL);
+		LedaSys.OutT("- text flows validated", 1);
+		LedaSys.OutT("- trap stops action [forced trap]", 1);
+		LedaSys.Halt("forced trap")
+	END ValidateTexts;
+	
+	PROCEDURE AdaptEndFormat(VAR old, new: LedaBase.FormatDsc; VAR newFrm: BOOLEAN);
+	(* adapt the end format old to the new format new *)
+	BEGIN
+		newFrm := (old.lt # new.lt) OR (old.rt # new.rt) OR (old.lsp # new.lsp) OR (old.adj # new.adj);
+		IF  newFrm THEN old := new; old.gap := -1 END
+	END AdaptEndFormat;
+	
+	PROCEDURE SkipPlane(VAR F: Formatter);
+	(* advances base line if it cuts the plane *)
+		CONST Hgt = 2* LedaBase.MM;
+	BEGIN
+		IF F.plane # NIL THEN
+			WHILE (F.bL < F.boxH) & LedaBox.PlaneCuts(F.plane, F.colX+F.curX, F.bL-Hgt, F.curW, Hgt) DO
+				INC(F.bL, F.cur.lsp)
+			END
+		END
+	END SkipPlane;
+
+	PROCEDURE AdjustFormat(VAR F: Formatter; VAR fD: LedaBase.FormatDsc);
+	(* adjusts the formatting values according format variation fD *)
+		VAR calcW: BOOLEAN;
+	BEGIN
+		calcW := FALSE;
+		IF fD.lt # -1 THEN calcW := TRUE;
+			IF ODD(fD.lt) THEN INC(F.cur.lt, fD.lt - 1) ELSE F.cur.lt := fD.lt END;
+			IF F.cur.lt < 0 THEN F.cur.lt := 0 ELSIF 3 * F.cur.lt > 2 * F.colW THEN F.cur.lt := 2 * F.colW DIV 3 END
+		END; 
+		IF fD.rt # -1 THEN calcW := TRUE;
+			IF ODD(fD.rt) THEN INC(F.cur.rt, fD.rt - 1) ELSE F.cur.rt := fD.rt END;
+			IF F.cur.rt < 0 THEN F.cur.rt := 0 ELSIF 3 * F.cur.rt > 2 * F.colW THEN F.cur.rt := 2 * F.colW DIV 3 END
+		END;
+		IF calcW THEN
+			F.curX := F.cur.lt + ColInset; F.curW := F.colW - F.cur.lt;
+			IF F.curW < 2 * F.cur.rt THEN F.cur.rt := F.curW DIV 2 END;
+			DEC(F.curW, F.cur.rt + ColWInset) 
+		END;
+		F.cur.gap := fD.gap;	(* is only valid once *)
+		IF fD.lsp  >= 0 THEN
+			IF fD.lsp > LedaBase.MM THEN F.cur.lsp := fD.lsp
+			ELSE F.cur.lsp := F.lsp;
+				IF fD.lsp = 1 THEN INC(F.cur.lsp, 2*LedaSys.scnUnit)	(* extended line spacing *)
+				ELSIF fD.lsp = 2 THEN DEC(F.cur.lsp, 2*LedaSys.scnUnit)	(* reduced line spacing *)
+				END
+			END
+		END;
+		IF fD.adj # 0X THEN
+			IF fD.adj = "d" THEN F.cur.adj := F.adj ELSE F.cur.adj := fD.adj END
+		END
+	END AdjustFormat;
+	
+	PROCEDURE SetFormat(VAR F: Formatter; VAR bd: LedaBase.BaseData);
+	(* sets the basic formatting values according format base data bd *)
+		VAR cols: INTEGER;
+	BEGIN	(* F.boxW, F.boxH set *)
+		F.colX := 0; F.colDX := bd.colDX;
+		IF bd.cols = "m" THEN
+			F.colW := F.boxW; F.cur.lt := bd.colDX;
+			F.curX := bd.colDX; F.curW := F.colW - bd.colDX
+		ELSE
+			cols := ORD(bd.cols) - ORD("0");
+			F.colW := (F.boxW - (cols-1) * F.colDX) DIV cols;
+			F.curX := 0; F.curW := F.colW; F.cur.lt := 0
+		END;
+		F.lsp := bd.lsp; F.adj := bd.adj;
+		INC(F.curX, ColInset); DEC(F.curW, ColWInset);
+		F.cur.rt := 0; F.cur.lsp := F.lsp; F.cur.adj := F.adj; F.cur.gap := -1
+	END SetFormat;
+
+	PROCEDURE SetFormatter(VAR F: Formatter; text: LedaCtrl.Text; tB: Box);
+	(** sets the basic formatting information [standard and current values of F] *)
+	(** according tB.W, tB.text and the position pos *)
+		VAR ctrl: LedaBase.Control;
+	BEGIN
+		F.boxW := tB.W; F.boxH := tB.H; F.filler := FALSE;
+		LedaCtrl.TextBasics(text, LedaCtrl.GetId, FormatInd, ctrl);
+		SetFormat(F, ctrl(LedaBase.FormBase).data);	(* set basic settings of F *)
+		tB.colW := F.colW; tB.colDX := F.colDX;	(* save values [drawing] *)
+		IF text.prev # NIL THEN
+			AdjustFormat(F, text.prev.frm); F.cur.gap := -1
+		END;
+		LedaBox.PlaneGet(F.plane, tB, PlMask IN tB.flags);	(* PlMask IN tB.flags -> creates a mask for the plane *)
+		IF tB.asr > 0 THEN F.firstBL := tB.asr ELSE F.firstBL := F.lsp END;
+		F.bL := F.firstBL; SkipPlane(F);
+		F.maxLH := tB.H - (F.lsp DIV 5);
+		F.eob := FALSE; F.newCol := FALSE; F.newFrm := FALSE;
+		F.fBeg := -1; F.fLen := 0; F.tBeg := text.beg
+	END SetFormatter;
+	
+	PROCEDURE InitFiller(blk: LedaCtrl.Block);
+	BEGIN
+		blk.len := 0; blk.W := 0; blk.H := 0; blk.bH := 0; blk.w := 0; blk.gaps := 0;
+		blk.sepKind := LedaCtrl.NoSep; blk.mode := "f"	(* filler *)
+	END InitFiller;
+	
+	PROCEDURE AdjustBL(VAR F: Formatter; H, bH: LONGINT; VAR bL: LONGINT);
+	(* adjusts the base line of the formatter F to the big block height given in H, bH *)
+	(* bH is the descender part and is always negative [part below base line] *)
+	(* returned value bL gives the base line valid for big block *)
+		VAR dY, dH, asr, dsr: LONGINT;
+	BEGIN
+		asr := H + bH - 9 * F.cur.lsp DIV 10;
+		asr := ((asr + F.cur.lsp - 1) DIV F.cur.lsp) * F.cur.lsp;	(* additional ascender lines *)
+		dsr := - bH - 4 * F.cur.lsp DIV 10;
+		dsr := ((dsr + F.cur.lsp - 1) DIV F.cur.lsp) * F.cur.lsp;	(* additional descender lines *)
+		bL := F.bL; dY := 0; dH := asr + dsr;	(* dH: total additional lines *)
+		LOOP
+			IF F.bL + dY + dH >= F.boxH THEN
+				F.filler := TRUE; EXIT	(* no room for big line *)	(*###*)
+			ELSIF F.plane = NIL THEN
+				INC(bL, dY+asr); INC(F.bL, dY+dH); F.filler := FALSE; EXIT		(*###*)
+			ELSIF ~ LedaBox.PlaneCuts(F.plane, F.colX+F.curX, F.bL+dY, F.curW, dH) THEN
+				INC(bL, dY+asr); INC(F.bL, dY+dH); F.filler := FALSE; EXIT		(*###*)
+			END;
+			INC(dY, F.cur.lsp)
+		END
+	END AdjustBL;
+
+	PROCEDURE NewLineBlock(VAR F: Formatter; Y: LONGINT): LedaCtrl.Block;
+		VAR blk: Block;
+	BEGIN
+		NEW(blk); blk.next := NIL; blk.len := 0;
+		blk.X := F.colX + F.curX; blk.Y := Y; blk.W := F.curW; blk.H := 0;  
+		blk.cur.X := blk.X; blk.cur.W := F.curW; blk.cur.lsp := F.cur.lsp; blk.cur.adj := F.cur.adj; 
+		IF F.newFrm THEN blk.newFrm := TRUE; blk.var := F.var
+		ELSE blk.newFrm := FALSE; LedaBase.InitFormat(blk.var)
+		END;
+		F.newCol := FALSE; RETURN blk
+	END NewLineBlock;
+	
+	PROCEDURE NextLine(VAR F: Formatter; blk: LedaCtrl.Block; org: LONGINT);
+	(* prepares formatter F for next line; takes care about *)
+	(* column changes, format variations and end-of-box state *)
+		VAR gap, wrap: LONGINT;
+	BEGIN
+		IF F.filler THEN F.bL := F.boxH
+		ELSIF F.newFrm THEN
+			AdjustFormat(F, F.var);
+			IF org # 1 THEN INC(F.bL, F.cur.lsp) ELSIF blk # NIL THEN blk.Y := blk.H END;
+				(* org = 1: first character builds a line and specifies a line format -> lift this line *)
+			gap := F.cur.gap MOD 100H;
+			wrap := (F.cur.gap DIV 100H) MOD 100H;
+			IF gap = 0 THEN		(* no gap *)
+			ELSIF gap = 1 THEN		(* align to grid *)
+				DEC(F.bL, F.firstBL); INC(F.bL, F.lsp-1); F.bL := (F.bL DIV F.lsp) * F.lsp; INC(F.bL, F.firstBL)
+			ELSIF gap < 16 THEN INC(F.bL, F.cur.lsp DIV gap)		(* add fractial part of line space *)
+			ELSE gap := (F.cur.gap DIV 10000H) * 1000; INC(F.bL, gap)
+			END;
+			IF wrap = 0 THEN		(* no wrap *)
+			ELSIF wrap = 1 THEN F.bL := F.boxH	(* end of column *)
+			ELSIF F.bL + wrap * F.cur.lsp >= F.boxH THEN F.bL := F.boxH	(* conditional wrap *)
+			END
+		ELSE INC(F.bL, F.cur.lsp)
+		END;	(* F.bL -> base line for next line *)
+		SkipPlane(F); F.newCol := F.bL >= F.boxH;
+		IF F.newCol THEN	(* change column *)
+			INC(F.colX, F.colW + F.colDX); F.bL := F.firstBL; SkipPlane(F); F.eob := F.colX >= F.boxW
+		ELSIF F.newFrm & (blk # NIL) THEN blk.next := NewLineBlock(F, blk.Y)
+		END
+	END NextLine;
+
+	PROCEDURE NewTextBlock(VAR F: Formatter; VAR org: LONGINT): LedaCtrl.Block;
+	(* returns new formated text block [line block may be added] *)
+	(* advances base line F.bL and F.colX as needed and sets F.eob [end of box] *)
+		VAR blk, b: LedaCtrl.Block;	bL: LONGINT;
+	BEGIN
+		NEW(blk); blk.next := NIL; F.filler := FALSE;
+		bL := F.bL; LedaCtrl.FormatBlock(F, blk, F.curW, F.maxLH, F.cur.lsp, F.cur.adj);
+		IF F.bigHgt THEN	(* big line *)
+			blk.mode := CAP(blk.mode); AdjustBL(F, blk.H, blk.bH, bL);
+			IF F.filler THEN	(* no room: create filler and reset formatter *)
+				LedaCtrl.SetReader(F, LedaCtrl.ReaderPos(F) - blk.len);
+				F.newFrm := FALSE; F.bigHgt := FALSE; F.len := NotDef; InitFiller(blk)
+			END
+		END;
+		INC(org, LONG(blk.len)); INC(F.fLen, LONG(blk.len));
+		blk.Y := bL - blk.bH;		(* blk.bH is negative; F.bL -> current base line*)
+		b := blk; IF F.eot & (F.len = NotDef) THEN b := NIL END;
+		NextLine(F, b, org);
+		RETURN blk
+	END NewTextBlock;
+	
+	PROCEDURE FormatText*(tB: Box; VAR len: LONGINT; VAR newFrm, mask: BOOLEAN);
+	(** formats the text and builds block structure for box tB *)
+	(** returns in len the text length poured in box tB *)
+	(** mask: in: controls creation of masks for planes / out: reports if mask was created *)
+		VAR F: Formatter;	blk: LedaCtrl.Block;	beg, org: LONGINT;
+	BEGIN
+		IF mask THEN INCL(tB.flags, PlMask) END;	(* enable mask creation *)
+		beg := tB.text.beg; org := beg;
+		SetFormatter(F, tB.text, tB); LedaCtrl.InitFormatter(F, tB.text, beg);
+		tB.lines := NewLineBlock(F, 0); blk := tB.lines;
+		REPEAT
+			IF F.newCol THEN blk.next := NewLineBlock(F, 0); blk := blk.next END;
+			blk.next := NewTextBlock(F, org); blk := blk.next;
+			IF blk.next # NIL THEN blk := blk.next END	(* skip any LineBlock *)
+		UNTIL F.eob OR (F.eot & (F.len = NotDef));
+		len := org - beg;
+		AdaptEndFormat(tB.text.frm, F.cur, newFrm);	(* end format changed ? *)
+		IF mask THEN EXCL(tB.flags, PlMask); mask := F.plane # NIL END;	(* disable mask creation *)
+		LedaBox.PlaneDispose(F.plane)
+	END FormatText;
+	
+	PROCEDURE FormatChange(VAR F: Formatter; VAR O: Format): BOOLEAN;
+	BEGIN
+		RETURN (O.W # F.curW) OR (O.adj # F.cur.adj) OR (O.lsp # F.cur.lsp) OR (O.X # F.colX + F.curX)
+	END FormatChange;
+	
+	PROCEDURE NotFirstLine(pos: LONGINT; blk: LedaCtrl.Block; org: LONGINT): BOOLEAN;
+	BEGIN
+		RETURN (pos > org + blk.len) OR ((pos = org + blk.len) & (blk.next # NIL))
+		(* in first line: (pos < org + blk.len) OR ((pos = org + blk.len) & (blk.next = NIL)) *)
+	END NotFirstLine;
+	
+	PROCEDURE TwoBlkLen(blk: LedaCtrl.Block): LONGINT;
+		VAR len: LONGINT;	filler: BOOLEAN;
+	BEGIN	(* blk is not a LineBlock *)
+		len := blk.len; filler := blk.mode = "f";
+		IF blk.next # NIL THEN
+			blk := blk.next; IF blk IS Block THEN blk := blk.next END;
+			INC(len, LONG(blk.len)); filler := filler OR (blk.mode = "f")
+		END;
+		IF (blk.next = NIL) OR filler THEN len := MAX(LONGINT) END;
+		RETURN len
+	END TwoBlkLen;
+
+	PROCEDURE LocateUpdate(tB: Box; VAR F: Formatter; VAR O: Format; VAR txUpd: LedaCtrl.TextMsg;
+													VAR blk, old: LedaCtrl.Block; VAR org, oldOrg: LONGINT; VAR cancel: BOOLEAN);
+	(* locates the update position given by txUpdate [two lines look ahead] *)
+	(* sets the formatter F and the parameters blk, org, old, oldOrg ready to start the update *)
+	(* out: blk.next, org: points to line with change [if in first line] or to line before line containing change *)
+	(* out: old: points to previous text block: old = blk or old.next = blk or old = NIL [start of new column] *)
+	(* out: oldOrg: original origin of line blk.next; oldOrg # org -> update affectd previous text *)
+		VAR lBlk: Block;	dLen, bL: LONGINT;
+	BEGIN
+		cancel := FALSE; dLen := 0;
+		org := tB.text.beg; blk := tB.lines; O := blk(Block).cur;
+		old := NIL; oldOrg := org;
+		IF txUpd.id >= LedaCtrl.FlowInsId THEN	(* LedaCtrl.FlowInsId or LedaCtrl.FlowDelId *)
+			SetFormatter(F, tB.text, tB);
+			tB.lines := NewLineBlock(F, 0); tB.lines.next := blk.next; blk := tB.lines	(* new first line block *)
+		ELSIF (txUpd.id = LedaCtrl.FlowChkId) OR NotFirstLine(txUpd.beg, blk.next, org) THEN
+			SetFormatter(F, tB.text, tB); old := NIL;	(* new column *)
+			IF FormatChange(F, O) THEN LedaSys.OutT(" - forced text formatting [format change]", 1);
+				LedaCtrl.TextUpdateFlow(LedaCtrl.PourAll, tB.text); cancel := TRUE; RETURN	(*###*)
+			END;
+			WHILE txUpd.beg - org >= TwoBlkLen(blk.next) DO	(* search update; two line look ahead *)
+				F.newFrm := FALSE; blk := blk.next; INC(org, LONG(blk.len)); old := blk;
+				IF blk.mode <= "Z" THEN AdjustBL(F, blk.H, blk.bH, bL) END;	(* big line *)
+				IF blk.next IS Block THEN
+					blk := blk.next; lBlk := blk(Block);
+					F.newFrm := lBlk.newFrm; F.var := lBlk.var; O := lBlk.cur	(* format variation *)
+				END;
+				NextLine(F, NIL, org);
+				IF F.newCol THEN old := NIL; F.newCol := FALSE END
+			END;
+			oldOrg := org	(* same origin of blk.next *)
+		ELSE	(* update in first line *)
+			IF tB.text.prev # NIL THEN LedaCtrl.TextCheckPred(tB.text, dLen, cancel) END;	(* change in previous text ? *)
+			IF ~ cancel THEN
+				SetFormatter(F, tB.text, tB); INC(org, dLen);
+				IF FormatChange(F, O) THEN
+					tB.lines := NewLineBlock(F, 0); tB.lines.next := blk.next; blk := tB.lines	(* new first line block *)
+				END
+			END
+		END
+	END LocateUpdate;
+	
+	PROCEDURE StartUpdate(VAR F: Formatter; VAR O: Format; beg: LONGINT;
+												VAR blk, old: LedaCtrl.Block; VAR org, oldOrg: LONGINT; VAR upd: UpdDsc);
+	(* starts the update by formatting the first line concerned by the update and setting the update area *)
+	(* in: blk.next, org: points to line with change [if in first line] or to line before line containing change *)
+	(*      blk points either to a text or a line block; line block can also start new column *)
+	(* in: old: points to previous text block: old = blk or old.next = blk or old = NIL [start of new column] *)
+	(* in: oldOrg: already set; oldOrg # org -> first line differs because of change in previous text *)
+	(* out: blk: points to first new line; org: origin after first new line *)
+	(* out: old, oldOrg: points to original line containing update *)
+		VAR prev: LedaCtrl.Block;	Y, dX, dY, prevX: LONGINT;	py: INTEGER;
+	BEGIN
+		IF (old = NIL) OR (old = blk) THEN prev := old; prevX := F.colX + F.curX
+		ELSE prev := old; prevX := -1	(* block old is followed by line block -> prevX unknown *)
+		END;
+		upd.X := F.colX+ColInset; dX := F.colW-ColWInset; Y := 0; dY := 0; py := 0;
+		upd.org := org; upd.blkX := F.colX + F.curX;	(* update area *)
+		old := blk.next; blk.next := NewTextBlock(F, org); blk := blk.next;
+		IF (org <= beg) & (old.len = blk.len) & (old.w = blk.w) & (old.next # NIL) THEN	(* blocks old and blk [new] identical *)
+			prev := blk; prevX := upd.blkX; IF blk.next # NIL THEN blk := blk.next END;
+			IF F.newCol THEN
+				blk.next := NewLineBlock(F, 0); blk := blk.next;
+				prev := NIL; prevX := F.colX + F.curX; upd.X := F.colX+ColInset
+			END;
+			(* old.next -> points to line with change or line block before that line *)
+			INC(oldOrg, LONG(old.len)); old := old.next;
+			IF old IS Block THEN O := old(Block).cur; old := old.next END;
+			upd.org := org; upd.blkX := F.colX + F.curX;	(* update area [X, W, blkX, org] *)
+			blk.next := NewTextBlock(F, org); blk := blk.next
+		END;
+		upd.blk := blk; upd.pos := NotDef;
+		IF prev # NIL THEN py := 1;
+			IF old.Y-old.H < blk.Y-blk.H THEN Y := old.Y; dY := -old.H ELSE Y := blk.Y; dY := -blk.H END;
+			IF Y + dY < prev.Y THEN	(* cuts previous line -> redraw also prev *)
+				upd.blk := prev; upd.blkX := prevX; DEC(upd.org, LONG(prev.len)) 
+			END
+		END;		(*  update area [Y] *)
+		IF (blk.Y=old.Y) & (blk.H=old.H) & (blk.bH=old.bH) THEN
+			IF (blk.mode = old.mode) & (CAP(blk.mode) = "L") THEN upd.pos := beg END
+		END;
+		IF blk.next # NIL THEN blk := blk.next END;
+		IF upd.P # NIL THEN
+			LedaIO.out.define(upd.P, 1, upd.eX+upd.X, upd.eY+Y, dX, dY, -1, py)	(* upper right of update area *)
+		END
+	END StartUpdate;
+	
+	PROCEDURE SkipUpdate(VAR O: Format; id: INTEGER; beg, len: LONGINT;
+												VAR blk: LedaCtrl.Block; VAR org: LONGINT; VAR upd: UpdDsc);
+	(* skips the update specified by id, beg and len; O: current format of block blk [in & out] *)
+	(* blk, org:  in: block containing begin of update; out: first block not affected by update *)
+		VAR n: INTEGER;
+	BEGIN
+		id := id MOD LedaCtrl.FlowChkId;	(* to match Flow..Id's with Text..Id's *)
+		IF id = LedaCtrl.TextInsId THEN INC(org, len+blk.len); blk := blk.next;
+		ELSE n := 0;	(* id = LedaCtrl.TextDelId, LedaCtrl.TextUpdId *)
+			WHILE org < beg + len DO
+				INC(org, LONG(blk.len)); INC(n); blk := blk.next;
+				IF (blk # NIL) & (blk IS Block) THEN O := blk(Block).cur; blk := blk.next END
+			END;
+			IF n > 1 THEN upd.pos := NotDef END;	(* to clear old lines *)
+			IF id = LedaCtrl.TextDelId THEN DEC(org, len) END
+		END;
+		IF blk = NIL THEN org := MAX(LONGINT)	(* no synchronisation possible *)
+		ELSIF blk IS Block THEN O := blk(Block).cur; blk := blk.next	(* LineBlock can not be the last block *)
+		END
+	END SkipUpdate;
+	
+	PROCEDURE DisplayUpdate*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port);
+	(** displays the updates made on columns according the global update info disp *)
+		VAR tB: Box;	blk: LedaCtrl.Block;	R: LedaCtrl.Reader;	X: LONGINT;
+	BEGIN	(* update area cleared; clipping set *)
+		IF disp.blk # NIL THEN
+			tB := self(Box); blk := disp.blk; X := eX + disp.blkX;
+			LedaCtrl.InitReader(R, tB.text); LedaCtrl.SetReader(R, disp.org);
+			WHILE blk # disp.endBlk DO
+				IF blk IS Block THEN X := eX + blk(Block).X
+				ELSE LedaIO.out.text(P, X, eY+blk.Y, R, blk, ModeTxt);
+				END;
+				blk := blk.next
+			END
+		END
+	END DisplayUpdate;
+		
+	PROCEDURE NextColumn(VAR F: Formatter; VAR blk: LedaCtrl.Block; org: LONGINT; VAR upd: UpdDsc);
+	BEGIN
+		blk.next := NewLineBlock(F, 0); blk := blk.next;
+		upd.X := F.colX+ColInset; 
+		upd.org := org; upd.blkX := F.colX + F.curX;
+		upd.blk := blk; upd.pos := NotDef;
+		IF upd.P # NIL THEN
+			LedaIO.out.define(upd.P, 1, upd.eX+upd.X, upd.eY, F.colW-ColWInset, 0, -1, 0)	(* upper right of update area *)
+		END;
+	END NextColumn;
+
+	PROCEDURE ClearColumns(VAR F: Formatter; tB: Box; id: INTEGER; sameFrm: BOOLEAN; VAR upd: UpdDsc);
+	(* clear further columns *)
+		VAR X: LONGINT;
+	BEGIN
+		IF upd.P = NIL THEN RETURN END;	(*###*)
+		IF upd.oneLine OR ((id = LedaCtrl.TextInsId) & sameFrm) THEN RETURN END;	(*###*)
+		X := F.colX + F.colW + F.colDX;	(* to clear column *)
+		WHILE X < F.boxW DO
+			disp.blk := NIL; disp.endBlk := NIL;	(* no drawing; clears column *)
+			upd.P.eraseCol := BGColor(tB);
+			LedaIO.out.update(upd.P, upd.eX+X+ColInset, upd.eY, F.colW-ColWInset, tB.H, DisplayUpdate, tB);
+			INC(X, F.colW + F.colDX)
+		END
+	END ClearColumns;
+		
+	PROCEDURE OneBlock(blk, endBlk: LedaCtrl.Block): BOOLEAN;
+	BEGIN
+		IF (blk.next = endBlk) OR (blk.next = NIL) THEN RETURN TRUE
+		ELSE blk := blk.next; RETURN (blk IS Block) & (blk.next = endBlk)
+		END
+	END OneBlock;
+		
+	PROCEDURE ColumnUpdate(tB: Box; blk: LedaCtrl.Block; sync: BOOLEAN; VAR upd: UpdDsc);
+	(* handles the column update in box tB; blk -> last new line *)
+		VAR endBlk, b: LedaCtrl.Block;	R: LedaCtrl.Reader;	Y, dX, dY: LONGINT;	py: INTEGER;	clear: BOOLEAN;
+	BEGIN
+		IF upd.P = NIL THEN RETURN END;	(*###*)
+		endBlk := blk.next; Y := blk.Y; dY := 0; py := 0; dX := 0; clear := FALSE;
+		IF sync THEN	(* endBlk is not LineBlock *)
+			IF blk.Y > endBlk.Y-endBlk.H THEN endBlk := endBlk.next	(* cuts following line -> redraw this line too  *)
+			ELSE Y := endBlk.Y; dY := -endBlk.H
+			END
+		ELSIF blk.Y < tB.H THEN Y := tB.H; dY := 0; py := -1; clear := TRUE	(* clear to bottom *)
+		END;
+		(* one block in leftadjust --> inset clip rectangle [one block may include line block] *)
+		upd.oneLine := (upd.pos > 0) & OneBlock(upd.blk, endBlk);
+		IF upd.oneLine THEN	(* one block in leftadjust to display *)
+			LedaCtrl.InitReader(R, tB.text); LedaCtrl.SetReader(R, upd.org);
+			dX := LedaIO.out.width(upd.P, upd.pos, R, upd.blk) + upd.blkX - upd.X
+		END;
+		LedaIO.out.define(upd.P, 0, upd.eX+upd.X, upd.eY+Y, dX, dY, 0, py);	(* lower left of update area *)
+		IF upd.blkX = -1 THEN	(* get x coordinate for block upd.blk *)
+			b := tB.lines; upd.blkX := 0;
+			LOOP
+				IF b IS Block THEN upd.blkX := b(Block).X END;
+				IF b = upd.blk THEN EXIT ELSE b := b.next END	(*###*)
+			END
+		END;
+		disp.blk := upd.blk; disp.org := upd.org; disp.blkX := upd. blkX; disp.endBlk := endBlk;
+		upd.P.eraseCol := BGColor(tB);
+		LedaIO.out.update(upd.P, 0, 0, -1, -1, DisplayUpdate, tB);
+		disp.blk := NIL; disp.endBlk := NIL;
+		IF clear & (dX > 0) THEN
+(*
+			LedaIO.out.define(upd.P, 0, upd.eX+upd.X, upd.eY+Y, 0, dY, 0, -1);	(* lower left *)
+			LedaIO.out.define(upd.P, 1, upd.eX+upd.X, upd.eY+Y, dX, blk.Y - tB.H, -1, -1);	(* upper right *)
+*)
+			LedaIO.out.define(upd.P, 0, upd.eX+upd.X, upd.eY+Y, 0, 0, 0, -1);	(* lower left *)
+			LedaIO.out.define(upd.P, 1, upd.eX+upd.X, upd.eY+blk.Y, dX, 0, -1, 1);	(* upper right *)
+			upd.P.eraseCol := BGColor(tB);
+			LedaIO.out.update(upd.P, 0, 0, -1, -1, DisplayUpdate, tB)
+		END
+	END ColumnUpdate;
+	
+	PROCEDURE SameLine(VAR F: Formatter; blk: LedaCtrl.Block): BOOLEAN;
+		VAR dY: LONGINT;
+	BEGIN
+		IF blk.mode > "Z" THEN RETURN blk.Y + blk.bH = F.bL
+		ELSE	(* big line *)
+			dY := ((blk.H - 1) DIV F.cur.lsp) * F.cur.lsp;
+			RETURN blk.Y + blk.bH = F.bL  + dY
+		END
+	END SameLine;
+	
+	PROCEDURE OrgTextBlock(VAR F: Formatter; VAR O: Format; VAR old: LedaCtrl.Block; VAR org, oldOrg: LONGINT): LedaCtrl.Block;
+	(* returns adjusted original text block old [line block may be added] and sets old to next block *)
+	(* advances base line F.bL and F.colX as needed and sets F.eob [end of box] *)
+		VAR blk: LedaCtrl.Block;	lBlk: Block;	bL: LONGINT;
+	BEGIN	(* old.next # NIL *)
+		blk := old; INC(oldOrg, LONG(old.len)); old := old.next; blk.next := NIL;
+		F.newFrm := FALSE; F.filler := FALSE; bL := F.bL;
+		IF blk.mode = "f" THEN	(* skip filler *)
+			IF old IS Block THEN old := old.next END;	(* may not contain new format *)
+			RETURN NIL	(*###*)
+		ELSIF blk.mode <= "Z" THEN	(* big line *)
+			AdjustBL(F, blk.H, blk.bH, bL);
+			IF F.filler THEN	(* no room; create filler and reset old block *)
+				blk.next := old; DEC(oldOrg, LONG(blk.len)); old := blk; 
+				F.bigHgt := FALSE; F.newFrm := FALSE;
+				NEW(blk); blk.next := NIL; InitFiller(blk)
+			END
+		END;
+		INC(org, LONG(blk.len)); 
+		blk.Y := bL - blk.bH;	(* blk.bH is negative; F.bL -> current base line *)
+		IF old IS Block THEN
+			lBlk := old(Block); old := old.next;
+			F.newFrm := lBlk.newFrm; F.var := lBlk.var; O := lBlk.cur	(* format variation *)
+		END;
+		NextLine(F, blk, org);
+		RETURN blk
+	END OrgTextBlock;
+
+	PROCEDURE UpdateLoop(tB: Box; VAR F: Formatter; VAR O: Format; updId: INTEGER;
+												blk, old: LedaCtrl.Block; org, oldOrg: LONGINT;
+												VAR len: LONGINT; VAR newFrm: BOOLEAN; VAR upd: UpdDsc);
+	BEGIN
+		LOOP
+			IF F.eob OR (F.eot & (F.len = NotDef)) THEN AdaptEndFormat(tB.text.frm, F.cur, newFrm);
+				ColumnUpdate(tB, blk, FALSE, upd); ClearColumns(F, tB, updId, ~ newFrm, upd); EXIT	(*###*)
+			ELSIF F.newCol THEN ColumnUpdate(tB, blk, FALSE, upd); NextColumn(F, blk, org, upd)
+			END;
+			WHILE oldOrg < org DO	(* try to synchronize *)
+				INC(oldOrg, LONG(old.len)); old := old.next;
+				IF old = NIL THEN oldOrg := MAX(LONGINT)
+				ELSIF old IS Block THEN O := old(Block).cur; old := old.next
+				END
+			END;
+			IF (oldOrg = org) & (O.W = F.curW) & (O.adj = F.cur.adj) THEN	(* synchronization; original blocks equal *)
+				IF SameLine(F, old) & (O.X = F.colX + F.curX) & (O.lsp = F.cur.lsp) THEN	(* same location *)
+					blk.next := old; ColumnUpdate(tB, blk, TRUE, upd);	(* end of change *)
+					WHILE old # NIL DO INC(org, LONG(old.len)); old := old.next END;
+					newFrm := FALSE; EXIT	(*###*)
+				ELSIF old.next # NIL THEN		(* arrange original blocks *)
+					blk.next := OrgTextBlock(F, O, old, org, oldOrg);	(* return value NIL possible [-> WHILE] *)
+					WHILE blk.next # NIL DO blk := blk.next END	(* traverse added blocks *)
+				ELSE	(* old -> last original block; setup formatter *)
+					(* setup formatter in last block to not miss format changes in last block *)
+					LedaCtrl.TextMark(tB.text, F.fBeg, F.fLen); oldOrg := MAX(LONGINT);	(* no synchronization possible *)
+					LedaCtrl.InitFormatter(F, tB.text, org); F.fBeg := org; F.fLen := 0
+				END
+			ELSE	(* (oldOrg # org) OR (oldW # F.curW) OR (oldM # F.curAdj)  *)
+				blk.next := NewTextBlock(F, org); blk := blk.next;
+				IF blk.next # NIL THEN blk := blk.next END	(* skip any LineBlock *)
+			END
+		END;	(* LOOP *)
+		(*-- blk: points to last changed [new] block; org: end position of text in box --*)
+		len := org - tB.text.beg
+	END UpdateLoop;
+
+	PROCEDURE UpdateText*(tB: Box; P: LedaSys.Port; eX, eY: LONGINT;
+												  VAR txUpd: LedaCtrl.TextMsg; VAR len: LONGINT; VAR newFrm: BOOLEAN);
+	(** updates the text tB.text according the message txUpdate [structure and display] *)
+	(** returns in len the text length poured in box tB *)
+		VAR F: Formatter;	O: Format;	blk, old: LedaCtrl.Block;	upd: UpdDsc;
+			org, oldOrg: LONGINT;	cancel, mask: BOOLEAN;
+	BEGIN
+		IF tB.lines = NIL THEN	(* text not yet formatted [delayed loading] -> text not visible [no drawing] *)
+			mask := FALSE; FormatText(tB, len, newFrm, mask)	(* newFrm and len set *)
+		ELSIF tB.lines.next = tB.lines THEN	(* text flow invalid *)
+			ValidateTexts(tB);
+			newFrm := FALSE; len := tB.text.len
+		ELSE
+			INCL(tB.flags, PlMask);	(* enable mask creation *)
+			upd.P := P; upd.eX := eX; upd.eY := eY;
+			LocateUpdate(tB, F, O, txUpd, blk, old, org, oldOrg, cancel);
+			IF cancel THEN newFrm := FALSE; len := tB.text.len
+			ELSE
+				LedaCtrl.InitFormatter(F, tB.text, org); F.fBeg := org; F.fLen := 0;
+				StartUpdate(F, O, txUpd.beg, blk, old, org, oldOrg, upd);	(* blk: first new line / old: old changed line *)
+				IF (txUpd.id = LedaCtrl.FlowChkId) & (org = txUpd.beg) & F.eob THEN	(* no change in last line *)
+					newFrm := FALSE; len := org - tB.text.beg
+				ELSE
+					SkipUpdate(O, txUpd.id, txUpd.beg, txUpd.len, old, oldOrg, upd);	(* old, oldOrg: first unaffected block *)
+					UpdateLoop(tB, F, O, txUpd.id, blk, old, org, oldOrg, len, newFrm, upd)
+				END
+			END;	(* IF cancel ... *)
+			EXCL(tB.flags, PlMask);	(* disable mask creation *)
+			IF F.plane # NIL THEN
+				LedaBox.PlaneDispose(F.plane); LedaIO.out.mask(P, "R", 0, 0, 0, 0)	(* reset masks *)
+			END
+		END
+	END UpdateText;
+
+	PROCEDURE DisplayPart*(tB: Box; P: LedaSys.Port; eX, eY: LONGINT; pos, len: LONGINT);
+	(** displays the text part specified by pos and len *)
+		VAR blk, prev: LedaCtrl.Block;	X, pX, dX, Y, dY, W, org: LONGINT;	R: LedaCtrl.Reader;	mask: BOOLEAN;
+	BEGIN
+		IF (pos + len <= tB.text.beg) OR (tB.text.beg + tB.text.len <= pos) THEN RETURN END;	(*###*)
+		blk := tB.lines; org := tB.text.beg; X := blk(Block).X; W := blk.W;
+		pX := X; prev := NIL;
+		LOOP
+			IF pos < org + blk.len THEN EXIT	(*###*)
+			ELSIF blk IS Block THEN
+				IF blk.Y = 0 THEN prev := NIL; pX := blk(Block).X END;	(* new column *)
+				X := blk(Block).X; W := blk.W	(* blk.len = 0 for Block *)
+			ELSE INC(org, LONG(blk.len)); prev := blk; pX := X
+			END;
+			blk := blk.next; IF blk = NIL THEN EXIT END	(*###*)
+		END;
+		IF blk = NIL THEN RETURN END;	(*###*)
+		disp.blk := blk; disp.org := org; disp.blkX := X; disp.endBlk := blk.next;
+		IF (prev # NIL) & (blk.Y - blk.H < prev.Y) THEN	(* cuts previous line *)
+			disp.blk := prev; disp.blkX := pX; DEC(disp.org, LONG(prev.len))
+		END;
+		IF pos + len <= org + blk.len THEN			(* one line to display *)
+			IF (disp.endBlk # NIL) & (blk.Y > disp.endBlk.Y-disp.endBlk.H) THEN	(* cuts following line *)
+				disp.endBlk := disp.endBlk.next
+			END;
+			LedaCtrl.InitReader(R, tB.text);
+			LedaCtrl.SetReader(R, org); dX := LedaIO.out.width(P, pos, R, blk);	(* clip org to pos *)
+			LedaIO.out.define(P, 0, eX + X, eY + blk.Y, dX, 0, 0, 0);	(* lower left of update area *)
+			LedaCtrl.SetReader(R, org); dX := LedaIO.out.width(P, pos + len, R, blk);	(* clip len to blk.len *)
+			LedaIO.out.define(P, 1, eX + X, eY + blk.Y, dX, -blk.H, -1, 1);	(* upper right of update area *)
+			P.eraseCol := BGColor(tB);
+			LedaIO.out.update(P, 0, 0, -1, -1, DisplayUpdate, tB)
+		ELSE	(* multiple lines to display *)
+			LedaBox.PlaneMask(tB, mask);	(* set mask for plane *)
+			Y := blk.Y; dY := -blk.H; pX := X + W; INC(pos, len);
+			LOOP
+				IF blk IS Block THEN
+					IF blk.Y = 0 THEN EXIT END;	(*###*)
+					IF blk(Block).X < X THEN X := blk(Block).X END;	(* reduce left margin *)
+					IF blk(Block).X + blk.W > pX THEN pX := blk(Block).X + blk.W END	(* reduce right margin *)
+				END;
+				INC(org, LONG(blk.len)); IF pos <= org THEN EXIT END;	(*###*)
+				prev := blk; blk := blk.next; IF blk = NIL THEN EXIT END	(*###*)
+			END;
+			LedaIO.out.define(P, 1, eX + X, eY + Y, pX - X, dY, -1, 1);	(* upper right of update area *)
+			IF (blk = NIL) OR (blk.Y = 0) THEN Y := prev.Y; disp.endBlk := blk	(* end of blocks or end of column *)
+			ELSE Y := blk.Y; disp.endBlk := blk.next;
+				IF (disp.endBlk # NIL) & (blk.Y > disp.endBlk.Y-disp.endBlk.H) THEN	(* cuts following line *)
+					disp.endBlk := disp.endBlk.next
+				END
+			END;
+			LedaIO.out.define(P, 0, eX + X, eY + Y, 0, 0, 0, 0);	(* lower left of update area *)
+			P.eraseCol:= BGColor(tB);
+			LedaIO.out.update(P, 0, 0, -1, -1, DisplayUpdate, tB);
+			IF mask THEN LedaIO.out.mask(P, "R", 0, 0, 0, 0) END;	(* reset masks *)
+			IF pos > org THEN DisplayPart(tB, P, eX, eY, org, pos - org) END	(* to display rest part *)
+		END;
+		disp.blk := NIL; disp.endBlk := NIL
+	END DisplayPart;
+	
+
+BEGIN
+	disp.blk := NIL
+END LedaLines.

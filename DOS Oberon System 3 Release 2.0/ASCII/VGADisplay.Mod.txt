@@ -1,0 +1,2906 @@
+MODULE Display;	
+(* Name:      Module DOSColDisplay.Mod                         *)
+(* Purpose:   Analogon to Display-Module for B/W Monitor       *)
+(* Date:      18.3.92    /	3. 6. 93                                      *)
+(* Author:    Ott Hans-Werner                                  *)
+(* ARD, 31.08.94 Pharlap version                                  *)
+(* ARD, 18. 2. 95 Inline Version                                  *)
+
+	IMPORT Kernel, SYSTEM, DOS, Objects;
+	
+	CONST
+		black* = 0; white* = 15; 
+		BG* = 0; FG* = 15; (*background, foreground*)
+		replace* = 0; paint* = 1; invert* = 2; (*operation modes*)
+		
+		remove* = 0; suspend* = 1; restore* = 2; (*ControlMsg id*)
+		reduce* = 0; extend* = 1; move* = 2; (*ModifyMsg id*)
+		display* = 0; state* = 1; (*ModifyMsg mode*)
+		frame* = 0; area* = 1; (*DisplayMsg id*)
+		contents* = 0; view* = 1; (*PrintMsg id*)
+		get* = 0; set* = 1; reset* = 2; (*SelectMsg id*)
+		drop* = 0; integrate* = 1; (*ConsumeMsg id*)
+		
+	TYPE Pattern* = LONGINT;
+			PatternPtr = POINTER TO RECORD w, h, pixmap: SHORTINT END;
+
+			Frame* = POINTER TO FrameDesc;
+			FrameDesc* = RECORD (Objects.ObjDesc)
+				next*, dsc*: Frame;
+				X*, Y*, W*, H*: INTEGER
+			END;
+  
+			FrameMsg* = RECORD (Objects.ObjMsg)
+				F*: Frame; (*target*)
+				x*, y*, res*: INTEGER
+			END;
+		
+			ControlMsg* = RECORD (FrameMsg)
+				id*: INTEGER
+			END;
+		
+			ModifyMsg* = RECORD (FrameMsg)
+				id*, mode*: INTEGER;
+				dX*, dY*, dW*, dH*: INTEGER;
+				X*, Y*, W*, H*: INTEGER
+			END;
+		
+			DisplayMsg* = RECORD (FrameMsg)
+				id*: INTEGER;
+				u*, v*, w*, h*: INTEGER
+			END;
+		
+			PrintMsg* = RECORD (FrameMsg)
+				id*, pageno*: INTEGER
+			END;
+
+			LocateMsg* = RECORD (FrameMsg)
+				loc*: Frame;
+				X*, Y*, u*, v*: INTEGER
+			END;
+		
+			SelectMsg* = RECORD (FrameMsg)
+				id*: INTEGER;
+				time*: LONGINT;
+				sel*: Frame;
+				obj*: Objects.Object
+			END;
+		
+			ConsumeMsg* = RECORD (FrameMsg)
+				id*: INTEGER;
+				u*, v*: INTEGER;
+				obj*: Objects.Object
+			END;
+		
+			MsgProc* = PROCEDURE (VAR M: FrameMsg);
+
+	VAR
+		Unit*: LONGINT; (* RasterUnit = Unit/36000 mm *)
+		Left*, (* left margin of black-and-white maps *)
+		ColLeft*, (* left margin of color maps *)
+		Bottom*, (* bottom of primary map *)
+		UBottom*, (* bottom of secondary map *)
+		Width*, (* map width *)
+		Height*: (* map hight*)
+			INTEGER;
+			
+		arrow*, star*, cross*, downArrow*, hook*: Pattern;
+		grey0*, grey1*, grey2*, ticks*, solid*: Pattern;
+
+		Broadcast*: MsgProc;
+
+		Pat: ARRAY 60 OF PatternPtr;
+		count: LONGINT;
+
+		clipx, clipy, clipright, cliptop, height, width: INTEGER;	(* clipping variables *)
+		width3: LONGINT;
+		mask, imask: ARRAY 9 OF CHAR;
+		rev: ARRAY 256 OF CHAR;
+	
+	PROCEDURE max (i, j: INTEGER): INTEGER; BEGIN IF i >= j THEN RETURN i ELSE RETURN j END END max;
+	PROCEDURE min (i, j: LONGINT): INTEGER; BEGIN  IF i >= j THEN RETURN SHORT(j) ELSE RETURN SHORT(i) END END min;
+		
+	PROCEDURE Map*(X: INTEGER): LONGINT;
+	BEGIN RETURN 0 
+	END Map;
+	
+	PROCEDURE AdjustClip*(X, Y, W, H: INTEGER);
+	VAR right, top: INTEGER;
+	BEGIN 
+		right := X + W; top := Y + H; clipx := max(clipx, X); clipy := max(clipy, Y); 
+		clipright := min(right, clipright); cliptop := min(top, cliptop);
+	END AdjustClip;
+
+	PROCEDURE GetDim*(pat: Pattern; VAR w, h: INTEGER);
+	VAR s: SHORTINT;
+	BEGIN SYSTEM.GET(pat, s); w := s; SYSTEM.GET(pat+1, s); h := s; 
+	END GetDim;
+
+	PROCEDURE ResetClip*;
+	BEGIN clipx := 0; clipy := UBottom; clipright := width; cliptop := height
+	END ResetClip;
+	
+	PROCEDURE SetClip*(x, y, w, h: INTEGER);
+	BEGIN clipright := x+w; cliptop := y+h; clipy := y; clipx := x
+	END SetClip;
+	
+	PROCEDURE GetClip*(VAR x, y, w, h: INTEGER);
+	BEGIN x := clipx; y := clipy; w := clipright - clipx; h := cliptop - clipy
+	END GetClip;
+	
+	PROCEDURE SetColor*(col, red, green, blue: INTEGER);	(* 0 <= col, red, green, blue < 256 *)
+	BEGIN
+		IF col = 0 THEN
+			IF red > 128 THEN 
+ 				SYSTEM.PUTREG(0, 1001H); SYSTEM.PUTREG(3, 03F00H); SYSTEM.INT(10H);
+			ELSE 
+				SYSTEM.PUTREG(0, 1001H); SYSTEM.PUTREG(3, 0H); SYSTEM.INT(10H);
+			END;
+		END;
+		IF col = 6 THEN col := 14H ELSIF col > 7 THEN col := col + 30H END;
+		red := (red + 4) DIV 4 -1;
+		green := (green + 4) DIV 4 -1;
+		blue := (blue + 4) DIV 4 -1;
+		(*$ DInline.Assemble
+		MOV AX, col[EBP]
+		MOV EDX, $3C8
+		OUT DX, AL
+		MOV EDX, $3C9
+		MOV AX, red[EBP]
+		OUT DX, AL
+		MOV AX, green[EBP]
+		OUT DX, AL
+		MOV AX, blue[EBP]
+		OUT DX, AL
+		END *)
+	END SetColor;
+
+	PROCEDURE GetColor*(col: INTEGER; VAR red, green, blue: INTEGER);
+	BEGIN
+		IF col = 6 THEN col := 14H ELSIF col > 7 THEN col := col + 30H END;
+		(*$ DInline.Assemble
+		MOV AX, col[EBP]
+		MOV EDX, $3C7
+		OUT DX, AL
+		XOR EAX, EAX
+		MOV EDX, $3C9
+		IN AL, DX
+		MOV EBX, red[EBP]
+		MOV [EBX], AX
+		IN AL, DX
+		MOV EBX, green[EBP]
+		MOV [EBX], AX
+		IN AL, DX
+		MOV EBX, blue[EBP]
+		MOV [EBX], AX
+		END *);
+		red := red * 4 + red DIV 16;
+		green := green * 4 + green DIV 16;
+		blue := blue * 4 + blue DIV 16;
+	END GetColor;
+	
+	PROCEDURE SetCard(mode: INTEGER);
+	BEGIN
+		IF mode = invert THEN SYSTEM.PORTOUT(03CEH, 1803H)	(* AL = Data/Rotate; AH = Modus; DX = Graphic-Controller *)
+		ELSIF mode = replace THEN SYSTEM.PORTOUT(03CEH, LONG(03H))
+		ELSE (* mode = paint *) SYSTEM.PORTOUT(03CEH, 1003H)
+		END;
+	END SetCard;
+	
+	PROCEDURE Dot*(col, x, y, mode: INTEGER);
+	VAR dest: LONGINT;
+	BEGIN 
+		IF (y < clipy) OR (y >= cliptop) THEN RETURN END;
+		IF (x < clipx) OR (x >=  clipright) THEN RETURN END;
+		dest := (Height - y - 1) * width3 + x DIV 8;
+		SetCard(mode);
+		SYSTEM.PORTOUT(03C4H, 0F02H);	(* AX = Default map mask; DX = Sequencer *)
+		SYSTEM.PORTOUT(03CEH, 205H);	(* AL = Gaphics mode; AH = Read-Mode = 0/Write-Mode = 2 (bits 0,1) *)
+		(*$ DInline.Assemble
+			MOV DX, $03CE
+			MOV ECX, x[EBP]
+			AND ECX, 7
+			MOV ESI, dest[EBP]
+			MOV AH, 128
+			SHR AH, CL
+			MOV AL, 8
+			OUT DX, AX
+			MOV AX, $1F	; set selector for display area
+			MOV GS, AX
+			MOV AL, GS:[ESI]	; latch bytes
+			MOV AL, col[EBP]
+			MOV GS:[ESI], AL
+			PUSH DS
+			POP GS
+		END *);
+	END Dot;
+	
+	PROCEDURE CopyBlock*(SX, SY, W, H, DX, DY, mode: INTEGER);
+	VAR top, right, dX, dY: INTEGER;
+			x1, x2, x3, x4, x5, x6, x7, x8: LONGINT;
+			w3, help, help2, diff, plane, count, start, end, msk, imsk, h: LONGINT;
+			leftmask, rightmask: CHAR;  
+	BEGIN
+		right := DX + W; top := DY + H; dX := DX; dY := DY;
+		IF DX < clipx THEN W := W - (clipx - DX); DX := clipx END; 
+		IF DY < clipy THEN H := H - (clipy - DY); DY := clipy END;
+		IF  clipright < right THEN  W :=  clipright - DX END; 
+		IF cliptop  < top THEN H := cliptop - DY END;
+		IF (W <= 0) OR (H <= 0) THEN RETURN END;
+		w3 := width3; msk := SYSTEM.ADR(mask[0]); imsk := SYSTEM.ADR(imask[0]); h := height-1;
+		(*$ DInline.Assemble
+			MOV	AX, $1F
+			MOV	GS, AX
+		
+			MOV	EAX, h[EBP]
+			MOV	EBX, EAX
+			SUB	EAX, SY[EBP]	; EAX := height - sy
+			MOV	SY[EBP], EAX
+			SUB	EBX, DY[EBP]	; EBX := height - dy
+			MOV	DY[EBP], EBX
+			MOV	EAX, SX[EBP]	; EAX := sx
+			MOV	ECX, EAX
+			MOV	EBX, EAX
+			MOV	EDX, EAX
+			SHR	EAX, 3	; EAX := sx DIV 8
+			AND	ECX, 7	; ECX := sx MOD 8
+			ADD	EBX, W[EBP]
+			ADD	EDX, W[EBP]
+			SHR	EBX, 3	; EBX := (sx+w) DIV 8
+			AND	EDX, 7	; EDX := (sx+w) MOD 8
+			MOV	x1[EBP], EAX	; x1 := sx DIV 8
+			MOV	x2[EBP], EBX	; x2 := (sx+w) DIV 8
+			MOV	x3[EBP], ECX	; x3 := sx MOD 8
+			INC	EDX
+			MOV	x4[EBP], EDX	; x4 := (sx+w) MOD 8 (+1)
+			MOV	EAX, 16[EBP]	; EAX := dx
+			MOV	ECX, EAX
+			MOV	EBX, EAX
+			MOV	EDX, EAX
+			SHR	EAX, 3	; EAX := dx DIV 8
+			AND	ECX, 7	; ECX := dx MOD 8
+			ADD	EBX, W[EBP]	; EBX := dx +w
+			ADD	EDX, W[EBP]
+			SHR	EBX, 3	; EBX := (dx+w) DIV 8
+			AND	EDX, 7	; EDX := (dx+w) MOD 8
+			MOV	x5[EBP], EAX	; x5 := dx DIV 8
+			MOV	x6[EBP], EBX	; x6 := (dx+w) DIV 8
+			MOV	x7[EBP], ECX	; x7 := dx MOD 8
+			INC	EDX
+			MOV	x8[EBP], EDX	; x8 := (dx+w) MOD 8
+			MOV	ESI, SY[EBP]
+			IMUL	ESI, w3[EBP]
+			ADD	ESI, x1[EBP]	; ESI := startbyte source bottomleft
+			MOV	EDI, DY[EBP]
+			IMUL	EDI, w3[EBP]
+			ADD	EDI, EAX
+			MOV	start[EBP], ESI	; starbyte source bottom left
+			MOV	end[EBP], EDI	; startbyte dest bottom left
+			MOV	DX, $3CE
+			MOV	AX, 0005
+			OUT	DX, AX	; read/writemode = 0
+			MOV	AX, 0001
+			OUT	DX, AX	; enable/reset = 0000b
+			MOV	AH, 0
+			MOV	AL, 3
+			OUT	DX, AX	; replacemode
+			MOV	EBX, x8[EBP]
+			DEC	EBX
+			MOV	EDX, msk[EBP]
+			MOV	AH, [EDX + EBX*1]
+;			MOV	AH, mask[EBX]
+			MOV	rightmask[EBP], AH
+			MOV	EBX, x7[EBP]
+			MOV	EDX, imsk[EBP]
+			MOV	AH, [EDX + EBX*1]
+;			MOV	AH, imask[EBX]
+			MOV	leftmask[EBP], AH
+			MOV	EBX, x6[EBP]
+			SUB	EBX, x5[EBP]	; EBX := difference in bytes dx/dx+w
+			DEC	EBX
+			MOV	diff[EBP], EBX
+			JGE	inmorebytes
+			MOV	DH, rightmask[EBP]	; EBX = 0 /only one byte
+			AND	DH, leftmask[EBP]
+			MOV	leftmask[EBP], DH
+			MOV	rightmask[EBP], DH
+inmorebytes	MOV	EDX, H[EBP]	; EDX := h
+			MOV	EAX, SX[EBP]	; EAX := sx
+			MOV	EBX, SY[EBP]	; EBX := sy
+			CMP	EAX, 16[EBP]:double	; sx < dx ?
+			JGE	CB1	; no -> goto CB1
+			MOV	ECX, x8[EBP]	; sx < dx !
+			SUB	ECX, x4[EBP]	; ECX := differnce between s/dest x
+			ADD	ECX, 32
+			AND	CL, $1F	; CL := rotate shift count
+			CMP	EBX, DY[EBP]	; sy < dy ?
+			JL	CB10	; yes goto CB10
+			JMP	CB13	; else goto CB13
+				
+CB1	SUB	ECX, x3[EBP]	; sx >= dx
+			ADD	ECX, 32
+			AND	CL, $1F	; CL:= rotate shift count
+			CMP	BX, DY[EBP]	; sy >= dy?
+			JGE	CB12	; yes goto CB12
+CB11	MOV	help[EBP], EDX	; (sx >= dx) & (sy < dy) / save linecounter
+			MOV	EBX, diff[EBP]
+			CMP	EBX, 1
+			JLE	byte11	; in 1 Byte => normal CopyBlock
+			CMP	CL, 0	; rotateoffset = 0 ?
+			JE	qCB11	; QuickCopy
+byte11	MOV	count[EBP]:double, 3	; there are 4 Bitplanes
+			MOV	plane[EBP]:double, 8	; begin with plane 4
+CB11h	MOV	DX, $3CE
+			MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX	; select plane to read
+			MOV	AH, leftmask[EBP]	; bitmask select
+			MOV	AL, 8
+			OUT	DX, AX	; set mask at destination
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]	; set bitplanemask
+			MOV	AL, 2
+			OUT	DX, AX	; set sequencer
+			XOR	EAX, EAX
+			MOV	AH, GS:[ESI]
+			MOV	AL, GS:1[ESI]
+			ADD	ESI, 2
+			ROR	EAX, CL
+			CMP	EBX, 0	; in one byte ?
+			JL	cbl31
+cbl6i	MOV	DL, GS:[EDI]	; latch bytes
+			MOV	GS:[EDI], AH
+			INC	EDI
+			ROL	EAX, 8
+			CMP	EBX, 0	; in 2 bytes ?
+			JE	cbl3 ;**
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08	; all maskbits
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+cbl6	ROL	EAX, CL
+			MOV	AL, GS:[ESI]
+			INC	ESI
+			ROR	EAX, CL
+			MOV	GS:[EDI], AH
+			INC	EDI
+			ROL	EAX, 8
+			DEC	BX
+			JG	cbl6
+cbl3	MOV	EBX, x6[EBP]
+			SUB	EBX, x5[EBP]
+			MOV	help2[EBP], EBX
+			MOV	EBX, x2[EBP]
+			SUB	EBX, x1[EBP]
+			CMP	EBX, help2[EBP]
+			JE	cbl31
+			ROL	EAX, CL
+			MOV	AL, GS:[ESI]
+			ROR	EAX, CL
+cbl31	PUSH	AX
+			MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX	; set right dest bitmask
+			POP	AX
+			MOV	DL, GS:[EDI]
+			MOV	GS:[EDI], AH
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			SHR	plane[EBP]:double, 1
+			MOV	EBX, diff[EBP]
+			DEC	count[EBP]:double
+			JGE	CB11h
+			MOV	EDX, help[EBP]	; next line / get linecounter
+			SUB	start[EBP], 80:double
+			SUB	end[EBP], 80:double
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			MOV	count[EBP]:double, 3
+			MOV	plane[EBP]:double, 8
+			DEC	EDX
+			MOV	help[EBP], EDX	; save new linecounter
+			CMP	EDX, 0
+			JG	CB11h
+			JMP	resetgrafCB
+CB12	MOV	EAX, H[EBP]	; (sx >= dx) & (sy >= dy)
+			DEC	EAX
+			IMUL	EAX, w3[EBP]
+			SUB	ESI, EAX
+			SUB	EDI, EAX
+			MOV	start[EBP], ESI
+			MOV	end[EBP], EDI
+			MOV	help[EBP], EDX	; save linecounter
+			MOV	EBX, diff[EBP]
+			CMP	EBX, 1 
+			JLE	byte12
+			CMP	CL, 0	; rotate shift = 0 ?
+			JE	qCB12	; quick CopyBlock
+byte12	MOV	count[EBP]:double, 3	; there are 4 Bitplanes
+			MOV	plane[EBP]:double, 8
+cbl1	MOV	DX, $3CE
+			MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX	; select plane to read
+			MOV	AH, leftmask[EBP]	; bitmask select
+			MOV	AL, 8
+			OUT	DX, AX	; set mask at destination
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set sequencer
+			XOR	EAX, EAX
+			MOV	AH, GS:[ESI]
+			MOV	AL, GS:1[ESI]
+			ADD	ESI, 2
+			ROR	EAX, CL
+			CMP	EBX, 0
+			JL	cbl41
+cbl7i	MOV	DL, GS:[EDI]	; latch bytes
+			MOV	GS:[EDI], AH
+			INC	EDI
+			ROL	EAX, 8	; ready for new out
+			CMP	EBX, 0	; in 2 bytes ?
+			JE	cbl4 ;**
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08	; all maskbits
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+cbl7	ROL	EAX, CL
+			MOV	AL, GS:[ESI]
+			INC	ESI
+			ROR	EAX, CL
+			MOV	GS:[EDI], AH
+			INC	EDI
+			ROL	EAX, 8
+			DEC	BX
+			JG	cbl7
+cbl4	MOV	EBX, x6[EBP]
+			SUB	EBX, x5[EBP]
+			MOV	help2[EBP], EBX
+			MOV	EBX, x2[EBP]
+			SUB	EBX, x1[EBP]
+			CMP	EBX, help2[EBP]
+			JE	cbl41
+			ROL	EAX, CL
+			MOV	AL, GS:[ESI]
+			ROR	EAX, CL
+cbl41	PUSH	AX
+			MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX	; set right dest bitmask
+			POP	AX
+			MOV	DL, GS:[EDI]
+			MOV	GS:[EDI], AH
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			SHR	plane[EBP]:double, 1
+			MOV	EBX, diff[EBP]
+			DEC	count[EBP]:double
+			JGE	cbl1
+			MOV	EDX, help[EBP]	; next line / get linecounter
+			ADD	start[EBP], 80:double
+			ADD	end[EBP], 80:double
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			MOV	plane[EBP]:double, 8
+			MOV	count[EBP]:double, 3
+			DEC	EDX
+			MOV	help[EBP], EDX	; save new linecounter
+			CMP	EDX, 0
+			JG	cbl1
+			JMP	resetgrafCB
+CB10	MOV	EAX, x2[EBP]	; (sx < dx) & (sy < dy)
+			SUB	EAX, x1[EBP]
+			ADD	ESI, EAX
+			MOV	EAX, x6[EBP]
+			SUB	EAX, x5[EBP]
+			ADD	EDI, EAX
+			MOV	start[EBP], ESI	; startbyte source bottom right
+			MOV	end[EBP], EDI	; starbyte dest bottom right
+			MOV	help[EBP], EDX	; save linecounter
+			MOV	EBX, diff[EBP]
+			CMP	EBX, 1
+			JLE	byte10
+			CMP	CL, 0
+			JE	qCB10	; Quick CopyBlock
+byte10	MOV	count[EBP]:double, 3	; there are 4 Bitplanes
+			MOV	plane[EBP]:double, 8
+cbl10	MOV	DX, $3CE
+			MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX	; select plane to read
+			MOV	AH, rightmask[EBP]	; bitmask select
+			MOV	AL, 8
+			OUT	DX, AX	; set mask at destination
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set sequencer
+			XOR	EAX, EAX
+			MOV	AL, GS:[ESI]
+			MOV	AH, GS:-1[ESI]
+			SUB	ESI, 2
+			ROR	EAX, CL
+			CMP	EBX, 0	; in one byte ?
+			JGE	cbl11i
+			MOV	DL, rightmask[EBP]	; xchg masks
+			MOV	leftmask[EBP], DL
+			JMP	cbl121
+cbl11i	MOV	DL, GS:[EDI]	; latch bytes
+			MOV	GS:[EDI], AL
+			DEC	EDI
+			ROR	EAX, 8
+			CMP	EBX, 0
+			JE	cbl12 ;**
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08	; all maskbits
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+cbl11	ROL	EAX, CL
+			MOV	AH, GS:[ESI]
+			DEC	ESI
+			ROR	EAX, CL
+			MOV	GS:[EDI], AL
+			DEC	EDI
+			ROR	EAX, 8
+			DEC	BX
+			JG	cbl11
+cbl12	MOV	EBX, x6[EBP]
+			SUB	EBX, x5[EBP]
+			MOV	help2[EBP], EBX
+			MOV	EBX, x2[EBP]
+			SUB	EBX, x1[EBP]
+			CMP	EBX, help2[EBP]
+			JE	cbl121
+			ROL	EAX, CL
+			MOV	AH, GS:[ESI]
+			ROR	EAX, CL
+cbl121	PUSH	AX
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX	; set left dest bitmask
+			POP	AX
+			MOV	DL, GS:[EDI]
+			MOV	GS:[EDI], AL
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			SHR	plane[EBP]:double, 1
+			MOV	EBX, diff[EBP]
+			DEC	count[EBP]:double
+			JGE	cbl10
+			MOV	EDX, help[EBP]	; next line / get linecounter
+			SUB	start[EBP], 80:double
+			SUB	end[EBP], 80:double
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			MOV	plane[EBP]:double, 8
+			MOV	count[EBP]:double, 3
+			DEC	EDX
+			MOV	help[EBP], EDX	; save new linecounter
+			CMP	EDX, 0
+			JG	cbl10
+			JMP	resetgrafCB
+CB13	MOV	EAX, H[EBP]	; (sx < dx) & (sy >= dy)
+			DEC	EAX
+			IMUL	EAX, w3[EBP]
+			SUB	ESI, EAX
+			SUB	EDI, EAX
+			MOV	EAX, x2[EBP]
+			SUB	EAX, x1[EBP]
+			ADD	ESI, EAX
+			MOV	EAX, x6[EBP]
+			SUB	EAX, x5[EBP]
+			ADD	EDI, EAX
+			MOV	start[EBP], ESI
+			MOV	end[EBP], EDI
+			MOV	help[EBP], EDX	; save linecounter
+			MOV	EBX, diff[EBP]
+			CMP	EBX, 1
+			JLE	byte13
+			CMP	CL, 0
+			JE	qCB13
+byte13	MOV	count[EBP]:double, 3	; there are 4 Bitplanes
+			MOV	plane[EBP]:double, 8
+cbl13	MOV	DX, $3CE
+			MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX	; select plane to read
+			MOV	AH, rightmask[EBP]	; bitmask select
+			MOV	AL, 8
+			OUT	DX, AX	; set mask at destination
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set sequencer
+			XOR	EAX, EAX
+			MOV	AL, GS:[ESI]
+			MOV	AH, GS:-1[ESI]
+			SUB	ESI, 2
+			ROR	EAX, CL
+			CMP	EBX, 0
+			JGE	cbl14i
+			MOV	DL, rightmask[EBP]
+			MOV	leftmask[EBP], DL
+			JMP	cbl151
+cbl14i	MOV	DL, GS:[EDI]	; latch bytes
+			MOV	GS:[EDI], AL
+			DEC	EDI
+			ROR	EAX, 8
+			CMP	EBX, 0	; in 2 bytes ?
+			JE	cbl15 ;**
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08	; all maskbits
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+cbl14	ROL	EAX, CL
+			MOV	AH, GS:[ESI]
+			DEC	ESI
+			ROR	EAX, CL
+			MOV	GS:[EDI], AL
+			DEC	EDI
+			ROR	EAX, 8
+			DEC	BX
+			JG	cbl14
+cbl15	MOV	EBX, x6[EBP]
+			SUB	EBX, x5[EBP]
+			MOV	help2[EBP], EBX
+			MOV	EBX, x2[EBP]
+			SUB	EBX, x1[EBP]
+			CMP	EBX, help2[EBP]
+			JE	cbl151
+			ROL	EAX, CL
+			MOV	AH, GS:[ESI]
+			ROR	EAX, CL
+cbl151	PUSH	AX
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX	; set left dest bitmask
+			POP	AX
+			MOV	DL, GS:[EDI]
+			MOV	GS:[EDI], AL
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			SHR	plane[EBP]:double, 1
+			MOV	EBX, diff[EBP]
+			DEC	count[EBP]:double
+			JGE	cbl13
+			MOV	EDX, help[EBP]	; next line / get linecounter
+			ADD	start[EBP], 80:double
+			ADD	end[EBP], 80:double
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			MOV	count[EBP]:double, 3
+			MOV	plane[EBP]:double, 8
+			DEC	EDX
+			MOV	help[EBP], EDX	; save new linecounter
+			CMP	EDX, 0
+			JG	cbl13
+			
+			JMP	resetgrafCB
+qCB12	MOV	DX, $3CE	; Quick CopyBlock begin
+			MOV	AH, leftmask[EBP]	; bitmask select
+			MOV	AL, 8
+			OUT	DX, AX	; set mask at destination
+			MOV	count[EBP]:double, 3
+			MOV	plane[EBP]:double, 8
+q12lloop	MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			MOV	CL, GS:[ESI]	; fetch source
+			MOV	AL, GS:[EDI]	; latch at destiation
+			MOV	GS:[EDI], CL	; set source
+			MOV	DX, $3CE
+			SHR	plane[EBP]:double, 1
+			DEC	count[EBP]:double
+			JGE	q12lloop	; next plane
+			MOV	DX, $3C4
+			MOV	AH, $0F
+			MOV	AL, 2
+			OUT	DX, AX	; all planes again
+			MOV	DX, $3CE
+			INC	ESI
+			INC	EDI
+			MOV	AX, $0105	; writemode 1
+			OUT	DX, AX
+qcbl1	MOV	AL, GS:[ESI]
+			INC	ESI
+			MOV	GS:[EDI], AH
+			INC	EDI
+			DEC	BX
+			JG	qcbl1
+qcbl7	MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX	; set right dest bitmask
+			MOV	AX, 0005	; writemode 0
+			OUT	DX, AX
+			MOV	count[EBP]:double, 3
+			MOV	plane[EBP]:double, 8
+q12rloop	MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			MOV	CL, GS:[ESI]	; fetch source
+			MOV	AL, GS:[EDI]	; latch at destiation
+			MOV	GS:[EDI], CL	; set source
+			MOV	DX, $3CE
+			SHR	plane[EBP]:double, 1
+			DEC	count[EBP]:double
+			JGE	q12rloop	; next plane
+			MOV	EBX, diff[EBP]
+			ADD	start[EBP], 80:double
+			ADD	end[EBP], 80:double
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			DEC	help[EBP]:double	; dec linecounter
+			JG	qCB12
+			JMP	resetgrafCB
+qCB11	MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]	; bitmask select
+			MOV	AL, 8
+			OUT	DX, AX	; set mask at destination
+			MOV	count[EBP]:double, 3
+			MOV	plane[EBP]:double, 8
+q11lloop	MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			MOV	CL, GS:[ESI]	; fetch source
+			MOV	AL, GS:[EDI]	; latch at destiation
+			MOV	GS:[EDI], CL	; set source
+			MOV	DX, $3CE
+			SHR	plane[EBP]:double, 1
+			DEC	count[EBP]:double
+			JGE	q11lloop	; next plane
+			MOV	DX, $3C4
+			MOV	AH, $0F
+			MOV	AL, 2
+			OUT	DX, AX	; all panes again
+			MOV	DX, $3CE
+			INC	ESI
+			INC	EDI
+			MOV	AX, $0105	; writemode 1
+			OUT	DX, AX
+qcbl6	MOV	AL, GS:[ESI]
+			INC	ESI
+			MOV	GS:[EDI], AH
+			INC	EDI
+			DEC	BX
+			JG	qcbl6
+qcbl3	MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX	; set right dest bitmask
+			MOV	AX, 0005	; writemode 0
+			OUT	DX, AX
+			MOV	count[EBP]:double, 3
+			MOV	plane[EBP]:double, 8
+q11rloop	MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			MOV	CL, GS:[ESI]	; fetch source
+			MOV	AL, GS:[EDI]	; latch at destiation
+			MOV	GS:[EDI], CL	; set source
+			MOV	DX, $3CE
+			SHR	plane[EBP]:double, 1
+			DEC	count[EBP]:double
+			JGE	q11rloop	; next plane
+			MOV	EBX, diff[EBP]
+			SUB	start[EBP], 80:double
+			SUB	end[EBP], 80:double
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			DEC	help[EBP]:double	; dec linecounter
+			JG	qCB11
+			JMP	resetgrafCB
+qCB10	MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]	; bitmask select
+			MOV	AL, 8
+			OUT	DX, AX	; set mask at destination
+			MOV	count[EBP]:double, 3
+			MOV	plane[EBP]:double, 8
+q10rloop	MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			MOV	CL, GS:[ESI]	; fetch source
+			MOV	AL, GS:[EDI]	; latch at destiation
+			MOV	GS:[EDI], CL	; set source
+			MOV	DX, $3CE
+			SHR	plane[EBP]:double, 1
+			DEC	count[EBP]:double
+			JGE	q10rloop	; next plane
+			MOV	DX, $3C4
+			MOV	AH, $0F
+			MOV	AL, 2
+			OUT	DX, AX	; all panes again
+			MOV	DX, $3CE
+			DEC	ESI
+			DEC	EDI
+			MOV	AX, $0105	; writemode 1
+			OUT	DX, AX
+qcbl10	MOV	AL, GS:[ESI]
+			DEC	ESI
+			MOV	GS:[EDI], AH
+			DEC	EDI
+			DEC	BX
+			JG	qcbl10
+qcbl12	MOV	AX, 0005	; writemode 0
+			OUT	DX, AX
+			MOV	AH, leftmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX	; set left dest bitmask
+			MOV	count[EBP]:double, 3
+			MOV	plane[EBP]:double, 8
+q10lloop	MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			MOV	CL, GS:[ESI]	; fetch source
+			MOV	AL, GS:[EDI]	; latch at destiation
+			MOV	GS:[EDI], CL	; set source
+			MOV	DX, $3CE
+			SHR	plane[EBP]:double, 1
+			DEC	count[EBP]:double
+			JGE	q10lloop	; next plane
+			MOV	EBX, diff[EBP]
+			SUB	start[EBP], 80:double
+			SUB	end[EBP], 80:double
+			MOV	ESI, start[EBP]:double
+			MOV	EDI, end[EBP]:double
+			DEC	help[EBP]:double	; dec linecounter
+			JG	qCB10
+			JMP	resetgrafCB
+qCB13	MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]	; bitmask select
+			MOV	AL, 8
+			OUT	DX, AX	; set mask at destination
+			MOV	AH, 0
+			MOV	AL, 3
+			OUT	DX, AX
+			MOV	count[EBP], 3:double
+			MOV	plane[EBP], 8:double
+q13rloop	MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			MOV	CL, GS:[ESI]	; fetch source
+			MOV	AL, GS:[EDI]	; latch at destiation
+			MOV	GS:[EDI], CL	; set source
+			MOV	DX, $3CE
+			SHR	plane[EBP]:double, 1
+			DEC	count[EBP]:double
+			JGE	q13rloop	; next plane
+			MOV	DX, $3C4
+			MOV	AH, $0F
+			MOV	AL, 2
+			OUT	DX, AX	; all panes again
+			MOV	DX, $3CE
+			DEC	ESI
+			DEC	EDI
+			MOV	AX, $0105	; writemode 1
+			OUT	DX, AX
+qcbl13	MOV	AL, GS:[ESI]
+			DEC	ESI
+			MOV	GS:[EDI], AH
+			DEC	EDI
+			DEC	BX
+			JG	qcbl13
+qcbl14	MOV	AX, 0005	; writemode 0
+			OUT	DX, AX
+			MOV	AH, leftmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX	; set left dest bitmask
+			MOV	count[EBP], 3:double
+			MOV	plane[EBP], 8:double
+q13lloop	MOV	AH, count[EBP]
+			MOV	AL, 4
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, plane[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			MOV	CL, GS:[ESI]	; fetch source
+			MOV	AL, GS:[EDI]	; latch at destiation
+			MOV	GS:[EDI], CL	; set source
+			MOV	DX, $3CE
+			SHR	plane[EBP]:double, 1
+			DEC	count[EBP]:double
+			JGE	q13lloop	; next plane
+			MOV	EBX, diff[EBP]
+			ADD	start[EBP], 80:double
+			ADD	end[EBP], 80:double
+			MOV	ESI, start[EBP]
+			MOV	EDI, end[EBP]
+			DEC	help[EBP]:double	; dec linecounter
+			JG	qCB13
+			JMP	resetgrafCB
+resetgrafCB	MOV	DX, $3CE
+			MOV	AX, $0FF08	; default bitmask
+			OUT	DX, AX
+			MOV	AX, 0005	; default mode-reg
+			MOV	DX, AX
+			MOV	AX, 0003	; default Function-Select
+			OUT	DX, AX
+			MOV	AX, 0001	; default enable set/reset
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; default map mask
+			OUT	DX, AX
+endCB	PUSH DS
+			POP GS
+		END *)
+	END CopyBlock;
+	
+	PROCEDURE SetMode*(X: INTEGER; s: SET);
+	BEGIN END SetMode;
+	
+	PROCEDURE CopyPattern*(col: INTEGER; pat: Pattern; X, Y, mode: INTEGER);
+	VAR dest, i, help1, reverse, w3, diff: LONGINT; 
+			w, h, cpsw, cpw, cph: SHORTINT; 
+			x, y, cpX, cpY, cpW, cpH, nofbytes: INTEGER;
+			buf: ARRAY 256 OF INTEGER;
+			lm, rm: CHAR;
+	BEGIN 
+		SYSTEM.GET(pat, w); SYSTEM.GET(pat+1, h); 
+		cpW := w + X; cpH := h + Y; 
+		x := X; y := Y;
+		IF x < clipx THEN X := clipx END;
+		IF y < clipy THEN Y := clipy END;
+		IF cpW >  clipright THEN cpW :=  clipright END;
+		IF cpH > cliptop THEN cpH := cliptop END;
+		cpW := cpW - X; cpH := cpH - Y; 
+		cpX := X - x; cpY := Y - y;
+		IF (cpW <= 0) OR (cpH <= 0) OR (cpX < 0) OR (cpY < 0) THEN RETURN END;
+		IF (cpW # w) OR (cpH # h) THEN 
+			(*$ DInline.Assemble
+				MOV BX,cpW[EBP]
+				ADD BX,7
+				SHR BX,3
+				MOV cpw[EBP],BL				 ; cpw := cpW DIV 8
+				MOV ESI,pat[EBP]
+				XOR EAX,EAX
+				MOV AL,[ESI]
+				ADD AX,7
+				SHR AX,3
+				MOV cpsw[EBP],AL				  ; cpsw := p.w DIV 8
+				LEA EDI,buf[EBP]
+				MOV AX,cpW[EBP]
+				MOV [EDI],AL				 ; new p.w
+				INC EDI
+				MOV AX,cpH[EBP]				  ; new p.h
+				MOV [EDI],AL
+				INC EDI
+				MOVSX BX,cpsw[EBP]:byte
+				MOV AX,cpY[EBP]
+				IMUL  AX,BX
+				MOVSX EAX,AX
+				ADD ESI,EAX
+				MOV CX,cpX[EBP]
+				SHR CX,3
+				MOVSX ECX,CX
+				ADD ESI,ECX
+				ADD ESI,2					; ESI := Sourcepos for Copyloop
+				MOV cph[EBP],0:byte					; init loop variables
+				MOV DH, 0
+				MOV DL,cph[EBP]
+				MOV CX,cpX[EBP]
+				AND CX,7					 ; cpX MOD 8  
+loopcp	  CMP cpH[EBP],DX
+				JLE l7cp					 ; height reached ?
+				MOV EAX,[ESI]
+				SHR EAX,CL				 ; in proper position
+				PUSH  CX
+				MOV EBX,-2
+				MOV CX,cpW[EBP]
+				SHL EBX,CL
+				SHR EBX, 1
+				NOT EBX
+				AND EAX,EBX
+				POP CX
+				MOV [EDI],EAX				; copy for a new pattern
+				MOVSX EAX,cpsw[EBP]:byte
+				ADD ESI,EAX				  ; one line in source up
+				MOVSX EAX,cpw[EBP]:byte
+				ADD EDI,EAX				  ; one line at destination up
+				INC DX
+				JMP loopcp
+l7cp		LEA EDI,buf[EBP]
+				MOV pat[EBP],EDI
+			END *)
+		END;
+		SYSTEM.GET(pat, w); SYSTEM.GET(pat+1, h); 
+		dest := (Height-Y-1) * width3 + X DIV 8; help1 := (X + w-1) MOD 8; diff := (X + w-1) DIV 8 - (X DIV 8);
+		reverse := SYSTEM.ADR(rev[0]); w3 := width3;
+		(*$ DInline.Assemble
+			MOV AX, $1F
+			MOV GS, AX
+			MOV DX, $03CE	; AX = Default bitmask; DX = Graphic-Controller
+			MOV AX, $FF08
+			OUT DX, AX
+			MOV AX, $5		; AL = Graphics mode; AH = Read-Mode = 0/Write-Mode = 0 (bits 0,1)
+			OUT DX, AX
+		END *)
+		IF mode = invert THEN SYSTEM.PORTOUT(03CEH, 1803H); (* AX = invert mode; DX = Graphic-Controller *)	
+			IF w <= 8 THEN
+				IF diff = 0 THEN 
+					(*$ DInline.Assemble
+						MOV EDI, dest[EBP]
+						MOV ESI, pat[EBP]	; patternaddress
+						ADD ESI, 2
+						MOV ECX, X[EBP]	; X MOD 8
+						AND ECX, 7
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AH, col[EBP]
+						MOV AL, 2
+						OUT DX, AX
+						MOV EAX, reverse[EBP]
+						XOR EBX, EBX
+cploop2			MOV BL, [ESI]
+						INC ESI
+						SHL BL, CL
+						MOV BL, [EAX + EBX*1]
+						MOV DL, GS:[EDI]	; latch byte
+						MOV GS:[EDI], BL	; set pattern
+						SUB EDI, w3[EBP]
+						DEC h[EBP]:byte
+						JG cploop2
+					END *)
+				ELSE
+					(*$ DInline.Assemble
+						MOV EDI, dest[EBP]
+						MOV ESI, pat[EBP]	; patternaddress
+						ADD ESI, 2
+						MOV ECX, X[EBP]	; X MOD 8
+						AND ECX, 7
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AH, col[EBP]
+						MOV AL, 2
+						OUT DX, AX
+						MOV EAX, reverse[EBP]
+cploop3			XOR EBX, EBX
+						MOV BL, [ESI]
+						INC ESI
+						SHL BX, CL
+						MOV DX, BX
+						AND BX, $FF
+						MOV DL, [EAX + EBX*1]
+						MOV BL, DH
+						MOV DH, [EAX + EBX*1]
+						MOV BL, GS:[EDI]	; latch byte
+						MOV GS:[EDI], DL	; set pattern
+						MOV BL, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], DH	; set pattern
+						SUB EDI, w3[EBP]
+						DEC h[EBP]:byte
+						JG cploop3
+					END *)
+				END
+			ELSIF w <= 16 THEN
+				IF diff = 1 THEN
+					(*$ DInline.Assemble
+						MOV EDI, dest[EBP]
+						MOV ESI, pat[EBP]	; patternaddress
+						ADD ESI, 2
+						MOV ECX, X[EBP]	; X MOD 8
+						AND ECX, 7
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AH, col[EBP]
+						MOV AL, 2
+						OUT DX, AX
+						MOV EAX, reverse[EBP]
+cploop5			XOR EBX, EBX
+						MOV BX, [ESI]
+						ADD ESI, 2
+						SHL BX, CL
+						MOV DX, BX
+						AND BX, $FF
+						MOV DL, [EAX + EBX*1]
+						MOV BL, DH
+						MOV DH, [EAX + EBX*1]
+						MOV BL, GS:[EDI]	; latch byte
+						MOV GS:[EDI], DL	; set pattern
+						MOV BL, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], DH	; set pattern
+						SUB EDI, w3[EBP]
+						DEC h[EBP]:byte
+						JG cploop5
+					END *)
+				ELSE
+					(*$ DInline.Assemble
+						MOV EDI, dest[EBP]
+						MOV ESI, pat[EBP]	; patternaddress
+						ADD ESI, 2
+						MOV ECX, X[EBP]	; X MOD 8
+						AND ECX, 7
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AH, col[EBP]
+						MOV AL, 2
+						OUT DX, AX
+						MOV EAX, reverse[EBP]
+cploop7			XOR EBX, EBX
+						MOV BX, [ESI]
+						ADD ESI, 2
+						SHL EBX, CL
+						MOV DX, BX
+						SHR EBX, 16
+						AND BX, $FF
+						MOV CH, [EAX + EBX*1]
+						MOV BL, DL
+						MOV DL, [EAX + EBX*1]
+						MOV BL, DH
+						MOV DH, [EAX + EBX*1]
+						MOV BL, GS:[EDI]	; latch byte
+						MOV GS:[EDI], DL	; set pattern
+						MOV BL, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], DH	; set pattern
+						MOV BL, GS:2[EDI]	; latch byte
+						MOV GS:2[EDI], CH	; set pattern
+						SUB EDI, w3[EBP]
+						DEC h[EBP]:byte
+						JG cploop7
+					END *)
+				END
+			ELSIF w <= 24 THEN
+				(*$ DInline.Assemble
+					MOV EDI, dest[EBP]
+					MOV ESI, pat[EBP]	; patternaddress
+					ADD ESI, 2
+					MOV ECX, X[EBP]	; X MOD 8
+					AND ECX, 7
+					MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+					MOV AH, col[EBP]
+					MOV AL, 2
+					OUT DX, AX
+					MOV EAX, reverse[EBP]
+cploop9		MOV EBX, [ESI]
+					ADD ESI, 3
+					AND EBX, $FFFFFF
+					SHL EBX, CL
+					PUSH ECX
+					MOV DX, BX
+					SHR EBX, 16
+					MOV CX, BX
+					AND BX, $FF
+					MOV CL, [EAX + EBX*1]
+					MOV BL, CH
+					MOV CH, [EAX + EBX*1]
+					MOV BL, DL
+					MOV DL, [EAX + EBX*1]
+					MOV BL, DH
+					MOV DH, [EAX + EBX*1]
+					MOV BL, GS:[EDI]	; latch byte
+					MOV GS:[EDI], DL	; set pattern
+					MOV BL, GS:1[EDI]	; latch byte
+					MOV GS:1[EDI], DH	; set pattern
+					MOV BL, GS:2[EDI]	; latch byte
+					MOV GS:2[EDI], CL	; set pattern
+					MOV BL, GS:3[EDI]	; latch byte
+					MOV GS:3[EDI], CH	; set pattern
+					POP ECX
+					SUB EDI, w3[EBP]
+					DEC h[EBP]:byte
+					JG cploop9
+				END *)
+			ELSE
+				(*$ DInline.Assemble
+					MOV EDI, dest[EBP]
+					MOV ESI, pat[EBP]	; patternaddress
+					ADD ESI, 2
+					MOV ECX, X[EBP]	; X MOD 8
+					AND ECX, 7
+					MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+					MOV AH, col[EBP]
+					MOV AL, 2
+					OUT DX, AX
+					MOV EAX, reverse[EBP]
+cploop11	MOV EBX, [ESI]
+					ADD ESI, 4
+					PUSH ESI
+					XOR ESI, ESI
+					SHLD ESI, EBX, CL
+					SHL EBX, CL
+					PUSH ECX
+					MOV DX, BX
+					SHR EBX, 16
+					MOV CX, BX
+					AND BX, $FF
+					MOV CL, [EAX + EBX*1]
+					MOV BL, CH
+					MOV CH, [EAX + EBX*1]
+					MOV BL, DL
+					MOV DL, [EAX + EBX*1]
+					MOV BL, DH
+					MOV DH, [EAX + EBX*1]
+					MOV BH, [EAX + ESI*1]
+					MOV BL, GS:[EDI]	; latch byte
+					MOV GS:[EDI], DL	; set pattern
+					MOV BL, GS:1[EDI]	; latch byte
+					MOV GS:1[EDI], DH	; set pattern
+					MOV BL, GS:2[EDI]	; latch byte
+					MOV GS:2[EDI], CL	; set pattern
+					MOV BL, GS:3[EDI]	; latch byte
+					MOV GS:3[EDI], CH	; set pattern
+					MOV BL, GS:4[EDI]	; latch byte
+					MOV GS:4[EDI], BH	; set pattern
+					POP ECX
+					POP ESI
+					SUB EDI, w3[EBP]
+					DEC h[EBP]:byte
+					JG cploop11
+				END *)
+			END;
+		ELSE (* paint & replace *)
+			IF w <= 8 THEN
+				IF diff = 0 THEN 
+					(*$ DInline.Assemble
+						MOV EDI, dest[EBP]
+						MOV ESI, pat[EBP]	; patternaddress
+						ADD ESI, 2
+						MOV ECX, X[EBP]	; X MOD 8
+						AND ECX, 7
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+cploop1			MOV AX, $0F02
+						OUT DX, AX
+						MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+						MOV AX, $0803
+						OUT DX, AX
+						XOR EBX, EBX
+						MOV BL, [ESI]
+						INC ESI
+						SHL BL, CL
+						MOV EDX, reverse[EBP]
+						MOV BL, [EDX + EBX*1]
+						MOV BH, GS:[EDI]	; latch byte
+						NOT BL
+						MOV GS:[EDI], BL	; clear pattern
+						NOT BL
+						MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+						MOV AX, $1003
+						OUT DX, AX
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AL, 2
+						MOV AH, col[EBP]
+						OUT DX, AX
+						MOV BH, GS:[EDI]	; latch byte
+						MOV GS:[EDI], BL	; set pattern
+						SUB EDI, w3[EBP]
+						DEC h[EBP]:byte
+						JG cploop1
+					END *)
+				ELSE
+					(*$ DInline.Assemble
+						MOV EDI, dest[EBP]
+						MOV ESI, pat[EBP]	; patternaddress
+						ADD ESI, 2
+						MOV ECX, X[EBP]	; X MOD 8
+						AND ECX, 7
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+cploop4			MOV AX, $0F02
+						OUT DX, AX
+						MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+						MOV AX, $0803
+						OUT DX, AX
+						XOR EBX, EBX
+						MOV BL, [ESI]
+						INC ESI
+						SHL BX, CL
+						MOV EDX, reverse[EBP]
+						MOV AX, BX
+						AND BX, $FF
+						MOV AL, [EDX + EBX*1]
+						MOV BL, AH
+						MOV AH, [EDX + EBX*1]
+						NOT AX
+						MOV BH, GS:[EDI]	; latch byte
+						MOV GS:[EDI], AL	; clear pattern
+						MOV BH, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], AH	; clear pattern
+						NOT AX
+						MOV BX, AX
+						MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+						MOV AX, $1003
+						OUT DX, AX
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AL, 2
+						MOV AH, col[EBP]
+						OUT DX, AX
+						MOV CH, GS:[EDI]	; latch byte
+						MOV GS:[EDI], BL	; set pattern
+						MOV CH, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], BH	; set pattern
+						SUB EDI, w3[EBP]
+						DEC h[EBP]:byte
+						JG cploop4
+					END *)
+				END
+			ELSIF w <= 16 THEN
+				IF diff = 1 THEN
+					(*$ DInline.Assemble
+						MOV EDI, dest[EBP]
+						MOV ESI, pat[EBP]	; patternaddress
+						ADD ESI, 2
+						MOV ECX, X[EBP]	; X MOD 8
+						AND ECX, 7
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+cploop6			MOV AX, $0F02
+						OUT DX, AX
+						MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+						MOV AX, $0803
+						OUT DX, AX
+						XOR EBX, EBX
+						MOV BX, [ESI]
+						ADD ESI, 2
+						SHL BX, CL
+						MOV EDX, reverse[EBP]
+						MOV AX, BX
+						AND BX, $FF
+						MOV AL, [EDX + EBX*1]
+						MOV BL, AH
+						MOV AH, [EDX + EBX*1]
+						NOT AX
+						MOV BH, GS:[EDI]	; latch byte
+						MOV GS:[EDI], AL	; clear pattern
+						MOV BH, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], AH	; clear pattern
+						NOT AX
+						MOV BX, AX
+						MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+						MOV AX, $1003
+						OUT DX, AX
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AL, 2
+						MOV AH, col[EBP]
+						OUT DX, AX
+						MOV CH, GS:[EDI]	; latch byte
+						MOV GS:[EDI], BL	; set pattern
+						MOV CH, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], BH	; set pattern
+						SUB EDI, w3[EBP]
+						DEC h[EBP]:byte
+						JG cploop6
+					END *)
+				ELSE
+					(*$ DInline.Assemble
+						MOV EDI, dest[EBP]
+						MOV ESI, pat[EBP]	; patternaddress
+						ADD ESI, 2
+						MOV ECX, X[EBP]	; X MOD 8
+						AND ECX, 7
+cploop8			MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AX, $0F02
+						OUT DX, AX
+						MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+						MOV AX, $0803
+						OUT DX, AX
+						XOR EBX, EBX
+						MOV BX, [ESI]
+						ADD ESI, 2
+						SHL EBX, CL
+						MOV EDX, reverse[EBP]
+						MOV AX, BX
+						SHR EBX, 16
+						AND BX, $FF
+						MOV CH, [EDX + EBX*1]
+						MOV BL, AL
+						MOV AL, [EDX + EBX*1]
+						MOV BL, AH
+						MOV AH, [EDX + EBX*1]
+						NOT AX
+						NOT CH
+						MOV BH, GS:[EDI]	; latch byte
+						MOV GS:[EDI], AL	; clear pattern
+						MOV BH, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], AH	; clear pattern
+						MOV BH, GS:2[EDI]	; latch byte
+						MOV GS:2[EDI], CH	; clear pattern
+						NOT CH
+						NOT AX
+						MOV BX, AX
+						MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+						MOV AX, $1003
+						OUT DX, AX
+						MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+						MOV AL, 2
+						MOV AH, col[EBP]
+						OUT DX, AX
+						MOV DH, GS:[EDI]	; latch byte
+						MOV GS:[EDI], BL	; set pattern
+						MOV DH, GS:1[EDI]	; latch byte
+						MOV GS:1[EDI], BH	; set pattern
+						MOV DH, GS:2[EDI]	; latch byte
+						MOV GS:2[EDI], CH	; set pattern
+						SUB EDI, w3[EBP]
+						DEC h[EBP]:byte
+						JG cploop8
+					END *)
+				END
+			ELSIF w <= 24 THEN
+				(*$ DInline.Assemble
+					MOV EDI, dest[EBP]
+					MOV ESI, pat[EBP]	; patternaddress
+					ADD ESI, 2
+					MOV ECX, X[EBP]	; X MOD 8
+					AND ECX, 7
+cploop10		MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+					MOV AX, $0F02
+					OUT DX, AX
+					MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+					MOV AX, $0803
+					OUT DX, AX
+					MOV EBX, [ESI]
+					AND EBX, $FFFFFF
+					ADD ESI, 3
+					SHL EBX, CL
+					PUSH ECX
+					MOV EDX, reverse[EBP]
+					MOV AX, BX
+					SHR EBX, 16
+					MOV CX, BX
+					AND BX, $FF
+					MOV CL, [EDX + EBX*1]
+					MOV BL, CH
+					MOV CH, [EDX + EBX*1]
+					MOV BL, AL
+					MOV AL, [EDX + EBX*1]
+					MOV BL, AH
+					MOV AH, [EDX + EBX*1]
+					NOT AX
+					NOT CX
+					MOV BH, GS:[EDI]	; latch byte
+					MOV GS:[EDI], AL	; clear pattern
+					MOV BH, GS:1[EDI]	; latch byte
+					MOV GS:1[EDI], AH	; clear pattern
+					MOV BH, GS:2[EDI]	; latch byte
+					MOV GS:2[EDI], CL	; clear pattern
+					MOV BH, GS:3[EDI]	; latch byte
+					MOV GS:3[EDI], CH	; clear pattern
+					NOT CX
+					NOT AX
+					MOV BX, AX
+					MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+					MOV AX, $1003
+					OUT DX, AX
+					MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+					MOV AL, 2
+					MOV AH, col[EBP]
+					OUT DX, AX
+					MOV DH, GS:[EDI]	; latch byte
+					MOV GS:[EDI], BL	; set pattern
+					MOV DH, GS:1[EDI]	; latch byte
+					MOV GS:1[EDI], BH	; set pattern
+					MOV DH, GS:2[EDI]	; latch byte
+					MOV GS:2[EDI], CL	; set pattern
+					MOV DH, GS:3[EDI]	; latch byte
+					MOV GS:3[EDI], CH	; set pattern
+					POP ECX
+					SUB EDI, w3[EBP]
+					DEC h[EBP]:byte
+					JG cploop10
+				END *)
+			ELSE
+				(*$ DInline.Assemble
+					MOV EDI, dest[EBP]
+					MOV ESI, pat[EBP]	; patternaddress
+					ADD ESI, 2
+					MOV ECX, X[EBP]	; X MOD 8
+					AND ECX, 7
+cploop12		MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+					MOV AX, $0F02
+					OUT DX, AX
+					MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+					MOV AX, $0803
+					OUT DX, AX
+					MOV EBX, [ESI]
+					ADD ESI, 4
+					PUSH ESI
+					XOR ESI, ESI
+					SHLD ESI, EBX, CL
+					SHL EBX, CL
+					PUSH ECX
+					MOV EDX, reverse[EBP]
+					MOV AX, BX
+					SHR EBX, 16
+					MOV CX, BX
+					AND BX, $FF
+					MOV CL, [EDX + EBX*1]
+					MOV BL, CH
+					MOV CH, [EDX + EBX*1]
+					MOV BL, AL
+					MOV AL, [EDX + EBX*1]
+					MOV BL, AH
+					MOV AH, [EDX + EBX*1]
+					MOV BL, [EDX + ESI*1]
+					NOT AX
+					NOT CX
+					NOT BL
+					MOV BH, GS:[EDI]	; latch byte
+					MOV GS:[EDI], AL	; clear pattern
+					MOV BH, GS:1[EDI]	; latch byte
+					MOV GS:1[EDI], AH	; clear pattern
+					MOV BH, GS:2[EDI]	; latch byte
+					MOV GS:2[EDI], CL	; clear pattern
+					MOV BH, GS:3[EDI]	; latch byte
+					MOV GS:3[EDI], CH	; clear pattern
+					MOV BH, GS:4[EDI]	; latch byte
+					MOV GS:4[EDI], BL	; clear pattern
+					NOT BL
+					NOT CX
+					NOT AX
+					MOV DX, BX
+					MOV BX, AX
+					PUSH EDX
+					MOV EDX, $03CE	; AL = Data/Rotate; AH = Modus; DX = Graphic-Controller
+					MOV AX, $1003
+					OUT DX, AX
+					MOV EDX, $03C4	; AL = Plane select; AH = Bitplanemask; DX = Sequencer
+					MOV AL, 2
+					MOV AH, col[EBP]
+					OUT DX, AX
+					POP EDX
+					MOV DH, GS:[EDI]	; latch byte
+					MOV GS:[EDI], BL	; set pattern
+					MOV DH, GS:1[EDI]	; latch byte
+					MOV GS:1[EDI], BH	; set pattern
+					MOV DH, GS:2[EDI]	; latch byte
+					MOV GS:2[EDI], CL	; set pattern
+					MOV DH, GS:3[EDI]	; latch byte
+					MOV GS:3[EDI], CH	; set pattern
+					MOV DH, GS:4[EDI]	; latch byte
+					MOV GS:4[EDI], DL	; set pattern
+					POP ECX
+					POP ESI
+					SUB EDI, w3[EBP]
+					DEC h[EBP]:byte
+					JG cploop12
+				END *)
+			END;
+		END;
+		(*$ DInline.Assemble
+			PUSH DS
+			POP GS
+		END *)
+	END CopyPattern;
+	
+	PROCEDURE ReplConst*(col, X, Y, W, H, mode: INTEGER);
+	VAR right, top: INTEGER; addr, start, end, w3, temp: LONGINT; rm, lm: CHAR;
+	BEGIN  
+		top := Y + H; right := X + W;
+		IF X < clipx THEN X := clipx END;
+		IF Y < clipy THEN Y := clipy END;
+		IF  clipright < right THEN right :=  clipright END; 
+		IF cliptop < top THEN top := cliptop END;
+		W := right - X; H := top - Y;
+		IF (W <= 0) OR (H <= 0) OR (X < 0) OR (Y < 0) THEN RETURN END;
+		SetCard(mode);
+		SYSTEM.PORTOUT(03CEH, 205H);	(* AL = Gaphics mode; AH = Read-Mode = 0/Write-Mode = 2 (bits 0,1) *)
+		SYSTEM.PORTOUT(03C4H, 0F02H);	(* AL = Plane select; AH = Bitplanemask; DX = Sequencer *)
+		addr := (Height - Y - 1) * width3;
+		start := addr + X DIV 8; end := addr + (X + W) DIV 8;
+		lm := imask[X MOD 8]; rm := mask[(X + W) MOD 8]; w3 := width3;
+		IF start = end THEN
+			(*$ DInline.Assemble
+				MOV AH, lm[EBP]
+				AND AH, rm[EBP]
+				MOV AL, 8
+				MOV EDX, $03CE
+				OUT DX, AX	; Bitmask
+				MOV AX, $1F	; set selector for display area
+				MOV GS, AX
+				MOV AH, col[EBP]
+				MOV ECX, H[EBP]
+				MOV ESI, start[EBP]
+rcloop1	MOV AL, GS:[ESI]	; latch bytes
+				MOV GS:[ESI], AH
+				SUB ESI, w3[EBP]
+				LOOP rcloop1
+				PUSH DS
+				POP GS
+			END *)
+		ELSE
+			(*$ DInline.Assemble
+				MOV ESI, start[EBP]
+				MOV BH, col[EBP]
+				MOV EDI, end[EBP]
+				SUB EDI, ESI	; difference beween start and end
+				MOV temp[EBP], EDI	; save difference beween start and end
+				MOV EDX, $03CE		; set Graphic controller
+				MOV AX, $1F	; set selector for display area
+				MOV GS, AX
+rcloop2	MOV AH, lm[EBP]	; prepare left mask
+				MOV AL, 8
+				OUT DX, AX	; set left Bitmask
+				MOV AL, GS:[ESI]	; latch byte
+				MOV GS:[ESI], BH	; set byte
+				MOV AX, $FF08	; prepare full mask
+				OUT DX, AX	; set full mask
+				MOV ECX,ESI
+				INC ECX
+rclabel2	CMP EDI, 1
+				JLE rclabel1
+				MOV AL, GS:[ECX]	; latch bytes
+				MOV GS:[ECX], BH	; set bytes
+				DEC EDI
+				INC ECX
+				JMP rclabel2
+rclabel1	MOV AH, rm[EBP]	; prepare right mask
+				MOV AL, 8
+				OUT DX, AX	; set right Bitmask
+				MOV AL, GS:[ECX]	; latch byte
+				MOV GS:[ECX], BH	; set byte
+				SUB ESI, w3[EBP]	; next line
+				DEC H[EBP]: word
+				MOV EDI, temp[EBP]
+				JG rcloop2
+				PUSH DS
+				POP GS
+			END *)
+		END;
+	END ReplConst;
+	
+	PROCEDURE FillPattern*(col: INTEGER; pat: Pattern; pX, pY, X, Y, W, H, mode: INTEGER);
+	VAR w, h: SHORTINT; right, top: INTEGER; hgt, leftmask, rightmask, w3: LONGINT;
+			help, help1, help2, help3, topleft, flag, color, msk, imsk, reverse: LONGINT;
+	BEGIN 
+		SYSTEM.GET(pat, w); SYSTEM.GET(pat+1, h);
+		IF (w # 16) & (w # 32) THEN RETURN END;
+		top := Y + H; right := X + W; 
+		IF X < clipx THEN X := clipx END;
+		IF Y < clipy THEN Y := clipy END;
+		IF  clipright < right THEN right :=  clipright END; 
+		IF cliptop < top THEN top := cliptop END;
+		IF (W <= 0) OR (H <= 0) OR (X < 0) OR (Y < 0) THEN RETURN END;
+		hgt := height-1; w3 := width3; 
+msk := SYSTEM.ADR(mask[0]); imsk := SYSTEM.ADR(imask[0]);
+		reverse := SYSTEM.ADR(rev[0]);
+		(*$ DInline.Assemble
+			MOV	AX, $1F
+			MOV	GS, AX
+		
+			MOV	EAX, mode[EBP]	; get mode and set local AH
+			CMP	AX, 0
+			JNE	Inv4
+			MOV	AH, 0
+			JMP	setGC4
+Inv4	CMP	AX, 2
+			JNE	Paint4
+			MOV	AH, $18
+			JMP	setGC4
+Paint4	MOV	AH, $10	; with wrong mode =>
+;			; automatically paint mode
+; Set graphic-controller-registers
+		
+setGC4	MOV	DX, $3CE	; Graphic-Controller
+			MOV	AL, 3	; AL = Data/Rotate / AH = Modus
+			OUT	DX, AX
+			MOV	AX, $0005	; AL = Read-Mode = 0
+;			; Write-Mode = 0 (bits 0, 1)
+			OUT	DX, AX	; Set
+; Get params x, y
+getxy4	MOV	EBX, hgt[EBP]
+			SUB	EBX, Y[EBP]	; (0, 0) in bottom left corner
+			MOV	EAX, Y[EBP]
+			MOV	Y[EBP], EBX	; y:= height -1 - y
+			XOR	EDX, EDX
+			SUB	EAX, pY[EBP]
+			MOV	ECX, pat[EBP]
+			MOVSX	ECX, 1[ECX]:byte
+			IDIV	ECX
+			MOV	help2[EBP], EDX
+			MOV	EBX, X[EBP]	; EBX := x
+			MOV	ECX, EBX
+			MOV	EDX, EBX
+			MOV	ESI, EBX
+			SHR	EBX, 3	; EBX := X DIV 8
+			ADD	EDX, W[EBP]	; EDX := x + w
+			DEC	EDX
+			SHR	EDX, 3	; EDX := (x + w-1) DIV 8
+			AND	ECX, 7	; ECX := x mod 8
+			ADD	ESI, W[EBP]
+			DEC	ESI
+			AND	ESI, 7	; ESI := (x+w-1) MOD 8
+			MOV	EDI, imsk[EBP]
+			MOV	AL, [EDI + ECX*1]			
+;			MOV	AL, imask[ECX]
+			MOV	leftmask[EBP], AL
+			INC	ESI	; *$*
+			MOV	EDI, msk[EBP]
+			MOV	AL, [EDI + ESI*1]		
+;			MOV	AL, mask[ESI]
+			MOV	rightmask[EBP], AL
+		
+			MOV	EDI, w3[EBP]
+			IMUL	EDI, Y[EBP]
+			ADD	EDI, EBX	; EDI := START-Adr
+			SUB	EDX, EBX	; Diff in bytes
+			MOV	help[EBP], EDX
+			MOV	help1[EBP], EDI
+			MOV	EBX, H[EBP]
+			IMUL	EBX, w3[EBP]
+			SUB	EDI, EBX
+			MOV	topleft[EBP], EDI: double
+			MOV	EDI, help1[EBP]
+			MOV	ESI, pat[EBP]	; get addr of pat
+			MOVSX	EAX, X[EBP]:word	; EAX := x
+			XOR	EDX, EDX
+			MOVSX	EBX, [ESI]:byte
+			IDIV	EBX
+			MOV	help3[EBP], DL	;help3 := x MOD p.w
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AH, col[EBP]
+			MOV	AL, 2
+			OUT	DX, AX
+			
+			MOV	EBX, help2[EBP]
+			MOV	flag[EBP], 0:byte
+			MOV	EDX, help[EBP]
+			CMP	EDX, 0	; in one byte ?
+			JE	onebyte
+			CMP	[ESI], 16: byte	; width = 16 ?
+			JNE	RP32
+RP16	CMP	mode[EBP], 0: byte	; replacemode ?
+			JE	R16
+			CMP	mode[EBP], 1: byte	; paintmode ?
+			JE	P16left
+IP16left	MOV	AX, 2[ESI+EBX*2]	; invert/paint p.w = 16
+			CMP	help3[EBP], 8:byte
+			JGE	label
+			ROR	AX, 8
+label	MOV	CL, pX[EBP]
+			ROL	AX, CL
+			XOR	EDX, EDX
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	DL, AL
+			MOV	AL, [EBX+EDX*1] 
+;			MOV	AL, rev[EDX] 
+			MOV	DL, AH
+			MOV	AH, [EBX+EDX*1] 
+;			MOV	AH, rev[EDX]
+			POP EBX
+			MOV	CH, GS:[EDI]	; latch
+			MOV	GS:[EDI], AH
+			ROL	AX, 8
+			MOV	EDX, 1
+			CMP	EDX, help[EBP]
+			JE	IP16right
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+			MOV	EDX, 1
+IP16mid	MOV	CH, GS:[EDI+EDX*1]	; latch
+			MOV	GS:[EDI+EDX*1], AH
+			ROL	AX, 8
+			INC	EDX
+			CMP	EDX, help[EBP]
+			JL	IP16mid
+IP16right	MOV	help1[EBP], EDX
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+			MOV	EDX, help1[EBP]
+			MOV	CH, GS:[EDI+EDX*1]
+			MOV	GS:[EDI+EDX*1], AH
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]	; prepare rightmask again
+			MOV	AL, 8
+			OUT	DX, AX
+			XOR	EDX, EDX
+			INC	EBX
+			CMP	BL, 1[ESI]	; height of pattern reached?
+			JNE	IP16left
+			XOR	EBX, EBX	; yes, then reset counter
+			JMP	IP16left
+			
+P16left	MOV	AX, 2[ESI+EBX*2]	; invert/paint p.w = 16
+			CMP	help3[EBP], 8:byte
+			JGE	plabel
+			ROR	AX, 8
+plabel	MOV	CL, pX[EBP]
+			ROL	AX, CL
+			XOR	EDX, EDX
+			MOV	DL, AL
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	AL, [EBX+EDX*1] 
+;			MOV	AL, rev[EDX] 
+			MOV	DL, AH
+			MOV	AH, [EBX+EDX*1] 
+;			MOV	AH, rev[EDX]
+			POP EBX
+			MOV	CH, GS:[EDI]	; latch
+			
+			PUSH	EDX
+			PUSH	EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; set all planes
+			OUT	DX, AX	; set color/sequencer planemap
+			MOV	AH, 8	; set mode to AND
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			
+			POP	EAX
+			NOT	AH	; negate AH
+			MOV	GS:[EDI], AH	; clear pattern
+			NOT	AH	; negate AH
+			PUSH	EAX
+		
+			MOV	AH, $10	; set mode to OR
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			MOV	AH, col[EBP]	; get color and set bitplanes
+			MOV	AL, 2
+			MOV	DX, $3C4
+			OUT	DX, AX
+			POP	EAX
+			POP	EDX
+		
+			MOV	GS:[EDI], AH
+			ROL	AX, 8
+			MOV	EDX, 1
+			CMP	EDX, help[EBP]
+			JE	P16right
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+			MOV	EDX, 1
+P16mid	MOV	CH, GS:[EDI+EDX*1]	; latch
+		
+			PUSH	EDX
+			PUSH	EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; set all planes
+			OUT	DX, AX	; set color/sequencer planemap
+			MOV	AH, 8	; set mode to AND
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			
+			POP	EAX
+			POP	EDX
+			NOT	AH	; negate AH
+			MOV	GS:[EDI+EDX*1], AH	; clear pattern
+			NOT	AH	; negate AH
+			PUSH	EDX
+			PUSH	EAX
+		
+			MOV	AH, $10	; set mode to OR
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			MOV	AH, col[EBP]	; get color and set bitplanes
+			MOV	AL, 2
+			MOV	DX, $3C4
+			OUT	DX, AX
+			POP	EAX
+			POP	EDX
+			
+			MOV	GS:[EDI+EDX*1], AH
+			ROL	AX, 8
+			INC	EDX
+			CMP	EDX, help[EBP]
+			JL	P16mid
+P16right	MOV	help1[EBP], EDX
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+			MOV	EDX, help1[EBP]
+			MOV	CH, GS:[EDI+EDX*1]
+			
+			PUSH	EDX
+			PUSH	EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; set all planes
+			OUT	DX, AX	; set color/sequencer planemap
+			MOV	AH, 8	; set mode to AND
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			
+			POP	EAX
+			POP	EDX
+			NOT	AH	; negate AH
+			MOV	GS:[EDI+EDX*1], AH	; clear pattern
+			NOT	AH	; negate AH
+			PUSH	EDX
+			PUSH	EAX
+		
+			MOV	AH, $10	; set mode to OR
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			MOV	AH, col[EBP]	; get color and set bitplanes
+			MOV	AL, 2
+			MOV	DX, $3C4
+			OUT	DX, AX
+			POP	EAX
+			POP	EDX
+			
+			MOV	GS:[EDI+EDX*1], AH
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]	; prepare rightmask again
+			MOV	AL, 8
+			OUT	DX, AX
+			XOR	EDX, EDX
+			INC	EBX
+			CMP	BL, 1[ESI]	; height of pattern reached?
+			JNE	P16left
+			XOR	EBX, EBX	; yes, then reset counter
+			JMP	P16left
+			
+R16	MOV	AH, col[EBP]
+			MOV	color[EBP], AH
+R16left	MOV	AX, 2[ESI+EBX*2]	; replace p.w = 16
+			CMP	help3[EBP], 8:byte
+			JGE	label1
+			ROR	AX, 8
+label1	MOV	CL, pX[EBP]
+			ROL	AX, CL
+			XOR	DX, DX
+			MOV	DL, AL
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	AL, [EBX+EDX*1] 
+;			MOV	AL, rev[EDX]
+			MOV	DL, AH
+;			MOV	AH, rev[EDX]
+			MOV	AH, [EBX+EDX*1] 
+			POP EBX
+			MOV	help2[EBP], EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02
+			OUT	DX, AX
+			MOV	CH, GS:[EDI]	; latch
+			MOV	GS:[EDI], 0: byte
+			MOV	AH, color[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set color
+			MOV	EAX, help2[EBP]
+			MOV	GS:[EDI], AH
+			ROL	AX, 8
+			MOV	EDX, 1
+			CMP	EDX, help[EBP]
+			JE	R16right
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08
+			OUT	DX, AX
+			MOV	EDX, 1
+			MOV	EAX, help2[EBP]
+R16mid	MOV	help1[EBP], EDX
+			MOV	help2[EBP], EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02
+			OUT	DX, AX
+			XCHG	help1[EBP], EDX
+			MOV	GS:[EDI+EDX*1], 0: byte
+			XCHG	help1[EBP], EDX
+			MOV	AH, color[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set color
+			XCHG	help1[EBP], EDX
+			XCHG	help2[EBP], EAX
+			MOV	GS:[EDI+EDX*1], AH
+			ROL	AX, 8
+			INC	EDX
+			CMP	EDX, help[EBP]
+			JL	R16mid
+R16right	MOV	help1[EBP], EDX
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AX, $0F02
+			OUT	DX, AX
+			XCHG	help1[EBP], EDX
+			MOV	CH, GS:[EDI+EDX*1]	; latch
+			MOV	GS:[EDI+EDX*1], 0: byte
+			XCHG	help1[EBP], EDX
+			MOV	AH, color[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set color
+			MOV	EAX, help2[EBP]
+			MOV	EDX, help1[EBP]
+			MOV	GS:[EDI+EDX*1], AH
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]	; prepare rightmask again
+			MOV	AL, 8
+			OUT	DX, AX
+			XOR	EDX, EDX
+			INC	EBX
+			CMP	BL, 1[ESI]	; height of pattern reached?
+			JNE	R16left
+			XOR	EBX, EBX	; yes, then reset counter
+			JMP	R16left
+onebyte	CMP	[ESI], 16: byte	; width = 16 ?
+			SETE	flag[EBP]	; flag = 1 if p.w=16
+			CMP	mode[EBP], 0: byte	; replace ?
+			JE	onebyteR
+			CMP	mode[EBP], 1: byte	; paint ?
+			JE	onebyteP
+IPonebyte	CMP	flag[EBP], 1:byte
+			JNE	p32
+			MOV	AX, 2[ESI+EBX*2]	; p.w = 16
+			CMP	help3[EBP], 8:byte
+			JGE	label2
+			ROR	AX, 8
+label2	MOV	CL, pX[EBP]
+			ROL	AX, CL
+			JMP	down
+p32	MOV	EAX, 2[ESI+EBX*4]	; p.w = 32
+			CMP	help3[EBP], 24:byte
+			JL	labela
+			ROR	EAX, 24
+			JMP	labelc
+labela	CMP	help3[EBP], 16:byte	
+			JL	labelb
+			ROR	EAX, 16
+			JMP	labelc
+labelb	CMP	help3[EBP], 8:byte 
+			JL	labelc
+			ROR	EAX, 8
+labelc	MOV	CL, pX[EBP]
+			ROL	EAX, CL
+down	XOR	DX, DX
+			MOV	DL, AL
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	DL, [EBX+EDX*1] 
+;			MOV	DL, rev[EDX]
+			POP EBX
+			AND	AL, rightmask[EBP]
+			MOV	CH, GS:[EDI]	; latch
+			MOV	GS:[EDI], AL
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			INC	EBX
+			CMP	BL, 1[ESI]
+			JNE	IPonebyte
+			XOR	EBX, EBX
+			JMP	IPonebyte
+			
+onebyteP	CMP	flag[EBP], 1:byte
+			JNE	pp32
+			MOV	AX, 2[ESI+EBX*2]	; p.w = 16
+			CMP	help3[EBP], 8:byte
+			JGE	plabel2
+			ROR	AX, 8
+plabel2	MOV	CL, pX[EBP]
+			ROL	AX, CL
+			JMP	pdown
+pp32	MOV	EAX, 2[ESI+EBX*4]	; p.w = 32
+			CMP	help3[EBP], 24:byte
+			JL	plabela
+			ROR	EAX, 24
+			JMP	plabelc
+plabela	CMP	help3[EBP], 16:byte	
+			JL	plabelb
+			ROR	EAX, 16
+			JMP	plabelc
+plabelb	CMP	help3[EBP], 8:byte 
+			JL	plabelc
+			ROR	EAX, 8
+plabelc	MOV	CL, pX[EBP]
+			ROL	EAX, CL
+pdown	XOR	DX, DX
+			MOV	DL, AL
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	DL, [EBX+EDX*1] 
+;			MOV	DL, rev[EDX]
+			POP EBX
+			AND	AL, rightmask[EBP]
+			MOV	CH, GS:[EDI]	; latch
+		
+			PUSH	EDX
+			PUSH	EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; set all planes
+			OUT	DX, AX	; set color/sequencer planemap
+			MOV	AH, 8	; set mode to AND
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			
+			POP	EAX
+			NOT	AL	; negate AL
+			MOV	GS:[EDI], AL	; clear pattern
+			NOT	AL	; negate AL
+			PUSH	EAX
+		
+			MOV	AH, $10	; set mode to OR
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			MOV	AH, col[EBP]	; get color and set bitplanes
+			MOV	AL, 2
+			MOV	DX, $3C4
+			OUT	DX, AX
+			POP	EAX
+			POP	EDX
+		
+			MOV	GS:[EDI], AL
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			INC	EBX
+			CMP	BL, 1[ESI]
+			JNE	onebyteP
+			XOR	EBX, EBX
+			JMP	onebyteP
+			
+onebyteR	MOV	AH, col[EBP]	; replace in 1 byte
+			MOV	color[EBP], AH
+Ronebyte	CMP	flag[EBP], 1:byte
+			JNE	p32r
+			MOV	AX, 2[ESI+EBX*2]	; p.w = 16
+			CMP	help3[EBP], 8:byte
+			JGE	label3
+			ROR	AX, 8
+label3	MOV	CL, pX[EBP]
+			ROL	AX, CL
+			JMP	downr
+p32r	MOV	EAX, 2[ESI+EBX*4]	; p.w = 32
+			CMP	help3[EBP], 24:byte
+			JL	labelc1
+			ROR	EAX, 24
+			JMP	labelc1
+labela1	CMP	help3[EBP], 16:byte	
+			JL	labelb1
+			ROR	EAX, 16
+			JMP	labelc1
+labelb1	CMP	help3[EBP], 8:byte 
+			JL	labelc1
+			ROR	EAX, 8
+labelc1	MOV	CL, pX[EBP]
+			ROL	EAX, CL
+downr	XOR	EDX, EDX
+			MOV	DL, AL
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	AL, [EBX+EDX*1] 
+;			MOV	AL, rev[EDX]
+			POP EBX
+			MOV	help1[EBP], EAX
+			MOV	AH, leftmask[EBP]
+			AND	AH, rightmask[EBP]
+			MOV	DX, $3CE
+			MOV	AL, 8
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AX, $0F02
+			OUT	DX, AX
+			MOV	CH, GS:[EDI]	; latch
+			MOV	GS:[EDI], 0: byte
+			MOV	AH, color[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set color
+			MOV	EAX, help1[EBP]
+			MOV	GS:[EDI], AL
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			INC	EBX
+			CMP	BL, 1[ESI]
+			JNE	Ronebyte
+			XOR	EBX, EBX
+			JMP	Ronebyte
+RP32	CMP	[ESI], 32: byte	; p.w = 32 ?
+			JNE	endRP	; only p.w = 16 OR 32 allowed
+			CMP	mode[EBP], 0: byte
+			JE	R32
+			CMP	mode[EBP], 1: byte
+			JE	P32left
+		
+IP32left	MOV	EAX, 2[ESI+EBX*4]	;invert/paint p.w = 32
+			CMP	help3[EBP], 24:byte
+			JL	labela2
+			ROR	EAX, 24
+			JMP	labelc2
+labela2	CMP	help3[EBP], 16:byte	
+			JL	labelb2
+			ROR	EAX, 16
+			JMP	labelc2
+labelb2	CMP	help3[EBP], 8:byte 
+			JL	labelc2
+			ROR	EAX, 8
+labelc2	MOV	CL, pX[EBP]
+			ROL	EAX, CL
+			XOR	EDX, EDX
+			PUSH	CX
+			MOV	CX, 4
+iloop	MOV	DL, AL
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	AL, [EBX+EDX*1] 
+;			MOV	AL, rev[EDX]
+			POP EBX
+			ROR	EAX, 8
+			LOOP	iloop
+			POP	CX
+			MOV	CH, GS:[EDI]	; latch
+			MOV	GS:[EDI], AL
+			ROR	EAX, 8
+			MOV	EDX, 1
+			CMP	EDX, help[EBP]
+			JE	IP32right
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+			MOV	EDX, 1
+IP32mid	MOV	CH, GS:[EDI+EDX*1]	; latch
+			MOV	GS:[EDI+EDX*1], AL
+			ROR	EAX, 8
+			INC	EDX
+			CMP	EDX, help[EBP]
+			JL	IP32mid
+IP32right	MOV	help2[EBP], EAX
+			MOV	help1[EBP], EDX
+			MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+			MOV	EDX, help1[EBP]
+			MOV	CH, GS:[EDI+EDX*1]
+			MOV	GS:[EDI+EDX*1], AL
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]	; prepare leftmask again
+			MOV	AL, 8
+			OUT	DX, AX
+			XOR	EDX, EDX
+			INC	EBX
+			CMP	BL, 1[ESI]	; height of pattern reached?
+			JNE	IP32left
+			XOR	EBX, EBX	; yes, then reset counter
+			JMP	IP32left
+		
+P32left	MOV	EAX, 2[ESI+EBX*4]	;invert/paint p.w = 32
+			CMP	help3[EBP], 24:byte
+			JL	plabela2
+			ROR	EAX, 24
+			JMP	plabelc2
+plabela2	CMP	help3[EBP], 16:byte	
+			JL	plabelb2
+			ROR	EAX, 16
+			JMP	plabelc2
+plabelb2	CMP	help3[EBP], 8:byte 
+			JL	plabelc2
+			ROR	EAX, 8
+plabelc2	MOV	CL, pX[EBP]
+			ROL	EAX, CL
+			XOR	EDX, EDX
+			PUSH	CX
+			MOV	CX, 4
+piloop	MOV	DL, AL
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	AL, [EBX+EDX*1] 
+;			MOV	AL, rev[EDX]
+			POP EBX
+			ROR	EAX, 8
+			LOOP	piloop
+			POP	CX
+			MOV	CH, GS:[EDI]	; latch
+		
+			PUSH	EDX
+			PUSH	EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; set all planes
+			OUT	DX, AX	; set color/sequencer planemap
+			MOV	AH, 8	; set mode to AND
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			
+			POP	EAX
+			NOT	AL	; negate AL
+			MOV	GS:[EDI], AL	; clear pattern
+			NOT	AL	; negate AL
+			PUSH	EAX
+		
+			MOV	AH, $10	; set mode to OR
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			MOV	AH, col[EBP]	; get color and set bitplanes
+			MOV	AL, 2
+			MOV	DX, $3C4
+			OUT	DX, AX
+			POP	EAX
+			POP	EDX
+		
+			MOV	GS:[EDI], AL
+			ROR	EAX, 8
+			MOV	EDX, 1
+			CMP	EDX, help[EBP]
+			JE	P32right
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+			MOV	EDX, 1
+P32mid	MOV	CH, GS:[EDI+EDX*1]	; latch
+		
+			PUSH	EDX
+			PUSH	EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; set all planes
+			OUT	DX, AX	; set color/sequencer planemap
+			MOV	AH, 8	; set mode to AND
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			
+			POP	EAX
+			POP	EDX
+			NOT	AL	; negate AL
+			MOV	GS:[EDI+EDX*1], AL	; clear pattern
+			NOT	AL	; negate AL
+			PUSH	EDX
+			PUSH	EAX
+		
+			MOV	AH, $10	; set mode to OR
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			MOV	AH, col[EBP]	; get color and set bitplanes
+			MOV	AL, 2
+			MOV	DX, $3C4
+			OUT	DX, AX
+			POP	EAX
+			POP	EDX
+		
+			MOV	GS:[EDI+EDX*1], AL
+			ROR	EAX, 8
+			INC	EDX
+			CMP	EDX, help[EBP]
+			JL	P32mid
+P32right	MOV	help2[EBP], EAX
+			MOV	help1[EBP], EDX
+			MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX
+			MOV	EAX, help2[EBP]
+			MOV	EDX, help1[EBP]
+			MOV	CH, GS:[EDI+EDX*1]
+		
+			PUSH	EDX
+			PUSH	EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; set all planes
+			OUT	DX, AX	; set color/sequencer planemap
+			MOV	AH, 8	; set mode to AND
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			
+			POP	EAX
+			POP	EDX
+			NOT	AL	; negate AL
+			MOV	GS:[EDI+EDX*1], AL	; clear pattern
+			NOT	AL	; negate AL
+			PUSH	EDX
+			PUSH	EAX
+		
+			MOV	AH, $10	; set mode to OR
+			MOV	AL, 3
+			MOV	DX, $3CE
+			OUT	DX, AX
+			MOV	AH, col[EBP]	; get color and set bitplanes
+			MOV	AL, 2
+			MOV	DX, $3C4
+			OUT	DX, AX
+			POP	EAX
+			POP	EDX
+		
+			MOV	GS:[EDI+EDX*1], AL
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]	; prepare leftmask again
+			MOV	AL, 8
+			OUT	DX, AX
+			XOR	EDX, EDX
+			INC	EBX
+			CMP	BL, 1[ESI]	; height of pattern reached?
+			JNE	IP32left
+			XOR	EBX, EBX	; yes, then reset counter
+			JMP	P32left
+		
+R32	MOV	AH, col[EBP]
+			MOV	color[EBP], AH
+R32left	MOV	EAX, 2[ESI+EBX*4]	; replace p.w = 32
+			CMP	help3[EBP], 24:byte
+			JL	labela3
+			ROR	EAX, 24
+			JMP	labelc3
+labela3	CMP	help3[EBP], 16:byte	
+			JL	labelb3
+			ROR	EAX, 16
+			JMP	labelc3
+labelb3	CMP	help3[EBP], 8:byte 
+			JL	labelc3
+			ROR	EAX, 8
+labelc3	MOV	CL, pX[EBP]
+			ROL	EAX, CL
+			XOR	EDX, EDX
+			PUSH	CX
+			MOV	CX, 4
+i2loop	MOV	DL, AL
+			PUSH EBX
+			MOV EBX, reverse[EBP]
+			MOV	AL, [EBX+EDX*1] 
+;			MOV	AL, rev[EDX]
+			POP EBX
+			ROR	EAX, 8
+			LOOP	i2loop
+			POP	CX
+			MOV	help2[EBP], EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02
+			OUT	DX, AX
+			MOV	CH, GS:[EDI]	; latch
+			MOV	GS:[EDI], 0: byte
+			MOV	AH, color[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set color
+			MOV	EAX, help2[EBP]
+			MOV	GS:[EDI], AL
+			ROR	EAX, 8
+			MOV	EDX, 1
+			CMP	EDX, help[EBP]
+			JE	R32right
+			MOV	help2[EBP], EAX
+			MOV	DX, $3CE
+			MOV	AX, $FF08
+			OUT	DX, AX
+			MOV	EDX, 1
+			MOV	EAX, help2[EBP]
+R32mid	MOV	help1[EBP], EDX
+			MOV	help2[EBP], EAX
+			MOV	DX, $3C4
+			MOV	AX, $0F02
+			OUT	DX, AX
+			XCHG	help1[EBP], EDX
+			MOV	GS:[EDI+EDX*1], 0: byte
+			XCHG	help1[EBP], EDX
+			MOV	AH, color[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set color
+			XCHG	help1[EBP], EDX
+			XCHG	help2[EBP], EAX
+			MOV	GS:[EDI+EDX*1], AL
+			ROR	EAX, 8
+			INC	EDX
+			CMP	EDX, help[EBP]
+			JL	R32mid
+R32right	MOV	help2[EBP], EAX
+			MOV	help1[EBP], EDX
+			MOV	DX, $3CE
+			MOV	AH, rightmask[EBP]
+			MOV	AL, 8
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AX, $0F02
+			OUT	DX, AX
+			XCHG	help1[EBP], EDX
+			MOV	CH, GS:[EDI+EDX*1]	; latch
+			MOV	GS:[EDI+EDX*1], 0: byte
+			XCHG	help1[EBP], EDX
+			MOV	AH, color[EBP]
+			MOV	AL, 2
+			OUT	DX, AX	; set color
+			MOV	EAX, help2[EBP]
+			MOV	EDX, help1[EBP]
+			MOV	GS:[EDI+EDX*1], AL
+			SUB	EDI, w3[EBP]
+			CMP	EDI, topleft[EBP]
+			JLE	resetgrafRP
+			MOV	DX, $3CE
+			MOV	AH, leftmask[EBP]	; prepare leftmask again
+			MOV	AL, 8
+			OUT	DX, AX
+			XOR	EDX, EDX
+			INC	EBX
+			CMP	BL, 1[ESI]	; height of pattern reached?
+			JNE	R32left
+			XOR	EBX, EBX	; yes, then reset counter
+			JMP	R32left
+			JMP	endRP
+resetgrafRP	MOV	DX, $3CE
+			MOV	AX, $FF08	; default bit mask
+			OUT	DX, AX
+			MOV	AX, 0005	; default mode-reg
+			OUT	DX, AX
+			MOV	AX, 0003	; default function
+			OUT	DX, AX
+			MOV	DX, $3C4
+			MOV	AX, $0F02	; default map mask
+			OUT	DX, AX
+endRP	PUSH DS
+			POP GS
+		END *)	
+	END FillPattern;
+
+	PROCEDURE ReplPattern*(col: INTEGER; pat: Pattern; X, Y, W, H, mode: INTEGER);
+	BEGIN 
+		FillPattern(col, pat, 0, 0, X, Y, W, H, mode);
+	END ReplPattern;
+	
+	PROCEDURE NewPattern*(width, height: INTEGER; VAR image: ARRAY OF SET): Pattern;
+	VAR len, src, dest: LONGINT; i: INTEGER; p: PatternPtr; inter: SET;
+	BEGIN 
+		len := (width+7) DIV 8;
+		SYSTEM.NEW(p, 4+len*height); p.w := SHORT(width); p.h := SHORT(height);
+		src := SYSTEM.ADR(image); dest := SYSTEM.ADR(p.pixmap);
+		i := 0;
+		WHILE i < height DO SYSTEM.MOVE(src, dest, len); INC(src, 4); INC(dest, len); INC(i) END;
+		Pat[count] := p; INC(count);
+		RETURN SYSTEM.ADR(p.w)
+	END NewPattern;
+	
+	PROCEDURE CreatePatterns;
+	VAR image: ARRAY 16 OF SET;
+	BEGIN
+		image[0] := {13};
+		image[1] := {12..14};
+		image[2] := {11..13};
+		image[3] := {10..12};
+		image[4] := {9..11};
+		image[5] := {8..10};
+		image[6] := {7..9};
+		image[7] := {0, 6..8};
+		image[8] := {0, 1, 5..7};
+		image[9] := {0..2, 4..6};
+		image[10] := {0..5};
+		image[11] := {0..4};
+		image[12] := {0..5};
+		image[13] := {0..6};
+		image[14] := {0..7};
+		arrow := NewPattern(15, 15, image);
+		
+		image[0] := {0, 10};
+		image[1] := {1, 9};
+		image[2] := {2, 8};
+		image[3] := {3, 7};
+		image[4] := {4, 6};
+		image[5] := {};
+		image[6] := {4, 6};
+		image[7] := {3, 7};
+		image[8] := {2, 8};
+		image[9] := {1, 9};
+		image[10] := {0, 10};
+		cross := NewPattern(11, 11, image); 
+		
+		image[0] := {6};
+		image[1] := {5..7};
+		image[2] := {4..8};
+		image[3] := {3..9};
+		image[4] := {2..10};
+		image[5] := {5..7};
+		image[6] := {5..7};
+		image[7] := {5..7};
+		image[8] := {5..7};
+		image[9] := {5..7};
+		image[10] := {5..7};
+		image[11] := {5..7};
+		image[12] := {5..7};
+		image[13] := {5..7};
+		image[14] := {};
+		downArrow := NewPattern(15, 15, image);
+		
+		image[0] := {0, 4, 8, 12};
+		image[1] := {};
+		image[2] := {2, 6, 10, 14};
+		image[3] := {};
+		image[4] := {0, 4, 8, 12};
+		image[5] := {};
+		image[6] := {2, 6, 10, 14};
+		image[7] := {};
+		image[8] := {0, 4, 8, 12};
+		image[9] := {};
+		image[10] := {2, 6, 10, 14};
+		image[11] := {};
+		image[12] := {0, 4, 8, 12};
+		image[13] := {};
+		image[14] := {2, 6, 10, 14};
+		image[15] := {};
+		grey0 := NewPattern(16, 16, image);
+		
+		image[0] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[1] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[2] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[3] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[4] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[5] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[6] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[7] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[8] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[9] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[10] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[11] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[12] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[13] := {1, 3, 5, 7, 9, 11, 13, 15};
+		image[14] := {0, 2, 4, 6, 8, 10, 12, 14};
+		image[15] := {1, 3, 5, 7, 9, 11, 13, 15};
+		grey1 := NewPattern(16, 16, image);
+		
+		image[0] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[1] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[2] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[3] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[4] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[5] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[6] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[7] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[8] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[9] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[10] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[11] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[12] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[13] := {0, 1, 4, 5, 8, 9, 12, 13};
+		image[14] := {2, 3, 6, 7, 10, 11, 14, 15};
+		image[15] := {2, 3, 6, 7, 10, 11, 14, 15};
+		grey2 := NewPattern(16, 16, image);
+		
+		image[0] := {0..2, 8..11};
+		image[1] := {0..2, 7..10};
+		image[2] := {0..2, 6..9};
+		image[3] := {0..2, 5..8};
+		image[4] := {0..2, 4..7};
+		image[5] := {0..6};
+		image[6] := {0..5};
+		image[7] := {0..4};
+		image[8] := {0..3};
+		image[9] := {0..2};
+		image[10] := {0, 1};
+		image[11] := {0};
+		hook := NewPattern(12, 12, image);
+		
+		image[0] := {7};
+		image[1] := {7};
+		image[2] := {2, 7, 12};
+		image[3] := {3, 7, 11};
+		image[4] := {4, 7, 10};
+		image[5] := {5, 7, 9};
+		image[6] := {6..8};
+		image[7] := {0..6, 8..14};
+		image[8] := {6..8};
+		image[9] := {5, 7, 9};
+		image[10] := {4, 7, 10};
+		image[11] := {3, 7, 11};
+		image[12] := {2, 7, 12};
+		image[13] := {7};
+		image[14] := {7};
+		star := NewPattern(15, 15, image);
+		
+		image[0] := {};
+		image[1] := {};
+		image[2] := {0};
+		image[3] := {};
+		image[4] := {};
+		image[5] := {};
+		image[6] := {};
+		image[7] := {};
+		image[8] := {};
+		image[9] := {};
+		image[10] := {};
+		image[11] := {};
+		image[12] := {};
+		image[13] := {};
+		image[14] := {};
+		image[15] := {};
+		ticks := NewPattern(16, 16, image);
+		
+		image[0] := -{};
+		image[1] := -{};
+		solid := NewPattern(16, 2, image);
+		
+	END CreatePatterns;
+	
+	PROCEDURE Depth*(X: INTEGER): INTEGER;
+	BEGIN RETURN 4 END Depth; 
+	
+	PROCEDURE DisplayBlock*(B:LONGINT; DX, DY, W, H, SX, SY, mode:INTEGER);
+	VAR BitmapWth, locW, locH, locAddr, SourceAdr, DestAdr, AreaHeight: LONGINT;
+	BEGIN
+		locW := Width DIV 8;
+		locH := Height-2;
+		locAddr := Kernel.Display;
+	(*$ DInline.Assemble
+							CLI
+							MOV AX, $1F
+							MOV GS, AX
+							MOV ESI, 36[EBP]			; address of bitmap descriptor
+							MOV EDI, 12[ESI]
+							MOV EAX, 8[ESI] 
+							MOV BitmapWth[EBP], EAX
+							MOVZX ECX, 28[EBP] : word
+							IMUL EAX,ECX
+							MOVZX EBX, 32[EBP] :word
+							ADD EAX, EBX	
+							ADD EAX, EDI				; source address
+							MOV SourceAdr[EBP], EAX 	
+							MOV ESI, EAX				; esi = source index register
+							MOV EAX, locW[EBP] 
+							MOV EBX, locH[EBP] 
+							SUB EBX,12[EBP] :double
+							IMUL EAX,EBX 
+							MOVZX EBX, 16[EBP] :word
+							SHR EBX,3
+							ADD EAX, EBX
+;							ADD EAX, locAddr[EBP]		; destination address
+							MOV DestAdr[EBP], EAX		
+							MOV EDI, EAX				; edi = destination index register
+							MOV DX, $03CE
+							MOV AL, 3
+							MOV BX, 8[EBP]
+							CMP BX, $1
+							JE DispPMode
+							JG DispIMode
+DispRMode  		MOV AH,$00
+							JMP DispSetMode
+DispPMode		  MOV AH, $10
+							JMP DispSetMode
+DispIMode	  	MOV AH, $18
+DispSetMode	  OUT DX, AX
+							MOV AX, $0205
+							OUT DX, AX				  ; set writemode 2, readmode 0
+							MOV CL, 16[EBP]
+							AND CL, 7						; DX MOD 8
+							MOV AX, $8008 		
+							SHR AH,CL					  ; prepare bitmask
+							MOV DestAdr[EBP], EDI
+							MOVZX ECX, 20[EBP] :word
+							IMUL ECX, BitmapWth[EBP] :word
+							ADD ECX, ESI
+							MOVZX EBX, 24[EBP] :word
+							MOV AreaHeight[EBP], EBX
+DispRowLoop 	 JE DispEnd
+							OUT DX, AX					; set bitmask register
+							MOV SourceAdr[EBP], ESI
+DispColLoop		CMP ESI, ECX
+							JGE DispColEnd
+							MOV BL, GS:[EDI]
+							MOV BL, [ESI]				; get PEL from bitmap
+							MOV GS:[EDI], BL				; write PEL to VGA
+							ADD ESI, BitmapWth[EBP]
+							SUB EDI, locW[EBP]
+							JMP DispColLoop
+DispColEnd		  MOV ESI, SourceAdr[EBP]
+							INC ESI
+							INC ECX
+							MOV EDI, DestAdr[EBP]
+							ROR AH,1
+							JNB NextCol
+							INC EDI	
+							MOV DestAdr[EBP], EDI
+NextCol				DEC AreaHeight[EBP]:double		  	; next row
+							JMP DispRowLoop
+DispEnd			 MOV AL, 3						; restore invert mode
+							MOV AH, $18
+							OUT DX, AX
+							MOV AX, $FF08				; enable all latches
+							OUT DX, AX
+							MOV AX, $05					; restore read/write mode 0
+							OUT DX, AX
+							STI
+		END *)
+	END DisplayBlock;
+
+BEGIN
+	Width := 640; DOS.DispWidth := Width;
+	Height := 480; DOS.DispHeight := Height;
+	Left:= 0; ColLeft:= 0; Bottom:= 0; UBottom:= -330; 
+	count := 0;
+	DOS.InitDisplay(12H);
+	width := Width;
+	height := Height;
+	clipx := 0; clipy := UBottom; clipright := width; cliptop := height;
+	width3 := width DIV 8;
+	mask[0] := 0X; mask[1] := 80X; mask[2] := 0C0X; mask[3] := 0E0X; mask[4] := 0F0X; 
+	mask[5] := 0F8X; mask[6] := 0FCX; mask[7] := 0FEX; mask[8] := 0FFX;
+	imask[0] := 0FFX; imask[1] := 7FX; imask[2] := 3FX; imask[3] := 1FX; imask[4] := 0FX; 
+	imask[5] := 7X; imask[6] := 3X; imask[7] := 1X; imask[8] := 0X;
+	rev[0] := 0X; rev[1] := 80X; rev[2] := 40X; rev[3] := 0C0X; rev[4] := 20X; rev[5] := 0A0X; rev[6] := 60X; rev[7] := 0E0X;
+	rev[8] := 10X; rev[9] := 90X; rev[10] := 50X; rev[11] := 0D0X; rev[12] := 30X; rev[13] := 0B0X; rev[14] := 70X; rev[15] := 0F0X;
+	rev[16] := 8X; rev[17] := 88X; rev[18] := 48X; rev[19] := 0C8X; rev[20] := 28X; rev[21] := 0A8X; rev[22] := 68X; rev[23] := 0E8X;
+	rev[24] := 18X; rev[25] := 98X; rev[26] := 58X; rev[27] := 0D8X; rev[28] := 38X; rev[29] := 0B8X; rev[30] := 78X; rev[31] := 0F8X;
+	rev[32] := 4X; rev[33] := 84X; rev[34] := 44X; rev[35] := 0C4X; rev[36] := 24X; rev[37] := 0A4X; rev[38] := 64X; rev[39] := 0E4X;
+	rev[40] := 14X; rev[41] := 94X; rev[42] := 54X; rev[43] := 0D4X; rev[44] := 34X; rev[45] := 0B4X; rev[46] := 74X; rev[47] := 0F4X;
+	rev[48] := 0CX; rev[49] := 8CX; rev[50] := 4CX; rev[51] := 0CCX; rev[52] := 2CX; rev[53] := 0ACX; rev[54] := 6CX; rev[55] := 0ECX;
+	rev[56] := 1CX; rev[57] := 9CX; rev[58] := 5CX; rev[59] := 0DCX; rev[60] := 3CX; rev[61] := 0BCX; rev[62] := 7CX; rev[63] := 0FCX;
+	rev[64] := 2X; rev[65] := 82X; rev[66] := 42X; rev[67] := 0C2X; rev[68] := 22X; rev[69] := 0A2X; rev[70] := 62X; rev[71] := 0E2X;
+	rev[72] := 12X; rev[73] := 92X; rev[74] := 52X; rev[75] := 0D2X; rev[76] := 32X; rev[77] := 0B2X; rev[78] := 72X; rev[79] := 0F2X;
+	rev[80] := 0AX; rev[81] := 8AX; rev[82] := 4AX; rev[83] := 0CAX; rev[84] := 2AX; rev[85] := 0AAX; rev[86] := 6AX; rev[87] := 0EAX;
+	rev[88] := 1AX; rev[89] := 9AX; rev[90] := 5AX; rev[91] := 0DAX; rev[92] := 3AX; rev[93] := 0BAX; rev[94] := 7AX; rev[95] := 0FAX;
+	rev[96] := 6X; rev[97] := 86X; rev[98] := 46X; rev[99] := 0C6X; rev[100] := 26X; rev[101] := 0A6X; rev[102] := 66X; rev[103] := 0E6X;
+	rev[104] := 16X; rev[105] := 96X; rev[106] := 56X; rev[107] := 0D6X; rev[108] := 36X; rev[109] := 0B6X; rev[110] := 76X; rev[111] := 0F6X;
+	rev[112] := 0EX; rev[113] := 8EX; rev[114] := 4EX; rev[115] := 0CEX; rev[116] := 2EX; rev[117] := 0AEX; rev[118] := 6EX; rev[119] := 0EEX;
+	rev[120] := 1EX; rev[121] := 9EX; rev[122] := 5EX; rev[123] := 0DEX; rev[124] := 3EX; rev[125] := 0BEX; rev[126] := 7EX; rev[127] := 0FEX;
+	rev[128] := 1X; rev[129] := 81X; rev[130] := 41X; rev[131] := 0C1X; rev[132] := 21X; rev[133] := 0A1X; rev[134] := 61X; rev[135] := 0E1X;
+	rev[136] := 11X; rev[137] := 91X; rev[138] := 51X; rev[139] := 0D1X; rev[140] := 31X; rev[141] := 0B1X; rev[142] := 71X; rev[143] := 0F1X;
+	rev[144] := 9X; rev[145] := 89X; rev[146] := 49X; rev[147] := 0C9X; rev[148] := 29X; rev[149] := 0A9X; rev[150] := 69X; rev[151] := 0E9X;
+	rev[152] := 19X; rev[153] := 99X; rev[154] := 59X; rev[155] := 0D9X; rev[156] := 39X; rev[157] := 0B9X; rev[158] := 79X; rev[159] := 0F9X;
+	rev[160] := 5X; rev[161] := 85X; rev[162] := 45X; rev[163] := 0C5X; rev[164] := 25X; rev[165] := 0A5X; rev[166] := 65X; rev[167] := 0E5X;
+	rev[168] := 15X; rev[169] := 95X; rev[170] := 55X; rev[171] := 0D5X; rev[172] := 35X; rev[173] := 0B5X; rev[174] := 75X; rev[175] := 0F5X;
+	rev[176] := 0DX; rev[177] := 8DX; rev[178] := 4DX; rev[179] := 0CDX; rev[180] := 2DX; rev[181] := 0ADX; rev[182] := 6DX; rev[183] := 0EDX;
+	rev[184] := 1DX; rev[185] := 9DX; rev[186] := 5DX; rev[187] := 0DDX; rev[188] := 3DX; rev[189] := 0BDX; rev[190] := 7DX; rev[191] := 0FDX;
+	rev[192] := 3X; rev[193] := 83X; rev[194] := 43X; rev[195] := 0C3X; rev[196] := 23X; rev[197] := 0A3X; rev[198] := 63X; rev[199] := 0E3X;
+	rev[200] := 13X; rev[201] := 93X; rev[202] := 53X; rev[203] := 0D3X; rev[204] := 33X; rev[205] := 0B3X; rev[206] := 73X; rev[207] := 0F3X;
+	rev[208] := 0BX; rev[209] := 8BX; rev[210] := 4BX; rev[211] := 0CBX; rev[212] := 2BX; rev[213] := 0ABX; rev[214] := 6BX; rev[215] := 0EBX;
+	rev[216] := 1BX; rev[217] := 9BX; rev[218] := 5BX; rev[219] := 0DBX; rev[220] := 3BX; rev[221] := 0BBX; rev[222] := 7BX; rev[223] := 0FBX;
+	rev[224] := 7X; rev[225] := 87X; rev[226] := 47X; rev[227] := 0C7X; rev[228] := 27X; rev[229] := 0A7X; rev[230] := 67X; rev[231] := 0E7X;
+	rev[232] := 17X; rev[233] := 97X; rev[234] := 57X; rev[235] := 0D7X; rev[236] := 37X; rev[237] := 0B7X; rev[238] := 77X; rev[239] := 0F7X;
+	rev[240] := 0FX; rev[241] := 8FX; rev[242] := 4FX; rev[243] := 0CFX; rev[244] := 2FX; rev[245] := 0AFX; rev[246] := 6FX; rev[247] := 0EFX;
+	rev[248] := 1FX; rev[249] := 9FX; rev[250] := 5FX; rev[251] := 0DFX; rev[252] := 3FX; rev[253] := 0BFX; rev[254] := 7FX; rev[255] := 0FFX;
+	CreatePatterns;
+	Unit := 10000;	
+	SYSTEM.PUTREG(0, 1001H); SYSTEM.PUTREG(3, 03F00H); SYSTEM.INT(10H);
+END Display.

@@ -1,0 +1,1212 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Hex;	(* Hansjoerg Buchser; 25. 2. 1994 / adapted for System 3 by MB, JM , 9.11.1994 *)
+
+	IMPORT Texts, TextFrames, Viewers, Display, Files, Oberon, MenuViewers, Fonts, Input, Objects;
+
+	CONST StandardMenu = "System.Close  System.Copy  System.Grow  Hex.Search  Hex.StoreText  Hex.Store ";
+
+		updateByte = 0; changeFont = 1;	(* message id *)
+		ord0 = 48; ordA = 65; orda = 97;	(* ASCII values *)
+		hexdX = 3; dY = 3;	(* cursor overlapping *)
+		begOfLine = 20; barW = 13;	(* x-coords in Frame *)
+		colspace = 3; adrlen = 6;	(* number of chars *)
+		number = 16;	(* number of bytes per line *)
+		DefaultFont = "Courier12.Scn.Fnt";
+		MR = 0; MM = 1; ML = 2;
+		fgd = Display.white; bgd = Display.black;
+
+	TYPE CursorCoord = POINTER TO CursorCoordDesc;
+		CursorCoordDesc = RECORD X, W : INTEGER END;
+
+		Model = POINTER TO ModelDesc;
+		ModelDesc = RECORD name : ARRAY 32 OF CHAR; file : Files.File END; 
+
+		Frame = POINTER TO FrameDesc;
+		FrameDesc = RECORD (Display.FrameDesc)
+			virgin, hasCursor : BOOLEAN;
+			cursor1, cursor2 : CursorCoord;	(* primary, secondary cursor *)
+			cursorY : INTEGER;
+			cursorBytePos : LONGINT;
+			model : Model;
+			org, len : LONGINT
+		END;
+
+		UpdateMsg = RECORD (Display.FrameMsg)
+			id : INTEGER;
+			file : Files.File;
+			pos : LONGINT;
+			ch : CHAR
+		END;
+
+		CursorMsg = RECORD (Display.FrameMsg)
+			pos : LONGINT;
+			file : Files.File;
+		END;
+
+	VAR font : Fonts.Font;	(* actual font *)
+		fontname : ARRAY 32 OF CHAR;	(* name of actual font *)
+
+		fontwidth, fontheight, hmin, hmax, amin, amax : INTEGER;	(* display variables *)
+		cursorH, greybar1, greybar2, greybar3 : INTEGER;
+		hexcurs, asccurs : CursorCoord;
+
+		nextline : ARRAY number OF CHAR;	(* output variables *)
+		R : Files.Rider;
+		W : Texts.Writer;
+		res : INTEGER;
+		addrOffset : LONGINT;
+
+	(* ____________________________ HeXFrames-Part of Module __________________________ *)
+
+	(* ______________________________ some auxiliary functions ____________________________ *)
+
+	PROCEDURE ReplConstC(F: Frame; col, X, Y, W, H, mode: INTEGER);
+	BEGIN
+		Display.ReplConst(col, X, Y, W, H, mode);
+	END ReplConstC;
+
+	PROCEDURE Cap(ch : CHAR) : CHAR;
+	BEGIN
+		CASE ch OF "a".."z" : RETURN CAP(ch) ELSE RETURN ch END;
+	END Cap;
+
+	PROCEDURE DecToHex(d : LONGINT) : CHAR;
+	BEGIN
+		IF d < 10 THEN d := d + ord0 ELSE d := d + ordA - 10 END;
+		RETURN CHR(d)
+	END DecToHex;
+
+	PROCEDURE HexToDec(ch : CHAR) : INTEGER;
+	BEGIN
+		CASE ch OF  "A".."F" : RETURN ORD(ch) - ordA + 10
+		| "a".."f" : RETURN ORD(ch) - orda + 10
+		| "0".."9" : RETURN ORD(ch) - ord0
+		ELSE RETURN -1
+		END
+	END HexToDec;
+		
+	PROCEDURE ReadableChar(ch : CHAR) : CHAR;
+	BEGIN
+		CASE ORD(ch) OF
+			32..126, 128..149, 155 : RETURN ch
+			ELSE RETURN "."
+		END
+	END ReadableChar;
+
+	(* ______________________________ init procedure ____________________________ *) 
+
+	PROCEDURE InitDisplayVars;
+		VAR dx, x, y, w, h : INTEGER;
+			p : Display.Pattern;
+	BEGIN
+		Fonts.GetChar(font, "0", dx, x, y, w, h, p);
+		fontwidth := dx;
+		fontheight := font.height + 1;
+		hmin := begOfLine + (adrlen + colspace)*fontwidth;
+		hmax := hmin + (number*3 - 1)*fontwidth;
+		amin := hmax + colspace*fontwidth;
+		amax := amin + number*fontwidth;
+		greybar1 := hmin + (hmax - hmin - fontwidth) DIV 4;
+		greybar2 := hmin + (hmax - hmin) DIV 2;
+		greybar3 := hmax - (hmax - hmin - fontwidth) DIV 4;
+		NEW(hexcurs); hexcurs.W := 2*fontwidth + hexdX;
+		NEW(asccurs); asccurs.W := fontwidth;
+		cursorH := fontheight
+	END InitDisplayVars;
+
+	(* ______________________________ coord conversion ____________________________ *)
+
+	PROCEDURE GetLine(F : Frame; Y : INTEGER; VAR line : INTEGER);
+	BEGIN
+		IF Y >= F.Y THEN
+			line := (F.Y + F.H - Y - dY) DIV fontheight;
+			IF (line + 1)*fontheight >= F.H - dY THEN DEC(line) END;
+			IF line < 0 THEN line := 0 END
+		ELSE
+			line :=  (F.H  - dY) DIV fontheight - 1
+		END
+	END GetLine;
+
+	PROCEDURE GetOffset(F : Frame; X : INTEGER; VAR off : INTEGER);
+	BEGIN
+		IF (hmin <= X - F.X) & (X - F.X <= hmax) THEN
+			off := (X - F.X - hmin + fontwidth DIV 2) DIV (3*fontwidth)
+		ELSIF (amin <= X - F.X) & (X - F.X <= amax) THEN
+			off := (X - F.X - amin) DIV fontwidth
+		ELSE 
+			off := -1
+		END
+	END GetOffset;
+
+	PROCEDURE GetX(F : Frame; pos : LONGINT; VAR hX, aX : INTEGER);
+	BEGIN
+		IF pos < F.len THEN
+			DEC(pos, F.org);
+			pos := pos MOD number;
+			hX := F.X + hmin + SHORT(pos)*3*fontwidth;
+			aX := F.X + amin + SHORT(pos)*fontwidth
+		ELSE
+			hX := -1; aX := -1
+		END
+	END GetX;
+
+	PROCEDURE GetY(F : Frame; pos : LONGINT; VAR Y : INTEGER);
+	BEGIN
+		IF pos < F.len THEN
+			DEC(pos, F.org);
+			pos := pos DIV number;
+			Y := F.Y + F.H - (SHORT(pos) + 1)*fontheight
+		ELSE
+			Y := -1
+		END
+	END GetY;
+
+	(* ______________________________ display support ____________________________ *)
+
+	PROCEDURE WriteBang(F : Frame);
+		VAR R : Texts.Reader; V : Viewers.Viewer; T : Texts.Text; ch : CHAR;
+	BEGIN
+		V := Viewers.This(F.X, F.Y);
+		IF (V IS MenuViewers.Viewer) & (V.dsc IS TextFrames.Frame) THEN
+			T := V.dsc(TextFrames.Frame).text;
+			IF T.len > 0 THEN Texts.OpenReader(R, T, T.len - 1); Texts.Read(R, ch) ELSE ch := 0X END;
+			IF ch # "!" THEN Texts.Write(W, "!"); Texts.Append(T, W.buf) END
+		END
+	END WriteBang;
+
+	PROCEDURE DeleteBang(F : Frame);
+		VAR R : Texts.Reader; V : Viewers.Viewer; T : Texts.Text; ch : CHAR;
+	BEGIN
+		V := Viewers.This(F.X, F.Y);
+		IF (V IS MenuViewers.Viewer) & (V.dsc IS TextFrames.Frame) THEN
+			T := V.dsc(TextFrames.Frame).text;
+			IF T.len > 0 THEN Texts.OpenReader(R, T, T.len - 1); Texts.Read(R, ch) ELSE ch := 0X END;
+			IF ch = "!" THEN Texts.Delete(T, T.len - 1, T.len) END
+		END
+	END DeleteBang;
+		
+	PROCEDURE InvertCursor(F : Frame);
+	BEGIN
+		IF (F.X < F.cursor1.X) & (F.cursor1.X + F.cursor1.W < F.X + F.W) &
+			(F.Y < F.cursorY) & (F.cursorY + cursorH <= F.Y + F.H) THEN
+			F.hasCursor := ~F.hasCursor;
+			Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+			Display.ReplConst(fgd, F.cursor1.X, F.cursorY, F.cursor1.W, cursorH, Display.invert);
+			ReplConstC(F, fgd, F.cursor2.X, F.cursorY, F.cursor2.W, 2, Display.invert) 
+		END
+	END InvertCursor;
+
+	PROCEDURE RemoveCursor(F : Frame);
+	BEGIN
+		IF F.hasCursor THEN
+			InvertCursor(F);
+			F.cursorBytePos := -1
+		END
+	END RemoveCursor;
+
+	PROCEDURE DrawCursor(F : Frame);
+	BEGIN
+		Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+		ReplConstC(F, fgd, F.cursor1.X, F.cursorY, F.cursor1.W, cursorH, Display.invert); 
+		ReplConstC(F, fgd, F.cursor2.X, F.cursorY, F.cursor2.W, 2,Display.invert) 
+	END DrawCursor;
+
+	PROCEDURE SetCursor(F : Frame; X, Y : INTEGER);
+		VAR offset, line : INTEGER;
+			pos : LONGINT;
+	BEGIN
+		GetOffset(F, X, offset);
+		GetLine(F, Y, line);
+		pos := LONG(line)*number + offset + F.org;
+		IF pos < F.len THEN
+			IF F.cursor1 = hexcurs THEN
+				GetX(F, pos, F.cursor1.X, F.cursor2.X);
+				DEC(F.cursor1.X, hexdX DIV 2)
+			ELSE (* F.cursor1 = asccurs *)
+				GetX(F, pos, F.cursor2.X, F.cursor1.X);
+				DEC(F.cursor2.X, hexdX DIV 2)
+			END;
+			GetY(F, pos, F.cursorY);
+			DEC(F.cursorY, dY);
+			F.cursorBytePos := pos;
+			InvertCursor(F)
+		END
+	END SetCursor;
+
+	(* ______________________________ draw file content ____________________________ *)
+
+	PROCEDURE ShowChar(F : Frame; ch : CHAR; VAR X : INTEGER; Y : INTEGER);
+		VAR dx, x, y, w, h : INTEGER;
+			p : Display.Pattern;
+	BEGIN
+		IF (F.X < X) & (X + fontwidth < F.X + F.W) & (F.Y + dY < Y) & (Y + fontheight <= F.Y + F.H) THEN
+			Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+			Fonts.GetChar(font, ch, dx, x, y, w, h, p);
+			Display.CopyPattern(fgd, p, X+x, Y+y, Display.replace);
+			INC(X, dx)
+		END
+	END ShowChar;
+
+	PROCEDURE ShowSpaces(F : Frame; num : INTEGER; VAR X : INTEGER; Y : INTEGER);
+		VAR i : INTEGER;
+	BEGIN
+		i := 0;
+		WHILE i < num  DO 
+			ShowChar(F, " ", X, Y);
+			INC(i)
+		END
+	END ShowSpaces;
+
+	PROCEDURE ShowAddress(F : Frame; pos : LONGINT; VAR X : INTEGER; Y : INTEGER);
+		VAR div : LONGINT;
+	BEGIN
+		INC(pos, addrOffset);
+		div := 0100000H;
+		REPEAT
+			ShowChar(F, DecToHex(pos DIV div), X, Y);
+			pos := pos MOD div;
+			div :=ASH(div, -4);
+		UNTIL div = 0;
+	END ShowAddress;
+
+	PROCEDURE ShowHexPart(F : Frame; max : INTEGER; VAR X : INTEGER; Y : INTEGER);
+		VAR i : INTEGER;
+	BEGIN
+		i := 0;
+		WHILE i < max DO
+			ShowChar(F, DecToHex(ASH(ORD(nextline[i]), -4)), X, Y);
+			ShowChar(F, DecToHex(ORD(nextline[i]) MOD 16), X, Y);
+			ShowSpaces(F, 1, X, Y);
+			INC(i)
+		END;
+		ShowSpaces(F, (number-i)*3, X, Y)
+	END ShowHexPart;
+
+	PROCEDURE ShowAscPart(F : Frame; max : INTEGER; VAR X : INTEGER; Y : INTEGER);
+		VAR i : INTEGER;
+	BEGIN
+		i := 0;
+		WHILE i < max DO
+			ShowChar(F, ReadableChar(nextline[i]), X, Y);
+			INC(i)
+		END
+	END ShowAscPart;
+
+	PROCEDURE ShowLine(F : Frame; Y, nr : INTEGER; adr : LONGINT);
+		VAR X : INTEGER;
+	BEGIN
+		X := F.X + begOfLine;
+		ShowAddress(F, adr, X, Y);
+		ShowSpaces(F, colspace, X, Y);
+		ShowHexPart(F, nr, X, Y);
+		ShowSpaces(F, colspace-1, X, Y);
+		ShowAscPart(F, nr, X, Y)
+	END ShowLine;
+
+	PROCEDURE DrawGreyBars(F : Frame);
+		VAR Y, H, line : INTEGER; help : LONGINT;
+	BEGIN
+		GetLine(F, F.Y + 1, line);
+		help := F.len - F.org;
+		IF (line + 1)*number > help THEN (* eof visible *)
+			Y := F.Y + F.H - SHORT((help - 1) DIV number + 1)*fontheight - dY;
+			H := SHORT((help - 1) DIV number + 1)*fontheight	
+		ELSE (* eof not visible *)
+			Y := F.Y + F.H - (line + 1)*fontheight - dY;
+			H := (line + 1)*fontheight
+		END;
+		IF (F.H - 1 - dY) DIV fontheight > 0 THEN (* at least one line visible *)	
+			Display.ReplPattern(fgd, Display.grey1, F.X + greybar1, Y, 1, H, Display.replace);
+			Display.ReplPattern(fgd, Display.grey1, F.X + greybar2, Y, 1, H, Display.replace);
+			Display.ReplPattern(fgd, Display.grey1, F.X + greybar3, Y, 1, H, Display.replace)
+		END
+	END DrawGreyBars;
+
+	PROCEDURE DrawClip(F : Frame);
+		CONST clipW = 8; clipH = 2;
+		VAR Y : INTEGER;
+	BEGIN
+		Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+		Display.ReplConst(bgd, F.X + 1, F.Y, barW - 2, F.H, Display.replace);
+		Y := F.Y + F.H - clipH - SHORT((F.H - clipH)*F.org DIV F.len);
+		Display.ReplConst(fgd, F.X + 1, Y, clipW, clipH, Display.replace)
+	END DrawClip;
+	
+	PROCEDURE Draw(F : Frame; Y, maxY : INTEGER; pos : LONGINT);
+		VAR X : INTEGER;
+			rest : INTEGER;
+	BEGIN
+		DEC(Y, fontheight);
+		IF F.len > 0 THEN
+			Files.Set(R, F.model.file, pos);
+			Files.ReadBytes(R, nextline, number);
+			WHILE ~R.eof & (Y > maxY) DO
+				ShowLine(F, Y, number, Files.Pos(R) - number);
+				DEC(Y, fontheight);
+				Files.ReadBytes(R, nextline, number)
+			END;
+			rest := number - SHORT(R.res); 
+			IF (Y > maxY) & (rest > 0) THEN
+				ShowLine(F, Y, rest, Files.Pos(R)-rest)
+			END;
+			DrawClip(F)
+		END
+	END Draw;
+
+	PROCEDURE DrawFrame(F : Frame);
+		VAR line : INTEGER;
+	BEGIN
+		RemoveCursor(F);
+		Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+		Display.ReplConst(bgd, F.X, F.Y, F.W, F.H, Display.replace);
+		Display.ReplConst(fgd, F.X+barW, F.Y, 1, F.H, Display.replace);
+		Draw(F, F.Y + F.H, F.Y + dY, F.org);
+		DrawGreyBars(F)
+	END DrawFrame;
+
+	(* ______________________________ update procedures ____________________________ *)
+
+	PROCEDURE AscUpdateByte(F : Frame; ch : CHAR);
+	BEGIN
+		Files.Set(R, F.model.file, F.cursorBytePos);
+		Files.Write(R, ch)
+	END AscUpdateByte;
+
+	PROCEDURE HexUpdateByte(F : Frame; ord : INTEGER);
+		VAR help : CHAR;
+	BEGIN
+		Files.Set(R, F.model.file, F.cursorBytePos);
+		Files.Read(R, help);
+		help := CHR(ASH(ORD(help), 4) + ord);
+		Files.Set(R, F.model.file, F.cursorBytePos);
+		Files.Write(R, help)
+	END HexUpdateByte;
+
+	PROCEDURE Update(F : Frame; pos : LONGINT; ch : CHAR);
+		VAR hX, aX, Y : INTEGER;
+	BEGIN
+		GetX(F, pos, hX, aX);
+		GetY(F, pos, Y);
+		Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+		ReplConstC(F, bgd, hX - hexdX DIV 2, Y - dY, hexcurs.W, cursorH, Display.replace); 
+		ShowChar(F, DecToHex(ASH(ORD(ch), -4)), hX, Y);
+		ShowChar(F, DecToHex(ORD(ch) MOD 16), hX, Y); 
+		ReplConstC(F, bgd, aX, Y - dY, asccurs.W, cursorH, Display.replace); 
+		ShowChar(F, ReadableChar(ch), aX, Y)
+	END Update;
+
+	PROCEDURE SendUpdateMsg(F : Frame);
+		VAR M : UpdateMsg; ch : CHAR;
+	BEGIN
+		Files.Set(R, F.model.file, F.cursorBytePos);
+		Files.Read(R, ch);
+		M.id := updateByte; M.file := F.model.file; M.ch := ch; M.pos := F.cursorBytePos;
+		Display.Broadcast(M)
+	END SendUpdateMsg;
+
+	(* ______________________________ scrolling procedures ____________________________ *)
+
+	PROCEDURE ScrollFrame(F : Frame; pos : LONGINT; line : INTEGER);
+		VAR H, d, maxline : INTEGER;
+	BEGIN
+		Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+		GetLine(F, F.Y + 1, maxline);
+		d := F.H - (maxline + 1)*fontheight;
+		IF (F.org < pos) & (pos <= F.org + maxline*number) THEN
+			(* scroll down *)
+			RemoveCursor(F);
+			H := F.H - line*fontheight - d;
+			F.org := pos;
+			Display.CopyBlock(F.X + barW + 1, F.Y + d - dY, F.W - barW - 1,
+				H, F.X + barW + 1, F.Y + F.H - H - dY, Display.replace);
+			Display.ReplConst(bgd, F.X + barW + 1, F.Y, F.W - barW - 1, F.H - H - dY, Display.replace);
+			Draw(F, F.Y + F.H - H, F.Y + dY, F.org + (maxline - line + 1)*number);
+			DrawGreyBars(F)
+		ELSIF (pos < F.org) & (F.org <= pos + maxline*number) THEN
+			(* scroll up *)
+			RemoveCursor(F);
+			IF F.len DIV number <= maxline THEN (* whole file fits in frame *)
+				d := F.H - SHORT(F.len DIV number + 1)*fontheight
+			END;
+			H := (line + 1)*fontheight;
+			F.org := pos;
+			Display.CopyBlock(F.X + barW + 1, F.Y + F.H - H - dY,
+				F.W - barW - 1, H, F.X + barW + 1, F.Y + d - dY, Display.replace);
+			Display.ReplConst(bgd, F.X + barW + 1, F.Y + H + d - dY, F.W - barW - 1, F.H - H - d + dY, Display.replace);
+			Draw(F, F.Y + F.H, F.Y + H + d - 1, F.org);
+			DrawGreyBars(F)
+		ELSE
+			(* redraw whole frame *)
+			F.org := pos;
+			DrawFrame(F)
+		END
+	END ScrollFrame;
+
+	PROCEDURE Scroll(F : Frame; X, Y : INTEGER; keysum : SET);
+	
+	VAR pos : LONGINT;
+		line, line1, Ybar : INTEGER;
+
+		PROCEDURE Underscore(col, mode : INTEGER);
+		BEGIN
+			Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+			ReplConstC(F, col, F.X + begOfLine, Ybar - 3, adrlen*fontwidth, 2, mode) 
+		END Underscore;
+
+		PROCEDURE Track(VAR X, Y : INTEGER; VAR keysum : SET);
+			VAR keys, prim : SET; Y1, oldline : INTEGER;
+		BEGIN
+			keys := keysum; prim := keysum;
+			oldline := -1; Ybar := -1;
+			WHILE keys # {} DO
+				Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, X, Y);
+				GetLine(F, Y, line);
+				IF line*number + F.org >= F.len THEN
+					line := SHORT((F.len - F.org - 1) DIV number)
+				END;
+ 				IF line # oldline THEN
+					IF ~(MM IN prim) THEN Underscore(bgd, Display.replace) END;
+					GetY(F, line*number + F.org, Ybar);
+					IF ~(MM IN prim) THEN Underscore(fgd, Display.replace) END;
+					oldline := line
+				END;
+				Input.Mouse(keys, X, Y);
+				keysum := keysum + keys
+			END
+		END Track;
+
+	BEGIN
+		pos := F.org;
+		IF MR IN keysum THEN
+			Track(X, Y, keysum);
+			IF keysum = {ML, MM, MR} THEN
+				(* cancel *)
+				Underscore(bgd, Display.replace);
+				RETURN
+			ELSE
+				(* this line to bottom of frame *)
+				GetLine(F, F.Y + 1, line1);
+				pos := F.org - (line1 - line)*number;
+				IF pos < 0  THEN
+					IF F.len DIV number > line1 THEN (* whole file fist in frame *)
+						line := ((line1 + 1)*number - SHORT(F.org)) DIV number - 1
+					END;
+					pos := 0
+				END;
+				Underscore(bgd, Display.replace)
+			END
+		ELSIF MM IN keysum THEN
+			Track(X, Y, keysum);
+			IF keysum = {ML, MM, MR} THEN
+				(* cancel *)
+				RETURN
+			ELSIF MR IN keysum THEN
+				(* scroll to bof *)
+				pos := 0;
+				IF pos # F.org THEN F.org := pos; DrawFrame(F); RETURN END
+			ELSIF ML IN keysum THEN
+				(* scroll to eof *)
+				pos := (F.len DIV number - 2)*number (* 2 is heuristic *);
+				IF pos < 0 THEN pos := 0 END;
+				IF pos # F.org THEN F.org := pos; DrawFrame(F); RETURN END
+			ELSE
+				(* set clip to position *)
+				pos := (F.Y + F.H - Y)*F.len DIV F.H;
+				pos := pos DIV number*number;
+				line := SHORT(pos - F.org) DIV number;
+				IF line < 0 THEN (* scroll up *)
+					GetLine(F, F.Y + 1, line1);
+					IF F.len DIV number > line1 THEN
+						line := line1 + line
+					ELSE (* whole file fits in frame *)
+						line := SHORT(F.len) DIV number + line
+					END
+				END
+			END
+		ELSIF ML IN keysum THEN
+			Track(X, Y, keysum);
+			IF keysum = {ML, MM, MR} THEN
+				(* cancel *)
+				Underscore(bgd, Display.replace);
+				RETURN
+			ELSE
+				(* this line to top of frame *)
+				pos := line*number + F.org;
+				IF pos > F.len THEN pos := F.len DIV number*number END;
+				Underscore(bgd, Display.replace)
+			END
+		END;
+		IF F.org # pos THEN ScrollFrame(F, pos, line) END
+	END Scroll;
+
+	(* ______________________________ mouse tracking ____________________________ *)
+		
+	PROCEDURE TrackMouse(F : Frame; X, Y : INTEGER; VAR keys : SET);
+		VAR off, line : INTEGER;
+			track : BOOLEAN;
+			prim, sec : CursorCoord;
+	BEGIN
+		IF ~F.hasCursor & (keys = {ML}) THEN
+			(* Oberon.PassFocus(Viewers.This(X, Y)); *) Oberon.Defocus;
+			track := TRUE
+		ELSIF keys = {ML} THEN
+			track := TRUE
+		ELSE
+			track := FALSE
+		END;
+		WHILE keys # {} DO
+			Input.Mouse(keys, X, Y);
+			IF (F.X + hmin < X) & (X < F.X + hmax) THEN
+				prim := hexcurs; sec := asccurs;
+			ELSIF (F.X + amin < X) & (X < F.X + amax) THEN
+				prim := asccurs; sec := hexcurs
+			ELSE
+				RemoveCursor(F); prim := NIL; sec := NIL;
+			END;
+			GetLine(F, Y, line); GetOffset(F, X, off);
+			IF track THEN
+				IF (prim # NIL) & ((F.cursor1 # prim) OR (F.org + line*number + off # F.cursorBytePos)) THEN
+					RemoveCursor(F);
+					F.cursor1 := prim; F.cursor2 := sec;
+					SetCursor(F, X, Y)
+				END
+			END;
+			Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, X, Y)
+		END
+	END TrackMouse;
+
+	(* ______________________________ edit procedures ____________________________ *)
+		
+	PROCEDURE CopyFile(F : Frame);
+		CONST bufSize = 512;
+		VAR new : Files.File;
+			writer : Files.Rider;
+			buf : ARRAY bufSize OF CHAR;
+	BEGIN
+		Files.Set(R, F.model.file, 0);
+		new := Files.New(F.model.name);
+		Files.Set(writer, new, 0);
+		Files.ReadBytes(R, buf, bufSize);
+		WHILE ~R.eof DO
+			Files.WriteBytes(writer, buf, bufSize);
+			Files.ReadBytes(R, buf, bufSize)
+		END;
+		Files.WriteBytes(writer, buf, bufSize - R.res);
+		F.model.file := new
+	END CopyFile;
+	
+	PROCEDURE Edit(F : Frame; ch : CHAR);
+		CONST cright = 0C3X; cleft = 0C4X;
+		VAR hX, aX, Y : INTEGER;
+	BEGIN
+		IF F.hasCursor THEN
+			IF (ch = cright) & (F.cursorBytePos # F.len-1) THEN
+				InvertCursor(F);
+				INC(F.cursorBytePos);
+				GetX(F, F.cursorBytePos, hX, aX); GetY(F, F.cursorBytePos, Y);
+				IF F.cursor1 = hexcurs THEN SetCursor(F, hX, Y) ELSE SetCursor(F, aX, Y) END
+			ELSIF (ch = cleft) & (F.cursorBytePos # 0) THEN
+				InvertCursor(F);
+				DEC(F.cursorBytePos);
+				GetX(F, F.cursorBytePos, hX, aX); GetY(F, F.cursorBytePos, Y);
+				IF F.cursor1 = hexcurs THEN SetCursor(F, hX, Y) ELSE SetCursor(F, aX, Y) END
+			ELSIF F.cursor1 = hexcurs THEN
+				IF HexToDec(ch) >= 0 THEN
+					IF F.virgin THEN F.virgin := FALSE; CopyFile(F) END;
+					HexUpdateByte(F, HexToDec(ch));
+					SendUpdateMsg(F);
+					DrawCursor(F)
+				END
+			ELSIF F.cursor1 = asccurs THEN
+				IF (ch = ".") OR (ReadableChar(ch) # ".") THEN
+					IF F.virgin THEN F.virgin := FALSE; CopyFile(F) END;
+					AscUpdateByte(F, ch);
+					SendUpdateMsg(F);
+					DrawCursor(F);
+					IF F.cursorBytePos # F.len-1 THEN
+						InvertCursor(F);
+						INC(F.cursorBytePos);
+						GetX(F, F.cursorBytePos, hX, aX); GetY(F, F.cursorBytePos, Y);
+						SetCursor(F, aX, Y)
+					END
+				END
+			END
+		END
+	END Edit;
+
+	(* ______________________________ message handling ____________________________ *) 
+
+	PROCEDURE Copy(src, dst : Frame);
+	BEGIN
+		dst.virgin := src.virgin; dst.hasCursor := FALSE;
+		dst.cursor1 := NIL; dst.cursor2 := NIL; dst.cursorBytePos := -1;
+		NEW(dst.model);  dst.model := src.model;
+		dst.org := src.org; dst.len := src.len;
+		dst.handle := src.handle
+	END Copy;
+
+	PROCEDURE Modify(F : Frame; Y, H : INTEGER);
+		VAR line, dH : INTEGER;
+	BEGIN
+		dH := H - F.H;
+		IF dH > 0 THEN (* extend *)
+			Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+			GetLine(F, F.Y, line);
+			IF F.Y + F.H # Y + H THEN
+				Display.CopyBlock(F.X, F.Y, F.W, F.H, F.X, Y + dH, Display.replace)
+			END;
+			F.Y := Y; F.H := H;
+			Display.ReplConst(bgd, F.X, F.Y, F.W, dH, Display.replace);
+			Display.ReplConst(fgd, F.X + barW, F.Y, 1, dH, Display.replace);
+			Draw(F, Y + H - line*fontheight, F.Y + dY, F.org + line*number);
+			DrawGreyBars(F)
+		ELSIF dH < 0 THEN (* reduce *)
+			Oberon.RemoveMarks(F.X, F.Y, F.W, F.H);
+			line := (H -1- dY) DIV fontheight;
+			IF (line + 1)*fontheight >= H - dY THEN DEC(line) END;
+			dH := (line + 1)*fontheight;
+			IF F.Y + F.H # Y + H THEN
+				Display.CopyBlock(F.X, F.Y + F.H - dH - dY, F.W, dH + dY, F.X, Y + H - dH - dY, Display.replace)
+			END;
+			F.Y := Y; F.H := H;
+			IF dH < 0 THEN dH := 0 END;
+			Display.ReplConst(bgd, F.X + barW + 1, F.Y, F.W - barW - 1, H - dH - dY, Display.replace);
+			DrawClip(F);
+			DrawGreyBars(F)
+		END
+	END Modify;
+
+	PROCEDURE Handle(F : Objects.Object; VAR M : Objects.ObjMsg);
+		VAR dest : Frame;
+	BEGIN
+		WITH F : Frame DO
+			IF M IS Oberon.InputMsg THEN
+				WITH M : Oberon.InputMsg DO
+					IF M.id = Oberon.track THEN
+						IF M.X < F.X + barW THEN
+							Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, M.X, M.Y);
+							Scroll(F, M.X, M.Y, M.keys)
+						ELSE
+							Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, M.X, M.Y);
+							TrackMouse(F, M.X, M.Y, M.keys)
+						END
+					ELSIF M.id = Oberon.consume THEN
+						Edit(F, M.ch)
+					END
+				END
+			ELSIF M IS Display.ModifyMsg THEN
+				WITH M : Display.ModifyMsg DO
+					RemoveCursor(F);
+					Modify(F, M.Y, M.H)
+				END
+			ELSIF M IS Objects.CopyMsg THEN
+				WITH M : Objects.CopyMsg DO
+					NEW(dest); M.obj := dest;
+					RemoveCursor(F);
+					IF M.obj IS Frame THEN Copy(F, M.obj(Frame)) END
+				END
+			ELSIF M IS UpdateMsg THEN
+				WITH M : UpdateMsg DO
+					IF M.id = changeFont THEN
+						DrawFrame(F)
+					ELSIF M.id = updateByte THEN
+						IF M.file = F.model.file THEN
+							WriteBang(F); Update(F, M.pos, M.ch)
+						END
+					END
+				END			
+			ELSIF M IS Oberon.ControlMsg THEN
+				WITH M : Oberon.ControlMsg DO
+					IF M.id = Oberon.defocus THEN
+						RemoveCursor(F)
+					ELSIF M.id = Oberon.neutralize THEN
+						RemoveCursor(F)
+					END
+				END
+			ELSIF M IS CursorMsg THEN
+				WITH M : CursorMsg DO
+					IF F.hasCursor  THEN
+						M.file := F.model.file;
+						M.pos := F.cursorBytePos
+					END
+				END
+			END
+		END
+	END Handle;
+	
+	(* ______________________ auxiliary procedures StoreTextToFile _________________________ *)
+
+	PROCEDURE WriteSpaces(num : INTEGER);
+		VAR i : INTEGER;
+	BEGIN
+		i := 0; 
+		WHILE i < num  DO Texts.Write(W, " "); INC(i) END
+	END WriteSpaces;
+
+	PROCEDURE WriteAddress(pos : LONGINT);
+		VAR div : LONGINT;
+	BEGIN
+		div := 0100000H;
+		REPEAT
+			Texts.Write(W, DecToHex(pos DIV div));
+			pos := pos MOD div;
+			div := ASH(div, -4);
+		UNTIL div = 0
+	END WriteAddress;
+
+	PROCEDURE WriteHexPart(max : INTEGER);
+		VAR i : INTEGER;
+	BEGIN
+		i := 0;
+		WHILE i < max DO
+			Texts.Write(W, DecToHex(ASH(ORD(nextline[i]), -4)));
+			Texts.Write(W, DecToHex(ORD(nextline[i]) MOD 16));
+			WriteSpaces(1); INC(i)
+		END;
+ 		WriteSpaces((number-i)*3)
+	END WriteHexPart;
+
+	PROCEDURE WriteAscPart(max : INTEGER);
+		VAR i : INTEGER;
+	BEGIN
+		i := 0;
+		WHILE i < max DO Texts.Write(W, ReadableChar(nextline[i])); INC(i) END
+	END WriteAscPart;
+	
+	PROCEDURE WriteLine(nr : INTEGER; adr : LONGINT);
+	BEGIN
+		WriteAddress(adr); WriteSpaces(colspace);
+		WriteHexPart(nr); WriteSpaces(colspace-1);
+		WriteAscPart(nr); Texts.WriteLn(W)
+	END WriteLine;
+
+	(* ______________________________ Interface to HeX-Part of Module ____________________________ *)
+
+	PROCEDURE OpenNewFrame(F : Frame; file : Files.File; name : ARRAY OF CHAR; handle : Objects.Handler);
+	BEGIN
+		F.virgin := TRUE; F.hasCursor := FALSE;
+		F.cursor1 := NIL; F.cursor2 := NIL;
+		F.cursorBytePos := -1;
+		NEW(F.model); F.model.file := file;
+		COPY(name, F.model.name);
+		F.org := 0; F.len := Files.Length(file);
+		F.handle := handle
+	END OpenNewFrame;
+
+	PROCEDURE StoreFile(F : Frame; name : ARRAY OF CHAR);
+	BEGIN
+		F.virgin := TRUE;
+		DeleteBang(F);
+		COPY(name, F.model.name);
+		CopyFile(F);
+		Files.Register(F.model.file)
+	END StoreFile;
+
+	PROCEDURE StoreTextToFile(F : Frame; name : ARRAY OF CHAR);
+		VAR T : Texts.Text;
+			rest : INTEGER;
+			oldfont : Fonts.Font; f: Files.File; len: LONGINT;
+	BEGIN
+		T := TextFrames.Text("");
+		oldfont := W.lib(Fonts.Font);
+		Texts.SetFont(W, font);
+		Files.Set(R, F.model.file, 0);
+		Files.ReadBytes(R, nextline, number);
+		WHILE ~R.eof DO
+			WriteLine(number, Files.Pos(R)-number);
+			Files.ReadBytes(R, nextline, number)
+		END;
+		rest := number - SHORT(R.res); 
+		IF rest > 0 THEN WriteLine(rest, Files.Pos(R) - rest) END;
+		Texts.Append(T, W.buf);
+		(* Texts.Close(T, name); *)
+			f := Files.New(name);
+			Texts.Store(T, f, 0, len);
+			Files.Register(f);
+		Texts.SetFont(W, oldfont);
+	END StoreTextToFile;
+
+	PROCEDURE ChangeFont(name : ARRAY OF CHAR; VAR res : INTEGER);
+		VAR newfont : Fonts.Font;
+			M : UpdateMsg;
+			dx1, dx2, x, y, w, h : INTEGER;
+			p : Display.Pattern;
+	BEGIN
+		newfont := Fonts.This(name);
+		IF name # Fonts.Default.name THEN
+			IF (Fonts.Default = newfont) OR (newfont = NIL) THEN
+				res := 1; (* font not found *)
+				RETURN
+			END
+		END;
+		Fonts.GetChar(newfont, "W", dx1, x, y, w, h, p);
+		Fonts.GetChar(newfont, "i", dx2, x, y, w, h, p);
+		IF dx1 # dx2 THEN
+			res := 2 (* not a non-proportional font  *)
+		ELSE
+			res := 0; (* ok *)
+			font := newfont;
+			COPY(name, fontname);
+			InitDisplayVars;
+			M.id := changeFont;
+			Display.Broadcast(M)
+		END
+	END ChangeFont;
+
+	PROCEDURE SearchPat (F: Frame; pat: ARRAY OF CHAR; len: INTEGER);
+		VAR org, pos, cursorpos: LONGINT; ch: CHAR; patpos: INTEGER;
+			hX, aX, Y: INTEGER;
+	BEGIN
+		IF F.hasCursor THEN pos := F.cursorBytePos ELSE pos := 0 END;
+		REPEAT
+			Files.Set(R, F.model.file, pos); Files.Read(R, ch);
+			WHILE ~R.eof & (ch # pat[0]) DO Files.Read(R, ch) END;
+			IF ch = pat[0] THEN pos := Files.Pos(R); Files.Read(R, ch); patpos := 1;
+				WHILE (patpos < len) & (ch = pat[patpos]) DO Files.Read(R, ch); INC(patpos) END;
+				IF patpos = len THEN (* pattern found *)
+					IF ~F.hasCursor THEN Oberon.Defocus; F.hasCursor := TRUE (*Oberon.PassFocus(Viewers.This(F.X, F.Y))*) END;
+					cursorpos := pos + len - 1;
+					org := ((cursorpos DIV number) - 1) * number;
+					IF org < 0 THEN org := 0 END;
+					F.org := org; DrawFrame(F);
+					F.cursor1 := asccurs; F.cursor2 := hexcurs;
+					GetX(F, cursorpos, hX, aX); GetY(F, cursorpos, Y);
+					SetCursor(F, aX, Y);
+					RETURN;
+				END
+			END
+		UNTIL R.eof;
+		RemoveCursor(F);
+	END SearchPat;
+
+	(* ________________________________ HeX-Part of Module _______________________________ *)
+
+	(* ____________________________ some auxiliary procedures ___________________________ *)
+
+	PROCEDURE FindStoreFrame(VAR F : Frame; VAR name : ARRAY OF CHAR);
+		VAR par : Oberon.ParList;
+			V : Viewers.Viewer;
+			T : Texts.Text;
+			S : Texts.Scanner;
+			beg, end, time : LONGINT;
+	BEGIN
+		par := Oberon.Par;
+		IF par.frame = par.vwr.dsc THEN
+			V := par.vwr;
+			Texts.OpenScanner(S, V.dsc(TextFrames.Frame).text, 0)
+		ELSE
+			V := Oberon.MarkedViewer();
+			Texts.OpenScanner(S, par.text, par.pos)
+		END;
+		Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "^") THEN
+			Oberon.GetSelection(T, beg, end, time);
+			IF time > 0 THEN Texts.OpenScanner(S, T, beg); Texts.Scan(S) END
+		END;
+		IF (S.class = Texts.Name) & (V.dsc # NIL) & (V.dsc.next IS Frame) THEN
+			F := V.dsc.next(Frame);
+			COPY(S.s, name)
+		ELSE
+			F := NIL
+		END
+	END FindStoreFrame;
+
+	PROCEDURE FindInputName(VAR name : ARRAY OF CHAR);
+		VAR T : Texts.Text;
+			S : Texts.Scanner;
+			beg, end, time : LONGINT;
+	BEGIN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+		Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "^") OR (S.line # 0) THEN
+			Oberon.GetSelection(T, beg, end, time);
+			IF time >= 0 THEN
+				Texts.OpenScanner(S, T, beg);
+				Texts.Scan(S)
+			END
+		END;
+		IF S.class = Texts.Name THEN
+			COPY(S.s, name)
+		ELSE
+			COPY("", name)
+		END
+	END FindInputName;
+
+	PROCEDURE FontLogText(name : ARRAY OF CHAR; res : INTEGER);
+	BEGIN
+		Texts.WriteString(W, name);
+		IF res = 1 THEN (* not found *)
+			Texts.WriteString(W, " not found");
+		ELSIF res = 2 THEN (* not a non-proportional font *)
+			Texts.WriteString(W, " is not a fixed-width font")
+		END;
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END FontLogText;
+
+	PROCEDURE SetRider(VAR done : BOOLEAN);
+		VAR M : CursorMsg;
+	BEGIN
+		M.pos := -1;
+		Display.Broadcast(M);
+		IF M.pos >= 0 THEN
+			Files.Set(R, M.file, M.pos); done := TRUE
+		ELSE
+			done := FALSE
+		END
+	END SetRider;
+
+	(* ______________________________ Commands of Module HeX ____________________________ *)
+
+	PROCEDURE Open*;
+		VAR F : Frame;
+			V : Viewers.Viewer;
+			File : Files.File;
+			X, Y : INTEGER;
+			name : ARRAY 32 OF CHAR;
+			res : INTEGER;
+	BEGIN
+		FindInputName(name);
+		IF name # "" THEN
+			File := Files.Old(name);
+			IF File # NIL THEN
+				IF fontname # "" THEN
+					NEW(F);
+					OpenNewFrame(F, File, name, Handle);
+					Oberon.AllocateUserViewer(Oberon.Mouse.X, X, Y);
+					V := MenuViewers.New(TextFrames.NewMenu(name,
+							StandardMenu), F, TextFrames.menuH, X, Y)
+				ELSE
+					Texts.WriteString(W, "invalid font"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf)
+				END
+			ELSE
+				Texts.WriteString(W, "file not found"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf)
+			END
+		END
+	END Open;
+
+	PROCEDURE Store*;
+		VAR F : Frame;
+			name : ARRAY 32 OF CHAR;
+
+		PROCEDURE Backup(VAR name : ARRAY OF CHAR);
+			VAR res, i : INTEGER;
+				bak : ARRAY 32 OF CHAR;
+		BEGIN
+			i := 0;
+			WHILE name[i] # 0X DO bak[i] := name[i]; INC(i) END;
+			bak[i] := "."; bak[i+1] := "B"; bak[i+2] := "a"; bak[i+3] := "k";
+			bak[i+4] := 0X;
+			Files.Rename(name, bak, res);
+		END Backup;
+
+	BEGIN
+		Texts.WriteString(W, "Hex.Store ");
+		FindStoreFrame(F, name);
+		IF F # NIL THEN
+			Texts.WriteString(W, name);
+			Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+			Backup(name);
+			StoreFile(F, name)
+		END
+	END Store;
+
+	PROCEDURE StoreText*;
+		VAR F : Frame;
+			name : ARRAY 32 OF CHAR;
+
+		PROCEDURE NewName(VAR name : ARRAY OF CHAR);
+			VAR i : INTEGER;
+		BEGIN
+			i := 0;
+			WHILE name[i] # 0X DO INC(i) END;
+			name[i] := "."; name[i+1] := "T"; name[i+2] := "e"; name[i+3] := "x"; name[i+4] := "t";
+			name[i+5] := 0X
+		END NewName;
+
+	BEGIN
+		Texts.WriteString(W, "Hex.StoreText ");
+		FindStoreFrame(F, name);
+		IF F # NIL THEN
+			NewName(name);
+			Texts.WriteString(W, name);
+			Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+			StoreTextToFile(F, name)
+		END
+	END StoreText;
+
+	PROCEDURE SetFont*;
+		VAR res : INTEGER;
+			name : ARRAY 32 OF CHAR;
+	BEGIN
+		FindInputName(name);
+		IF name # "" THEN
+			ChangeFont(name, res);
+			IF res # 0 THEN
+				FontLogText(name, res)
+			END
+		END
+	END SetFont;
+
+	PROCEDURE GetSInt*;
+		VAR x : CHAR; done : BOOLEAN;
+	BEGIN
+		SetRider(done);
+		IF done THEN
+			Files.Read(R, x);
+			Texts.WriteString(W, "SHORTINT :"); Texts.Write(W, 09X);
+			Texts.WriteInt(W, ORD(x), 0); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END;
+	END GetSInt;
+
+	PROCEDURE GetInt*;
+		VAR x : INTEGER; done : BOOLEAN;
+	BEGIN
+		SetRider(done);
+		IF done THEN
+			Files.ReadInt(R, x);
+			Texts.WriteString(W, "INTEGER :"); Texts.Write(W, 09X);
+			Texts.WriteInt(W, x, 0); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END GetInt;
+
+	PROCEDURE GetLInt*;
+		VAR x : LONGINT; done : BOOLEAN;
+	BEGIN
+		SetRider(done);
+		IF done THEN
+			Files.ReadLInt(R, x);
+			Texts.WriteString(W, "LONGINT :"); Texts.Write(W, 09X);
+			Texts.WriteInt(W, x, 0); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END GetLInt;
+
+	PROCEDURE GetReal*;
+		VAR x : REAL; done : BOOLEAN;
+	BEGIN
+		SetRider(done);
+		IF done THEN
+			Files.ReadReal(R, x);
+			Texts.WriteString(W, "REAL :"); Texts.Write(W, 09X);
+			Texts.WriteReal(W, x, 20); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END GetReal;
+
+	PROCEDURE GetLReal*;
+		VAR x : LONGREAL; done : BOOLEAN;
+	BEGIN
+		SetRider(done);
+		IF done THEN
+			Files.ReadLReal(R, x);
+			Texts.WriteString(W, "LONGREAL :"); Texts.Write(W, 09X);
+			Texts.WriteLongReal(W, x, 20); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END GetLReal;
+
+	PROCEDURE GetNum*;
+		VAR x, n : LONGINT; done : BOOLEAN;
+	BEGIN
+		SetRider(done);
+		IF done THEN
+			n := Files.Pos(R);
+			Files.ReadNum(R, x);
+			n := Files.Pos(R) - n;
+			Texts.WriteString(W, "Number ["); Texts.WriteInt(W, n, 0);
+			Texts.WriteString(W, " Byte(s)] :"); Texts.Write(W, 09X);
+			Texts.WriteInt(W, x, 0); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END GetNum;
+
+	PROCEDURE GetSet*;
+		VAR x : SET; done : BOOLEAN; i, last : SHORTINT;
+	BEGIN
+		SetRider(done);
+		IF done THEN
+			Files.ReadSet(R, x);
+			Texts.WriteString(W, "SET :"); Texts.Write(W, 09X); Texts.Write(W, "{");
+			i := 0; last := -1; 
+			REPEAT
+				IF i IN x THEN
+					IF last >= 0 THEN Texts.WriteInt(W, last, 0); Texts.Write(W, ",") END;
+					last := i;
+				END;
+				INC(i)
+			UNTIL (i = 32);
+			IF last >= 0 THEN Texts.WriteInt(W, last, 0) END;
+			Texts.Write(W, "}");
+			Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END GetSet;
+
+	PROCEDURE GetBool*;
+		VAR x : CHAR; done : BOOLEAN;
+	BEGIN
+		SetRider(done);
+		IF done THEN
+			Files.Read(R, x);
+			Texts.WriteString(W, "BOOLEAN :"); Texts.Write(W, 09X);
+			IF x = 01X THEN Texts.WriteString(W, "TRUE")
+			ELSE Texts.WriteString(W, "FALSE")
+			END;
+			Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END GetBool;
+
+	PROCEDURE Search*;
+		VAR F: Frame; name: ARRAY 32 OF CHAR; ch: CHAR;
+			T: Texts.Text; beg, end, time: LONGINT; R: Texts.Reader; len: INTEGER;
+	BEGIN
+		FindStoreFrame(F, name);
+		IF F # NIL THEN
+			Oberon.GetSelection(T, beg, end, time);
+			IF time > 0 THEN
+				Texts.OpenReader(R, T, beg); Texts.Read(R, ch); len := 0;
+				WHILE (len <= LEN(name)) & (Texts.Pos(R) <= end) DO
+					name[len] := ch; INC(len); Texts.Read(R, ch);
+				END;
+				SearchPat(F, name, len);
+			END;
+		END
+	END Search;
+
+	PROCEDURE SetOffset*;
+	VAR S: Texts.Scanner;
+	BEGIN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+		Texts.Scan(S);
+		IF S.class = Texts.Int THEN addrOffset := S.i END
+	END SetOffset;
+	
+BEGIN
+	addrOffset := 0;
+	Texts.OpenWriter(W);
+	COPY(DefaultFont, fontname);
+	ChangeFont(fontname, res);
+	IF res # 0 THEN
+		FontLogText(fontname, res);
+		COPY("", fontname)
+	END
+END Hex.

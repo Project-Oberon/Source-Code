@@ -1,0 +1,564 @@
+MODULE Line;  (*NW 24.3.89 / 12.11.94*)
+	IMPORT Files, V24, Viewers, Texts, TextFrames, MenuViewers, Oberon;
+
+(* packet types:
+	1 = data,  2 = data ack,
+	3 = open,  4 = open ack,
+	5 = close,  6 = close ack,
+	7 = abort *)
+	
+	CONST PakSize = 256;
+		T0 = 1200;  (*timeout*)
+		ENQ = 40X; SND = 41X; REC = 42X; FDIR = 45X; NPW = 48X; DEL = 49X;
+		MDIR = 4AX; SML = 4BX; RML = 4CX; DML = 4DX;
+		ACK = 10X; NAK = 25X; NPR = 26X;
+
+		Menu = "^Edit.Menu.Text System.Close  System.Copy  System.Grow  Edit.Search  Edit.Replace  Edit.Store ";
+
+	VAR W, W1: Texts.Writer;
+		handler: Oberon.Task;
+		myR, myS: INTEGER;  (*receiver and sender sequence numbers*)
+		rx: INTEGER;  (*receiver buffer index*)
+		rbuf: ARRAY 260 OF CHAR;  (*receiver buffer*)
+
+	PROCEDURE Rec(VAR ch: CHAR);
+		VAR time: LONGINT; ch0: CHAR;
+	BEGIN time := Oberon.Time() + T0;
+		LOOP
+			IF V24.Available() > 0 THEN
+				V24.Receive(ch0); ch := CHR(ORD(ch0) MOD 80H); EXIT
+			END ;
+			IF Oberon.Time() > time THEN ch := 1X; EXIT END
+		END
+	END Rec;
+
+	PROCEDURE SendPacket(typ, len: INTEGER; VAR data: ARRAY OF CHAR);
+		VAR i, u, x: INTEGER; cs: LONGINT;
+	BEGIN V24.Send("{"); cs := typ + 5; i := 0;
+		WHILE i < len DO
+			cs := (cs*5 + ORD(data[i])) MOD 32767; INC(i)
+		END ;
+		data[len] := CHR(cs); data[len+1] := CHR(cs DIV 100H); INC(len, 2);
+		V24.Send(CHR(typ MOD 64 + 33)); x := typ DIV 64; u := 1; i := 0;
+		WHILE i < len DO  (*encode*)
+			IF u = 0 THEN
+				x := ORD(data[i]); V24.Send(CHR(x MOD 64 + 33)); x := x DIV 64; u := 1
+			ELSIF u = 1 THEN
+				x := ORD(data[i])*4 + x; V24.Send(CHR(x MOD 64 + 33)); x := x DIV 64; u := 2
+			ELSIF u = 2 THEN
+				x := ORD(data[i])*16 + x; V24.Send(CHR(x MOD 64 + 33)); V24.Send(CHR(x DIV 64 + 33)); u := 0
+			END ;
+			INC(i)
+		END ;
+		IF u > 0 THEN V24.Send(CHR(x MOD 64 + 33)) END ;
+		V24.Send(0DX)
+	END SendPacket;
+
+	PROCEDURE ReceivePacket(VAR typ, len: INTEGER);
+		VAR ch: CHAR;
+			i, j, u, x: INTEGER; cs: LONGINT;
+	BEGIN len := 0; typ := 0; rbuf[1] := 0X;
+		REPEAT Rec(ch) UNTIL ch > 0X;
+		IF ch = "}" THEN
+			Rec(ch); i := 0; u := 0;
+			WHILE (ch > 0DX) & (i < 260) DO
+				IF u = 0 THEN
+					x := ORD(ch) - 33; Rec(ch); x := (ORD(ch) - 33) * 64 + x;
+					rbuf[i] := CHR(x); INC(i); x := x DIV 256; u := 2
+				ELSIF u = 1 THEN
+					x := (ORD(ch) - 33) * 4 + x; rbuf[i] := CHR(x); INC(i); u := 0
+				ELSIF u = 2 THEN
+					x := (ORD(ch) - 33) * 16 + x; rbuf[i] := CHR(x); INC(i); x := x DIV 256; u := 1
+				END ;
+				Rec(ch)
+			END ;
+			IF (ch = 0DX) & (i > 2) THEN
+				DEC(i, 2); j := 0; cs := 1;
+				WHILE j < i DO
+					cs := (cs*5 + ORD(rbuf[j])) MOD 32767; INC(j)
+				END ;
+				IF (CHR(cs) = rbuf[i]) & (CHR(cs DIV 256) = rbuf[i+1]) THEN
+					rx := 1; typ := ORD(rbuf[0]); len := i-1
+				END
+			END
+		END
+	END ReceivePacket;
+
+	PROCEDURE Open1(len: INTEGER; VAR msg: ARRAY OF CHAR; VAR res: INTEGER);
+		VAR typ, plen, retries: INTEGER;
+	BEGIN retries := 3; myS := 0; myR := 0;
+		LOOP SendPacket(30H, len, msg); ReceivePacket(typ, plen);
+			IF typ DIV 10H = 4 THEN res := 0; EXIT END ;
+			IF typ DIV 10H = 7 THEN res := 2; EXIT END ;
+			DEC(retries);
+			IF retries = 0 THEN res := 1; EXIT END ;
+		END
+	END Open1;
+
+	PROCEDURE Send1(len: INTEGER; VAR buf: ARRAY OF CHAR; VAR res: INTEGER);
+		VAR retries, typ, plen: INTEGER;
+	BEGIN myS := 1 - myS; retries := 3;
+		SendPacket(myR*2+myS+14H, len, buf);
+		LOOP ReceivePacket(typ, plen);
+			IF typ <= 0 THEN (*error*) DEC(retries);
+				IF retries = 0 THEN res := 1; EXIT END ;
+				SendPacket(myR*2+myS+14H, len, buf)
+			ELSIF (typ DIV 10H = 2) & (typ DIV 2 MOD 2 = myS) THEN res := 0; EXIT
+			ELSIF typ DIV 10H = 7 THEN (*abort*) res := 2; EXIT
+			END
+		END
+	END Send1;
+
+	PROCEDURE Receive1(VAR len, res: INTEGER);
+		VAR typ: INTEGER;
+			dmy: ARRAY 4 OF CHAR;
+	BEGIN
+		LOOP ReceivePacket(typ, len);
+			IF typ <= 0 THEN (*error*) res := 1; EXIT
+			ELSIF typ DIV 10H = 1 THEN (*data*)
+				IF typ MOD 2 # myR THEN
+					myR := 1 - myR; SendPacket(myR*2+myS+20H, 0, dmy); res := 0; EXIT
+				ELSE SendPacket(myR*2+myS+20H, 0, dmy)
+				END
+			ELSIF typ DIV 10H = 7 THEN (*abort*) res := 3; EXIT
+			END
+		END
+	END Receive1;
+
+	PROCEDURE SendData(F: Files.File; VAR res: INTEGER);
+		VAR  k: INTEGER;
+			x: CHAR;
+			L: LONGINT;
+			R: Files.Rider;
+			buf: ARRAY PakSize+2 OF CHAR;
+	BEGIN Files.Set(R, F, 0); L := 0;
+		LOOP k := 0;
+			LOOP Files.Read(R, x);
+				IF R.eof THEN EXIT END ;
+				buf[k] := x; INC(k);
+				IF k = PakSize THEN EXIT END
+			END ;
+			Send1(k, buf, res);
+			IF res # 0 THEN Texts.WriteString(W, " failed"); EXIT END ;
+			L := L + k;
+			Texts.Write(W, "."); Texts.Append(Oberon.Log, W.buf);
+			IF k < PakSize THEN EXIT END ;
+			Texts.Append(Oberon.Log, W.buf)
+		END ;
+		Texts.WriteInt(W, L, 7)
+	END SendData;
+
+	PROCEDURE SendText(T: Texts.Text; VAR res: INTEGER);
+		VAR  k, m: INTEGER;
+			L: LONGINT;
+			R: Texts.Reader;
+			buf: ARRAY PakSize+2 OF CHAR;
+	BEGIN Texts.OpenReader(R, T, 0); L := T.len;
+		LOOP k := 0;
+			IF L > PakSize THEN m := PakSize ELSE m := SHORT(L) END ;
+			WHILE k < m DO Texts.Read(R, buf[k]); INC(k) END ;
+			Send1(k, buf, res);
+			IF res # 0 THEN Texts.WriteString(W, " failed"); EXIT END ;
+			L := L - m;
+			Texts.Write(W, "."); Texts.Append(Oberon.Log, W.buf);
+			IF m < PakSize THEN EXIT END
+		END
+	END SendText;
+
+	PROCEDURE ReceiveData(F: Files.File; VAR res: INTEGER);
+		VAR k, len: INTEGER; L: LONGINT;
+			R: Files.Rider;
+	BEGIN Files.Set(R, F, 0); L := 0;
+		LOOP Receive1(len, res);
+			IF res = 0 THEN k := 0;
+				WHILE k < len DO
+					Files.Write(R, rbuf[rx]); INC(rx); INC(k)
+				END ;
+				L := L + k;
+				Texts.Write(W, "."); Texts.Append(Oberon.Log, W.buf);
+				IF len < 256 THEN EXIT END
+			ELSE Texts.WriteString(W, "  failed"); EXIT
+			END
+		END ;
+		Texts.WriteInt(W, L, 8)
+	END ReceiveData;
+
+	PROCEDURE ReceiveText(T: Texts.Text; VAR res: INTEGER);
+		VAR k, len: INTEGER;
+			L: LONGINT;
+	BEGIN L := 0;
+		LOOP Receive1(len, res);
+			IF res = 0 THEN k := 0;
+				WHILE k < len DO Texts.Write(W1, rbuf[rx]); INC(rx); INC(k) END ;
+				Texts.Append(T, W1.buf); L := L + k;
+				Texts.Write(W, "."); Texts.Append(Oberon.Log, W.buf);
+				IF len < 256 THEN EXIT END
+			ELSE Texts.WriteString(W, "  failed"); Texts.WriteLn(W);
+				Texts.Append(Oberon.Log, W.buf); EXIT
+			END
+		END
+	END ReceiveText;
+
+	PROCEDURE reply(msg: INTEGER);
+	BEGIN
+		CASE msg OF
+			  0:
+			| 1: Texts.WriteString(W, " no link")
+			| 2: Texts.WriteString(W, " no permission")
+			| 3: Texts.WriteString(W, " not done")
+			| 4: Texts.WriteString(W, " not found")
+			| 5: Texts.WriteString(W, " no response")
+			| 6: Texts.WriteString(W, " link open")
+			| 7: Texts.WriteString(W, " password set")
+			| 8: Texts.WriteString(W, " no recipient")
+		END ;
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END reply;
+
+	PROCEDURE AppendS(VAR s: ARRAY OF CHAR; VAR d: ARRAY OF CHAR; VAR k: INTEGER);
+		VAR i: INTEGER; ch: CHAR;
+	BEGIN i := 0;
+		REPEAT ch := s[i]; d[k] := ch; INC(i); INC(k) UNTIL ch = 0X
+	END AppendS;
+
+	PROCEDURE AppendW(s: LONGINT; VAR d: ARRAY OF CHAR; n: INTEGER; VAR k: INTEGER);
+		VAR i: INTEGER;
+	BEGIN i := 0;
+		REPEAT d[k] := CHR(s); s := s DIV 100H; INC(i); INC(k) UNTIL i = n
+	END AppendW;
+
+	(*------------------------ Commands -----------------------*)
+
+	PROCEDURE GetPar(VAR S: Texts.Scanner);
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S)
+	END GetPar;
+
+	PROCEDURE OpenLink*;
+		VAR res: INTEGER;
+			msg: ARRAY 4 OF CHAR;
+	BEGIN msg[0] := ENQ; Open1(1, msg, res);
+		IF res = 0 THEN reply(6) ELSE reply(3) END
+	END OpenLink;
+
+	PROCEDURE SendFiles*;
+		VAR len, res, k: INTEGER;
+			S: Texts.Scanner;
+			F: Files.File;
+			name: ARRAY 32 OF CHAR;
+			buf: ARRAY 64 OF CHAR;
+	BEGIN GetPar(S);
+			LOOP
+				IF S.class # Texts.Name THEN EXIT END ;
+				Texts.WriteString(W, S.s); k := 0; AppendS(S.s, name, k);
+				IF S.nextCh = ":" THEN (*prefix*)
+					Texts.Scan(S); Texts.Scan(S);
+					IF S.class = Texts.Name THEN
+						name[k-1] := "."; AppendS(S.s, name, k);
+						Texts.Write(W, ":"); Texts.WriteString(W, S.s)
+					END
+				END ;
+				Texts.WriteString(W, " sending"); Texts.Append(Oberon.Log, W.buf);
+				F := Files.Old(S.s);
+				IF F # NIL THEN
+					buf[0] := REC; k := 1;
+					AppendS(Oberon.User, buf, k); AppendW(Oberon.Password, buf, 4, k);
+					AppendS(name, buf, k); Open1(k, buf, res);
+					IF res = 0 THEN
+						Receive1(len, res);
+						IF rbuf[rx] = ACK THEN SendData(F, res); reply(0)
+						ELSIF rbuf[rx] = NPR THEN reply(2); EXIT
+						ELSIF rbuf[rx] = NAK THEN reply(3); EXIT
+						ELSE reply(5)
+						END
+					ELSE reply(5); EXIT
+					END
+				ELSE reply(4)
+				END ;
+				Texts.Scan(S)
+			END
+	END SendFiles;
+
+	PROCEDURE ReceiveFiles*;
+		VAR k, len, res: INTEGER;
+			S: Texts.Scanner;
+			F: Files.File;
+			name: ARRAY 32 OF CHAR;
+			buf: ARRAY 64 OF CHAR;
+	BEGIN GetPar(S);
+		LOOP
+			IF S.class # Texts.Name THEN EXIT END ;
+			Texts.WriteString(W, S.s); k := 0; AppendS(S.s, name, k);
+			IF S.nextCh = ":" THEN (*prefix*)
+				Texts.Scan(S); Texts.Scan(S);
+				IF S.class = Texts.Name THEN
+					name[k-1] := "."; AppendS(S.s, name, k);
+					Texts.Write(W, ":"); Texts.WriteString(W, S.s)
+				END
+			END ;
+			Texts.WriteString(W, " receiving"); Texts.Append(Oberon.Log, W.buf);
+			buf[0] := SND; k := 1; AppendS(Oberon.User, buf, k); AppendW(Oberon.Password, buf, 4, k);
+			AppendS(name, buf, k); Open1(k, buf, res);
+			IF res = 0 THEN
+				Receive1(len, res);
+				IF rbuf[rx] = ACK THEN
+					F := Files.New(S.s);
+					IF F # NIL THEN
+						ReceiveData(F, res);
+						IF res = 0 THEN Files.Register(F); reply(0) ELSE EXIT END
+					END
+				ELSIF rbuf[rx] = NAK THEN reply(4)
+				ELSIF rbuf[rx] = NPR THEN reply(2); EXIT
+				ELSE reply(5); EXIT
+				END
+			ELSE reply(5); EXIT
+			END ;
+			Texts.Scan(S)
+		END
+	END ReceiveFiles;
+
+	PROCEDURE DeleteFiles*;
+		VAR len, res, k: INTEGER;
+			S: Texts.Scanner;
+			buf: ARRAY 64 OF CHAR;
+	BEGIN GetPar(S);
+		LOOP
+			IF S.class # Texts.Name THEN EXIT END ;
+			buf[0] := DEL; k := 1; AppendS(Oberon.User, buf, k); AppendW(Oberon.Password, buf, 4, k);
+			AppendS(S.s, buf, k); Open1(k, buf, res);
+			Texts.WriteString(W, S.s); Texts.WriteString(W, " remote deleting");
+			IF res = 0 THEN
+				Receive1(len, res);
+				IF rbuf[rx] = ACK THEN reply(0)
+				ELSIF rbuf[rx] = NPR THEN reply(2); EXIT
+				ELSIF rbuf[rx] = NAK THEN reply(3)
+				ELSE reply(5)
+				END
+			ELSE reply(5); EXIT
+			END ;
+			Texts.Scan(S)
+		END
+	END DeleteFiles;
+
+	PROCEDURE Directory*;
+		VAR k, X, Y, len, res: INTEGER;
+			T: Texts.Text;
+			V: Viewers.Viewer;
+			buf: ARRAY 32 OF CHAR;
+			S: Texts.Scanner;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF S.class = Texts.Name THEN
+			buf[0] := FDIR; k := 1;
+			AppendS(Oberon.User, buf, k); AppendW(Oberon.Password, buf, 4, k); AppendS(S.s, buf, k);
+			Open1(k, buf, res);
+			IF res = 0 THEN
+				Receive1(len, res);
+				IF rbuf[rx] = ACK THEN
+					T := TextFrames.Text("");
+					Oberon.AllocateSystemViewer(Oberon.Par.frame.X, X, Y);
+					V := MenuViewers.New(
+							TextFrames.NewMenu("Line.Directory", "System.Close  Edit.Store "),
+							TextFrames.NewText(T, 0), TextFrames.menuH, X, Y);
+					ReceiveText(T, res)
+				ELSIF rbuf[rx] = NAK THEN reply(4)
+				ELSIF rbuf[rx] = NPR THEN reply(2)
+				ELSE reply(5)
+				END
+			ELSE reply(5)
+			END
+		END
+	END Directory;
+
+	PROCEDURE Mailbox*;
+		VAR k, X, Y, len, res: INTEGER;
+			T: Texts.Text;
+			V: Viewers.Viewer;
+			buf: ARRAY 32 OF CHAR;
+	BEGIN buf[0] := MDIR; k := 1;
+		AppendS(Oberon.User, buf, k); AppendW(Oberon.Password, buf, 4, k);
+		Open1(k, buf, res);
+		IF res = 0 THEN
+			Receive1(len, res);
+			IF rbuf[rx] = ACK THEN
+				T := TextFrames.Text("");
+				Oberon.AllocateSystemViewer(Oberon.Par.frame.X, X, Y);
+				V := MenuViewers.New(
+						TextFrames.NewMenu("Mailbox.Text", "System.Close  Line.ReceiveMail  Line.DeleteMail "),
+						TextFrames.NewText(T, 0), TextFrames.menuH, X, Y);
+				ReceiveText(T, res)
+			ELSIF rbuf[rx] = NAK THEN reply(4)
+			ELSIF rbuf[rx] = NPR THEN reply(2)
+			ELSE reply(5)
+			END
+		ELSE reply(5)
+		END
+	END Mailbox;
+
+	PROCEDURE ReceiveMail*;
+		CONST Name = "Message.Text";
+		VAR k, len, res, X, Y: INTEGER;
+			T: Texts.Text;
+			M, F: TextFrames.Frame;
+			S: Texts.Scanner;
+			V: Viewers.Viewer;
+			buf: ARRAY 32 OF CHAR;
+	BEGIN F := Oberon.Par.frame.next(TextFrames.Frame); T := F.text;
+		IF F.hasSel THEN
+			Texts.OpenScanner(S, T, F.selbeg.pos); Texts.Scan(S);
+			IF S.class = Texts.Int THEN
+				buf[0] := SML; k := 1; AppendS(Oberon.User, buf, k); AppendW(Oberon.Password, buf, 4, k);
+				AppendW(S.i, buf, 2, k); Open1(k, buf, res);
+				IF res = 0 THEN
+					Receive1(len, res);
+					IF rbuf[rx] = ACK THEN
+						Oberon.AllocateUserViewer(Oberon.Par.frame.X, X, Y);
+						M := TextFrames.NewMenu(Name, Menu);
+						T := TextFrames.Text("");
+						V := MenuViewers.New(M, TextFrames.NewText(T, 0), TextFrames.menuH, X, Y);
+						ReceiveText(T, res)
+					ELSIF rbuf[rx] = NAK THEN reply(4)
+					ELSIF rbuf[rx] = NPR THEN reply(2)
+					ELSE reply(5)
+					END
+				ELSE  reply(5)
+				END
+			END
+		END
+	END ReceiveMail;
+
+	PROCEDURE SendMail*;
+		VAR k, len, res: INTEGER;
+			S: Texts.Scanner;
+			T: Texts.Text;
+			v: Viewers.Viewer;
+			buf: ARRAY 64 OF CHAR;
+	BEGIN v := Oberon.MarkedViewer();
+		IF (v.dsc # NIL) & (v.dsc.next IS TextFrames.Frame) THEN
+			T := v.dsc.next(TextFrames.Frame).text; Texts.OpenScanner(S, T, 0); Texts.Scan(S);
+			IF (S.class = Texts.Name) & (S.s = "To") THEN
+				buf[0] := RML; k := 1; AppendS(Oberon.User, buf, k); AppendW(Oberon.Password, buf, 4, k);
+				Open1(k, buf, res);
+				IF res = 0 THEN
+					Receive1(len, res);
+					IF rbuf[rx] = ACK THEN
+						Texts.WriteString(W, " mailing"); Texts.Append(Oberon.Log, W.buf);
+						SendText(T, res); reply(0)
+					ELSIF rbuf[rx] = NPR THEN reply(2)
+					ELSIF rbuf[rx] = NAK THEN reply(3)
+					ELSE reply(5)
+					END
+				ELSE reply(5)
+				END
+			ELSE reply(8)
+			END
+		END
+	END SendMail;
+
+	PROCEDURE DeleteMail*;
+		VAR ch: CHAR;
+			len, res, k: INTEGER;
+			T: Texts.Text;
+			F: TextFrames.Frame;
+			S: Texts.Scanner;
+			buf: ARRAY 32 OF CHAR;
+	BEGIN F := Oberon.Par.frame.next(TextFrames.Frame); T := F.text;
+		IF F.hasSel THEN
+			Texts.OpenScanner(S, T, F.selbeg.pos); Texts.Scan(S);
+			IF S.class = Texts.Int THEN
+				buf[0] := DML; k := 1; AppendS(Oberon.User, buf, k); AppendW(Oberon.Password, buf, 4, k);
+				AppendW(S.i, buf, 2, k); Open1(k, buf, res);
+				IF res = 0 THEN
+					Receive1(len, res);
+					IF rbuf[rx] = ACK THEN
+						REPEAT Texts.Read(S, ch) UNTIL ch < " ";
+						Texts.Delete(T, F.selbeg.pos, Texts.Pos(S))
+					ELSIF rbuf[rx] = NAK THEN reply(3)
+					ELSIF rbuf[rx] = NPR THEN reply(2)
+					ELSE reply(5)
+					END
+				ELSE reply(5)
+				END
+			END
+		END
+	END DeleteMail;
+
+	PROCEDURE SetPassword*;
+		VAR res, len, k: INTEGER; oldpw: LONGINT;
+			S: Texts.Scanner;
+			buf: ARRAY 64 OF CHAR;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF S.class = Texts.String THEN 
+			oldpw := Oberon.Password; Oberon.SetUser(Oberon.User, S.s);
+			buf[0] := NPW; k := 1; AppendS(Oberon.User, buf, k); AppendW(oldpw, buf, 4, k);
+			AppendW(Oberon.Password, buf, 4, k);
+			Open1(k, buf, res);
+			IF res = 0 THEN
+				Receive1(len, res);
+				IF rbuf[rx] = ACK THEN reply(7)
+				ELSIF rbuf[rx] = NPR THEN reply(2)
+				ELSIF rbuf[rx] = NAK THEN reply(3)
+				ELSE reply(5)
+				END
+			ELSE reply(5)
+			END
+		END
+	END SetPassword;
+
+	PROCEDURE CloseLink*;
+		VAR typ, plen, retries: INTEGER;
+	BEGIN retries := 3;
+		LOOP SendPacket(50H, 0, rbuf); ReceivePacket(typ, plen);
+			IF typ DIV 10H = 6 THEN EXIT END ;
+			DEC(retries);
+			IF retries = 0 THEN EXIT END
+		END
+	END CloseLink;
+
+	PROCEDURE ExitDataMode*;
+	BEGIN V24.Send("+"); V24.Send("+"); V24.Send("+")
+	END ExitDataMode;
+
+	PROCEDURE Start*;
+		VAR S: Texts.Scanner;
+	BEGIN Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF S.class = Texts.Int THEN
+			IF S.i = 1200 THEN V24.Start(66X, 13X, 7X)
+			ELSIF S.i = 2400 THEN V24.Start(88X, 13X, 7X)
+			ELSIF S.i = 19200 THEN V24.Start(0CCX, 13X, 7X)
+			ELSE V24.Start(0BBX, 13X, 7X); S.i := 9600
+			END ;
+			Oberon.Remove(handler); Oberon.Install(handler);
+			Texts.WriteString(W, "  Line started at"); Texts.WriteInt(W, S.i, 6);
+			Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+		END
+	END Start;
+
+	PROCEDURE SendMsg*;
+		VAR ch: CHAR;
+			S: Texts.Reader;
+	BEGIN Texts.OpenReader(S, Oberon.Par.text, Oberon.Par.pos);
+		REPEAT Texts.Read(S, ch) UNTIL ch > " ";
+		REPEAT V24.Send(ch); Texts.Read(S, ch) UNTIL ch < " ";
+		V24.Send(0DX) 
+	END SendMsg;
+
+	PROCEDURE Stop*;
+	BEGIN Oberon.Remove(handler); Texts.WriteString(W, "  Line stopped");
+		Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+	END Stop;
+
+	PROCEDURE Escape*;
+	BEGIN V24.Send(3X); V24.Send(0DX)
+	END Escape;
+
+	PROCEDURE Serve;
+		VAR n: INTEGER; ch: CHAR;
+	BEGIN n := V24.Available();
+		IF n > 0 THEN
+			REPEAT Rec(ch); Texts.Write(W, ch); DEC(n) UNTIL n = 0;
+			Texts.Append(Oberon.Log, W.buf)
+		END
+	END Serve;
+
+BEGIN Texts.OpenWriter(W); Texts.OpenWriter(W1);
+	NEW(handler); handler.handle := Serve
+END Line.

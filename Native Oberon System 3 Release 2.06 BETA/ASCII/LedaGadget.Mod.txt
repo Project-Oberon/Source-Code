@@ -1,0 +1,747 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaGadget;	(* uh, Tue, 7-Dec-1993 *)
+
+	(* eos 11.4.95 adapted to release 2.0 *)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaFrames, LedaBox, LedaContainer,	(* leda system *)
+		Display, Objects, Oberon, Viewers, MenuViewers,	(* oberon system *)
+		Attributes, Panels, BasicGadgets, Gadgets, TextFields, Views, Documents, Desktops;	(* gadget system *)
+	
+CONST
+	ModName = "LedaGadget";	ModVersion = " [uh/3.1]";
+	NewCmd = "LedaGadget.NewPanel";	GetCmd = "Leda.GetAttr";	GetStyleCmd = "Leda.GetStyle";
+	SetCmd = "LedaGadget.SetAttr";	SetStyleCmd = "LedaGadget.SetStyle";	NewStyleCmd = "LedaGadget.NewStyle";
+	ViewName = "LedaDialog";	ViewMenu = "System.Close  System.Grow  Leda.GetAttr  Leda.GetStyle";
+	GetCap = "Get Attr";	GetStyleCap = "Get Style";
+	SetCap = "Apply Attr";	SetStyleCap = "Apply Style";	NewStyleCap = "New Style";
+	
+	ColorPicker = (LedaBox.Str + LedaBox.Int + LedaBox.Enum) * 10;
+	
+	Lsp = 22;	StrV = 2; 	BttnV = 3;	W0 = 10;	Lt = 50;	Tab0 = 30;	RadioDX = 5;
+	Margin = 10;	MinPanelW = 3*Lt + 2*Margin;	
+	(* Margin = 5; *)
+	
+	GadgCmds = "System.Close  System.Copy  System.Grow  LedaGadget.Update";
+	
+	(*--- gadget control ---*)
+	GadgCh = 018X;	(* CTRL-X *)
+	GadgName = "gadget";
+	GadgDefW = 3 * LedaBase.CM;	GadgDefH = 4 * LedaBase.MM;
+	
+	
+TYPE	
+	(*--- dialog panel ---*)
+	List = POINTER TO ListDsc;
+	ListDsc = RECORD
+		next, dsc: List;	(* dsc: used by enumerations [specify attributes following radio button] *)
+		typ: INTEGER;	(* type of attribute [LedaBox.Str / LedaBox.Int / LedaBox.Enum] *)
+		obj: Objects.Object	(*basic gadget [string/integer/checkbutton] *)
+	END;
+		(*---
+			- the list controls the order and contents of the attributes in a panel
+			- the list is processed to get all the attribute values to be set or that
+				define a style
+		---*)
+	
+	Panel = POINTER TO PanelDsc;
+	PanelDsc = RECORD
+		(Panels.PanelDesc)
+		list: List
+	END;
+	
+	PanelMsg = RECORD
+		(Display.FrameMsg);
+		P: Panel
+	END;
+	
+	(*--- panel look ---*)
+	Look = RECORD
+		X, Y, lsp, v: INTEGER;	(* current frame location, line space and vertical offset *)
+		x0, y0: INTEGER;	(* lower left of frames *)
+		x1, y1: INTEGER;	(* upper right of frames *)
+		frames, f: Display.Frame;	(* list of frames [linked with slink field] *)
+		list, l: List
+	END;
+		(*---
+			- the look controls the arrangement of gadgets in a panel
+				during creation of the panel
+		---*)
+	
+	(*--- viewer ---*)
+	Viewer = POINTER TO ViewerDsc;
+	ViewerDsc = RECORD
+		(MenuViewers.ViewerDesc)
+		gadg: LedaContainer.Cont
+	END;
+
+	
+VAR
+	panelHandle: Objects.Handler;	(* handler for dialog panel *)
+	brkX: INTEGER;
+	(*--- gadget control ---*)
+	gadgDoOp: LedaBase.CtrlProc;		(* control handle *)
+	
+	
+	PROCEDURE Min(i0, i1: INTEGER): INTEGER;
+	BEGIN
+		IF i0 < i1 THEN RETURN i0 ELSE RETURN i1 END
+	END Min;
+	
+	PROCEDURE Max(i0, i1: INTEGER): INTEGER;
+	BEGIN
+		IF i0 > i1 THEN RETURN i0 ELSE RETURN i1 END
+	END Max;
+	
+(*--- panel look ---*)
+	
+	PROCEDURE LookInit(VAR L: Look);
+	BEGIN
+		L.X := 0; L.Y := - (Lsp + Lsp DIV 2); L.v := 0; L.lsp := Lsp;
+		L.x0 := 0; L.y0 := 0; L.x1 := 0; L.y1 := 0;
+		L.frames := NIL; L.f := NIL; L.list := NIL; L.l := NIL
+	END LookInit;
+	
+	PROCEDURE LookSet(VAR L: Look; P: Panel; newPanel: BOOLEAN);
+	(* sets the look L in panel P: replaces the content, sets the new size and freezes the panel *)
+		VAR m: Display.ModifyMsg;	c: Display.ConsumeMsg;	a: Objects.AttrMsg;
+	BEGIN
+		P.dsc := NIL;	(* kill panel content *)
+		P.mask := NIL; P.state0 := {};
+		P.list := L.list;
+		IF newPanel THEN
+			P.W := L.x1 - L.x0 + 1 + 2*Margin; P.H := L.y1 - L.y0 + 1 + 2*Margin;
+			IF P.W < MinPanelW THEN P.W := MinPanelW END
+		ELSE
+			m.id := Display.extend; m.F := P; m.mode := Display.display;
+			m.W := L.x1 - L.x0 + 1 + 2*Margin; IF m.W < MinPanelW THEN m.W := MinPanelW END;
+			m.X := P.X; m.dX := 0; m.dW := m.W - P.W;
+			m.H := L.y1 - L.y0 + 1 + 2*Margin; m.Y := P.Y + P.H - m.H; m.dY := m.Y - P.Y; m.dH := m.H - P.H;
+			Display.Broadcast(m)
+		END;	(* size of panel set *)
+		c.id := Display.drop; c.obj := L.frames;
+		c.x := 0; c.y := 0; c.F := P; c.u := Margin; c.v := Margin - P.H; c.res := -1;
+		P.handle(P, c);	(* insert new panel content *)
+		IF newPanel THEN	(* freeze panel *)
+			a.id := Objects.set; a.name := "Locked"; a.class := Objects.Bool; a.b := TRUE; P.handle(P, a)
+(*
+			a.id := Objects.set; a.name := "Selection"; a.class := Objects.Bool; a.b := FALSE; P.handle(P, a);
+			a.id := Objects.set; a.name := "Insert"; a.class := Objects.Bool; a.b := FALSE; P.handle(P, a)
+*)
+		END	
+	END LookSet;
+	
+	PROCEDURE LookAddFrame(VAR L: Look; F: Display.Frame);
+		(* eos 25.01.95 CONST FreezeSet = {Gadgets.nomove, Gadgets.noresize, Gadgets.nodelete}; *)
+	BEGIN
+		F.X := L.X; INC(L.X, F.W);
+		F.Y := L.Y + L.v; L.v := 0;	(* bottom aligned *)
+		IF F IS Gadgets.Frame THEN
+			F(Gadgets.Frame).state := F(Gadgets.Frame).state (* + FreezeSet *)
+		END;
+		IF L.frames = NIL THEN
+			L.frames := F; L.x0 := F.X; L.y0 := F.Y; L.x1 := F.X + F.W - 1; L.y1 := F.Y + F.H - 1
+		ELSE
+			L.f.slink := F; L.x0 := Min(L.x0, F.X); L.y0 := Min(L.y0, F.Y);
+			L.x1 := Max(L.x1, F.X + F.W - 1); L.y1 := Max(L.y1, F.Y + F.H - 1);
+		END;
+		L.f := F; F.slink := NIL
+	END LookAddFrame;
+	
+	PROCEDURE LookAddList(VAR L: Look; typ: INTEGER; obj: Objects.Object);
+	BEGIN
+		IF L.list = NIL THEN NEW(L.list); L.l := L.list ELSE NEW(L.l.next); L.l := L.l.next END;
+		L.l.typ := typ; L.l.obj := obj
+	END LookAddList;
+	
+	PROCEDURE PutDX(VAR L: Look; dx: INTEGER); BEGIN INC(L.X, dx) END PutDX;
+	PROCEDURE PutDY(VAR L: Look; dy: INTEGER); BEGIN DEC(L.Y, dy) END PutDY;
+	
+	PROCEDURE PutLeft(VAR L: Look; lt: INTEGER);
+	BEGIN
+		IF L.X < lt THEN L.X := lt ELSE INC(L.X, Margin) END
+	END PutLeft;
+	
+	PROCEDURE PutTab(VAR L: Look; x0, tab: INTEGER);
+	BEGIN
+		L.X := ((L.X + tab - x0) DIV tab) * tab + x0
+	END PutTab;
+	
+	PROCEDURE PutLn(VAR L : Look);
+	BEGIN
+		DEC(L.Y, L.lsp); L.X := 0
+	END PutLn;
+	
+	PROCEDURE PutCmd(VAR L: Look; caption, cmd: ARRAY OF CHAR);
+		VAR F: BasicGadgets.Button;	m: Objects.AttrMsg;
+	BEGIN
+		BasicGadgets.NewButton; F := Objects.NewObj(BasicGadgets.Button);
+		LedaSys.CopyStr(caption, F.caption); F.val := FALSE; F.popout := TRUE;
+		m.id := Objects.set; m.name := "Cmd"; LedaSys.CopyStr(cmd, m.s); m.class := Objects.String; m.res := -1;
+		F.handle(F, m);	(* set command of button *)
+		LookAddFrame(L, F)
+	END PutCmd;
+	
+	PROCEDURE PutButton(VAR L: Look; obj: Objects.Object; nr: INTEGER; active: BOOLEAN);
+		VAR F: BasicGadgets.CheckBox;
+	BEGIN
+		BasicGadgets.NewCheckBox; F := Objects.NewObj(BasicGadgets.CheckBox);
+		F.obj := obj; F.setval := nr; F.val := active;
+		IF F.H > 12 THEN F.W := 12; F.H := 12 END;
+		L.v := BttnV; LookAddFrame(L, F);
+		LookAddList(L, LedaBox.Enum, F)
+	END PutButton;
+	
+	PROCEDURE NewCaption(VAR s: ARRAY OF CHAR): Display.Frame;
+		VAR F: TextFields.Caption; nolines: INTEGER;
+	BEGIN
+		TextFields.NewCaption; F := Objects.NewObj(TextFields.Caption);
+		Attributes.StrToTxt(s, F.text); (* Texts.ChangeLooks(F.text, 0, F.text.len, {1}, NIL, 0, 0);	change color *)
+		TextFields.CalcSize(F, F.W, F.H, nolines, TRUE);
+		RETURN F
+	END NewCaption;
+	
+	PROCEDURE NewTextField(obj: Objects.Object; VAR s: ARRAY OF CHAR): Display.Frame;
+		VAR F: TextFields.TextField;
+	BEGIN
+		TextFields.NewTextField; F := Objects.NewObj(TextFields.TextField);
+		F.obj := obj; LedaSys.CopyStr(s, F.val);
+		RETURN F
+	END NewTextField;
+	
+	PROCEDURE PutNote(VAR L: Look; s: ARRAY OF CHAR);
+		VAR F: Display.Frame;
+	BEGIN
+		F := NewCaption(s);
+		L.v := StrV; LookAddFrame(L, F)
+	END PutNote;
+	
+	PROCEDURE PutString(VAR L: Look; s: ARRAY OF CHAR; static: BOOLEAN);
+		VAR F: Display.Frame;	obj: Objects.Object;
+	BEGIN
+		BasicGadgets.NewString; obj := Objects.NewObj; LedaSys.CopyStr(s, obj(BasicGadgets.String).val);
+		IF static THEN F := NewCaption(s); L.v := StrV;
+		ELSE F := NewTextField(obj, s); F.W := 3 * F.W DIV 2;
+		END;
+		LookAddFrame(L, F);
+		LookAddList(L, LedaBox.Str, obj)
+	END PutString;
+	
+	PROCEDURE PutColorPicker(VAR L: Look; C: Display.Frame; col: LONGINT);
+		VAR P: Display.Frame;	a: Objects.AttrMsg;	m: Display.ModifyMsg;	(* eos 25.01.95 *)
+	BEGIN
+		m.id := Display.move; m.mode := Display.state; m.res := -1; m.F := C; m.x := 0; m.y := 0; m.dlink := NIL; Objects.Stamp(m);
+		m.X := C.X; m.Y := C.Y; m.W := 20; m.H := 20; m.dX := 0; m.dY := 0; m.dW := 20 - C.W; m.dH := 20 - C.H;
+		C.handle(C, m);
+		a.id := Objects.set; a.name := "Cmd"; a.class := Objects.String;
+		a.s := "Gadgets.Set  lPan.Color  #Col  ~"; C.handle(C, a);	(* set color picker command *)
+		a.id := Objects.set; a.name := "Colors"; a.class := Objects.String;
+		a.s := "15 1 2 3 4 5 6 7 8 9 10 11 12 13 14 0"; C.handle(C, a);	(* set color numbers *)
+		Panels.NewPanel; P := Objects.NewObj(Display.Frame);	(* create new panel *)
+		P.W := C.W; P.H := C.H;	(* set to same size as color picker *)
+		a.id := Objects.set; a.name := "Name"; a.class := Objects.String; a.s := "lPan"; P.handle(P, a);	(* set panel name *)
+		a.id := Objects.set; a.name := "Color"; a.class := Objects.Int; a.i := col; P.handle(P, a);	(* set panel color *)
+		LookAddFrame(L, P); PutDX(L, RadioDX);
+		LookAddFrame(L, C);
+		LookAddList(L, ColorPicker, P)
+	END PutColorPicker;
+			
+	PROCEDURE PutInt(VAR L: Look; p: LedaBox.ParaDsc);
+		VAR F: Display.Frame;	obj: Objects.Object;	s: ARRAY 12 OF CHAR;
+	BEGIN
+		obj := NIL;
+		IF p.s = "color" THEN	(* create color picker *)
+			Objects.NewObj := NIL; LedaSys.Execute("ColorTools", "NewColorPicker"); obj := Objects.NewObj;	(* get color picker *)
+			IF (obj = NIL) OR ~(obj IS Display.Frame) THEN obj := NIL	(* create integer field *)
+			ELSE PutColorPicker(L, obj(Display.Frame), p.i)
+			END
+		END;
+		IF obj = NIL THEN
+			BasicGadgets.NewInteger; obj := Objects.NewObj; obj(BasicGadgets.Integer).val := p.i;
+			Attributes.IntToStr(p.i, s);
+			IF p.stat THEN F := NewCaption(s) ELSE F := NewTextField(obj, s); F.W := F.W DIV 2 END;
+			LookAddFrame(L, F);
+			LookAddList(L, LedaBox.Int, obj)
+		END
+	END PutInt;
+	
+(*--- dialog panel ---*)
+	
+	PROCEDURE PanelNew(): Panel;
+		VAR P: Panel;	L: Look;	m: Objects.CopyMsg;
+	BEGIN
+		NEW(P);
+		P.handle := NIL; P.list := NIL;
+		m.id := Objects.deep; m.obj := NIL; Objects.Stamp(m);
+		Panels.NewPanel;	(* Objects.NewObj contains new standard panel *)
+		Panels.CopyPanel(m, Objects.NewObj(Panels.Panel), P);
+		P.handle := panelHandle;
+		LookInit(L);
+		PutCmd(L, GetCap, GetCmd); PutDX(L, W0);
+		PutCmd(L, GetStyleCap, GetStyleCmd); PutLn(L);
+		LookSet(L, P, TRUE);	(* TRUE: P is new panel *)
+		RETURN P
+	END PanelNew;
+	
+	PROCEDURE PanelGet(context: BOOLEAN; VAR new: BOOLEAN): Panel;
+		VAR P: Panel;	o: Objects.Object;	m: PanelMsg;
+	BEGIN
+		o := NIL; new := FALSE;
+		IF context THEN
+			o := Gadgets.context; WHILE (o # NIL) & ~ (o IS Panel) DO o := o.dlink END
+		END;
+		IF o # NIL THEN P := o(Panel)
+		ELSE
+			m.P := NIL; m.F := NIL; m.res := -1; Display.Broadcast(m);	(* get visible panel *)
+			IF m.P # NIL THEN P := m.P
+			ELSE P := PanelNew(); new := TRUE
+			END
+		END;
+		RETURN P
+	END PanelGet;
+	
+	PROCEDURE PanelShow(P: Panel);
+		VAR G: Gadgets.Frame;	V: MenuViewers.Viewer;	X, Y: INTEGER;
+	BEGIN
+		P.mask := NIL; EXCL(P.state, Gadgets.selected); (* eos 25.01.95 EXCL(P.state, Gadgets.nomove); *)
+		G := Views.ViewOf(P); INCL(G.state, 31);
+		IF Oberon.Par.vwr # NIL THEN X := Oberon.Par.vwr.X ELSE X := Oberon.UserTrack(0) END;
+		Oberon.AllocateSystemViewer(X, X, Y);
+		V := MenuViewers.New(Desktops.NewMenuFrame(ViewName, ViewMenu), G,  Desktops.menuH,  X, Y)
+	END PanelShow;
+		
+	PROCEDURE *PanelHandler(F: Objects.Object; VAR M: Objects.ObjMsg);
+		VAR P: Panel;
+	BEGIN
+		P := F(Panel);
+		IF M IS Objects.AttrMsg THEN
+			WITH M: Objects.AttrMsg DO
+				IF (M.id = Objects.get) & (M.name = "Gen") THEN COPY(NewCmd, M.s); RETURN END	(*###*)
+			END
+		ELSIF M IS Objects.CopyMsg THEN
+			M(Objects.CopyMsg).obj := PanelNew(); RETURN	(*###*)
+		ELSIF M IS PanelMsg THEN
+			M(PanelMsg).P := P; M(PanelMsg).res := 99; RETURN	(*###*)
+		(* storing and loading not supported *)
+		END;
+		Panels.PanelHandler(P, M)
+	END PanelHandler;
+	
+	PROCEDURE NewPanel*;
+	(* creates a new panel and deposits it in Objects.NewObj *)
+	BEGIN
+		Objects.NewObj := PanelNew()
+	END NewPanel;
+	
+(*--- attributes ---*)
+	
+	PROCEDURE *ShowAttributes(flags: SET; VAR M: LedaBox.AttributeMsg);
+	(* shows the attributes given in attribute message M *)
+		VAR P: Panel;	L: Look;	i: INTEGER;	newP: BOOLEAN;
+
+		PROCEDURE ProcessEnum(VAR L: Look; s: LedaSys.String; active: LONGINT; VAR i: INTEGER; VAR a: LedaBox.Attributes);
+			VAR obj: Objects.Object;	sList, sl: List;
+				j, bttnNr: INTEGER;	vertical: BOOLEAN;
+		BEGIN
+			BasicGadgets.NewInteger; obj := Objects.NewObj; obj(BasicGadgets.Integer).val := active;
+			vertical := s[0] = "v"; IF vertical THEN j := 1 ELSE j := 0 END;
+			bttnNr := 0; PutButton(L, obj, bttnNr, bttnNr=active);
+			sList := L.list; sl := L.l; L.list := NIL; L.l := NIL;	(* to build new descender list for button *)
+			WHILE s[j] # 0X DO
+				IF s[j] = "-" THEN	(* inspect next attribute *)
+					INC(i); PutDX(L, RadioDX);
+					IF a[i].typ = LedaBox.Str THEN PutString(L, a[i].s, a[i].stat)
+					ELSIF a[i].typ = LedaBox.Int THEN PutInt(L, a[i])
+					END
+				ELSIF s[j] = "|" THEN
+					sl.dsc := L.list;	(* add list as descenders to previous button *)
+					L.list := sList; L.l := sl;	(* restore list *)
+					IF vertical THEN PutLn(L); PutLeft(L, Lt)
+					ELSE PutTab(L, Lt, Tab0);
+						IF L.X > brkX - Tab0 THEN PutLn(L); PutLeft(L, Lt) END
+					END;
+					INC(bttnNr); PutButton(L, obj, bttnNr, bttnNr=active);
+					sList := L.list; sl := L.l; L.list := NIL; L.l := NIL;	(* to build new descender list for button *)
+				END;
+				INC(j)
+			END;
+			sl.dsc := L.list;	(* add list as descenders to previous button *)
+			L.list := sList; L.l := sl	(* restore list *)
+		END ProcessEnum;
+
+	BEGIN
+		P := PanelGet(FALSE, newP);	(* get opened panel [opens new panel if needed] *)
+		LookInit(L);
+		IF LedaBox.StyleFlag IN flags THEN
+			PutCmd(L, SetStyleCap, SetStyleCmd); PutDX(L, W0);
+			PutCmd(L, NewStyleCap, NewStyleCmd)
+		ELSE
+			PutCmd(L, SetCap, SetCmd)
+		END;
+(*
+		PutLeft(L, 3*Lt);
+		PutCmd(L, GetCap, GetCmd); PutDX(L, W0);
+		PutCmd(L, GetStyleCap, GetStyleCmd);
+*)
+		PutLn(L);
+		PutDY(L, Margin);
+		PutNote(L, "type"); PutLeft(L, Lt); PutString(L, M.name, TRUE); PutDX(L, W0);
+		i := 0;
+		WHILE i < M.nbr DO
+			IF M.a[i].typ = LedaBox.NewLn THEN
+				PutDX(L, -W0); PutLn(L);	(* terminate line *)
+				IF M.a[i].s # "" THEN PutNote(L, M.a[i].s) END;
+				PutLeft(L, Lt)
+			ELSIF M.a[i].typ = LedaBox.Str THEN PutString(L, M.a[i].s, M.a[i].stat); PutDX(L, W0)
+			ELSIF M.a[i].typ = LedaBox.Int THEN PutInt(L, M.a[i]); PutDX(L, W0)
+			ELSIF M.a[i].typ = LedaBox.Enum THEN ProcessEnum(L, M.a[i].s, M.a[i].i, i, M.a); PutDX(L, W0)
+			END;
+			INC(i)
+		END;
+		LookSet(L, P, newP);
+		IF newP THEN PanelShow(P) END
+	END ShowAttributes;
+	
+	PROCEDURE ScanList(l: List; VAR i: INTEGER; VAR a: LedaBox.Attributes);
+	(* scans the attributes given in the list l and sets attribute message M accordingly *)
+		VAR m: Objects.AttrMsg; (* eos 25.01.95 *)
+	BEGIN
+		WHILE l # NIL DO
+			IF l.typ = LedaBox.Str THEN
+				a[i].typ := LedaBox.Str; LedaSys.CopyStr(l.obj(BasicGadgets.String).val, a[i].s); INC(i)
+			ELSIF l.typ = LedaBox.Int THEN
+				a[i].typ := LedaBox.Int; a[i].i := l.obj(BasicGadgets.Integer).val; INC(i)
+			ELSIF l.typ = ColorPicker THEN
+				m.id := Objects.get; m.name := "Color"; m.i := 0; m.res := -1; m.dlink := NIL; Objects.Stamp(m); l.obj.handle(l.obj, m);
+				a[i].typ := LedaBox.Int; a[i].i := (*l.obj(Gadgets.Frame).col*) m.i; INC(i)
+			ELSIF l.typ = LedaBox.Enum THEN
+				IF l.obj(BasicGadgets.CheckBox).val THEN ScanList(l.dsc, i, a) END
+			END;
+			l := l.next
+		END
+	END ScanList;
+	
+	PROCEDURE SendAttributes(first: BOOLEAN; msgId: INTEGER);
+		VAR F: LedaFrames.Frame;	sel: LedaBase.Box;	P: Panel;
+			p: LedaFrames.Port;	level: INTEGER;	newP: BOOLEAN;
+			M: LedaBox.AttributeMsg;	m: Oberon.ControlMsg;
+	BEGIN
+		P := PanelGet(TRUE, newP);	(* TRUE -> context *)
+		IF P.list = NIL THEN M.nbr := 0
+		ELSE
+			m.id := Oberon.defocus; m.F := NIL; m.dlink := NIL; Objects.Stamp(m);
+			m.x := 0; m.y := 0; m.res := -1; 
+			P.handle(P, m);	(* remove focus in panel *)
+			M.id := msgId;
+			LedaSys.CopyStr(P.list.obj(BasicGadgets.String).val, M.name);
+			M.nbr := 0; ScanList(P.list.next, M.nbr, M.a)
+		END;
+		IF M.nbr > 0 THEN
+			F := LedaFrames.Selection();
+			IF F # NIL THEN
+				LedaFrames.GetPort(F.trailer, F.box, p, level);
+				IF level # 0 THEN LedaFrames.Reset; LedaFrames.GetPort(F.trailer, F.box, p, level) END;
+				sel := F.box.sel; M.P := p;
+				WHILE sel # NIL DO
+					sel.do.handle(sel, M);
+					IF first OR (sel.sel = sel) THEN sel := NIL ELSE sel := sel.sel END
+				END;
+				LedaFrames.UpdatePort(p, level)
+			END
+		END
+	END SendAttributes;
+	
+(*--- commands ---*)
+
+	PROCEDURE InsertPanel*;
+	BEGIN
+		Gadgets.Integrate(PanelNew())
+	END InsertPanel;
+	
+	PROCEDURE OpenPanel*;
+	BEGIN
+		PanelShow(PanelNew())
+	END OpenPanel;
+	
+	PROCEDURE SetAttr*;
+	(** to set the specified attributes at the selection [value or style] *)
+	BEGIN
+		SendAttributes(TRUE, LedaBox.SetValue)
+	END SetAttr;
+	
+	PROCEDURE SetStyle*;
+	(** to set the specified attributes of the selected style *)
+	BEGIN
+		SendAttributes(TRUE, LedaBox.SetStyle)
+	END SetStyle;
+	
+	PROCEDURE NewStyle*;
+	(** to create a new style with the specified attributes and replace the selected style *)
+	BEGIN
+		SendAttributes(TRUE, LedaBox.NewStyle)
+	END NewStyle;
+	
+(*--- viewer ---*)
+	
+	PROCEDURE ViewerCopy(V: Viewer): Viewer;
+		VAR nV: Viewer;	Menu, Main: Display.Frame;	M: Objects.CopyMsg;
+	BEGIN
+		Menu := V.dsc; Main := V.dsc.next;
+		NEW(nV); nV^ := V^; nV.state := 0;
+		M.id := Objects.shallow; M.obj := NIL; Objects.Stamp(M);
+		Menu.handle(Menu, M); nV.dsc := M.obj(Display.Frame);
+		Main.handle(Main, M); nV.dsc.next := M.obj(Display.Frame);
+		RETURN nV
+	END ViewerCopy;
+		
+	PROCEDURE *ViewerHandle(V: Objects.Object; VAR M: Objects.ObjMsg);
+	BEGIN
+		IF M IS Objects.CopyMsg THEN M(Objects.CopyMsg).obj := ViewerCopy(V(Viewer))
+		ELSE MenuViewers.Handle(V, M)
+		END
+	END ViewerHandle;
+	
+	PROCEDURE ViewerOpen(V: Viewer); 
+		VAR X, Y: INTEGER;	M: Display.ControlMsg;
+	BEGIN
+		Oberon.AllocateUserViewer(Oberon.Mouse.X, X, Y);
+		V.handle := ViewerHandle; Viewers.Open(V, X, Y);
+		M.id := Display.restore; M.F := NIL; M.res := -1;  V.handle(V, M)	(* restore viewer *)
+	END ViewerOpen;
+
+(*--- utilities ---*)
+	
+	PROCEDURE CreatePanel(obj: Objects.Object): Display.Frame;
+	(* creates and returns a new panel containing object(s) obj [linked with slink field] *)
+		CONST Margin = 10;
+		VAR P: Panels.Panel;	M: Display.ConsumeMsg;	C: Objects.CopyMsg;
+			f: Display.Frame;	n: Objects.Object;	x0, y0, x1, y1: INTEGER;
+	BEGIN
+		Objects.NewObj := NIL; LedaSys.Execute("Illustrate", "NewCanvas");
+		IF Objects.NewObj = NIL THEN P := NIL
+		ELSE
+			P := Objects.NewObj(Panels.Panel);
+			x0 := MAX(INTEGER); y0 := MAX(INTEGER);	(* [x0..x1] -> width of given strucutre *)
+			x1 := MIN(INTEGER); y1 := MIN(INTEGER);	(* [y0..y1] -> height of given strucutre *)
+			n := NIL; Objects.Stamp(C);	(* same stamp for copying the whole structure *)
+			WHILE obj # NIL DO
+				C.id := Objects.deep; C.obj := NIL; obj.handle(obj, C);	(* deep copy of obj *)
+				IF C.obj # NIL THEN C.obj.slink := n; n := C.obj END;	(* add new list *)
+				IF obj IS Display.Frame THEN f := obj(Display.Frame);
+					x0 := Min(x0, f.X); y0 := Min(y0, f.Y);
+					x1 := Max(x1, f.X + f.W - 1); y1 := Max(y1, f.Y + f.H - 1)
+				END;	(* adjust size of given structure *)
+				obj := obj.slink
+			END;
+			IF n # NIL THEN	(* insert copied structure in panel *)
+				P.W := 2*Margin + x1 - x0 + 1; P.H := 2*Margin + y1 - y0 + 1;	(* set panel size *)
+				M.id := Display.drop; M.obj := n; M.res := -1; Objects.Stamp(M);
+				M.x := 0; M.y := 0; M.F := P; M.dlink := NIL; M.u := Margin; M.v := Margin - P.H;
+				P.handle(P, M);	(* insert new panel content *)
+				LedaContainer.NeutralizeFrame(P)
+			ELSE
+				P.W := SHORT(GadgDefW DIV LedaSys.scnUnit); P.H := SHORT(GadgDefH DIV LedaSys.scnUnit); 	(* set panel size *)
+			END
+		END;
+		RETURN P
+	END CreatePanel;
+
+	PROCEDURE GetContent(VAR f: Display.Frame);
+	BEGIN
+		WHILE (f # NIL) & ((f IS Documents.Document) OR (f IS Views.View)) DO
+			IF f IS Documents.Document THEN f := f.dsc 
+			ELSIF f IS Views.View THEN f := f(Views.View).obj(Display.Frame)
+			END
+		END
+	END GetContent;
+	
+(*--- gadget control ---*)
+
+	(*---
+		- a gadget control is a unique control; every control displays a gadget frame for its own
+		- at creation the star marked gadget frame will be copied and displayed [internal gadget]
+		- internal gadgets can be exported or imported; thereby the frame will be copied
+	---*)
+	
+	PROCEDURE New*(G: Display.Frame; dY: LONGINT; copy: BOOLEAN): LedaContainer.Cont;
+		VAR gadg: LedaContainer.Cont;
+	BEGIN
+		gadg := LedaContainer.New(G, dY, copy);
+		(* eos 25.01.95
+		IF (gadg.C # NIL) & (gadg.C IS Gadgets.Frame) THEN INCL(gadg.C(Gadgets.Frame).state, Gadgets.nomove) END;
+		*)
+		gadg.doOp := gadgDoOp;
+		RETURN gadg
+	END New;
+	
+	PROCEDURE GadgImport(VAR G: Display.Frame);
+		VAR f: Display.Frame;	g: Objects.Object;	M: Display.SelectMsg;
+	BEGIN
+		G := NIL;
+		IF Oberon.Pointer.on THEN
+			f := Documents.MarkedDoc();
+			IF f = NIL THEN
+				f := Oberon.MarkedViewer();
+				IF (f # NIL) & (f.dsc # NIL) THEN f := f.dsc.next ELSE f := NIL END
+			END;
+			GetContent(f);
+			IF f # NIL THEN G := LedaContainer.CopyFrame(f, Objects.deep) END
+		END;
+		IF G = NIL THEN
+			M.id := Display.get; M.time := -1; M.F := NIL; M.obj := NIL; Display.Broadcast(M);
+			IF (M.time > 0) & (M.obj # NIL) THEN
+				IF M.obj.slink = NIL THEN
+					IF M.obj IS Display.Frame THEN f := M.obj(Display.Frame); GetContent(f) ELSE f := NIL END; 
+					IF f # NIL THEN G := LedaContainer.CopyFrame(f, Objects.deep) END
+				ELSE G := CreatePanel(M.obj)
+				END
+			END
+		END;
+		IF G # NIL THEN LedaContainer.NeutralizeFrame(G) END
+	END GadgImport;
+
+	PROCEDURE GadgExport(gadg: LedaContainer.Cont);
+		VAR V: Viewer;	G: Display.Frame;
+	BEGIN
+		G := LedaContainer.CopyFrame(gadg.C, Objects.deep);
+		(* eos 25.01.95
+		IF G IS Gadgets.Frame THEN EXCL(G(Gadgets.Frame).state, Gadgets.nomove) END;
+		*)
+		NEW(V);
+		V.dsc := LedaFrames.GetMenu(LedaSys.dialogMod, "DM", "Exported.Gadget", GadgCmds, V.menuH);	(* menu frame [gadget or standard] *)
+		V.dsc.next := Views.ViewOf(G);	(* gadget frame *)
+		IF V.dsc.next IS Gadgets.Frame THEN INCL(V.dsc.next(Gadgets.Frame).state, 31) END;
+		V.gadg := gadg;
+		ViewerOpen(V)
+	END GadgExport;
+
+	PROCEDURE GadgExec(gadg: LedaContainer.Cont; text: LedaCtrl.Text; beg, len: LONGINT; VAR id: INTEGER);
+		VAR s: LedaSys.String;	G: Display.Frame;
+	BEGIN
+		LedaBox.ParPopStr(s);
+		IF LedaSys.EqualStr("imag", s) THEN id := -1;	(* handled *)
+			LedaBox.ParPopStr(s);
+			IF s = "import" THEN
+				GadgImport(G);
+				IF G # NIL THEN
+					gadg.C := G; LedaContainer.BindFrame(G, FALSE, gadg.lib);
+					LedaContainer.SetSize(gadg, -1, -1);
+					LedaContainer.NotifyChange(text, beg, 1)
+				END
+			ELSIF s = "export" THEN GadgExport(gadg)
+			END
+		END
+	END GadgExec;
+
+	PROCEDURE *DoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for gadget control; unique reference *)
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF
+				| LedaBase.LoadId:  m.ctrl := New(NIL, 0, FALSE); LedaContainer.Load(m.r, m.ctrl(LedaContainer.Cont))
+				| LedaBase.StoreModCmd:  LedaBase.StoreStr(m.r, ModName); LedaBase.StoreStr(m.r, "GC")
+				ELSE LedaContainer.DoOp(ctrl, m)	(* pass message *)
+				END
+			END
+		ELSIF m IS LedaCtrl.TextMsg THEN
+			WITH m: LedaCtrl.TextMsg DO
+				IF m.id = LedaCtrl.ExecuteId THEN GadgExec(ctrl(LedaContainer.Cont), m.text, m.beg, m.len, m.id) END
+			END
+		ELSE LedaContainer.DoOp(ctrl, m)	(* pass message *)
+		END
+	END DoOp;
+
+	PROCEDURE GC*;
+	(** deposits a empty control in LedaBase *)
+	(** is used during loading of gadget control *)
+	BEGIN LedaBase.depositedCtrl := New(NIL, 0, FALSE)
+	END GC;
+
+	PROCEDURE Create*;
+		VAR gadg: LedaContainer.Cont;	G: Display.Frame;
+	BEGIN
+		GadgImport(G); IF G = NIL THEN G := CreatePanel(NIL) END;
+		gadg := New(G, 0, FALSE);
+		IF G # NIL THEN LedaContainer.BindFrame(G, FALSE, gadg.lib) END;
+		LedaBase.depositedCtrl := gadg
+	END Create;
+		
+	PROCEDURE Open*;
+	BEGIN LedaSys.Execute("Desktops", "OpenDoc")
+	END Open;
+		
+	PROCEDURE Update*;
+		VAR V: Viewer;	gadg: LedaContainer.Cont;	G: Display.Frame;
+			M: LedaBox.Msg;	p: LedaFrames.Port;	level: INTEGER;
+	BEGIN
+		IF (Oberon.Par.vwr # NIL) & (Oberon.Par.vwr IS Viewer) THEN
+			V := Oberon.Par.vwr(Viewer); gadg := V.gadg;
+			M.id := LedaBox.LocateId; M.op := 5; M.ctrl := gadg;
+			M.text := NIL; M.l1 := -1;
+			LedaBox.Broadcast(NIL, {LedaBox.BcTxt}, M);
+			IF (M.l1 # -1) & (M.text # NIL) & (M.text.owner # NIL) THEN
+				G := LedaContainer.CopyFrame(V.dsc.next(Gadgets.Frame).obj(Display.Frame), Objects.deep);
+				IF G # NIL THEN
+					LedaFrames.GetPort(NIL, LedaBox.Root(M.text.owner), p, level);
+					IF level # 0 THEN LedaFrames.Reset; LedaFrames.GetPort(NIL, LedaBox.Root(M.text.owner), p, level) END;
+					LedaContainer.NeutralizeFrame(G);
+					gadg.C := G; LedaContainer.BindFrame(G, FALSE, gadg.lib);
+					LedaContainer.SetSize(gadg, -1, -1);
+					LedaContainer.NotifyChange(M.text, M.l1, 1);
+					LedaFrames.UpdatePort(p, level)
+				END
+			END
+		END
+	END Update;
+	
+(*--- installation calls ---*)
+
+	PROCEDURE DAL*;
+	(** DAL -> deposit attribute log [dialog for attributes] *)
+	BEGIN
+		LedaBox.SetAttrLog(ShowAttributes)
+	END DAL;
+	
+	PROCEDURE DM*;
+	(** DM -> deposit menu [gadgets menu] *)
+		VAR title: LedaSys.String;	cmds: ARRAY 128 OF CHAR;
+	BEGIN
+		LedaFrames.SetMenu(NIL, 0, title, cmds);	(* get title and commands of menu *)
+		IF cmds # "" THEN	(* create menu *)
+			LedaFrames.SetMenu(Desktops.NewMenuFrame(title, cmds), Desktops.menuH, title, cmds)	(* deposit gadgets menu *)
+		END
+	END DM;
+	
+	PROCEDURE Init*;
+	BEGIN
+		LedaSys.dialogMod := ModName
+	END Init;
+	
+			
+BEGIN
+	LedaSys.OutT(ModName, 0); LedaSys.OutT(ModVersion, 1);
+	
+	(*--- own intialisation ---*)
+	LedaSys.dialogMod := ModName;
+	panelHandle := PanelHandler;
+	brkX := Oberon.DisplayWidth(0) - Oberon.SystemTrack(0) - 2 * Margin;
+	
+	(*--- gadget control ---*)
+	gadgDoOp := DoOp;
+	LedaCtrl.DefChCtrl(GadgCh, GadgName, FALSE, FALSE, NIL, NIL, ModName, "Create");	(* register for key input *)
+	
+END LedaGadget.
+
+		

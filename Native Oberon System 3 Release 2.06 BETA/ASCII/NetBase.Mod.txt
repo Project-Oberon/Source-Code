@@ -1,0 +1,223 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE NetBase;	(* 18.12.95 mg *)
+
+IMPORT
+	SYSTEM, Oberon, EtherNet;
+	
+CONST
+	maxpack = 220;
+
+	arpid = 0806H; rarpid = 8035H; ipid = 0800H;
+	
+TYPE
+	Item* = POINTER TO ItemDesc;
+
+	ItemDesc* = RECORD
+		etherh*: EtherNet.Header;
+		data*: EtherNet.Data;
+		len*: INTEGER;
+		next: Item
+	END ;
+
+	Queue* = RECORD
+		n*: INTEGER;
+		first, last: Item
+	END;
+
+VAR
+	itq*: Queue;
+	arprec*, rarprec*, iprec*: PROCEDURE (it: Item);
+
+	task: Oberon.Task;
+	ethrc, ethsd: LONGINT;
+
+PROCEDURE ChkSum* (VAR data: ARRAY OF SYSTEM.BYTE; len: INTEGER; base: LONGINT): LONGINT;
+CODE
+	MOV EAX, base[EBP]
+	MOV EBX, data[EBP]
+	MOV CX, len[EBP]
+	SAR CX, 1
+csloop:
+	MOVZX EDX, WORD 0[EBX]
+	ADD EAX, EDX
+	ADD EBX, 2
+	DEC CX
+	JNZ csloop
+	MOV EBX, EAX
+	SAR EBX, 16
+	AND EAX, 0FFFFH
+	ADD EAX, EBX
+	MOV EBX, EAX
+	SAR EBX, 16
+	ADD EAX, EBX
+	NOT EAX
+	AND EAX, 0FFFFH
+END ChkSum;
+
+PROCEDURE Sum* (VAR data: ARRAY OF SYSTEM.BYTE; len: INTEGER): LONGINT;
+CODE
+	XOR EAX, EAX
+	MOV EBX, data[EBP]
+	MOV CX, len[EBP]
+	SAR CX, 1
+sloop:
+	MOVZX EDX, WORD 0[EBX]
+	ADD EAX, EDX
+	ADD EBX, 2
+	DEC CX
+	JNZ sloop
+END Sum;
+
+PROCEDURE Net2Host* (VAR i: INTEGER);
+BEGIN i := SYSTEM.ROT(i, 8)
+END Net2Host;
+
+PROCEDURE Host2Net* (VAR i: INTEGER);
+BEGIN i := SYSTEM.ROT(i, 8)
+END Host2Net;
+
+PROCEDURE NetL2Host* (VAR l: ARRAY OF SYSTEM.BYTE);
+VAR
+	b: SYSTEM.BYTE;
+BEGIN b := l[3]; l[3] := l[0]; l[0] := b; b := l[2]; l[2] := l[1]; l[1] := b
+END NetL2Host;
+
+PROCEDURE HostL2Net* (VAR l: ARRAY OF SYSTEM.BYTE);
+VAR
+	b: SYSTEM.BYTE;
+BEGIN b := l[3]; l[3] := l[0]; l[0] := b; b := l[2]; l[2] := l[1]; l[1] := b
+END HostL2Net;
+
+PROCEDURE Equal* (VAR a, b: ARRAY OF SYSTEM.BYTE; len: INTEGER): BOOLEAN;
+VAR
+	i: INTEGER;
+BEGIN i := 0; WHILE (i < len) & (a[i] = b[i]) DO INC(i) END; RETURN i = len
+END Equal;
+
+PROCEDURE Copy* (VAR src, dst: ARRAY OF SYSTEM.BYTE; len: INTEGER);
+BEGIN SYSTEM.MOVE(SYSTEM.ADR(src[0]), SYSTEM.ADR(dst[0]), len)
+END Copy;
+
+(* FastCopy - Copy size bytes from source to dest.  (No overlap allowed) *)
+
+PROCEDURE FastCopy*(source, dest, size: LONGINT);
+CODE
+	MOV ESI, source[EBP]
+	MOV EDI, dest[EBP]
+	MOV ECX, size[EBP]
+	CLD
+	CMP ECX, 8
+	JB bytemove
+	XOR EAX, EAX
+	SHRD EAX, ESI, 2
+	JZ copyd
+	TEST EDI, 3
+	JZ copyd
+	SHRD EAX, EDI, 2
+	SHR EAX, 28
+	CMP AL, 10
+	JZ mov2
+	CMP AL, 5
+	JZ mov3
+	NOT AL
+	AND AL, 5
+	JNZ copyd
+	MOVSB
+	DEC ECX
+	JMP copyd
+mov3:
+	MOVSB
+	DEC ECX
+mov2:
+	MOVSW
+	SUB ECX, 2
+copyd:
+	SHRD EAX, ECX, 2
+	SHR ECX, 2
+	REP MOVSD
+	SHLD ECX, EAX, 2
+bytemove:
+	REP MOVSB
+END FastCopy;
+
+PROCEDURE GetItem* (VAR Q: Queue; VAR item: Item);
+BEGIN ASSERT(Q.n > 0, 100);
+	item := Q.first; Q.first := Q.first.next; DEC(Q.n);
+	IF Q.first = NIL THEN Q.last := NIL END
+END GetItem;
+
+PROCEDURE NewItem* (VAR item: Item);
+BEGIN
+	IF itq.n = 0 THEN NEW(item);
+		NEW(item.etherh); NEW(item.data)
+	ELSE GetItem(itq, item)
+	END
+END NewItem;
+
+PROCEDURE PutItem* (VAR Q: Queue; item: Item);
+BEGIN
+    IF Q.last # NIL THEN Q.last.next := item ELSE Q.first := item END;
+    Q.last := item; item.next := NIL; INC(Q.n);
+END PutItem;
+
+PROCEDURE Reset* (VAR Q: Queue);
+BEGIN Q.n := 0; Q.first := NIL; Q.last := NIL
+END Reset;
+
+PROCEDURE Dmy (it: Item);
+BEGIN PutItem(itq, it)
+END Dmy;
+
+PROCEDURE Demux*(me: Oberon.Task);
+VAR
+	item: Item;
+	type, i: INTEGER;
+BEGIN i := 0;
+	WHILE EtherNet.Available() (*& (i < 10)*) DO NewItem(item);
+		EtherNet.ReceivePacket(item.etherh, item.data, item.len);
+		ethrc := (ethrc + 1) MOD MAX(LONGINT);
+		type := item.etherh.type; Net2Host(type);
+		IF type = arpid THEN arprec(item)
+(*		ELSIF type = rarpid THEN rarprec(item)	*)
+		ELSIF type = ipid THEN iprec(item); INC(i)
+		ELSE PutItem(itq, item)
+		END
+	END
+END Demux;
+
+PROCEDURE Output* (item: Item);
+BEGIN EtherNet.SendPacket(item.etherh, item.data, item.len);
+	ethsd := (ethsd + 1) MOD MAX(LONGINT);
+	PutItem(itq, item)
+END Output;
+
+PROCEDURE Start*;
+VAR
+	it: Item;
+	i: INTEGER;
+BEGIN Reset(itq);
+	task.safe := FALSE; task.time := 0;
+	task.handle := Demux; Oberon.Install(task);
+	ethrc := 0; ethsd := 0
+END Start;
+
+PROCEDURE Stop*;
+BEGIN Oberon.Remove(task);
+END Stop;
+
+BEGIN NEW(task);
+	arprec := Dmy; rarprec := Dmy; iprec := Dmy;
+	ethrc := 0; ethsd := 0
+END NetBase.

@@ -1,0 +1,467 @@
+MODULE Debug;
+
+(* Module: Debug, command module *)
+(* Author: Martin Buechi *)
+(* Language: Oberon(-1) including FOR loops *)
+(* System: Oberon System 3 DOS Release 1.5, Pharlap Release 1.5, Process System Release 2.0, Seminative Version 1.5 *)
+(* Version: 1.0 *)
+(* Date of last change: 18.02.1995 *)
+
+	IMPORT
+		Kernel, Files, Texts, Viewers, Oberon, MenuViewers, TextFrames, System, DOCS, DebugT, DebugS, DebugV;
+	
+	CONST
+		DumpFileName="CoreDump.Deb";
+		DebugMenu="System.Close System.Copy System.Grow Debug.Show Debug.Source Edit.Search";
+		DumpMenu="System.Close System.Copy System.Grow Debug.Dump Edit.Search";
+		StandardMenu ="System.Close System.Copy System.Grow Edit.Search Edit.Store";
+		PastLen=400; (* number of old chars displayed after append *)
+		OptionChar="/";
+		MemDumpLen=4; (* number of lines in memory dump *)
+		(* symbols, as in DOCS, Compiler *)
+		minus=7; arrow=17; period=18; comma=19; upto=21; rparen=22; rbrace=24; lparen=29; lbrace=31;
+		not=32; nil=35; bar=39;
+		thisname="this"; (* name of find item *)
+		Sext=".Mod";
+						
+	VAR
+		W: Texts.Writer;
+		LastDump: RECORD adr, len: LONGINT; bytes: BOOLEAN END; (* info about last dump *)
+		find: DebugS.SearchCriteria; (* search criteria of last find *)
+		DebugText: Texts.Text;
+		
+		
+	(* ______________________________ auxiliary functions ____________________________ *)
+		
+	PROCEDURE Max(a, b: LONGINT): LONGINT;
+	(* max of 2 longints *)
+	BEGIN
+		IF a>b THEN RETURN a ELSE RETURN b END
+	END Max;
+	
+	PROCEDURE Reset;
+	(* reset value of last dump and find to none *)
+	BEGIN
+		LastDump.adr:=-1; LastDump.bytes:=TRUE; find.res:=NIL; find.ptr:=NIL; find.given:=NIL;
+	END Reset;
+	
+	PROCEDURE Close*;
+	(* release memory allocated by debugger, close session *)
+	BEGIN
+		DebugV.Close
+	END Close;
+	
+	PROCEDURE Options(VAR name: ARRAY OF CHAR; install: BOOLEAN);
+	(* set options for Install, ShowStack, ShowModules *)
+		VAR
+			ch: CHAR;
+			S: Texts.Scanner;			
+	BEGIN
+		DebugV.ShowTypes:=TRUE; DebugV.ShowAddresses:=FALSE;
+		DebugV.LongintAsPointer:=FALSE; DebugV.ShowFullStack:=FALSE;
+		IF install THEN DebugT.FullDump:=FALSE; DebugT.RunGC:=FALSE END;
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class=Texts.Name) & (S.line=0) THEN COPY(S.s, name); Texts.Scan(S)
+		ELSE COPY(DumpFileName, name)
+		END;
+		IF (S.class=Texts.Char) & (S.c=OptionChar) THEN
+			ch:=S.nextCh;
+			LOOP
+				IF install THEN
+					IF ch="f" THEN DebugT.FullDump:=TRUE
+					ELSIF ch="g" THEN DebugT.RunGC:=TRUE
+					ELSE S.nextCh:=ch; EXIT
+					END
+				ELSE
+					IF ch="t" THEN DebugV.ShowTypes:=FALSE
+					ELSIF ch="a" THEN DebugV.ShowAddresses:=TRUE
+					ELSIF ch="p" THEN DebugV.LongintAsPointer:=TRUE
+					ELSIF ch="s" THEN DebugV.ShowFullStack:=TRUE
+					ELSE S.nextCh:=ch; EXIT
+					END
+				END;
+				Texts.Read(S, ch) 
+			END
+		END
+	END Options;
+	
+	PROCEDURE GetSelectedItem(VAR item: DebugS.Item; VAR T: Texts.Text; VAR S: Texts.Scanner; VAR beg: LONGINT);
+	(* get selected item *)
+		VAR
+			end, time, no: LONGINT;
+			ch: CHAR;
+			valid: BOOLEAN;
+			par: Oberon.ParList;
+			S2: Texts.Scanner;
+	BEGIN
+		item:=NIL; par:=Oberon.Par; valid:=FALSE;
+		IF par.frame=par.vwr.dsc THEN Oberon.GetSelection(T, beg, end, time);
+			IF time>0 THEN Texts.OpenScanner(S, T, beg); valid:=TRUE ELSE T:=NIL END;
+		ELSE Texts.OpenScanner(S2, Oberon.Par.text, Oberon.Par.pos); S:=S2; Texts.Scan(S2);
+			IF (S2.class=Texts.Char) & (S2.c="^") THEN Oberon.GetSelection(T, beg, end, time);
+				IF time>0 THEN Texts.OpenScanner(S, T, beg); valid:=TRUE ELSE T:=NIL END
+			ELSE T:=Oberon.Par.text; valid:=TRUE
+			END
+		END;
+		IF valid THEN ch:=S.nextCh;
+			WHILE ~S.eot & (ch#DebugV.NumberSign) & (ch#DebugV.CR) DO Texts.Read(S, ch) END;
+			IF ch=DebugV.NumberSign THEN
+				Texts.Read(S, ch);
+				WHILE (ch=" ") OR (ch=DebugV.Tab) DO Texts.Read(S, ch) END;
+				no:=-1;
+				LOOP (* Read instead of Scan because of possible period after item number *)
+					IF (ch<"0") OR (ch>"9") THEN EXIT END;
+					IF no=-1 THEN no:=0 END;
+					IF (MAX(LONGINT)-(ORD(ch)-DebugV.ord0)) DIV 10 > no THEN (* prevent overflow *)
+						no:=no*10+(ORD(ch)-DebugV.ord0)
+					ELSE no:=-1; EXIT
+					END; Texts.Read(S, ch)
+				END; S.nextCh:=ch;
+				item:=DebugS.GetItem(no)
+			END
+		END		
+	END GetSelectedItem;
+	
+	PROCEDURE CheckSetVal(sym: INTEGER): BOOLEAN;
+	(* check whether last current token from DOCS is valid set element *)
+	BEGIN
+		RETURN (sym=DebugS.number) & (DOCS.numtyp<=DebugS.integer) &
+			(0<=DOCS.intval) & (DOCS.intval<DebugT.WordLen)
+	END CheckSetVal;
+	
+	PROCEDURE ReadSet(VAR set: SET; VAR res: BOOLEAN);
+	(* read set *)
+		VAR
+			sym: INTEGER;
+			from: LONGINT;
+	BEGIN
+		set:={}; DOCS.Get(sym);
+		WHILE (sym=DebugS.number) DO (* read set *)
+			IF ~CheckSetVal(sym) THEN res:=FALSE; RETURN END;
+			from:=DOCS.intval; DOCS.Get(sym);
+			IF sym=comma THEN
+				set:=set+{from}; DOCS.Get(sym);
+			ELSIF sym=upto THEN
+				DOCS.Get(sym);
+				IF ~CheckSetVal(sym) THEN res:=FALSE; RETURN END;
+				set:=set+{from..DOCS.intval};
+				DOCS.Get(sym);
+				IF (sym#rbrace) & (sym#comma) THEN res:=FALSE; RETURN END;
+			ELSIF sym#rbrace THEN res:=FALSE; RETURN
+			END
+		END;
+		res:=sym=rbrace
+	END ReadSet;
+	
+	
+	(* ______________________________ command procedures ____________________________ *)
+	
+	PROCEDURE Search*;
+	(* find item *)
+		VAR
+			T, OutT: Texts.Text;
+			S: Texts.Scanner;
+			beg, sgn: LONGINT;
+			sym: INTEGER;
+			item: DebugS.Item;
+			res: BOOLEAN;
+			V: Viewers.Viewer;
+	BEGIN
+		IF Oberon.Par.frame=Oberon.Par.vwr.dsc THEN OutT:=Oberon.Par.vwr.dsc.next(TextFrames.Frame).text
+		ELSE V:=Oberon.MarkedViewer();
+			IF (V#NIL) & (V.dsc#NIL) & (V IS MenuViewers.Viewer) & (V.dsc.next IS TextFrames.Frame) THEN
+				OutT:=V.dsc.next(TextFrames.Frame).text
+			ELSE RETURN
+			END
+		END;
+		GetSelectedItem(item, T, S, beg);
+		IF (item=NIL) OR ~(item IS DebugS.Pointer) THEN RETURN END;
+		find.ptr:=item(DebugS.Pointer); find.given:=NIL; DOCS.Init(T, Texts.Pos(S)-1);
+		DOCS.Get(sym);
+		IF sym=arrow THEN DOCS.Get(sym) END;
+		IF sym#period THEN RETURN END;
+		find.follow.nof:=0;
+		LOOP (* get follow fields *)
+			DOCS.Get(sym);
+			IF sym#DebugS.ident THEN RETURN END;
+			COPY(DOCS.name, find.follow.field[find.follow.nof]); INC(find.follow.nof);
+			DOCS.Get(sym);
+			IF sym#bar THEN EXIT END;
+			IF find.follow.nof=DebugS.MaxFollows THEN RETURN END;
+		END; 
+		IF sym#lparen THEN RETURN END;
+		DOCS.Get(sym);
+		IF sym=not THEN
+			find.neg:=TRUE; DOCS.Get(sym);
+			IF sym#lparen THEN RETURN END; DOCS.Get(sym)
+		ELSE find.neg:=FALSE
+		END;
+		IF (sym=DebugS.number) & (DOCS.numtyp=DebugS.integer) & (DOCS.intval>=0) & ~find.neg & (find.follow.nof=1) THEN
+			DebugV.Search(find, DOCS.intval, W) (* follow follow.field[0] DOCS.intval times *)
+		ELSIF (sym=DebugS.ident) & (DOCS.name=thisname) THEN (*  find item satisfying condition *)
+			DOCS.Get(sym);
+			IF sym=arrow THEN DOCS.Get(sym) END;
+			IF sym=period THEN
+				DOCS.Get(sym);
+				IF sym#DebugS.ident THEN RETURN END; 
+				COPY(DOCS.name, find.condfield); DOCS.Get(sym);
+			ELSE
+				find.condfield:=""
+			END;
+			IF sym=DebugS.sIS THEN (* condition is type test *)
+				DOCS.Get(sym);
+				IF sym#DebugS.ident THEN RETURN END;
+				COPY(DOCS.name, find.modname);
+				DOCS.Get(sym);
+				IF sym#period THEN RETURN END;
+				DOCS.Get(sym);
+				IF sym#DebugS.ident THEN RETURN END;
+				COPY(DOCS.name, find.typename); find.op:=DebugS.sIS;
+				DebugV.Search(find, -1, W)
+			ELSIF (sym>=DebugS.eql) & (sym<=DebugS.sIN) THEN (* condition is comparison *)
+				find.op:=sym; DOCS.Get(sym);
+				IF sym=minus THEN sgn:=-1; DOCS.Get(sym) ELSE sgn:=1 END;
+				IF sym=DebugS.number THEN
+					find.sym:=sym;
+					find.name[0]:=CHR(DOCS.intval); find.name[1]:=0X; (* one character strings *)
+					find.numtyp:=DOCS.numtyp; find.intval:=DOCS.intval*sgn; 
+					IF find.numtyp<=DebugS.integer THEN find.realval:=find.intval; find.lrlval:=find.intval (* type inclusion *)
+					ELSIF find.numtyp=DebugS.real THEN find.realval:=DOCS.realval*sgn; find.lrlval:=find.realval (* type inclusion *)
+					ELSE find.lrlval:=DOCS.lrlval*sgn
+					END;
+					DebugV.Search(find, -1, W)
+				ELSIF sym=DebugS.string THEN
+					find.sym:=sym; COPY(DOCS.name, find.name);
+					DebugV.Search(find, -1, W)
+				ELSIF sym=nil THEN
+					find.sym:=sym; find.intval:=0;
+					DebugV.Search(find, -1, W)
+				ELSIF sym=lbrace THEN (* set *)
+					ReadSet(find.set, res);				
+					IF res THEN find.sym:=DebugS.set; DebugV.Search(find, -1, W) END
+				END
+			END
+		END;
+		Texts.Append(OutT, W.buf)
+	END Search;
+	
+	PROCEDURE SearchNext*;
+	(* find next item that satisfies predicate *)
+		VAR
+			OutT: Texts.Text;
+			V: Viewers.Viewer;
+	BEGIN
+		IF Oberon.Par.frame=Oberon.Par.vwr.dsc THEN OutT:=Oberon.Par.vwr.dsc.next(TextFrames.Frame).text
+		ELSE V:=Oberon.MarkedViewer();
+			IF (V#NIL) & (V.dsc#NIL) & (V IS MenuViewers.Viewer) & (V.dsc.next IS TextFrames.Frame) THEN
+				OutT:=V.dsc.next(TextFrames.Frame).text
+			ELSE RETURN
+			END
+		END;
+		IF find.given#NIL THEN
+			DebugV.Search(find, -1, W); Texts.Append(OutT, W.buf)
+		END
+	END SearchNext;
+	
+	PROCEDURE Dump*;
+	(* untyped memory dump *)
+		VAR
+			T: Texts.Text;
+			S: Texts.Scanner;
+			adr, beg, end, time: LONGINT;
+			X, Y: INTEGER;
+			bytes, valid: BOOLEAN;
+			par: Oberon.ParList;
+			V: Viewers.Viewer;
+	BEGIN
+		par:=Oberon.Par; valid:=FALSE;
+		IF par.frame=par.vwr.dsc THEN valid:=FALSE
+		ELSE T:=par.text; Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+			IF (S.class=Texts.Char) & (S.c="^") THEN Oberon.GetSelection(T, beg, end, time);
+				IF time>0 THEN Texts.OpenScanner(S, T, beg); Texts.Scan(S); valid:=TRUE END
+			ELSE valid:=TRUE
+			END;
+		END;	
+		IF valid THEN
+			IF S.class=Texts.Int THEN
+				adr:=S.i; Texts.Scan(S);
+				IF (S.class=Texts.Char) & (S.c=OptionChar) & (S.nextCh="l") THEN bytes:=FALSE
+				ELSE bytes:=TRUE
+				END; LastDump.adr:=adr; LastDump.bytes:=bytes; LastDump.len:=MemDumpLen;
+				DebugV.MemDump(adr, bytes, MemDumpLen, W);
+				DebugText:=TextFrames.Text(""); Texts.Append(DebugText, W.buf);
+				Oberon.AllocateUserViewer(0, X, Y);
+				V:=MenuViewers.New(TextFrames.NewMenu("Dump.Text", DumpMenu),
+					TextFrames.NewText(DebugText, 0),TextFrames.menuH, X, Y);
+				Texts.Append(DebugText, W.buf);
+			ELSIF LastDump.adr#-1 THEN
+				INC(LastDump.adr, DebugV.BytesPerLine*MemDumpLen); INC(LastDump.len, LastDump.len);
+				DebugV.MemDump(LastDump.adr, LastDump.bytes, LastDump.len, W); Texts.Append(DebugText, W.buf)
+			END
+		ELSIF LastDump.adr#-1 THEN
+			INC(LastDump.adr, DebugV.BytesPerLine*MemDumpLen); INC(LastDump.len, LastDump.len);
+			DebugV.MemDump(LastDump.adr, LastDump.bytes, LastDump.len, W); Texts.Append(DebugText, W.buf)
+		END;
+	END Dump;
+		
+	PROCEDURE Show*;
+	(* show item *)
+		VAR
+			item: DebugS.Item;
+			level, pos, i, j, adr: LONGINT;
+			ch, lastch: CHAR;
+			T: Texts.Text;
+			S: Texts.Scanner;
+			modname, typename: DebugT.Name;
+			msg: DebugV.ExpandMsg;
+	BEGIN
+		GetSelectedItem(item, T, S, pos);
+		IF item#NIL THEN
+			IF item IS DebugS.Pointer THEN (* append *)
+				Texts.OpenReader(S, T, pos);
+				REPEAT Texts.Read(S, ch) UNTIL ch=DebugV.NumberSign;
+				WHILE ~S.eot & (ch#DebugV.CR) DO Texts.Write(W, ch); Texts.Read(S, ch) END;
+				Texts.WriteLn(W); Texts.Append(T, W.buf); msg.level:=-1; Texts.OpenWriter(msg.W);
+				item.handle(item, msg);
+				Texts.Append(T, msg.W.buf)
+			ELSE (* expand *)
+				level:=0; 
+				IF S.nextCh=DebugV.LevelSign THEN
+					Texts.Scan(S); Texts.Scan(S); IF S.class=Texts.Int THEN level:=S.i END
+				END;
+				REPEAT lastch:=ch; Texts.Read(S, ch) UNTIL S.eot OR ((ch=DebugV.CR) & (lastch#"."));
+				msg.level:=level; Texts.OpenWriter(msg.W); item.handle(item, msg);
+				Texts.Insert(T, Texts.Pos(S), msg.W.buf)
+			END
+		ELSIF T#NIL THEN Texts.OpenScanner(S, T, pos); Texts.Scan(S); (* typed dump *)
+			IF S.class=Texts.Int THEN
+				adr:=S.i; Texts.Scan(S);
+				IF (S.class=Texts.Char) & (S.c="(") THEN
+					Texts.Scan(S);
+					IF S.class#Texts.Name THEN RETURN END;
+					i:=0;
+					WHILE (S.s[i]#0X) & (S.s[i]#".") DO modname[i]:=S.s[i]; INC(i) END;
+					modname[i]:=0X; INC(i); j:=0;
+					IF S.s[i-1]#0X THEN WHILE (S.s[i]#0X) DO typename[j]:=S.s[i]; INC(i); INC(j) END END;
+					typename[j]:=0X;
+					DebugV.TypedDump(adr, modname, typename, W); Texts.Append(T, W.buf)
+				END
+			END
+		END 
+	END Show;
+	
+	PROCEDURE ShowModules*;
+	(* show module list *)
+		VAR
+			res: BOOLEAN;
+			X, Y: INTEGER;
+			V: MenuViewers.Viewer;
+			T: Texts.Text;
+			name: DebugT.Name;
+	BEGIN
+		Options(name, FALSE); DebugV.Open(name, res);
+		IF res THEN
+			T:=TextFrames.Text(""); DebugV.ShowModules(W); Texts.Append(T, W.buf);
+			Oberon.AllocateUserViewer(0, X, Y);
+			V:=MenuViewers.New(TextFrames.NewMenu("Modules.Text", DebugMenu),
+				TextFrames.NewText(T, 0),TextFrames.menuH, X, Y)
+		ELSE
+			Texts.WriteString(W, "dump file not found"); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+		END
+	END ShowModules;
+	
+	PROCEDURE ShowStack*;
+	(* show contents of stack *)
+		VAR
+			res: BOOLEAN;
+			X, Y: INTEGER;
+			V: MenuViewers.Viewer;
+			T: Texts.Text;
+			name: DebugT.Name;
+	BEGIN
+		Options(name, FALSE); DebugV.Open(name, res);
+		IF res THEN
+			T:=TextFrames.Text(""); DebugV.ShowStack(W); Texts.Append(T, W.buf);
+			Oberon.AllocateUserViewer(0, X, Y);
+			V:=MenuViewers.New(TextFrames.NewMenu("Stack.Text", DebugMenu),
+				TextFrames.NewText(T, 0),TextFrames.menuH, X, Y)
+		ELSE
+			Texts.WriteString(W, "dump file not found"); Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+		END
+	END ShowStack;
+		
+	PROCEDURE Source*;
+	(* show location in source code *)
+		VAR
+			Text: TextFrames.Frame;
+			T: Texts.Text;
+			S: Texts.Scanner;
+			V, MV: Viewers.Viewer;
+			pos: LONGINT;
+			X, Y: INTEGER;
+			item: DebugS.Item;
+			modname, name: DebugT.Name;	
+	BEGIN
+		GetSelectedItem(item, T, S, pos);
+		IF (item#NIL) & (item IS DebugS.Unit) THEN
+			WITH item: DebugS.Unit DO
+				V := Oberon.MarkedViewer(); MV:=V; DebugS.MakeName(item.mod.name, Sext, modname);
+				LOOP (* find menu viewer displaying source code *)
+					IF (V.dsc # NIL) & (V.dsc.next IS TextFrames.Frame) & (V IS MenuViewers.Viewer) THEN
+						MenuViewers.GetName(V(MenuViewers.Viewer), name);
+						IF name=modname THEN EXIT END
+					END;
+					V:=Viewers.Next(V);
+					IF V=MV THEN V:=NIL; EXIT END
+				END;
+				IF V=NIL THEN (* no viewer found: open new viewer *)
+					IF Files.Old(modname)#NIL THEN
+						Oberon.AllocateUserViewer(0, X, Y);
+						V:=MenuViewers.New(TextFrames.NewMenu(modname, StandardMenu),
+							TextFrames.NewText(TextFrames.Text(modname), 0),TextFrames.menuH, X, Y);
+					END
+				END;
+				IF V#NIL THEN									
+					Text := V.dsc.next(TextFrames.Frame);
+					TextFrames.RemoveSelection(Text);
+					TextFrames.RemoveCaret(Text);
+					Oberon.RemoveMarks(Text.X, Text.Y, Text.W, Text.H);
+					IF item(DebugS.Unit).desc#NIL THEN pos:=item(DebugS.Unit).desc.pos ELSE pos:=0 END;
+					TextFrames.Show(Text, Max(pos-PastLen, 0));
+					Oberon.Defocus;
+					TextFrames.SetCaret(Text, pos)
+				END
+			END
+		END
+	END Source;
+
+	PROCEDURE Install*;
+	(* install dump trap handler *)
+		VAR name: DebugT.Name;
+	BEGIN
+		Options(name, TRUE); (* name gets ignored *)
+		DebugT.Install(DebugV.ShowTrap, DebugV.Recursive, DumpFileName)
+	END Install;
+	
+	PROCEDURE Uninstall*;
+	(* install standard trap handler (System.Trap) *)
+	BEGIN
+		Kernel.InstallTrap(System.Trap)
+	END Uninstall;
+	
+	PROCEDURE EnableGC*;
+	(* enable garbage collection (default) *)
+	BEGIN
+		Kernel.GCenabled:=TRUE
+	END EnableGC;
+	
+	PROCEDURE DisableGC*;
+	(* disable garbage collection (even manual!) *)
+	BEGIN
+		Kernel.GCenabled:=FALSE
+	END DisableGC;
+	
+BEGIN
+	Texts.OpenWriter(W); Texts.WriteString(W, "Debug MB 26.02.1995"); Texts.WriteLn(W);
+	Texts.Append(Oberon.Log, W.buf); DebugV.Reset:=Reset; Close
+END Debug.

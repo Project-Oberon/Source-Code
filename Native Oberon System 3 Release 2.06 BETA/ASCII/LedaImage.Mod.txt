@@ -1,0 +1,852 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaImage;	(* uh, Tue, 7-Dec-1993 *)
+
+	(* eos 21.Dec.95  removed Oberon.Password (native version) *)
+	
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaFrames, LedaBox,
+		Input, Files, Display, Objects, Texts, Oberon, Pictures, (*PictureFrames, MenuViewers, Viewers, *)
+		Rembrandt, RembrandtDocs;
+	
+CONST
+	ModName = "LedaImage";
+	(*
+	Paint0Cmds = "System.Close  System.Copy  System.Grow  Paint.Zoom  Paint.Resize  LedaImage.Update  Paint.Store";
+	Paint1Cmds = "System.Close  System.Copy  System.Grow  Paint.Zoom  Paint.Resize  LedaImage.Select  Paint.Store";
+	*)
+	NotDef = -1;
+	DocTag0 = 0F7X;	DocTag1 = 07X;	(* gadgets document tag *)
+	
+	(*--- picture control ---*)
+	PictNew = "PictCreate";
+	PictCh = 10X;	(* CTRL - P *)
+	PictName = "picture";
+	PrtUnit = 3048;	(* LedaBase.Point * 72 DIV 300 *)
+	PictDefW = 3 * LedaBase.CM;	PictDefH = 4 * LedaBase.MM;
+	
+	(*--- protected picture files ---*)
+	Tag0 = 93X;	Tag1 = 7CX;
+	Pict0 = CHR(Pictures.PictFileId MOD 100H);	Pict1 = CHR((Pictures.PictFileId DIV 100H) MOD 100H);
+	
+	(*--- dialog ---*)
+	Unit = "unit";	Screen = "screen";	Printer = "printer";
+	Off = "off";	On = "on";
+	
+TYPE
+	(*--- picture control ---*)
+	Pict* = POINTER TO PictDsc;
+	PictDsc* = RECORD
+		(LedaBase.PieceCtrlDsc)
+		W*, H*, dY*: LONGINT;	(* width, height and vertical offset of control in document units *)
+		w*, h*: INTEGER;	(* width and height of control in screen units *)
+		pixel: LONGINT;	(* size of a bitmap pixel [resolution] *)
+		bitmap, view: Pictures.Picture;	(* pictures [bitmap: picture; view: screen display] *)
+		pwd: LONGINT	(* password [pwd = 0: no protection] *)
+	END;
+	
+	PwdMsg* = RECORD
+		(LedaBase.Msg)
+		pwd*: LONGINT
+	END;
+	
+	(*
+	Viewer = POINTER TO ViewerDsc;
+	ViewerDsc = RECORD
+		(MenuViewers.ViewerDesc)
+		pict: Pict
+	END;
+	*)
+	
+VAR
+	password: LONGINT;
+	(*--- picture control ---*)
+	pictDoOp: LedaBase.CtrlProc;		(* control handle *)
+	
+(*
+(*--- viewer ---*)
+	
+	PROCEDURE ViewerCopy(V: Viewer): Viewer;
+		VAR nV: Viewer;	Menu, Main: Display.Frame;	M: Objects.CopyMsg;
+	BEGIN
+		Menu := V.dsc; Main := V.dsc.next;
+		NEW(nV); nV^ := V^; nV.state := 0;
+		M.id := Objects.shallow; Objects.Stamp(M);
+		Menu.handle(Menu, M); nV.dsc := M.obj(Display.Frame);
+		Main.handle(Main, M); nV.dsc.next := M.obj(Display.Frame);
+		RETURN nV
+	END ViewerCopy;
+		
+	PROCEDURE *ViewerHandle(V: Objects.Object; VAR M: Objects.ObjMsg);
+	BEGIN
+		IF M IS Objects.CopyMsg THEN M(Objects.CopyMsg).obj := ViewerCopy(V(Viewer))
+		ELSE MenuViewers.Handle(V, M)
+		END
+	END ViewerHandle;
+	
+	PROCEDURE ViewerOpen(V: Viewer); 
+		VAR X, Y: INTEGER;	M: Display.ControlMsg;
+	BEGIN
+		Oberon.AllocateUserViewer(Oberon.Mouse.X, X, Y);
+		V.handle := ViewerHandle; Viewers.Open(V, X, Y);
+		M.id := Display.restore; M.res := -1;  V.handle(V, M)	(* restore viewer *)
+	END ViewerOpen;
+*)
+
+(*--- utilities ---*)
+
+	PROCEDURE Min(i0, i1: INTEGER): INTEGER;
+	BEGIN
+		IF i0 < i1 THEN RETURN i0 ELSE RETURN i1 END
+	END Min;
+	
+	PROCEDURE RegardSel(VAR S: Texts.Scanner);
+		VAR text: Texts.Text;	beg, end, time: LONGINT;
+	BEGIN
+		text := NIL; time := NotDef; Oberon.GetSelection(text, beg, end, time);
+		IF (text = NIL) OR (time = NotDef) THEN S.class := Texts.Inval
+		ELSE Texts.OpenScanner(S, text, beg); Texts.Scan(S)
+		END
+	END RegardSel;
+
+	PROCEDURE GetCmdSpec(VAR S: Texts.Scanner);
+		VAR new: BOOLEAN;
+	BEGIN
+		IF S.class # NotDef THEN
+			new := FALSE; IF S.eot OR (S.class = Texts.Inval) THEN RETURN END	(*###*)
+		ELSE	(* S is not defined yet *)
+			new := TRUE; Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos)
+		END;
+		Texts.Scan(S);
+		IF S.eot THEN S.class := NotDef
+		ELSIF new & (S.line > 0) THEN RegardSel(S)
+		ELSIF (S.class = Texts.Char) & (S.c = "^") THEN RegardSel(S)
+		END
+	END GetCmdSpec;
+	
+	(*
+	PROCEDURE DisplayPict(name: LedaSys.String; P: Pictures.Picture);
+		VAR V: MenuViewers.Viewer;	X, Y, menuH: INTEGER;
+	BEGIN
+		Oberon.AllocateUserViewer(Oberon.Mouse.X, X, Y);
+		V := MenuViewers.New(
+				LedaFrames.GetMenu(LedaSys.dialogMod, "DM", name, Paint1Cmds, menuH),	(* menu frame [gadget or standard] *)
+				PictureFrames.NewPicture(P),	(* picture frame *)
+				menuH, X, Y)
+	END DisplayPict;
+	*)
+	
+	PROCEDURE DisplayPict(name: LedaSys.String; P: Pictures.Picture);
+	BEGIN
+		RembrandtDocs.OpenPict(P, name)
+	END DisplayPict;
+	
+	PROCEDURE NewBitmap(bitmap: Pictures.Picture; width, height: INTEGER): Pictures.Picture;
+	(* returns a new bitmap with given width and height *)
+	(* that has the same color table as bitmap *)
+		VAR newmap: Pictures.Picture;	n, cols, red, green, blue: INTEGER;
+	BEGIN
+		NEW(newmap);
+		IF bitmap = NIL THEN
+			Pictures.Create(newmap, width, height, 1)
+		ELSE
+			Pictures.Create(newmap, width, height, bitmap.depth);
+			IF bitmap.depth > 1 THEN	(* copy color table *)
+				n := bitmap.depth; cols := 1;
+				WHILE n > 0 DO INC(cols, cols); DEC(n) END;	(* cols := 2^n *)
+				WHILE n < cols DO	(* copy color table *)
+					Pictures.GetColor(bitmap, n, red, green, blue);
+					Pictures.SetColor(newmap, n, red, green, blue);
+					INC(n)
+				END
+			END
+		END;
+		RETURN newmap
+	END NewBitmap;
+	
+	PROCEDURE NewLn(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR);
+	BEGIN
+		a.typ := LedaBox.NewLn; a.stat := TRUE; a.i := 0;
+		IF s # "" THEN COPY(s, a.s) ELSE a.s := "" END
+	END NewLn;
+	
+	PROCEDURE StrAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Str; COPY(s, a.s); a.stat := stat; a.i := 0;
+	END StrAt;
+	
+	PROCEDURE IntAt(VAR a: LedaBox.ParaDsc; i: LONGINT; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Int; a.i := i; a.stat := stat; a.s := ""
+	END IntAt;
+	
+	PROCEDURE EnumAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; i: LONGINT);
+	BEGIN
+		a.typ := LedaBox.Enum; COPY(s, a.s); a.i := i
+	END EnumAt;
+	
+	(* eos 21.Dec.95 *)
+	PROCEDURE AdjustPassword;
+	BEGIN
+		(*IF password = 0 THEN password := Oberon.Password END*)
+	END AdjustPassword;
+	
+	PROCEDURE PasswordOK(pwd: LONGINT): BOOLEAN;
+	BEGIN
+		(*AdjustPassword; RETURN pwd = password*)
+		RETURN TRUE
+	END PasswordOK;
+
+	PROCEDURE Password(VAR s: ARRAY OF CHAR): LONGINT;
+		VAR i: INTEGER; a, b, c: LONGINT;
+	BEGIN
+		a := 0; b := 0; i := 0;
+		WHILE s[i] # 0X DO
+			c := b; b := a; a := (c MOD 509 + 1) * 127 + ORD(s[i]);
+			INC(i)
+		END;
+		IF b >= 32768 THEN b := b - 65536 END;
+		RETURN b * 65536 + a
+	END Password;
+		
+	PROCEDURE SetPassword*;
+		VAR oldPwd: LONGINT;	i: INTEGER;
+			name: LedaSys.Name;	ch: CHAR;	m: PwdMsg;
+	BEGIN
+		Input.Read(ch); i := 0;
+		WHILE ch > " " DO
+			IF i < LedaSys.NameRange THEN name[i] := ch; INC(i) END; Input.Read(ch)
+		END;
+		name[i] := 0X;
+		oldPwd := password; password := Password(name); AdjustPassword;
+		IF oldPwd # password THEN
+			m.pwd := password; LedaBox.Broadcast(NIL, {LedaBox.BcTxt}, m)
+		END			
+	END SetPassword;
+	
+	PROCEDURE OutNote(nr: INTEGER);
+	BEGIN
+		CASE nr OF 0: LedaSys.OutT("not done [password not set]", 1)
+		| 1:  LedaSys.OutT("not done [password not corresponding]", 1)
+		| 2:  LedaSys.OutT("not done [name missing]", 1)
+		| 3:  LedaSys.OutT("not done [no picture marked]", 1)
+		| 4:  LedaSys.OutT("not done [file not found]", 1)
+		| 5:  LedaSys.OutT("not done [not a picture]", 1)
+		ELSE
+		END
+	END OutNote;
+		
+(*--- picture control ---*)
+
+	(*---
+		- a picture control is a unique control; every control displays a picture for its own
+		- at creation the star marked picture will be copied and displayed [internal picture]
+		- internal pictures can be exported or imported; thereby the picture will be copied
+	---*)
+	
+	PROCEDURE PictSetSize(pict: Pict; newW, newH: LONGINT);
+	(* sets the size of the picture; newW specifies the new picture width *)
+	(* newW/newH <= 0: set width/height to effective picture width/height *)
+		VAR pW, pH: LONGINT;
+	BEGIN
+		IF pict.bitmap = NIL THEN
+			pict.W := PictDefW; pict.H := PictDefH; pict.view := NIL
+		ELSE
+			pW := pict.pixel * pict.bitmap.width;	(* effective picture width *)
+			pH := pict.pixel * pict.bitmap.height;	(* effective picture height *)
+			IF (newW <= 0) OR (newW >= pW) THEN pict.W := pW ELSE pict.W := newW END;
+			IF (newH <= 0) OR (newH >= pH) THEN pict.H := pH ELSE pict.H := newH END;
+			pict.view := NIL; Oberon.Collect	(* dispose view *)
+		END;
+		pict.w := SHORT(pict.W DIV LedaSys.scnUnit);
+		pict.h := SHORT(pict.H DIV LedaSys.scnUnit)
+	END PictSetSize;
+	
+	PROCEDURE PictSetView(pict: Pict);
+	(* creates a new view [screen display of bitmap] *)
+	(* and scales bitmap to view *)
+		VAR pW, pH: LONGINT;	bw, bh: INTEGER;
+	BEGIN
+		pict.view := NewBitmap(pict.bitmap, pict.w, pict.h);
+		pW := pict.pixel * pict.bitmap.width;	(* effective picture width *)
+		pH := pict.pixel * pict.bitmap.height;	(* effective picture height *)
+		IF pW > pict.W THEN bw := SHORT(pict.W DIV pict.pixel) ELSE bw := pict.bitmap.width END;
+		IF pH > pict.H THEN bh := SHORT(pict.H DIV pict.pixel) ELSE bh := pict.bitmap.height END;
+		Pictures.Copy(pict.bitmap, pict.view, 0, 0, bw, bh, 0, 0, pict.w, pict.h, Display.replace)
+	END PictSetView;
+	
+	PROCEDURE *PictHeight(ctrl: LedaBase.PieceCtrl; VAR H, bH: LONGINT);
+		VAR pict: Pict;	dsr, asr: LONGINT;
+	BEGIN
+		pict := ctrl(Pict);
+		H := pict.H DIV LedaSys.scnUnit;
+		dsr := 0; asr := 0;
+		IF pict.dY < 0 THEN
+			dsr := ABS(pict.dY) DIV LedaSys.scnUnit;
+			IF H > dsr THEN asr := H - dsr END
+		ELSE
+			IF pict.dY > 0 THEN asr := pict.dY DIV LedaSys.scnUnit END;
+			INC(asr, H)
+		END;
+		H := (dsr + asr) * LedaSys.scnUnit;
+		bH := - (dsr * LedaSys.scnUnit)
+	END PictHeight;
+	
+	PROCEDURE *PictWidth(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR pict: Pict;	pW, pH: LONGINT;
+	BEGIN
+		pict := ctrl(Pict);
+		IF (I # NIL) & (pict.bitmap # NIL) THEN	(* check/adjust width *)
+			pW := LedaSys.Min(pict.pixel * pict.bitmap.width, I.width);
+			pH := LedaSys.Min(pict.pixel * pict.bitmap.height, I.height);
+			IF (pW # pict.W) OR (pH # pict.H) THEN PictSetSize(pict, pW, pH) END;
+			I.bigHgt := I.bigHgt OR (pict.dY + pict.H > I.lsp) 
+		END;
+		W := pict.W; w := pict.w 
+	END PictWidth;
+	
+	PROCEDURE *PictDraw(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+		VAR pict: Pict;	dy: INTEGER;
+	BEGIN
+		pict := ctrl(Pict);
+		dy := SHORT(pict.dY DIV LedaSys.scnUnit);
+		IF (pict.bitmap # NIL) & (pict.view = NIL) THEN PictSetView(pict) END;
+		IF (pict.bitmap = NIL) OR (pict.view = NIL) THEN
+			Display.ReplPattern(LedaSys.fg, LedaSys.scrPat[LedaSys.Grey3], x, y+dy, pict.w, pict.h, mode)
+		ELSIF (pict.pwd # 0) & ~ PasswordOK(pict.pwd) THEN
+			Display.ReplPattern(LedaSys.fg, LedaSys.scrPat[LedaSys.TxtrUp], x, y+dy, pict.w, pict.h, mode)
+		ELSE	(* pict.view # NIL *)
+			Pictures.DisplayBlock(pict.view, 0, 0, pict.view.width, pict.view.height, x, y+dy, mode)
+		END;
+		INC(x, pict.w)
+	END PictDraw;
+	
+	PROCEDURE PictPrint(pict: Pict; x, y, mode: INTEGER; P: LedaSys.PrtPort);
+		VAR pW: LONGINT;	w, h, dy, bw: INTEGER;
+	BEGIN
+		w := SHORT(pict.W DIV P.unit); h := SHORT(pict.H DIV P.unit); dy := SHORT(pict.dY DIV P.unit);
+		IF (pict.pwd # 0) & ~ PasswordOK(pict.pwd) THEN
+			P.out.replPattern(P.out, x, y+dy, w, h, LedaSys.fg, LedaSys.prtPat[LedaSys.TxtrUp], mode)
+		ELSE
+			pW := pict.pixel * pict.bitmap.width;	(* effective picture width *)
+			IF pW > pict.W THEN bw := SHORT(pict.W DIV pict.pixel) ELSE bw := pict.bitmap.width END;
+			P.out.picture(P.out, x, y+dy, w, h, pict.bitmap, bw, pict.bitmap.height, mode)
+		END
+	END PictPrint;
+	
+	PROCEDURE NewPict*(pict: Pict): Pict;
+		VAR nPict: Pict;
+	BEGIN
+		NEW(nPict); LedaBase.InitControl(nPict, pictDoOp);
+		nPict.width := PictWidth; nPict.height := PictHeight; nPict.draw := PictDraw;
+		IF (pict = NIL) OR (pict.bitmap = NIL) OR (pict.pwd # 0) THEN		(* default settings *)
+			nPict.pwd := 0; nPict.dY := 0; 
+			nPict.bitmap  := NIL; nPict.view := NIL; nPict.pixel := 2 * PrtUnit
+		ELSE
+			nPict.pwd := 0; nPict.dY := pict.dY;
+			nPict.view := NIL; nPict.pixel := pict.pixel;
+			nPict.bitmap := NewBitmap(pict.bitmap, pict.bitmap.width, pict.bitmap.height);
+			Pictures.CopyBlock (pict.bitmap, nPict.bitmap, 0, 0, pict.bitmap.width, pict.bitmap.height, 0, 0, Display.replace);
+		END;
+		PictSetSize(nPict, -1, -1);
+		RETURN nPict
+	END NewPict;
+	
+	PROCEDURE PictSetOffset(pict: Pict; dY: LONGINT);
+	BEGIN
+		IF dY < - LedaBase.CM THEN pict.dY := - LedaBase.CM
+		ELSIF dY > 15 * LedaBase.MM THEN pict.dY := 15 * LedaBase.MM
+		ELSE pict.dY := dY
+		END
+	END PictSetOffset;
+	
+	PROCEDURE PictSetPW(pict: Pict; pwdOn: BOOLEAN);
+	BEGIN
+		IF pwdOn THEN	(* protection on *)
+			IF pict.pwd = 0 THEN
+				AdjustPassword;
+				IF password # 0 THEN pict.pwd := password
+				ELSE LedaSys.OutT(" - protection on: ", 0); OutNote(0)
+				END
+			END
+		ELSE		(* protection off *)
+			IF pict.pwd # 0 THEN
+				IF PasswordOK(pict.pwd) THEN pict.pwd := 0
+				ELSE LedaSys.OutT(" - protection off: ", 0); OutNote(1)
+				END
+			END
+		END
+	END PictSetPW;
+	
+	PROCEDURE PictCheck(pict: Pict);
+	(* takes care about changed pixel size, vertical offset or protection *)
+	BEGIN
+		PictSetOffset(pict, pict.dY);
+		PictSetSize(pict, -1, -1);
+	END PictCheck;
+	
+	PROCEDURE PictNewPwd(pict: Pict);
+		VAR m: LedaCtrl.TextMsg;	owner: LedaBase.Box;
+	BEGIN
+		IF (pict.pwd # 0) & (LedaCtrl.bc.stamp = LedaBase.CurStamp()) THEN	(* LedaCtrl.bc is valid *)
+			m.text := LedaCtrl.bc.text; m.beg := LedaCtrl.bc.pos; m.len := 1;
+			m.id := LedaCtrl.DrawTextId; owner := m.text.owner;
+			IF owner # NIL THEN owner.do.handle(owner, m) END	(* display picture *)
+		END
+	END PictNewPwd;
+			
+	PROCEDURE *PictSetAttr(VAR ctrl: LedaBase.PieceCtrl; VAR M: LedaBox.AttributeMsg);
+	(* handles the attribute message with id's LedaBox.SetValue, LedaBox.SetStyle, LedaBox.NewStyle *)
+		VAR pict: Pict;	pixel, dY: LONGINT;	pwdOn, valid: BOOLEAN;
+	BEGIN
+		IF (M.name # PictName) OR (M.id # LedaBox.SetValue) THEN ctrl := NIL; RETURN END;	(*###*)
+		IF (ctrl = NIL) OR ~(ctrl IS Pict) THEN ctrl := NIL; RETURN END;	(*###*)
+		pict := ctrl(Pict); ctrl := NIL;
+		valid := FALSE;
+		LOOP	(* one pass; validate message *)
+			IF M.nbr # 5 THEN EXIT END;	(*###*)
+			IF (M.a[0].typ = LedaBox.Int) & (M.a[1].typ = LedaBox.Str) THEN
+				pixel := M.a[0].i;
+				IF M.a[1].s = Printer THEN pixel := pixel * PrtUnit
+				ELSIF M.a[1].s = Screen THEN pixel := pixel * LedaSys.scnUnit
+				ELSIF M.a[1].s = Unit THEN pixel := pixel * LedaBox.attrUnit
+				ELSE EXIT	(*###*)
+				END
+			ELSE EXIT	(*###*)
+			END;
+			IF (M.a[2].typ = LedaBox.Int) & (M.a[3].typ = LedaBox.Str) THEN
+				dY := M.a[2].i;
+				IF M.a[3].s = Printer THEN dY := dY * PrtUnit
+				ELSIF M.a[3].s = Screen THEN dY := dY * LedaSys.scnUnit
+				ELSIF M.a[3].s = Unit THEN dY := dY * LedaBox.attrUnit
+				ELSE EXIT	(*###*)
+				END
+			ELSE EXIT	(*###*)
+			END;
+			IF (M.a[4].typ = LedaBox.Str) & ((M.a[4].s = On) OR (M.a[4].s = Off)) THEN pwdOn := M.a[4].s = On
+			ELSE EXIT	(*###*)
+			END;
+			valid := TRUE; EXIT
+		END;
+		IF valid THEN
+			IF pict.dY # dY THEN PictSetOffset(pict, dY); ctrl := pict END;
+			IF pict.pixel # pixel THEN pict.pixel := pixel; PictSetSize(pict, -1, -1); ctrl := pict END;
+			IF (pict.pwd # 0) # pwdOn THEN PictSetPW(pict, pwdOn); ctrl := pict END
+		END
+	END PictSetAttr;
+	
+	PROCEDURE PictGetAttr(pict: Pict; VAR M: LedaBox.AttributeMsg);
+		CONST Dyn = FALSE;	Stat = TRUE;
+		VAR v: LONGINT;	i: INTEGER;
+	BEGIN
+		IF M.id = LedaBox.GetValue THEN
+			M.name := PictName; M.nbr := 16;
+				IF pict.pixel MOD PrtUnit = 0 THEN i := 2; v := pict.pixel DIV PrtUnit
+				ELSIF pict.pixel MOD LedaSys.scnUnit = 0 THEN i := 1; v := pict.pixel DIV LedaSys.scnUnit
+				ELSE i := 0; v := pict.pixel DIV LedaBox.attrUnit
+				END;
+				StrAt(M.a[3], Unit, Stat); StrAt(M.a[4], Screen, Stat); StrAt(M.a[5], Printer, Stat);
+			NewLn(M.a[0], "pixel"); IntAt(M.a[1], v, Dyn); EnumAt(M.a[2], "-|-|-", i);
+				IF pict.dY = 0 THEN v := 0; i := 0
+				ELSIF pict.dY MOD PrtUnit = 0 THEN i := 2; v := pict.dY DIV PrtUnit
+				ELSIF pict.dY MOD LedaSys.scnUnit = 0 THEN i := 1; v := pict.dY DIV LedaSys.scnUnit
+				ELSE i := 0; v := pict.dY DIV LedaBox.attrUnit
+				END;
+				StrAt(M.a[9], Unit, Stat); StrAt(M.a[10], Screen, Stat); StrAt(M.a[11], Printer, Stat);
+			NewLn(M.a[6], "offset"); IntAt(M.a[7], v, Dyn); EnumAt(M.a[8], "-|-|-", i);
+				IF pict.pwd = 0 THEN i := 0 ELSE i := 1 END;
+				StrAt(M.a[14], Off, Stat); StrAt(M.a[15], On, Stat);
+			NewLn(M.a[12], "protection"); EnumAt(M.a[13], "-|-", i);
+		END
+	END PictGetAttr;
+	
+	PROCEDURE PictImport(VAR bitmap: Pictures.Picture);
+		(*
+		VAR pF: PictureFrames.Frame;	f: Display.Frame;	m: PictureFrames.FocusMsg;
+			P: Pictures.Picture;	time: LONGINT;	x, y, w, h: INTEGER;
+		*)
+		VAR P: Pictures.Picture; f: Rembrandt.Frame; x, y, w, h: INTEGER;
+	BEGIN
+		P := NIL; bitmap := NIL;
+		IF Oberon.Pointer.on THEN
+			(*
+			f := Oberon.MarkedViewer();
+			IF (f # NIL) & (f.dsc # NIL) THEN f := f.dsc.next;
+				IF (f # NIL) & (f IS PictureFrames.Frame) THEN
+					P := f(PictureFrames.Frame).pict; x := 0; y := 0; w := P.width; h := P.height
+				END
+			END
+			*)
+			f := RembrandtDocs.MarkedFrame();
+			IF f # NIL THEN
+				P := f.pict; x := 0; y := 0; w := P.width; h := P.height
+			END
+		END;
+		IF P = NIL THEN
+			(*
+			PictureFrames.GetSelection(P, pF, time, x, y, w, h);
+			IF time <= 0 THEN P := NIL END
+			*)
+			Rembrandt.GetSelectedPict(P, x, y, w, h)
+		END;
+		(*
+		IF P = NIL THEN
+			m.F := NIL; Display.Broadcast(m);	(* get pictureframe with focus *)
+			IF (m.F # NIL) & (m.F IS PictureFrames.Frame) THEN
+				P := m.F(PictureFrames.Frame).pict; x := 0; y := 0; w := P.width; h := P.height
+			END
+		END;
+		*)
+		IF P # NIL THEN
+			bitmap := NewBitmap(P, w, h);
+			Pictures.CopyBlock(P, bitmap, x, y, w, h, 0, 0, Display.replace)
+		END
+	END PictImport;
+
+	PROCEDURE PictExport(pict: Pict);
+		VAR P, bm: Pictures.Picture;	(*V: Viewer;*)
+	BEGIN
+		IF pict.bitmap = NIL THEN RETURN END;	(*###*)
+		bm := pict.bitmap;
+		P := NewBitmap(bm, bm.width, bm.height);
+		Pictures.CopyBlock(bm, P, 0, 0, bm.width, bm.height, 0, 0, Display.replace);
+		(*
+		NEW(V);
+		V.dsc := LedaFrames.GetMenu(LedaSys.dialogMod, "DM", "Exported.Picture", Paint0Cmds, V.menuH);	(* menu frame [gadget or standard] *)
+		V.dsc.next := PictureFrames.NewPicture(P);	(* picture frame *)
+		V.pict := pict;
+		ViewerOpen(V)
+		*)
+		RembrandtDocs.OpenPict(P, "Exported.Picture")
+	END PictExport;
+
+	PROCEDURE PictLoadColors(bitmap: Pictures.Picture);
+		VAR n, cols, red, green, blue: INTEGER;
+	BEGIN
+		IF bitmap = NIL THEN RETURN END;	(*###*)
+		IF bitmap.depth > 1 THEN
+			n := Min(bitmap.depth, Display.Depth(Display.ColLeft));	(* minimum depth of bitmap or screen *)
+			cols := 1; WHILE n > 0 DO INC(cols, cols); DEC(n) END;	(* cols := 2^n *)
+			WHILE n < cols DO
+				Pictures.GetColor(bitmap, n, red, green, blue);
+				Display.SetColor(n, red, green, blue);
+				INC(n)
+			END
+		END
+	END PictLoadColors;
+	
+	PROCEDURE PictStoreColors(bitmap: Pictures.Picture);
+		VAR n, cols, red, green, blue: INTEGER;
+	BEGIN
+		IF bitmap = NIL THEN RETURN END;	(*###*)
+		IF bitmap.depth > 1 THEN
+			n := Min(bitmap.depth, Display.Depth(Display.ColLeft));	(* minimum depth of bitmap or screen *)
+			cols := 1; WHILE n > 0 DO INC(cols, cols); DEC(n) END;	(* cols := 2^n *)
+			WHILE n < cols DO
+				Display.GetColor(n, red, green, blue);
+				Pictures.SetColor(bitmap, n, red, green, blue);
+				INC(n)
+			END
+		END
+	END PictStoreColors;
+
+	PROCEDURE PictExec(pict: Pict; text: LedaCtrl.Text; beg, len: LONGINT; VAR id: INTEGER);
+		VAR s: LedaSys.String;	bitmap: Pictures.Picture;	m: LedaCtrl.TextMsg;
+	BEGIN
+		LedaBox.ParPopStr(s);
+		IF LedaSys.EqualStr("pict", s) THEN id := -1;	(* handled *)
+			LedaBox.ParPopStr(s);
+			IF s = "load" THEN
+				LedaBox.ParPopStr(s);
+				IF LedaSys.EqualStr("col", s) THEN PictLoadColors(pict.bitmap) END
+			ELSIF s = "store" THEN
+				LedaBox.ParPopStr(s);
+				IF LedaSys.EqualStr("col", s) THEN PictStoreColors(pict.bitmap) END
+			END
+		ELSIF LedaSys.EqualStr("imag", s) THEN id := -1;	(* handled *)
+			LedaBox.ParPopStr(s);
+			IF s = "import" THEN
+				IF (pict.pwd = 0) OR PasswordOK(pict.pwd) THEN
+					PictImport(bitmap);
+					IF bitmap # NIL THEN
+						pict.bitmap := bitmap; PictSetSize(pict, -1, -1);
+						IF text.owner # NIL THEN	(* notify text owner *)
+							m.id := LedaCtrl.TextUpdId; m.text := text; m.beg := beg; m.len := 1;
+							text.owner.do.handle(text.owner, m)
+						END
+					ELSE LedaSys.OutT(" - import: ", 0); OutNote(3)
+					END
+				ELSE LedaSys.OutT(" - import: ", 0); OutNote(1)
+				END
+			ELSIF s = "export" THEN
+				IF (pict.pwd = 0) OR PasswordOK(pict.pwd) THEN PictExport(pict)
+				ELSE LedaSys.OutT(" - export: ", 0); OutNote(1)
+				END
+			END
+		ELSE LedaBox.ParReset(LedaBox.Str)
+		END
+	END PictExec;
+	
+	PROCEDURE PictStore(VAR r: LedaBase.Rider; pict: Pict);
+		VAR pos, len, fixup: LONGINT;
+	BEGIN
+		LedaBase.StoreVal(r, pict.dY); LedaBase.StoreVal(r, pict.pixel);
+		LedaBase.StoreVal(r, pict.pwd);
+		LedaBase.StoreJump(r, fixup);
+		IF pict.bitmap = NIL THEN LedaBase.Store(r, 01CX); LedaBase.Store(r, 01X)
+		ELSE
+			pos := LedaBase.RiderPos(r);
+			Pictures.Store(pict.bitmap, Files.Base(r), pos, len);	(* tag written = 2 bytes *)
+			LedaBase.SetRider(r, pos + len)
+		END;
+		LedaBase.FixupJump(r, fixup)
+	END PictStore;
+	
+	PROCEDURE PictLoad(VAR r: LedaBase.Rider): Pict;
+		VAR pict: Pict;	pos, len, ret, jmp: LONGINT;	tag0, tag1: CHAR;
+	BEGIN
+		pict := NewPict(NIL);
+		LedaBase.LoadVal(r, pict.dY); LedaBase.LoadVal(r, pict.pixel);
+		LedaBase.LoadVal(r, pict.pwd);
+		LedaBase.LoadJump(r, ret, jmp);
+		LedaBase.Load(r, tag0); LedaBase.Load(r, tag1);
+		IF (tag0 # 01CX) OR (tag1 # 01X) THEN
+			NEW(pict.bitmap); pos := LedaBase.RiderPos(r);
+			Pictures.Load(pict.bitmap, Files.Base(r), pos, len);	(* tag read = 2 bytes *)
+			LedaBase.SetRider(r, pos + len)
+		END;
+		IF LedaBase.RiderPos(r) # jmp THEN LedaBase.SetRider(r, jmp);
+			LedaSys.OutT(" - LedaImage.PictLoad: incorrect number of bytes read", 1)
+		END;
+		PictSetSize(pict, -1, -1);
+		RETURN pict
+	END PictLoad;
+	
+	PROCEDURE *PictDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handle for picture control; unique reference *)
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN
+			WITH m: LedaBase.PrintMsg DO
+				IF m.id = 0 THEN	(* return print specification *)
+					m.id := 2; m.W := ctrl(Pict).W; m.sepKind := m.ch
+				ELSIF m.id = 2 THEN	(* print line *)
+					IF (m.p # NIL) & (m.p IS LedaSys.PrtPort) THEN
+						PictPrint(ctrl(Pict), m.x, m.y, m.mode, m.p(LedaSys.PrtPort))
+					END
+				END
+			END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := NewPict(ctrl(Pict))	(* deep copy *)
+				| LedaBase.RegisterId:  LedaBase.PutToList(ctrl, m.ctrlId)
+				| LedaBase.StoreId:  PictStore(m.r, ctrl(Pict))
+				| LedaBase.LoadId:  m.ctrl := PictLoad(m.r)
+				| LedaBase.StoreModCmd:  LedaBase.StoreStr(m.r, ModName); LedaBase.StoreStr(m.r, "PC")
+				| LedaBase.CheckId:  PictCheck(ctrl(Pict))
+				| LedaBase.ReplaceId:	(* no replacement possible *)
+				| LedaBase.UpdateId:	(* no updates possible *)
+				| LedaBase.InvertSepId:  INCL(m.s, LedaBase.InvertSepId);
+						Display.ReplPattern(LedaSys.inv, LedaSys.scrPat[LedaSys.Grey2], m.x, m.y, ctrl(Pict).w, m.ctrlId, Display.invert)
+				ELSE
+				END
+			END
+		ELSIF m IS LedaBox.AttributeMsg THEN PictGetAttr(ctrl(Pict), m(LedaBox.AttributeMsg))
+		ELSIF m IS LedaCtrl.TextMsg THEN
+			WITH m: LedaCtrl.TextMsg DO
+				IF m.id = LedaCtrl.ExecuteId THEN PictExec(ctrl(Pict), m.text, m.beg, m.len, m.id) END
+			END
+		ELSIF m IS PwdMsg THEN PictNewPwd(ctrl(Pict))
+		END
+	END PictDoOp;
+
+	PROCEDURE PAMH*;
+	(** deposits the attribute message handler for the picture control *)
+	(** is called if an attribute is changed or set *)
+	BEGIN LedaBox.SetAttrHandle(PictSetAttr)
+	END PAMH;
+
+	PROCEDURE PC*;
+	(** deposits a empty control in LedaBase *)
+	(** is used during loading of picture control *)
+	BEGIN LedaBase.depositedCtrl := NewPict(NIL)
+	END PC;
+
+	PROCEDURE PictCreate*;
+		VAR pict: Pict;
+	BEGIN
+		pict := NewPict(NIL);
+		PictImport(pict.bitmap); PictSetSize(pict, -1, -1);
+		LedaBase.depositedCtrl := pict
+	END PictCreate;
+	
+(*--- protected picture files ---*)
+
+	PROCEDURE Protect(VAR or, nr: LedaBase.Rider; digits: INTEGER);
+		VAR ch: CHAR;	i, j, l, h: INTEGER;	buf: ARRAY 4, 4 OF CHAR;
+			
+		PROCEDURE Put(ch: CHAR);
+			VAR ascii: INTEGER;
+		BEGIN
+			ascii := (ORD(ch) MOD l)*h; INC(ascii, ORD(ch) DIV l);
+			buf[i, j] := CHR(ascii); INC(j);
+			IF j = 4 THEN j := 0; INC(i);
+				IF i = 4 THEN	(* out buffer by columns *)
+					WHILE j < 4 DO
+						i := 0; WHILE i < 4 DO LedaBase.Store(nr, buf[i, j]); INC(i) END;
+						INC(j)
+					END;
+					i := 0; j := 0
+				END
+			END
+		END Put;
+		
+	BEGIN
+		l := 1; WHILE digits > 0 DO l := l*2; DEC(digits) END; 
+		h := 256 DIV l;	(* byte parts: l = low / h = high *)
+		i := 0; j := 0;
+		LedaBase.Load(or, ch);
+		WHILE ~ or.eof DO Put(ch); LedaBase.Load(or, ch) END;
+		WHILE (i # 0) & (j # 0) DO Put(CHR(Oberon.Time() MOD 256)) END
+	END Protect;
+		
+	PROCEDURE Store*;
+		VAR S: Texts.Scanner;	P: Pictures.Picture;	(*f: Display.Frame;*) f: Rembrandt.Frame;
+			t, r: LedaBase.Rider;	name: LedaSys.String;	len: LONGINT;
+	BEGIN
+		AdjustPassword;
+		P := NIL; S.class := NotDef; GetCmdSpec(S);
+		LedaSys.OutT(ModName, 0); LedaSys.OutT(".Store ", 0);
+		IF S.class # Texts.Name THEN name := "" ELSE LedaSys.CopyStr(S.s, name) END;
+		P := NIL;
+		IF Oberon.Pointer.on THEN
+			(*
+			f := Oberon.MarkedViewer();
+			IF (f # NIL) & (f.dsc # NIL) THEN f := f.dsc.next;
+				IF (f # NIL) & (f IS PictureFrames.Frame) THEN P := f(PictureFrames.Frame).pict END
+			END
+			*)
+			f := RembrandtDocs.MarkedFrame();
+			IF f # NIL THEN
+				P := f.pict
+			END
+		END;
+		IF name = "" THEN OutNote(2)
+		ELSIF P = NIL THEN OutNote(3)
+		ELSIF password = 0 THEN OutNote(0)
+		ELSE
+			LedaSys.OutT(name, 1);
+			(*- temporary file -*)
+			LedaBase.NewRider("XX.YY", t);
+			LedaBase.StoreLI(t, password);
+			Pictures.Store(P, Files.Base(t), LedaBase.RiderPos(t), len);
+			(*- protected file -*)
+			LedaBase.NewRider(name, r);
+			LedaBase.Store(r, Tag0); LedaBase.Store(r, Tag1);
+			LedaBase.SetRider(t, 0); Protect(t, r, 3);
+			LedaBase.CloseRider(r)
+		END
+	END Store;
+	
+	PROCEDURE Open*;
+	(* set LedaSys.execRes to LedaBase.CurStamp() if open call is handled *)
+		VAR S: Texts.Scanner;	P: Pictures.Picture;	name: LedaSys.String;
+			t, r: LedaBase.Rider;	pwd, len: LONGINT;	tag0, tag1: CHAR;
+	BEGIN
+		AdjustPassword;
+		S.class := NotDef; GetCmdSpec(S);
+		IF S.class = Texts.Name THEN
+			LedaSys.CopyStr(S.s, name);
+			LedaBase.OpenRider(name, r);
+			IF r.res # LedaBase.Done THEN tag0 := 0X; tag1 := 0X
+			ELSE LedaBase.Load(r, tag0); LedaBase.Load(r, tag1);
+				IF tag0 = DocTag0 THEN	(* gadget document file -> skip header *)
+					LedaBase.Load(r, tag0); WHILE tag0 # 0X DO LedaBase.Load(r, tag0) END;	(* skip string *)
+					LedaBase.Load(r, tag0); LedaBase.Load(r, tag1);	(* skip x *)
+					LedaBase.Load(r, tag0); LedaBase.Load(r, tag1);	(* skip y *)
+					LedaBase.Load(r, tag0); LedaBase.Load(r, tag1);	(* skip w *)
+					LedaBase.Load(r, tag0); LedaBase.Load(r, tag1);	(* skip h *)
+					LedaBase.Load(r, tag0); LedaBase.Load(r, tag1)	(* tag of content *)
+				END
+			END;
+			IF (tag0 = 0X) & (tag1 = 0X) THEN	(* file not found *)
+			ELSIF (tag0 = Tag0) & (tag1 = Tag1) THEN	(* own protected picture file *)
+				LedaSys.execRes := LedaBase.CurStamp();	(* open handled *)
+				LedaBase.NewRider("", t); Protect(r, t, 5);
+				LedaBase.SetRider(t, 0);
+				LedaBase.LoadLI(t, pwd);
+				IF pwd # password THEN
+					LedaSys.OutT(ModName, 0); LedaSys.OutT(".Open ", 0); OutNote(1)
+				ELSE
+					NEW(P); Pictures.Load(P, Files.Base(t), LedaBase.RiderPos(t) + 2, len);
+					DisplayPict(name, P)
+				END
+			ELSIF (tag0 = Pict0) & (tag1 = Pict1) THEN	(* normal picture file *)
+				LedaSys.execRes := LedaBase.CurStamp();	(* open handled *)
+				NEW(P); Pictures.Load(P, Files.Base(r), LedaBase.RiderPos(r), len);
+				DisplayPict(name, P)
+			ELSE	(* not a picture *)
+			END
+		END
+	END Open;
+
+	(*
+	PROCEDURE Select*;
+		VAR F: PictureFrames.Frame;
+	BEGIN
+		IF (Oberon.Par.vwr = NIL) OR (Oberon.Par.vwr.dsc = NIL) THEN RETURN END;	(*###*)
+		IF Oberon.Par.frame = Oberon.Par.vwr.dsc THEN	(* in menu *)
+			IF (Oberon.Par.vwr.dsc.next # NIL) & (Oberon.Par.vwr.dsc.next IS PictureFrames.Frame) THEN
+				F := Oberon.Par.vwr.dsc.next(PictureFrames.Frame);
+				WITH F : PictureFrames.Frame DO
+					PictureFrames.SetSelection(F, 0, 0, F.pict.width, F.pict.height, Display.display)
+				END
+			END
+		END
+	END Select;
+	
+	PROCEDURE Update*;
+		VAR V: Viewer;	pict: Pict;	P, bm: Pictures.Picture;
+			box: LedaBase.Box;	p: LedaFrames.Port;	level: INTEGER;
+			M: LedaBox.Msg;	m: LedaCtrl.TextMsg;	
+	BEGIN
+		IF (Oberon.Par.vwr # NIL) & (Oberon.Par.vwr IS Viewer) THEN
+			V := Oberon.Par.vwr(Viewer); pict := V.pict;
+			M.id := LedaBox.LocateId; M.op := 5; M.ctrl := pict;
+			M.text := NIL; M.l1 := -1;
+			LedaBox.Broadcast(NIL, {LedaBox.BcTxt}, M);
+			IF (M.l1 # -1) & (M.text # NIL) & (M.text.owner # NIL) THEN
+				box := M.text.owner;
+				LedaFrames.GetPort(NIL, LedaBox.Root(box), p, level);
+				IF level # 0 THEN LedaFrames.Reset; LedaFrames.GetPort(NIL, LedaBox.Root(box), p, level) END;
+				P := V.dsc.next(PictureFrames.Frame).pict;
+				bm := NewBitmap(P, P.width, P.height);
+				Pictures.CopyBlock(P, bm, 0, 0, P.width, P.height, 0, 0, Display.replace);
+				pict.bitmap := bm; PictSetSize(pict, -1, -1);
+				m.id := LedaCtrl.TextUpdId; m.text := M.text; m.beg := M.l1; m.len := 1;
+				box.do.handle(box, m);
+				LedaFrames.UpdatePort(p, level)
+			END
+		END
+	END Update;
+	*)
+	
+BEGIN
+	password := 0;
+	(*--- picture control ---*)
+	pictDoOp := PictDoOp;
+	LedaCtrl.DefChCtrl(PictCh, PictName, FALSE, FALSE, NIL, NIL, ModName, PictNew);	(* register for key input *)
+	LedaBox.DefineAttrName(PictName, ModName, "PAMH");		(* register for attribute handling *)
+	
+END LedaImage.

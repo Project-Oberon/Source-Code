@@ -1,0 +1,967 @@
+MODULE Files;	(* J. Templ 1.12. 89/31.10.91 Oberon files mapped onto Unix files *)
+(* DOS-Version ARD, 10. 2. 93 *)
+(* kr 5. 3. 93 fix bug & add termproc 
+	kr 8.3. 93 tag renamed to DOS.tag 
+	kr 9.3. 93 import export 
+	kr 10.3.93  short filenames 
+	kr 11.3. 93 delete temp files when quit
+	ard 12. 5. 93 Subdirectories 
+	ard 23. 6. 93 Bug with cacheentries fixed, RenameToTemp implemented 
+	ard Sat, 26-Jun-1993, Sentinel version 
+	ard Tue, 17-Aug-1993, renaming of pure DOS files
+	ard Mon, 18.04.94, Do NOT delete temp files when changing directory *)
+
+	IMPORT SYSTEM, Kernel, DOS, FileDir;
+
+	CONST
+		nofbufs = 4;
+		bufsize = 4096;
+		cacheSize = 65;
+		noDesc = -1;
+
+		(* file states *)
+		open = 0; create = 1; close = 2; 
+		
+		oberonoffset = 34; (* << KR *)  dosoffset = 0;
+		
+		MAIN = TRUE; CURRENT = FALSE;
+
+	TYPE
+		FileName = FileDir.FileName;
+		File* = POINTER TO Handle;
+		Buffer = POINTER TO BufDesc;
+
+		Handle = RECORD
+			workName, registerName, OrigName: FileName;
+			path: FileDir.Path;
+			fd, len, pos: LONGINT;
+			bufs: ARRAY nofbufs OF Buffer;
+			swapper, state: INTEGER;
+			dospath: BOOLEAN;
+			offset: SHORTINT;
+			lase: LONGINT;
+		END;
+
+		BufDesc = RECORD
+			f: File;
+			chg: BOOLEAN;
+			org, size: LONGINT;
+			data: ARRAY bufsize OF SYSTEM.BYTE
+		END;
+
+		Rider* = RECORD 
+			res*: LONGINT;
+			eof*: BOOLEAN;
+			buf: Buffer;
+			org, offset: LONGINT
+		END;
+
+		EntryHandler* = PROCEDURE (name: FileName; sec: LONGINT; VAR continue: BOOLEAN);
+					
+	VAR cache: ARRAY cacheSize OF LONGINT (*=File*);
+			count: INTEGER;
+			drv*: ARRAY 4 OF CHAR;
+			Output: BOOLEAN;
+			
+	PROCEDURE CheckName(str: ARRAY OF CHAR);
+	VAR err: ARRAY 32 OF CHAR; i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE str[i] # 0X DO
+			IF str[i] = "." THEN 
+				IF (i < 31) &  (str[i+1] = ".") THEN err := "No relative filenames allowed"; HALT(99) END;
+			END;
+			INC(i)
+		END
+	END CheckName;
+			
+	PROCEDURE MakeFileName(dir, name: ARRAY OF CHAR; VAR dest: ARRAY OF CHAR);
+	VAR i, j: INTEGER;
+	BEGIN
+		i := 0; j := 0; 
+		WHILE dir[i] # 0X DO dest[i] := dir[i]; INC(i) END;
+		IF (dest[i-1] # "\") THEN dest[i] := "\"; INC(i) END;
+		WHILE name[j] # 0X DO dest[i] := name[j]; INC(i); INC(j) END;
+		dest[i] := 0X;
+	END MakeFileName;
+	
+	PROCEDURE InsertInList(c, d: FileName; p: FileDir.Path);
+	VAR new, first: FileDir.NodePtr; fd, d1, d2, t1, t2 : LONGINT; path: FileDir.Path;
+	BEGIN
+		NEW(new); new.Ceres := c; new.Dos := d; new.path := p; new.main := (p = FileDir.main);
+		first := FileDir.First;
+		WHILE (new.Ceres > first.next.Ceres) DO first := first.next END;
+		IF (new.Ceres = first.next.Ceres) THEN
+			IF (first.next.path # new.path) THEN new.next := first.next; first.next := new
+			ELSIF c # "FILENAME.TEX" THEN
+				MakeFileName(FileDir.current, d, path); DOS.Open(path, FALSE, fd, DOS.ReadWriteDenyAll); 
+				IF DOS.Done THEN DOS.GetDateTime(d1,t1,fd); DOS.Close(fd) END;
+				MakeFileName(FileDir.current, first.next.Dos, path); DOS.Open(path, FALSE, fd, DOS.ReadWriteDenyAll); 
+				IF DOS.Done THEN DOS.GetDateTime(d2,t2,fd); DOS.Close(fd) END;
+				t1 := t1 MOD 10000H; t2 := t2 MOD 10000H;
+				IF (d1 > d2) OR ((d1 = d2) & (t1 >  t2)) THEN MakeFileName(FileDir.current, first.next.Dos, path); first.next.Dos := d;
+				ELSE MakeFileName(FileDir.current, d, path) END;
+				DOS.Delete(path);
+			END
+		ELSE new.next := first.next; first.next := new END;
+	END InsertInList;
+	
+	PROCEDURE DeleteInList(name: FileName);
+	VAR base: FileDir.NodePtr; 
+	BEGIN
+		base := FileDir.First; 
+		WHILE (base.next # FileDir.First) & ((base.next.Ceres # name) OR (base.next.path = FileDir.main) & (FileDir.current # FileDir.main)) DO 
+			base := base.next 
+		END;
+		IF base.next # FileDir.First THEN base.next := base.next.next END
+	END DeleteInList;
+
+	PROCEDURE Find(c: FileName; VAR d: FileName; VAR found, path: BOOLEAN);
+	VAR base: FileDir.NodePtr; i : INTEGER;
+	BEGIN 
+		path := FALSE; i := 0; 
+		WHILE c[i] # 0X DO 
+			IF (c[i] = "\") OR (c[i] = ":") THEN path := TRUE END; INC(i) 
+		END;
+		base := FileDir.First.next; found := FALSE;
+		WHILE base # FileDir.First DO 
+			IF base.Ceres = c THEN d := base.Dos; found := TRUE; RETURN ELSE base := base.next END
+		END
+	END Find;
+
+	PROCEDURE FindCurrent(c: FileName; VAR d: FileName; VAR found: BOOLEAN; VAR p: FileDir.Path);
+	VAR base: FileDir.NodePtr;
+	BEGIN 
+		base := FileDir.First.next; found := FALSE; d := "";
+		WHILE base # FileDir.First DO 
+			IF (base.Ceres = c) & (base.path = FileDir.current) THEN d := base.Dos; p := base.path; found := TRUE; RETURN
+			ELSE base := base.next END
+		END
+	END FindCurrent;
+
+	PROCEDURE FindMain(c: FileName; VAR d: FileName; VAR found: BOOLEAN; VAR p: FileDir.Path);
+	VAR base: FileDir.NodePtr;
+	BEGIN 
+		base := FileDir.First.next; found := FALSE; d := "";
+		WHILE base # FileDir.First DO 
+			IF (base.Ceres = c) & (base.path = FileDir.main) THEN d := base.Dos; p := base.path; found := TRUE; RETURN
+			ELSE base := base.next END
+		END
+	END FindMain;
+
+	PROCEDURE FileList*(ceres: ARRAY OF CHAR; VAR dos: ARRAY OF CHAR; VAR found: BOOLEAN);
+	(* Used in System.Directory */d *)
+	VAR path: BOOLEAN; c, d: FileName;
+	BEGIN
+		COPY(ceres, c); Find(c, d, found, path); COPY(d, dos);
+	END FileList;
+	
+	PROCEDURE ChangeDosName(ceres, dos: FileName; VAR found: BOOLEAN);
+	VAR base: FileDir.NodePtr;
+	BEGIN
+		base:= FileDir.First.next; found := FALSE;		
+		WHILE base # FileDir.First DO
+			IF (base.Ceres = ceres) & (base.path = FileDir.current) THEN base.Dos := dos; found := TRUE; RETURN
+			ELSE base := base.next END
+		END
+	END ChangeDosName;
+	
+	PROCEDURE GetTempName(VAR name: FileName);
+	BEGIN
+		name[0] := "1"; name[1] := "."; 
+		name[2] := CHR(count DIV 100 MOD 10 + 30H); 
+		name[3] := CHR(count DIV 10 MOD 10 + 30H); 
+		name[4] := CHR(count MOD 10 + 30H); 
+		name[5] := 0X; INC(count)
+	END GetTempName;
+	
+	PROCEDURE ChkDir(VAR entry: ARRAY OF CHAR);
+		VAR  i: INTEGER; path: FileDir.Path;
+		
+		PROCEDURE IncC(VAR ch : CHAR) : BOOLEAN;
+		BEGIN
+			ch := CHR(ORD(ch)+1);
+			IF (ch >= ":") & (ch <= "@") THEN ch := "A" ; RETURN TRUE
+			ELSIF ch > "Z" THEN ch := "0"; RETURN FALSE
+			ELSE RETURN TRUE END;
+		END IncC;
+		
+	BEGIN
+		i := 0; WHILE (i < 30) & (entry[i] # ".") DO INC(i) END;
+		MakeFileName(FileDir.current, entry, path); DOS.GetFirstFile(path);
+		WHILE DOS.Done DO
+			IF ~IncC(entry[i+3]) THEN
+				IF ~IncC(entry[i+2]) THEN
+					IF ~IncC(entry[i+1]) THEN END
+				END
+			END;
+			MakeFileName(FileDir.current, entry, path); DOS.GetFirstFile(path);
+		END;
+	END ChkDir;
+
+	PROCEDURE MakeDosName(C: ARRAY OF CHAR; VAR Dos: FileName);
+	VAR i, j, k: INTEGER;
+	
+		PROCEDURE cap(ch: CHAR):CHAR;
+		BEGIN IF (ch > 60X) & (ch < 7BX) THEN RETURN CAP(ch) ELSE RETURN ch END END cap;
+		
+	BEGIN 
+		IF C = "" THEN GetTempName(Dos); RETURN END;
+		IF C = "FILENAME.TEX" THEN Dos := "FILENAME.TEX"; RETURN END;
+		i := 0;
+		WHILE (i < 8) & (C[i] # 0X) & (C[i] # ".") DO Dos[i] := cap(C[i]); INC(i) END; Dos[i] := "."; 
+		j := 0; WHILE (j < 32) & (C[j] # 0X) & (C[j] # ".") DO INC(j) END;
+		Dos[i+1] := "0"; Dos[i+2] := "0"; Dos[i+3] := "0"; Dos[i+4] := 0X; 
+		IF (C[j] = ".") THEN k := 1;
+			WHILE (k <= 3) & (C[j+k] # ".") & (C[j+k] # 0X) DO Dos[i+k] := cap(C[j+k]); INC(k) END
+		END;
+		IF i # 0 THEN ChkDir(Dos);
+		ELSE (* temporary file *)
+			Dos[0] := "1"; Dos[1] := "."; 
+			Dos[2] := CHR(count DIV 100 MOD 10 + 30H); 
+			Dos[3] := CHR(count DIV 10 MOD 10 + 30H); 
+			Dos[4] := CHR(count MOD 10 + 30H); 
+			Dos[5] := 0X; INC(count)
+		END;
+	END MakeDosName;
+
+	PROCEDURE ^ Close* (f: File);
+	
+	PROCEDURE CacheEntry(name: ARRAY OF CHAR): File;
+	VAR f: File; i: INTEGER;
+	BEGIN 
+		i := 0;
+		WHILE i < cacheSize DO
+			f := SYSTEM.VAL(File, cache[i]);
+			IF (f # NIL) & (name = f.OrigName) & (f.path = FileDir.current) THEN RETURN f END;
+			INC(i)
+		END;
+		RETURN NIL
+	END CacheEntry;
+	
+	PROCEDURE RenameToTemp(VAR g: File; name: FileName);
+	VAR temp: FileName; pathnew, pathtemp: FileDir.Path;
+	BEGIN
+		GetTempName(temp); 
+		Close(g); 
+		DOS.Close(g.fd); cache[g.fd] := 0; 
+		MakeFileName(FileDir.current, name, pathnew); MakeFileName(FileDir.current, temp, pathtemp); 
+		DOS.Rename(pathnew, pathtemp);
+		DOS.Open(pathtemp, FALSE, g.fd, DOS.ReadWriteDenyAll); 
+		g.pos := g.offset; g.swapper := -1; (* << KR *)
+		COPY(temp, g.workName); COPY(temp, g.OrigName); COPY(temp, g.registerName);
+		cache[g.fd] := SYSTEM.VAL(LONGINT, g)	
+	END RenameToTemp;
+
+	PROCEDURE Create(f: File);
+	VAR err: ARRAY 25 OF CHAR; found: BOOLEAN; errno: LONGINT; g: File; path: ARRAY 64 OF CHAR; pathnew: FileDir.Path;
+	BEGIN
+		IF f.fd = noDesc THEN
+			IF f.state = create THEN 
+				IF ~f.dospath THEN GetTempName(f.workName) ELSE f.workName := f.OrigName END;
+			ELSIF f.state = close THEN 
+				IF ~f.dospath THEN Find(f.OrigName, f.workName, found, f.dospath)
+				ELSE f.workName := f.OrigName; found := TRUE END;
+				IF ~found THEN MakeDosName(f.OrigName, f.workName) 
+				ELSE g := CacheEntry(f.OrigName); 
+					IF g # NIL THEN RenameToTemp(g, g.workName)
+					ELSE MakeFileName(f.path, f.workName, pathnew); DOS.Delete(pathnew) END;
+				END;
+				f.registerName := "";
+			END;	
+			
+			IF Kernel.nofiles > cacheSize-10 THEN Kernel.GC END;
+			MakeFileName(f.path, f.workName, path); DOS.Open(path, TRUE, f.fd, DOS.ReadWriteDenyAll);
+			IF DOS.Done THEN
+				IF f.fd >= cacheSize-3 THEN Kernel.GC;
+					(*DOS.Close(f.fd); err := "too many files open"; HALT(99)*)
+				ELSE 
+					IF f.state = close THEN 
+						IF ~f.dospath THEN DOS.SetID(f.OrigName, f.fd) END;
+						Close(f);
+						ChangeDosName(f.OrigName, f.workName, found); (* KR *)
+						IF ~found & ~f.dospath THEN InsertInList(f.OrigName, f.workName, FileDir.current) END;
+						cache[f.fd] := SYSTEM.VAL(LONGINT, f);	
+					END;
+					f.state := open; f.pos := f.offset; f.swapper := -1;
+				END
+			ELSE errno := f.fd; err := "create not done"; HALT(99)
+			END
+		END;
+	END Create;
+	
+	PROCEDURE Flush(buf: Buffer);
+	VAR f: File; workName, registerName: FileName; err: ARRAY 25 OF CHAR;
+	BEGIN
+		IF buf.chg THEN f := buf.f; Create(f);
+			IF buf.org # f.pos THEN DOS.SetPos(buf.org, f.fd) END;
+			DOS.Write(buf.size, SYSTEM.ADR(buf.data), f.fd);
+			IF ~DOS.Done THEN
+				workName := f.workName; registerName := f.registerName; err := "error in writing file"; HALT(99)
+			END;
+			f.pos := buf.org + buf.size;
+			buf.chg := FALSE;
+		END
+	END Flush;
+	
+	PROCEDURE Close* (f: File);
+	VAR i: INTEGER;
+			workName, registerName,origName, err: FileName;
+	BEGIN
+		IF (f.state # create) OR (f.registerName # "") THEN
+			Create(f);
+			i := 0; WHILE (i < nofbufs) & (f.bufs[i] # NIL) DO Flush(f.bufs[i]); INC(i) END;
+		END;
+		 workName := f.workName; registerName := f.registerName; err := "error in writing file"; 
+		 origName := f.OrigName;
+		 IF (workName # registerName) OR (registerName # origName) OR (origName[0] # "1") THEN
+			DOS.Close(DOS.DoubleHandle(f.fd));	(* Flush DOS-buffers *)
+		END
+	END Close;
+
+	PROCEDURE Length* (f: File): LONGINT;
+	BEGIN RETURN f.len-f.offset
+	END Length;
+
+	PROCEDURE Old* (name: ARRAY OF CHAR): File;
+	VAR f: File; fd: LONGINT; found,path: BOOLEAN; dos, ceres: FileName; tag: ARRAY 4 OF CHAR;
+			pathname: FileDir.Path;
+	BEGIN
+		CheckName(name);
+		IF Kernel.nofiles > cacheSize-10 THEN Kernel.GC END;
+		IF name # "" THEN
+			COPY(name, ceres); Find(ceres, dos, found, path);
+			IF ~found & ~path THEN RETURN NIL END;
+			IF ~path THEN
+				f := CacheEntry(ceres); 
+				IF f # NIL THEN RETURN f	(* Im Cache *)
+				ELSE		(* File exists, but not in Cache *)
+					NEW(f); 
+					FindCurrent(ceres, dos, found, pathname);
+					IF ~found THEN FindMain(ceres, dos, found, pathname) END;
+					f.path := pathname;
+					MakeFileName(pathname, dos, pathname); DOS.Open(pathname, FALSE, fd, DOS.ReadWriteDenyAll); 
+					IF ~DOS.Done THEN HALT(97) END;
+					DOS.GetTag(tag, fd); 
+					IF tag = DOS.tag THEN DOS.GetID(f.OrigName, fd); f.offset := oberonoffset
+					ELSE COPY(name, f.OrigName); f.offset := dosoffset END; 
+					cache[fd] := SYSTEM.VAL(LONGINT, f);  
+					f.fd := fd; f.state := open; DOS.Length(f.len, f.fd); f.pos := f.offset; f.swapper := -1; (*all f.buf[i] = NIL*)
+					f.workName := dos; f.registerName := "";
+					RETURN f
+				END
+			ELSE COPY(name,dos);
+				DOS.GetFirstFile(dos);
+				IF DOS.Done THEN
+					DOS.Open(name, FALSE, fd, DOS.ReadWriteDenyAll); 
+					IF DOS.Done THEN NEW(f);
+						DOS.GetTag(tag, fd); 
+						IF (tag[0] = DOS.tag[0]) & (tag[1] = DOS.tag[1]) THEN f.offset := oberonoffset ELSE f.offset := dosoffset END; 
+						cache[fd] := SYSTEM.VAL(LONGINT, f); f.dospath := TRUE;
+						f.fd := fd; f.state := open; DOS.Length(f.len, f.fd); f.pos := f.offset; f.swapper := -1; (*all f.buf[i] = NIL*)
+						COPY(dos, f.workName); f.registerName := ""; COPY(name, f.OrigName);
+						RETURN f
+					ELSE RETURN NIL END
+				ELSE RETURN NIL END
+			END
+		END; 
+		RETURN NIL
+	END Old;
+
+	PROCEDURE Purge* (f: File);
+	VAR i: INTEGER; path: ARRAY 64 OF CHAR;
+	BEGIN i := 0;
+		WHILE i < nofbufs DO
+			IF f.bufs[i] # NIL THEN f.bufs[i].org := -1; f.bufs[i] := NIL END;
+			INC(i)
+		END;
+		DOS.Close(f.fd); cache[f.fd] := 0;
+		MakeFileName(FileDir.current, f.workName, path);
+		DOS.Open(path, TRUE, f.fd, DOS.ReadWriteDenyAll); cache[f.fd] := SYSTEM.VAL(LONGINT, f)
+	END Purge;
+	
+	PROCEDURE GetPath(VAR name, path, fname: ARRAY OF CHAR);
+	VAR i, j: INTEGER; 
+	BEGIN
+		COPY(name, path);
+		i := 0;
+		WHILE path[i] # 0X DO INC(i) END;
+		WHILE (i >= 0) & (path[i] # "\") DO path[i] := 0X; DEC(i) END; 
+		IF (i >=0) THEN path[i] := 0X END; 
+		INC(i);
+		j := 0; WHILE name[i] # 0X DO fname[j] := name[i]; INC(i); INC(j) END; fname[j] := 0X;
+		i := 0; WHILE path[i] # 0X DO IF (path[i] >= "a") & (path[i] <= "z") THEN path[i] := CAP(path[i]) END; INC(i) END;
+	END GetPath;
+
+	PROCEDURE New* (name: ARRAY OF CHAR): File;
+	VAR f: File; i: INTEGER; path: FileDir.Path; fname: FileDir.FileName;
+	BEGIN 
+		CheckName(name);
+		GetPath(name, path, fname);
+		NEW(f); f.workName := ""; f.OrigName := fname; f.registerName[0] := 0FFX;
+		IF (path = FileDir.current) OR (path = "") THEN f.len := oberonoffset; f.offset := oberonoffset; f.path := FileDir.current; f.dospath := FALSE
+		ELSE f.len := dosoffset; f.offset := dosoffset; f.path := path; f.dospath := TRUE END;
+		f.fd := noDesc; f.state := create;
+		IF ~f.dospath THEN 
+			NEW(f.bufs[0]); f.bufs[0].f := f;
+			f.bufs[0].data[0] := DOS.tag[0]; f.bufs[0].data[1] := DOS.tag[1]; (* << KR   *)
+			i := 0;
+			WHILE (i < 31) & (name[i] # 0X) DO f.bufs[0].data[i+2] := name[i]; INC(i) (* << KR *) END;
+			WHILE (i < 32) DO f.bufs[0].data[i+2] := 0X; INC(i) END;
+			f.bufs[0].chg := TRUE; f.bufs[0].org := 0; f.bufs[0].size := oberonoffset;
+		END; 
+		f.pos := f.offset; f.swapper := -1;
+		RETURN f
+	END New;
+
+	PROCEDURE GetDate* (f: File; VAR t, d: LONGINT);
+	BEGIN Create(f); DOS.GetDateTime(d, t, f.fd) END GetDate;
+
+	PROCEDURE Pos* (VAR r: Rider): LONGINT;
+	BEGIN RETURN r.org + r.offset - r.buf.f.offset END Pos;
+
+	PROCEDURE Set* (VAR r: Rider; f: File; pos: LONGINT);
+	VAR org, offset, i, n, errno: LONGINT; buf: Buffer;
+			workName, registerName: FileName;
+			err: ARRAY 25 OF CHAR;
+	BEGIN
+		IF f # NIL THEN
+			INC(pos, f.offset); (* ARD *)
+			IF pos > f.len THEN pos := f.len ELSIF pos < 0 THEN pos := 0 END;
+			offset := pos MOD bufsize; org := pos - offset; i := 0;
+			WHILE (i < nofbufs) & (f.bufs[i] # NIL) & (org # f.bufs[i].org) DO INC(i) END;
+			IF i < nofbufs THEN
+				IF f.bufs[i] = NIL THEN NEW(buf); buf.chg := FALSE; buf.org := -1; buf.f := f; f.bufs[i] := buf
+				ELSE buf := f.bufs[i]
+				END
+			ELSE
+				f.swapper := (f.swapper + 1) MOD nofbufs;
+				buf := f.bufs[f.swapper];
+				Flush(buf)
+			END;
+			IF buf.org # org THEN
+				IF org = f.len THEN buf.size := 0
+				ELSE Create(f);
+					IF f.pos # org THEN DOS.SetPos(org, f.fd) END;
+					DOS.Read(bufsize, SYSTEM.ADR(buf.data), f.fd, n); 
+					IF ~DOS.Done THEN errno := n;
+						workName := f.workName; registerName := f.registerName; err := "read not done"; HALT(99)
+					END;
+					f.pos := org + n;
+					buf.size := n
+				END;
+				buf.org := org; buf.chg := FALSE
+			END
+		ELSE buf := NIL; org := 0; offset := 0
+		END;
+		r.buf := buf; r.org := org; r.offset := offset; r.eof := FALSE; r.res := 0
+	END Set;
+
+	PROCEDURE Read* (VAR r: Rider; VAR x: SYSTEM.BYTE);
+	VAR offset: LONGINT; buf: Buffer;
+	BEGIN
+		buf := r.buf; offset := r.offset;
+		IF r.org # buf.org THEN Set(r, buf.f, r.org + offset - r.buf.f.offset); buf := r.buf; offset := r.offset END;
+		IF (offset < buf.size) THEN x := buf.data[offset]; r.offset := offset + 1
+		ELSIF r.org + offset < buf.f.len THEN
+			Set(r, r.buf.f, r.org + offset - r.buf.f.offset);
+			x := r.buf.data[0]; r.offset := 1
+		ELSE x := 0X; r.eof := TRUE END
+	END Read;
+
+	PROCEDURE ReadBytes* (VAR r: Rider; VAR x: ARRAY OF SYSTEM.BYTE; n: LONGINT);
+	VAR xpos, min, restInBuf, offset: LONGINT; buf: Buffer;
+	BEGIN
+		IF n > LEN(x) THEN HALT(99) END;
+		xpos := 0; buf := r.buf; offset := r.offset;
+		WHILE n > 0 DO
+			IF (r.org # buf.org) OR (offset >= bufsize) THEN
+				Set(r, buf.f, r.org + offset - r.buf.f.offset);
+				buf := r.buf; offset := r.offset
+			END;
+			restInBuf := buf.size - offset; 
+			IF restInBuf = 0 THEN r.res := n; r.eof := TRUE; RETURN
+			ELSIF n > restInBuf THEN min := restInBuf ELSE min := n END;
+			SYSTEM.MOVE(SYSTEM.ADR(buf.data) + offset, SYSTEM.ADR(x) + xpos, min);
+			INC(offset, min); r.offset := offset; INC(xpos, min); DEC(n, min)
+		END;
+		r.res := 0; r.eof := FALSE
+	END ReadBytes;
+
+	PROCEDURE Base* (VAR r: Rider): File;
+	BEGIN RETURN r.buf.f END Base;
+
+	PROCEDURE Write* (VAR r: Rider; x: SYSTEM.BYTE);
+	VAR buf: Buffer; offset: LONGINT;
+	BEGIN
+		buf := r.buf; offset := r.offset;
+		IF (r.org # buf.org) OR (offset >= bufsize) THEN
+			Set(r, buf.f, r.org + offset - r.buf.f.offset);
+			buf := r.buf; offset := r.offset
+		END;
+		buf.data[offset] := x;
+		buf.chg := TRUE;
+		IF offset = buf.size THEN INC(buf.size); INC(buf.f.len) END;
+		r.offset := offset + 1; r.res := 0;
+	END Write;
+
+	PROCEDURE WriteBytes* (VAR r: Rider; VAR x: ARRAY OF SYSTEM.BYTE; n: LONGINT);
+	VAR xpos, min, restInBuf, offset: LONGINT; buf: Buffer;
+	BEGIN
+		IF n > LEN(x) THEN HALT(99) END;
+		xpos := 0; buf := r.buf; offset := r.offset;
+		WHILE n > 0 DO
+			IF (r.org # buf.org) OR (offset >= bufsize) THEN
+				Set(r, buf.f, r.org + offset - r.buf.f.offset);
+				buf := r.buf; offset := r.offset
+			END;
+			restInBuf := bufsize - offset;
+			IF n > restInBuf THEN min := restInBuf ELSE min := n END;
+			SYSTEM.MOVE(SYSTEM.ADR(x) + xpos, SYSTEM.ADR(buf.data) + offset, min);
+			INC(offset, min); r.offset := offset;
+			IF offset > buf.size THEN INC(buf.f.len, offset - buf.size); buf.size := offset END;
+			INC(xpos, min); DEC(n, min); buf.chg := TRUE
+		END;
+		r.res := 0
+	END WriteBytes;
+
+	PROCEDURE ReadInt* (VAR R: Rider; VAR i: INTEGER);
+	BEGIN ReadBytes(R, i, 2) END ReadInt;
+
+	PROCEDURE ReadLInt* (VAR R: Rider; VAR i: LONGINT);
+	BEGIN ReadBytes(R, i, 4) END ReadLInt;
+
+	PROCEDURE ReadSet* (VAR R: Rider; VAR s: SET);
+	BEGIN ReadBytes(R, s, 4) END ReadSet;
+	
+	PROCEDURE ReadBool* (VAR R: Rider; VAR s: BOOLEAN);
+	VAR ch: CHAR;
+	BEGIN Read(R, ch); s := SYSTEM.VAL(BOOLEAN, ch) END ReadBool;
+
+	PROCEDURE ReadReal* (VAR R: Rider; VAR r: REAL);
+	BEGIN ReadBytes(R, r, 4) END ReadReal;
+
+	PROCEDURE ReadLReal* (VAR R: Rider; VAR r: LONGREAL);
+	BEGIN ReadBytes(R, r, 8) END ReadLReal;
+
+	PROCEDURE ReadString* (VAR R: Rider; VAR s: ARRAY OF CHAR);
+	VAR i: INTEGER; ch: CHAR;
+	BEGIN i := 0; REPEAT Read(R, ch); s[i] := ch; INC(i) UNTIL ch = 0X END ReadString;
+
+	PROCEDURE ReadNum* (VAR R: Rider; VAR i: LONGINT);
+	VAR s: SHORTINT; x: CHAR; n: LONGINT;
+	BEGIN s := 0; n := 0; Read(R, x);
+		WHILE x >= 80X DO INC(n, ASH(ORD(x) - 128, s) ); INC(s, 7); Read(R, x) END;
+		INC(n, ASH(ORD(x) MOD 64 - ORD(x) DIV 64 * 64, s) );
+		i := n
+	END ReadNum;
+
+	PROCEDURE WriteInt* (VAR R: Rider; i: INTEGER);
+	BEGIN WriteBytes(R, i, 2) END WriteInt;
+
+	PROCEDURE WriteLInt* (VAR R: Rider; i: LONGINT);
+	BEGIN WriteBytes(R, i, 4) END WriteLInt;
+
+	PROCEDURE WriteSet* (VAR R: Rider; s: SET);
+	BEGIN WriteBytes(R, s, 4) END WriteSet;
+	
+	PROCEDURE WriteBool* (VAR R: Rider; s: BOOLEAN);
+	BEGIN Write(R, SYSTEM.VAL(CHAR, s)) END WriteBool;
+
+	PROCEDURE WriteReal* (VAR R: Rider; r: REAL);
+	BEGIN WriteBytes(R, r, 4) END WriteReal;
+
+	PROCEDURE WriteLReal* (VAR R: Rider; r: LONGREAL);
+	BEGIN WriteBytes(R, r, 8);
+	END WriteLReal;
+
+	PROCEDURE WriteString* (VAR R: Rider; s: ARRAY OF CHAR);
+	VAR i: INTEGER;
+	BEGIN i := 0;
+		WHILE s[i] # 0X DO INC(i) END;
+		WriteBytes(R, s, i+1)
+	END WriteString;
+
+	PROCEDURE WriteNum* (VAR R: Rider; i: LONGINT);
+	BEGIN
+		WHILE (i < - 64) OR (i > 63) DO Write(R, CHR(i MOD 128 + 128)); i := i DIV 128 END;
+		Write(R, CHR(i MOD 128))
+	END WriteNum;
+
+	PROCEDURE Delete* (name: ARRAY OF CHAR; VAR res: INTEGER);
+	(* res = 0: File deleted
+		res = 3: name is not well formed
+		res = 4: name is too long *)
+	VAR dos, new, ceres: FileName; found: BOOLEAN; f: File; i: INTEGER; pathold, pathnew: FileDir.Path;
+	BEGIN
+		i := 0; WHILE (i < 32) & (name[i] # 0X) DO INC(i) END; 
+		IF i = 32 THEN res := 4; RETURN END;
+		COPY(name, ceres);
+		FindCurrent(ceres, dos, found, pathnew); 
+		IF ~found THEN res := 2; RETURN END;								(* File not found *)
+		f := CacheEntry(name); res := 0;
+		IF f = NIL THEN 			(* File not opened *)
+			MakeFileName(FileDir.current, dos, pathnew); DOS.Delete(pathnew); DeleteInList(ceres)
+		ELSE							(* File opened *)
+			DeleteInList(ceres);
+			RenameToTemp(f, f.workName);
+		END;
+	END Delete;
+
+	PROCEDURE Rename*(old, new: ARRAY OF CHAR; VAR res: INTEGER);
+	(* res = 0: File renamed
+		res = 1: new name already exists and is now associated with the new file
+		res = 2: old name is not in directory
+		res = 3: name is not well formed
+		res = 4: name is too long *)
+	VAR f, g: File; ceresold, ceresnew, dosold, dosnew: FileName; 
+			foundold, foundnew: BOOLEAN; i, handle: LONGINT;
+			pathnew, pathold: FileDir.Path;
+			tag: ARRAY 3 OF CHAR;
+	BEGIN res := 0;
+		i := 0; WHILE (i < 32) & (old[i] # 0X) DO INC(i) END; IF i = 32 THEN res := 4; RETURN END;
+		i := 0; WHILE (i < 32) & (new[i] # 0X) DO INC(i) END; IF i = 32 THEN res := 4; RETURN END;
+		IF new # old THEN 
+			COPY(new, ceresnew); COPY(old, ceresold);
+			FindCurrent(ceresold, dosold, foundold, pathold); IF ~foundold THEN res := 2; RETURN END;				(* File not found *)
+			FindCurrent(ceresnew, dosnew, foundnew, pathnew); 
+				f := CacheEntry(old); g := CacheEntry(new);
+			IF f # NIL THEN DOS.GetTag(tag, f.fd) 	(* Check for DOS-Files *)
+			ELSE 
+				MakeFileName(FileDir.current, dosold, pathold); 
+				DOS.Open(pathold, FALSE, handle, DOS.ReadWriteDenyAll);
+				DOS.GetTag(tag, handle);
+				DOS.Close(handle)
+			END;
+			IF tag # DOS.tag THEN res := 2; RETURN END;
+			DeleteInList(ceresold); DeleteInList(ceresnew);
+			IF g # NIL THEN RenameToTemp(g, g.workName)
+			ELSE MakeFileName(FileDir.current, dosnew, pathnew); DOS.Delete(pathnew) END;
+			MakeDosName(ceresnew, dosnew);
+			IF f = NIL THEN 													(* File closed *)
+				InsertInList(ceresnew, dosnew, FileDir.current);
+				(* MakeFileName(FileDir.current, dosold, pathold); *) 
+				MakeFileName(FileDir.current, dosnew, pathnew);
+				DOS.Rename(pathold, pathnew);
+				DOS.Open(pathnew, FALSE, handle, DOS.ReadWriteDenyAll);
+				DOS.SetID(ceresnew, handle);
+				DOS.Close(handle);
+			ELSE	
+				(* File opened *)
+				MakeFileName(FileDir.current, f.workName, pathold); 
+				ChkDir(f.workName);
+				f.OrigName := ceresnew; InsertInList(ceresnew, f.workName, FileDir.current); f.path := FileDir.current;
+				DOS.SetID(ceresnew, f.fd); 
+				Close(f); 
+				DOS.Close(f.fd); cache[f.fd] := 0;
+				MakeFileName(FileDir.current, f.workName, pathnew); 
+				IF pathnew # pathold THEN DOS.Rename(pathold, pathnew) END;
+				DOS.Open(pathnew, FALSE, f.fd, DOS.ReadWriteDenyAll);
+				cache[f.fd] := SYSTEM.VAL(LONGINT, f);
+				f.pos := f.offset; f.swapper := -1;
+			END;
+		END;
+	END Rename;
+
+	PROCEDURE DeleteTempFiles*;
+	VAR entry: FileName; end: BOOLEAN; f: File; i: LONGINT; path: FileDir.Path;
+	BEGIN
+		entry := "1.*";
+		MakeFileName(FileDir.current, entry, path); DOS.GetFirstFile(path);
+		i := 0; WHILE (i < 13) & (path[i] # 0X) DO entry[i] := path[i]; INC(i) END; entry[i] := 0X;
+		IF DOS.Done THEN 
+			REPEAT 
+				f := CacheEntry(entry); 
+				IF f # NIL THEN Close(f); DOS.Close(f.fd); cache[f.fd] := 0 END;
+				MakeFileName(FileDir.current, entry, path); DOS.Delete(path); 
+				DOS.GetNextFile(entry, end)
+			UNTIL end
+		END
+	END DeleteTempFiles;
+	
+	PROCEDURE NewDOS* (name: FileDir.Path): File;
+	VAR f: File; path: FileDir.Path; fname: FileDir.FileName;
+	BEGIN 
+		CheckName(name);
+		GetPath(name, path, fname);
+		NEW(f); f.workName := ""; 
+		COPY(fname, f.OrigName); 
+		COPY(name,f.registerName);
+		f.len := dosoffset; f.offset := dosoffset;
+		f.fd := noDesc; f.state := create;
+		f.pos := f.offset; f.swapper := -1;
+		f.path := path; f.dospath := TRUE;
+		RETURN f
+	END NewDOS;
+	
+	PROCEDURE^ Register* (f: File);
+	
+	PROCEDURE WriteFileNames(Main: BOOLEAN);
+	VAR N: File; R: Rider; base: FileDir.NodePtr; i: INTEGER; path: FileDir.Path;
+	BEGIN
+(*		DeleteTempFiles;*)
+		IF Main THEN MakeFileName(FileDir.main, "FILENAME.TEX", path); N := NewDOS(path) 
+		ELSE N := New("FILENAME.TEX"); N.offset := dosoffset; END; (* hack to make dos file *)
+		Set (R, N, 0); base := FileDir.First.next;
+		IF ~ Main THEN
+			WHILE base # FileDir.First DO
+				IF (base.path = FileDir.current) & (base.Ceres[0] # 0X) THEN 
+					i := 0; 
+					REPEAT Write(R, base.Ceres[i]); INC(i) UNTIL (base.Ceres[i-1] = 0X) OR (i = 31); 
+					REPEAT Write(R, 0X); INC(i) UNTIL i = 32;
+					i := 0; 
+					REPEAT Write(R, base.Dos[i]); INC(i) UNTIL (base.Dos[i-1] = 0X) OR (i = 12); 
+					REPEAT Write(R, 0X); INC(i) UNTIL i = 13;
+					Write(R, 0DX);
+				END;
+				base := base.next
+			END;
+		ELSE
+			WHILE base # FileDir.First DO
+				IF (base.path = FileDir.main) & (base.Ceres[0] # 0X) THEN 
+					i := 0; 
+					REPEAT Write(R, base.Ceres[i]); INC(i) UNTIL (base.Ceres[i-1] = 0X) OR (i = 31); 
+					REPEAT Write(R, 0X); INC(i) UNTIL i = 32;
+					i := 0; 
+					REPEAT Write(R, base.Dos[i]); INC(i) UNTIL (base.Dos[i-1] = 0X) OR (i = 12); 
+					REPEAT Write(R, 0X); INC(i) UNTIL i = 13;
+					Write(R, 0DX);
+				END;
+				base := base.next
+			END;
+		END;
+		Register(N); 
+	END WriteFileNames;
+	
+	PROCEDURE Register* (f: File);
+	VAR found: BOOLEAN; pathnew, pathold: FileDir.Path; g: File;
+	BEGIN
+		IF (f.state = create) & (f.registerName # "") THEN f.state := close (* shortcut renaming *) END;
+		Close(f);
+		IF f.dospath THEN DOS.Close(f.fd); cache[f.fd] := 0;
+		ELSE
+			IF (f.registerName # "") THEN
+				IF f.offset # dosoffset THEN DOS.SetID(f.OrigName, f.fd) END;		(* << KR *)
+				DOS.Close(f.fd); cache[f.fd] := 0;
+				f.pos := f.offset; f.swapper := -1;
+				Find(f.OrigName, f.registerName, found, f.dospath);
+				IF ~found THEN MakeDosName(f.OrigName, f.registerName) 
+				ELSE g := CacheEntry(f.OrigName); 
+					IF g # NIL THEN RenameToTemp(g, g.registerName)
+					ELSE MakeFileName(FileDir.current, f.registerName, pathnew); DOS.Delete(pathnew) END; 
+				END;
+				ChangeDosName(f.OrigName, f.registerName, found);  (* KR *)
+				IF ~found  THEN InsertInList(f.OrigName, f.registerName, FileDir.current) END;
+				MakeFileName(FileDir.current, f.registerName, pathnew); MakeFileName(FileDir.current, f.workName, pathold); 
+				DOS.Rename(pathold, pathnew);
+				DOS.Open(pathnew, FALSE, f.fd, DOS.ReadWriteDenyAll); 
+				cache[f.fd] := SYSTEM.VAL(LONGINT, f);	
+				(*all f.buf[i] = NIL*)
+				COPY(f.registerName, f.workName);
+			END;
+		END;
+		IF (f.path = FileDir.main) & (FileDir.main # FileDir.current) THEN InsertInList(f.OrigName, f.registerName, FileDir.main); WriteFileNames(MAIN)
+		END	(* Update filetable *)
+	END Register;
+	
+	PROCEDURE *Cleanup;
+	VAR idx, f: LONGINT; file: File; path: FileDir.Path;
+	BEGIN idx := 0; 
+		WHILE idx < cacheSize DO
+			f := cache[idx];
+			IF (f # 0) & ~SYSTEM.BIT(f-4, 0) THEN (* unmarked *)
+				file := SYSTEM.VAL(File, f); 
+				Close(file); DOS.Close(idx); cache[idx] := 0;
+				IF (file.workName[0] = "1") THEN 
+					MakeFileName(FileDir.current, file.workName, path);
+					DOS.Delete(path) 
+				END	(* Delete temporary files *)
+			END;
+			INC(idx)
+		END;
+	END Cleanup;
+	
+	PROCEDURE FileNamesOk() : BOOLEAN;
+	TYPE  NodePtr = POINTER TO Node; 
+			Node = RECORD Ceres, Dos : FileName; next : NodePtr; ok : BOOLEAN END;
+	VAR N: File; R: Rider;  ch : CHAR; ok,end : BOOLEAN; i: INTEGER;
+			new, first, help: NodePtr; temp : FileName; path: FileDir.Path;
+	BEGIN  
+		temp := "FILENAME.TEX"; 
+		MakeFileName(FileDir.current, temp, path);
+		DOS.GetFirstFile(path);
+		IF ~DOS.Done THEN RETURN FALSE END;
+		InsertInList(temp, temp, FileDir.current); 
+		N := Old("FILENAME.TEX");
+		IF N # NIL THEN 
+			Set (R, N, 0);  ok := TRUE; first := NIL;
+			WHILE ~R.eof DO NEW(new); 
+				ReadBytes(R, new.Ceres, 32); ReadBytes(R, new.Dos, 13); Read(R, ch);
+				IF new.Ceres[0] # 0X THEN new.next := first; first := new END;
+			END;
+			temp := "*.*";
+			MakeFileName(FileDir.current, temp, path);
+			DOS.GetFirstFile(path);
+			i := 0; WHILE (i < 13) & (path[i] # 0X) DO temp[i] := path[i]; INC(i) END; temp[i] := 0X;
+			REPEAT
+				help := first;
+				LOOP
+					IF help = NIL THEN EXIT END;
+					IF help.Dos = temp THEN help.ok := TRUE; EXIT END;
+					help := help.next;
+				END;
+				IF help = NIL THEN 
+					IF (temp # "FILENAME.TEX") & ~((temp[0] = "1") & (temp[1] = ".")) THEN
+						IF Output THEN DOS.WriteString("New File(s): "); DOS.WriteString(temp); DOS.WriteLn END;
+						RETURN FALSE
+					END
+				END;
+				DOS.GetNextFile(temp, end); 
+			UNTIL end;
+			help := first;
+			WHILE help # NIL DO
+				IF ~help.ok THEN
+					IF Output THEN DOS.WriteString("File(s) deleted"); DOS.WriteLn END;
+					RETURN FALSE;
+				END;
+				help := help.next
+			END;
+		ELSE RETURN FALSE END;
+		help := first;
+		WHILE help # NIL DO
+			InsertInList(help.Ceres, help.Dos, FileDir.current);
+			help := help.next
+		END;
+		RETURN TRUE;
+	END FileNamesOk;
+	
+	PROCEDURE ReadNames(Main: BOOLEAN);
+	VAR i: INTEGER; path: FileDir.Path; end: BOOLEAN; 
+			ceres, dos: FileName; tag: ARRAY 4 OF CHAR; handle: LONGINT;
+	BEGIN
+		IF ~ FileNamesOk() THEN 
+			IF Output THEN DOS.WriteString("Checking Files ") END;
+			i := 0;	
+			(* Initialisation of the translationtable *)
+			dos := "*.*";
+			MakeFileName(FileDir.current, dos, path);
+			DOS.GetFirstFile(path);
+			i := 0; WHILE (i < 13) & (path[i] # 0X) DO dos[i] := path[i]; INC(i) END; dos[i] := 0X;
+			REPEAT
+				MakeFileName(FileDir.current, dos, path); 
+				DOS.Open(path, FALSE, handle, DOS.ReadWriteDenyAll);
+				IF DOS.Done THEN 
+					DOS.GetTag(tag, handle);
+					IF tag = DOS.tag THEN DOS.GetID(ceres, handle) ELSE ceres := dos END;
+					DOS.Close(handle);
+					IF ~Main THEN InsertInList(ceres, dos, FileDir.current) ELSE InsertInList(ceres, dos, FileDir.main) END;
+				END;
+				DOS.GetNextFile(dos, end);
+				INC(i);
+				IF Output THEN IF i MOD 40 = 0 THEN DOS.WriteChar(".") END END;
+			UNTIL end;
+		END;
+		IF Output THEN DOS.WriteLn END;
+	END ReadNames;
+
+	PROCEDURE Init;
+	VAR i: LONGINT; res : INTEGER;
+	BEGIN
+		i := 0; WHILE i < cacheSize DO cache[i] := 0; INC(i) END;
+		DOS.SetFileCount(cacheSize-1);
+		IF ~DOS.Done THEN
+			DOS.WriteString("not enough File Handles (Check Config.Sys)"); DOS.WriteLn;
+			DOS.Quit
+		END;
+		Kernel.InstallgcNotifier(Cleanup);
+		Output := TRUE; ReadNames(MAIN); Output := FALSE;
+		Kernel.TableRoot := SYSTEM.ADR(FileDir.First);
+		Delete("FILENAME.TEX", res);
+	END Init;
+	
+	PROCEDURE RemoveDOSFiles*;
+	VAR entry: FileName; end: BOOLEAN; tag: ARRAY 4 OF CHAR; handle, i: LONGINT; path: FileDir.Path;
+	BEGIN
+		entry := "*.*";
+		MakeFileName(FileDir.current, entry, path); DOS.GetFirstFile(path);
+		i := 0; WHILE (i < 13) & (path[i] # 0X) DO entry[i] := path[i]; INC(i) END; entry[i] := 0X;
+		REPEAT
+			IF (entry # "O.BAT") & (entry # "OBERON.COM") & (entry # "START.COM") & (entry # "NEW.COM") THEN 
+				MakeFileName(FileDir.current, entry, path); DOS.Open(path, FALSE, handle, DOS.ReadWriteDenyAll);
+				DOS.GetTag(tag, handle);
+				DOS.Close(handle);
+				IF tag # DOS.tag (* << KR *) THEN DOS.Delete(path) END; 
+			END;
+			DOS.GetNextFile(entry, end);
+		UNTIL end;
+	END RemoveDOSFiles;
+
+	PROCEDURE *TermProc;
+	VAR idx: INTEGER;
+	BEGIN 
+(*		DeleteTempFiles;*)
+		WriteFileNames(CURRENT); 
+		idx := 0;
+		WHILE idx < cacheSize DO
+			IF (cache[idx] # 0) THEN Close(SYSTEM.VAL(File, cache[idx])); DOS.Close(idx) END;
+			INC(idx)
+		END;
+		DeleteTempFiles;
+	END TermProc;
+	
+	PROCEDURE GetEnvVar;
+	VAR i: INTEGER;
+	BEGIN
+		DOS.GetDrive(drv);
+		IF (FileDir.main[0] # 0X) & (FileDir.main[1] = ":") THEN drv[0] := CAP(FileDir.main[0]) END;
+		DOS.GetDir(drv, FileDir.current); 
+		i := 0; 
+		WHILE FileDir.current[i] # 0X DO INC(i) END;
+		WHILE i >= 0 DO FileDir.current[i+3] := FileDir.current[i]; DEC(i) END;
+		FileDir.current[0] := drv[0]; FileDir.current[1] := drv[1]; FileDir.current[2] := drv[2];
+		FileDir.main := FileDir.current;
+	END GetEnvVar;
+	
+	PROCEDURE DelFileText;
+	VAR base: FileDir.NodePtr; f: File;
+	BEGIN
+		base := FileDir.First; 
+		WHILE (base.next # FileDir.First) DO
+			IF (base.next.path = FileDir.current) & (FileDir.current # FileDir.main) THEN 
+				f := CacheEntry(base.next.Ceres);
+				IF (f # NIL) & (f.OrigName = "FILENAME.TEX") THEN Close(f); DOS.Close(f.fd); cache[f.fd] := 0 END;
+				base.next := base.next.next
+			ELSE base := base.next END;
+		END
+	END DelFileText;
+	
+	PROCEDURE ChangeDir*(new: ARRAY OF CHAR);
+	VAR res: INTEGER; i: INTEGER; help: ARRAY 32 OF CHAR; temp: FileDir.Path;
+	BEGIN
+		DOS.ChangeDir(new);
+		IF ~DOS.Done THEN RETURN END;
+		IF new[1] = ":" THEN drv[0] := CAP(new[0]) END;
+		DOS.GetDir(drv, temp);
+		i := 0; 
+		WHILE temp[i] # 0X DO INC(i) END;
+		WHILE i >= 0 DO temp[i+3] := temp[i]; DEC(i) END;
+		temp[0] := drv[0]; temp[1] := drv[1]; temp[2] := drv[2];
+		IF temp # FileDir.current THEN
+			DOS.ChangeDir(FileDir.current);
+			WriteFileNames(CURRENT);
+			DelFileText;
+			DOS.ChangeDir(temp);
+			FileDir.current := temp;
+			IF FileDir.current # FileDir.main THEN ReadNames(CURRENT) END;
+			Delete("FILENAME.TEX",res)
+		END;
+		DOS.Done := TRUE;
+	END ChangeDir;
+	
+BEGIN 
+	drv := "C:\"; count := 0; 
+	GetEnvVar; 
+	DeleteTempFiles; 
+	Init; 
+	DOS.AllocTermProc(TermProc);  
+END Files.

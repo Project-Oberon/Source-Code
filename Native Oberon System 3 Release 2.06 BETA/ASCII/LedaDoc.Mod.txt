@@ -1,0 +1,1077 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaDoc;	(* uh, Thu, 21-Oct-1993 *)
+	
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaBox, LedaIO, LedaRules;
+	
+CONST
+	ModName = "LedaDoc";
+	PageName = "LedaPage";
+	LetterName = "LedaLetter";
+	Document = "document";
+	NotImpl = "not implemented";	ProgErr = "program error";
+	
+	(*--- type area defaults ---*)
+	TARefW = 210;	TALeft = 25;	TARight = 20;
+	TARefH = 296;	TATop = 26;	TABot = 31;	
+	TAMinTop = 4;	TAMinBot = 4;	TAMinLeft = 13;	TAMinRight = 4;	(* minimal values*)
+	TAMinW = TARefW DIV 4;	TAMinH = TARefH DIV 6;	(* minimal values *)
+		(*---
+			- the default values will be scaled to be used also for other page sizes than the default size
+			- therefore a reference width and height is needed
+		---*)
+	
+	MargWFact = 50;	MargHFact = 120;	(* margin for page arrangement -> size DIV ConstFact *)
+	MarginalDiv = 4;	(* defines marginal indentation as fractional part of the type area width *)
+	MinRaster = 3;	(* minimal number of lines that form a raster field *)
+	
+	ObjTag = 0EEX;	EndTag = 0EFX;	(* tags for storing/loading *)
+	Version = 0A1X;	(* current version; previous versions: 0A0X *)
+	
+	(*--- change flags [used in SetDocAttr and ValidateDoc] ---*)
+	TAChng = 0;	HdgChng = 1;	FtrChng = 2;	FlowChng = 3;	SizeChng = 4;
+	PNbrChng = 5;	FrmtChng = 6;	OvlChng = 7;
+
+	(*--- dialog ---*)
+	Stat = TRUE;	Dyn = FALSE;
+	Normal = "normal";	Wide = "wide";	Dense = "dense";
+	Left = "left";	Adjust = "adjust";	Marginal = "marginal";
+	Right = "right";	Top = "top";	Bot = "bottom";
+	Third = "third";	Quarter = "quarter";	Fifth = "fifth";
+	Steady = "steady";	Alternate = "alternate";
+	
+	Black = -1;
+	ColBorder = -13;	(* color of page border; not drawn on black and white screen *)
+	ModeRepl = LedaIO.Replace;	ModeInv = LedaIO.Invert;
+	
+TYPE
+	Location* = POINTER TO LocationDsc;
+	LocationDsc = RECORD
+		X*, Y*: LONGINT
+	END;
+	TypeArea* = RECORD
+		top*, bot*: LONGINT;		(* top and bottom margin *)
+		left*, right*: LONGINT;	(* left and right margin *)
+		arr*: CHAR						(* arrangment: [s]teady, [a]lternate *)
+	END;
+	RefLoc* = RECORD
+		topY*, topH*: LONGINT;		(* lettering on top [heading] *)
+		botY*, botH*: LONGINT;		(* lettering on bottom [footer] *)
+	END;
+	Raster* = RECORD
+		fields*: INTEGER;	(* height of raster [number of fields] *)
+		set*: CHAR	(* setting of raster ["d"efault, "o"wn, "3".."5"] *)
+	END;
+	Box* = POINTER TO BoxDsc;
+	BoxDsc* = RECORD
+		(LedaBase.BoxDsc)
+		pageW*, pageH*: LONGINT;	(* page size *)
+		ta*: TypeArea;	(* type area *)
+		format*: LedaBase.FormBase;	(* basic formatting *)
+		raster*: Raster;	(* height of raster *)
+		styles*: LedaCtrl.List;	(* basic text styles [character, format, tabs] *)
+		refs*: RefLoc;	(* location of page letterings *)
+		number*: INTEGER;	(* first page number *)
+		dscW*, dscH*: LONGINT;	(* size of descenders *)
+		selLoc*: Location;	(* selection point *)
+	END;
+	
+	(*--- 
+		- the formatting is controlled by the fields format, raster and styles;
+			- format, styles: for the standard text flow
+			- format, raster: controls the overlay of the standard text flow [raster fields]
+		- remarks on raster fields:
+			- width: given by number of columns and basic type area width format.data.width
+			- height: given as number of lines calculated in procedure SetRasterHeight
+	---*)
+	
+	Longint2 = ARRAY 2 OF LONGINT;
+	
+	
+VAR
+	updPage: LedaBase.Box;	(* used in AppendPage and DisplayUpdate *)
+	updDX, updDY: LONGINT;	(* used in AppendPage and DisplayUpdate *)
+	(*--- box type control ---*)
+	typeDoOp: LedaBase.CtrlProc;
+	
+	(*--- remarks:
+		_ the upper left corner of the document box has
+			coordinates 0, 0  ->  dB.X = 0 and dB.Y = 0
+	---*)
+
+	PROCEDURE NewLn(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR);
+	BEGIN
+		a.typ := LedaBox.NewLn; a.stat := TRUE; a.i := 0;
+		IF s # "" THEN COPY(s, a.s) ELSE a.s := "" END
+	END NewLn;
+	
+	PROCEDURE StrAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Str; COPY(s, a.s); a.stat := stat; a.i := 0;
+	END StrAt;
+	
+	PROCEDURE IntAt(VAR a: LedaBox.ParaDsc; i: LONGINT; stat: BOOLEAN);
+	BEGIN
+		a.typ := LedaBox.Int; a.i := i; a.stat := stat; a.s := ""
+	END IntAt;
+	
+	PROCEDURE EnumAt(VAR a: LedaBox.ParaDsc; s: ARRAY OF CHAR; i: LONGINT);
+	BEGIN
+		a.typ := LedaBox.Enum; COPY(s, a.s); a.i := i
+	END EnumAt;
+	
+	PROCEDURE Scale(value, num, denum: LONGINT): LONGINT;
+		CONST Scale = 360;
+	BEGIN
+		value := value DIV Scale; value := (value * num) DIV denum; 
+		RETURN value * Scale
+	END Scale;
+
+	PROCEDURE SeqBroadcast(seq: LedaCtrl.Sequence; VAR M: LedaBase.Msg);
+		VAR ctrl: LedaBase.Control;
+	BEGIN
+		WHILE seq # NIL DO
+			ctrl := seq.ctrl; seq := seq.next;
+			IF LedaBase.Unstamped(ctrl.stamp) THEN ctrl.doOp(ctrl, M) END
+		END
+	END SeqBroadcast;
+
+	PROCEDURE GetDefWidth(taW: LONGINT; cols: CHAR; VAR colW, margW: LONGINT);
+	BEGIN
+		margW := taW DIV MarginalDiv;	(* default marginal indentation *)
+		IF cols = "m" THEN colW := taW - margW
+		ELSE colW := taW DIV (ORD(cols) - ORD("0"))
+		END
+	END GetDefWidth;
+
+	PROCEDURE NewDocFormat(taW: LONGINT; cols, adj: CHAR;
+														 VAR fName: LedaSys.Name; VAR seq: LedaCtrl.Sequence): LedaBase.FormBase;
+	(* returns new document format and the basic text styles *)
+	(* seq: basic text styles [character, format, tabs] *)
+		VAR fB: LedaBase.FormBase;	colW, margW: LONGINT;
+	BEGIN	(* values of parameters are valid *)	
+		margW := taW DIV MarginalDiv;	(* default marginal indentation *)
+		fB := LedaBase.NewFormBase(NIL);	(* default format base *)
+		GetDefWidth(taW, cols, colW, margW);
+		fB.data.width := taW; fB.data.sW := "o";
+		fB.data.lsp := LedaRules.LineSpace(colW); fB.data.sLsp := "n";
+		IF cols = "m" THEN fB.data.colDX := margW; fB.data.sDX := "n"
+		ELSE fB.data.colDX := LONG(LedaBase.MM DIV 2) * LedaRules.FontSize(colW); fB.data.sDX := "n"
+		END;
+		fB.data.adj := adj; fB.data.sAdj := adj;
+		fB.data.cols := cols; fB.data.sCols := cols;
+		seq := LedaRules.DefStyleSeq(fName, colW, margW);
+		RETURN fB
+	END NewDocFormat;
+
+	PROCEDURE SetRasterHeight(set: CHAR; pageH: LONGINT; VAR bd: LedaBase.BaseData; VAR fields: INTEGER);
+	(* set the raster field height fields according setting set: "d"efault / "3".."5": fractional part *)
+		VAR colW, H, lsp2: LONGINT;	max: INTEGER;
+	BEGIN
+		IF bd.cols = "m" THEN colW := bd.width - (bd.width DIV MarginalDiv)	(* subtract default marginal indentation *)
+		ELSE colW := bd.width DIV (ORD(bd.cols) - ORD("0"))
+		END;
+		lsp2 := bd.lsp DIV 2;
+		IF set = "d" THEN
+			colW := (colW * 2) DIV 3; fields := SHORT((colW+lsp2) DIV bd.lsp)
+		ELSIF LedaSys.EqualCh("345", set) THEN
+			H := pageH DIV (ORD(set) - ORD("0")); fields := SHORT((H+lsp2) DIV bd.lsp)
+		END;
+		H := pageH DIV 3; max := SHORT((H+lsp2) DIV bd.lsp);
+		IF fields < MinRaster THEN fields := MinRaster
+		ELSIF fields > max THEN fields := max
+		END
+	END SetRasterHeight;
+	
+	PROCEDURE ArrangeLayout(VAR ta: TypeArea; pageH, lsp: LONGINT;
+										VAR taBot: LONGINT; VAR refs: RefLoc);
+	(* arranges the basic page layout [type area, heading and footer] according pageH, lsp and ta  *)
+	(* the height of the type area and the references is a mulitple of the basic line space *)
+	(* returns the adjusted bottom margin of the type area in taBot *)
+	(* and the lettering location in refs *)
+		VAR n: LONGINT;
+	BEGIN
+		(*- type area height -*)
+		n := pageH - ta.top - ta.bot + (lsp DIV 3);	(* 1/3 lsp to round *)
+		n := n DIV lsp; IF n = 0 THEN INC(n) END;
+		taBot := pageH - ta.top - n * lsp;
+		(*- bottom reference -*)
+		refs.botY := ta.top + n * lsp; refs.botH := 0;
+		n := (pageH - refs.botY - Scale(pageH, TAMinBot, TARefH)) DIV lsp;
+		IF n > 0 THEN refs.botH := n * lsp - LedaSys.scnUnit END;
+		(*- top reference -*)
+		refs.topY := ta.top; refs.topH := 0;
+		n := (refs.topY - Scale(pageH, TAMinTop, TARefH)) DIV lsp;
+		IF n > 0 THEN
+			DEC(refs.topY, n * lsp); refs.topH := n * lsp - LedaSys.scnUnit
+		END
+	END ArrangeLayout;
+	
+	PROCEDURE AllocateDoc(VAR dB: Box; bT: LedaBase.BoxType; fName: LedaSys.Name; cols: INTEGER; adj: CHAR);
+		VAR taW: LONGINT;	seq: LedaCtrl.Sequence;	col: CHAR;
+	BEGIN
+		NEW(dB); LedaBox.Init(dB); dB.do := bT;
+		dB.pageW := LedaBase.WA4; dB.pageH := LedaBase.HA4;	(* default page size *)
+		dB.ta.left := Scale(dB.pageW, TALeft, TARefW);
+		dB.ta.right := Scale(dB.pageW, TARight, TARefW);
+		dB.ta.top := Scale(dB.pageH, TATop, TARefH);
+		dB.ta.bot := Scale(dB.pageH, TABot, TARefH);	(* fine adjust to line space *)
+		dB.ta.arr := "s";
+		taW := dB.pageW- dB.ta.left - dB.ta.right;	(* width of type area *)
+		IF cols = 0 THEN col := "m" ELSE col := CHR(ORD("0") + cols) END;
+		dB.format:= NewDocFormat(taW, col, adj, fName, seq);	(* basic document format *)
+		dB.raster.set := "d"; SetRasterHeight(dB.raster.set, dB.pageH, dB.format.data, dB.raster.fields);
+		IF seq # NIL THEN dB.styles := LedaCtrl.NewList(seq) ELSE dB.styles := NIL END;
+		ArrangeLayout(dB.ta, dB.pageH, dB.format.data.lsp, dB.ta.bot, dB.refs);
+		dB.number := 1;
+		dB.dscW := dB.pageW; dB.dscH := dB.pageH;	(* default descender size *)
+		dB.selLoc := NIL
+	END AllocateDoc;
+	
+	PROCEDURE GetPageNbr(dB: Box; VAR m: LedaBox.Msg);
+		VAR page: LedaBase.Box;	nbr: INTEGER;
+	BEGIN
+		page := dB.dsc; nbr := dB.number;
+		WHILE (page # NIL) & (page # m.caller) DO INC(nbr); page := page.next END;
+		m.id := LedaBox.DoneId; m.l1 := nbr
+	END GetPageNbr;
+	
+	PROCEDURE ArrangePages(dB: Box);
+		VAR box: LedaBase.Box;	mrgnW, mrgnH: LONGINT;
+	BEGIN
+		dB.dscW := dB.pageW; dB.dscH := dB.pageH;
+		mrgnW := dB.pageW DIV MargWFact;
+		mrgnH := dB.pageH DIV MargHFact;
+		dB.W := dB.pageW + 2 * mrgnW;
+		box := dB.dsc; dB.H := mrgnH;
+		WHILE box # NIL DO
+			box.X := mrgnW; box.Y := dB.H;
+			INC(dB.H, box.H); INC(dB.H, mrgnH); box := box.next
+		END;
+	END ArrangePages;
+
+	PROCEDURE SetBoxSize(dB: Box; box: LedaBase.Box; W, H: LONGINT);
+		VAR res: INTEGER;
+	BEGIN
+		IF (box.W # W) OR (box.H # H) THEN
+			IF (box.W # 0) OR (box.H # 0) THEN		(* set size, no drawing *)
+				box.do(LedaBase.BoxHandler).size(box, W, H, dB, FALSE, res)
+			END;
+			box.W := W; box.H := H
+		END
+	END SetBoxSize;
+	
+	PROCEDURE GetLettering(page: LedaBase.Box; VAR hdg, ftr: LedaBase.Box);
+		VAR m: LedaBox.PageMsg;
+	BEGIN
+		hdg := NIL; ftr := NIL;
+		IF page # NIL THEN
+			m.id := LedaBox.PgLettering; m.op := 1; m.typ := LedaBox.PgHeading; m.box := NIL;	(* get page heading *)
+			page.do.handle(page, m); hdg := m.box;
+			m.id := LedaBox.PgLettering; m.op := 1; m.typ := LedaBox.PgFooter; m.box := NIL;	(* get page footer *)
+			page.do.handle(page, m); ftr := m.box
+		END
+	END GetLettering;
+	
+	PROCEDURE NewLettering(dB: Box; ltrTyp: INTEGER; lT: LedaBase.BoxHandler; 
+													page, ltr: LedaBase.Box; X, Y, W, H: LONGINT);
+	(* set lettering on page page; ltr: model [to be copied]; lT: box handler to create new lettering *)
+		VAR m: LedaBox.PageMsg;
+	BEGIN
+		m.avail := H > 0;
+		IF H = 0 THEN H := dB.format.data.lsp END;
+		dB.dscW := W; dB.dscH := H;
+		IF ltr = NIL THEN m.box := lT.new(lT, dB, NIL)	(* new lettering *)
+		ELSE m.box := ltr.do(LedaBase.BoxHandler).new(ltr.do, dB, ltr)	(* copy lettering *)
+		END;
+		dB.dscW := dB.pageW; dB.dscH := dB.pageH;
+		IF m.box # NIL THEN
+			m.box.X := X; m.box.Y := Y; SetBoxSize(dB, m.box, W, H);
+			m.id := LedaBox.PgLettering; m.op := 2; m.typ := ltrTyp; m.X := X; m.Y := Y; m.W := W; m.H := H;
+			page.do.handle(page, m)
+		END
+	END NewLettering;
+	
+	PROCEDURE AdjustLettering(dB: Box; ltrTyp: INTEGER; ltr: LedaBase.Box; all: BOOLEAN);
+	(* adjusts the lettering of type ltrTyp according reference ltr and all [all or successor(s)] *)
+		VAR m: LedaBox.PageMsg;	page: LedaBase.Box;	p: INTEGER;	s: SET;
+	BEGIN
+		p := 1; page := dB.dsc;
+		WHILE page # ltr.anc DO p := 1 - p; page := page.next END;
+		IF page # NIL THEN
+			IF dB.ta.arr = "a" THEN s := {p} ELSE s := {0, 1} END;
+			IF all THEN p := 1; page := dB.dsc ELSE p := 1 - p; page := page.next END;
+			m.id := LedaBox.PgLettering; m.op := 3; m.typ := ltrTyp; m.box := ltr;
+			WHILE page # NIL DO
+				IF p IN s THEN page.do.handle(page, m) END;
+				p := 1 - p; page := page.next
+			END
+		END
+	END AdjustLettering;
+	
+	PROCEDURE InvalidateLettering(page: LedaBase.Box);
+		VAR m: LedaBox.PageMsg;
+	BEGIN
+		m.id := LedaBox.PgLettering; m.op := 5;
+		m.typ := LedaBox.PgHeading; page.do.handle(page, m);
+		m.id := LedaBox.PgLettering; m.op := 5;
+		m.typ := LedaBox.PgFooter; page.do.handle(page, m)
+	END InvalidateLettering;
+	
+	PROCEDURE ValidateLettering(page: LedaBase.Box; hdg, ftr: LedaBase.Box; hdgAvail, ftrAvail: BOOLEAN);
+		VAR m: LedaBox.PageMsg;
+	BEGIN
+		IF hdg # NIL THEN	(* set heading [validate] *)
+			m.avail := hdgAvail;
+			m.id := LedaBox.PgLettering; m.op := 2; m.typ := LedaBox.PgHeading;
+			m.box := hdg; m.X := hdg.X; m.Y := hdg.Y; m.W := hdg.W; m.H := hdg.H;
+			page.do.handle(page, m)
+		END;
+		IF ftr # NIL THEN	(* set footer [validate] *)
+			m.avail := ftrAvail;
+			m.id := LedaBox.PgLettering; m.op := 2; m.typ := LedaBox.PgFooter;
+			m.box := ftr; m.X := ftr.X; m.Y := ftr.Y; m.W := ftr.W; m.H := ftr.H;
+			page.do.handle(page, m)
+		END
+	END ValidateLettering;
+	
+	PROCEDURE MoveTypeArea(dB: Box; page: LedaBase.Box; X, dX: LONGINT);
+		VAR m: LedaBox.PageMsg;
+	BEGIN
+		IF dX # 0 THEN
+			m.id := LedaBox.PgArea;
+			m.X := X; m.dX := dX; m.Y := dB.ta.top; m.dY := 0;
+			m.W := dB.pageW - dB.ta.left - dB.ta.right; m.dW := 0;
+			m.H := dB.pageH - dB.ta.top - dB.ta.bot; m.dH := 0;
+			m.colsChng := FALSE; m.colDXChng := FALSE;
+			m.lspChng := FALSE; m.rstrChng := FALSE;
+			page.do.handle(page, m)
+		END
+	END MoveTypeArea;
+	
+	PROCEDURE PutIn(dB: Box; new: LedaBase.Box);
+	(* puts in box(es) new as descender of dB according ref [data structure] *)
+		VAR page, newPg, ltr: LedaBase.Box;	lT: LedaBase.BoxHandler;
+			W: LONGINT;	p: INTEGER;	kind: SHORTINT;
+			pg, hdg, ftr: ARRAY 2 OF LedaBase.Box;	X: Longint2;
+	BEGIN	(* 0 = left page / 1 = right page *)
+		page := dB.dsc;
+		IF page = NIL THEN
+			p := 0; page := dB; kind := LedaBox.LastDsc;
+			hdg[0] := NIL; hdg[1] := NIL; ftr[0] := NIL; ftr[1] := NIL;
+			ltr := LedaBox.New(LetterName, "", dB); lT := ltr.do(LedaBase.BoxHandler)
+		ELSE 
+			kind := LedaBox.After;
+			p := 1; pg[0] := NIL; pg[1] := page;
+			WHILE page.next # NIL DO
+				page := page.next; p := 1 - p; pg[p] := page
+			END;	(* pg: last left and right page *)
+			GetLettering(pg[p], hdg[p], ftr[p]);	(* of last page *)
+			IF dB.ta.arr = "a" THEN	(* alternate *)
+				GetLettering(pg[1 - p], hdg[1 - p], ftr[1 - p])	(* of second last page *)
+			ELSE hdg[1 - p] := hdg[p]; ftr[1 - p] := ftr[p]
+			END;
+			IF hdg[p] # NIL THEN lT := hdg[p].do(LedaBase.BoxHandler)
+			ELSIF ftr[p] # NIL THEN lT := ftr[p].do(LedaBase.BoxHandler)
+			ELSIF hdg[1 - p] # NIL THEN lT := hdg[1 - p].do(LedaBase.BoxHandler)
+			ELSIF ftr[1 - p] # NIL THEN lT := ftr[1 - p].do(LedaBase.BoxHandler)
+			ELSE ltr := LedaBox.New(LetterName, "", dB); lT := ltr.do(LedaBase.BoxHandler)
+			END
+		END;
+		X[1] := dB.ta.left;
+		IF dB.ta.arr = "a" THEN X[0] := dB.ta.right ELSE X[0] := X[1] END;
+		W := dB.pageW - dB.ta.left - dB.ta.right;
+		REPEAT
+			newPg := new; new := new.next;
+			p := 1 - p;	(* p = 0: left page / p = 1: right page *)
+			SetBoxSize(dB, newPg, dB.pageW, dB.pageH);
+			MoveTypeArea(dB, newPg, X[p], X[p] - X[1]);
+			NewLettering(dB, LedaBox.PgHeading, lT, newPg, hdg[p], X[p], dB.refs.topY, W, dB.refs.topH); 
+			NewLettering(dB, LedaBox.PgFooter, lT, newPg, ftr[p], X[p], dB.refs.botY, W, dB.refs.botH);
+			LedaBox.Insert(newPg, page, kind);
+			page := newPg; kind := LedaBox.After
+		UNTIL new = NIL;
+		ArrangePages(dB)
+	END PutIn;
+
+	PROCEDURE DrawPage(box: LedaBase.Box; dX, dY: LONGINT; P: LedaSys.Port);
+		VAR X, Y, W, H: LONGINT;
+	BEGIN
+		IF ~ (LedaSys.PrintFlag IN P.state) THEN	(* draw page border *)
+			X := box.X - dX; W := box.W + 2*dX;
+			Y := box.Y - LedaSys.scnUnit; H := box.H + 2*LedaSys.scnUnit;
+			LedaIO.out.area(P, X, box.Y-dY, W, dY+LedaSys.scnUnit, Black, ColBorder, ModeRepl);	(* top *)
+			LedaIO.out.area(P, X, Y, dX+LedaSys.scnUnit, H, Black, ColBorder, ModeRepl);	(* left *)
+			LedaIO.out.area(P, box.X+box.W, Y, dX, H, Black, ColBorder, ModeRepl);	(* right *)
+			LedaIO.out.area(P, X, box.Y+box.H, W, dY, Black, ColBorder, ModeRepl)	(* bottom *)
+		END;
+		box.do(LedaBase.BoxHandler).draw(box, box.X, box.Y, P)	(* draw page content *)
+	END DrawPage;
+
+	PROCEDURE DisplayUpdate*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port);
+	(** displays the updates on the page given by updPage [global] *)
+	BEGIN	(* dB.Y = 0 and dB.X = 0 *)
+		DrawPage(updPage, updDX, updDY, P)
+		(* updPage.do(LedaBase.BoxHandler).draw(updPage, updPage.X, updPage.Y, P) *)
+	END DisplayUpdate;
+	
+	PROCEDURE AppendPage(dB: Box; P: LedaSys.Port; new: LedaBase.Box);
+	(* appends page(s) new to document dB *)
+		VAR dY: LONGINT;
+	BEGIN
+		updPage := new;
+		updDX := dB.pageW DIV MargWFact;
+		updDY := dB.pageH DIV MargHFact; dY := updDY DIV 2;
+		PutIn(dB, new);
+		IF P # NIL THEN		(* display all pages starting with updPage *)
+			WHILE updPage # NIL DO
+				LedaIO.out.update(P, updPage.X-updDX, updPage.Y-dY,
+										  updPage.W+2*updDX, updPage.H+2*dY, DisplayUpdate, dB);
+				updPage := updPage.next
+			END
+		END
+	END AppendPage;
+	
+	PROCEDURE DeletePage(dB: Box; P: LedaSys.Port; del: LedaBase.Box);
+	(* deletes page del in document dB *)
+		VAR oldH, dY: LONGINT;	m: LedaBox.Msg;
+	BEGIN
+		updPage := del.next; oldH := dB.H;
+		updDX := dB.pageW DIV MargWFact;
+		updDY := dB.pageH DIV MargHFact; dY := updDY DIV 2;
+		LedaBox.Remove(del);
+		ArrangePages(dB);
+		IF P # NIL THEN		(* display all pages starting with page updPage *)
+			m.caller := updPage; GetPageNbr(dB, m);
+			WHILE updPage # NIL DO
+				m.id := LedaBox.PageNbrId; m.op := 2;	(* m.l1 -> new page number *)
+				updPage.do.handle(updPage, m);		(* set page  number *)
+				LedaIO.out.update(P, updPage.X-updDX, updPage.Y-dY, 
+										  updPage.W+2*updDX, updPage.H+2*dY, DisplayUpdate, dB);
+				updPage := updPage.next; INC(m.l1)
+			END;
+			LedaIO.out.erase(P, 0, dB.H-dY, dB.W, dY+oldH-dB.H)
+		END
+	END DeletePage;
+	
+	PROCEDURE AdjustToLine(dB: Box; VAR m: LedaBase.BoxMsg);
+		VAR box: LedaBase.Box;
+	BEGIN	(* dB.Y = 0 *)
+		box := dB.dsc;
+		LOOP
+			IF (box.Y <= m.l1) & (m.l1 < box.Y + box.H) THEN
+				DEC(m.l1, box.Y); DEC(m.l2, box.Y);
+				box.do.handle(box, m);
+				INC(m.l1, box.Y); INC(m.l2, box.Y); EXIT	(*###*)
+			END;
+			box := box.next;
+			IF box = NIL THEN EXIT END	(*###*)
+		END
+	END AdjustToLine;
+	
+	PROCEDURE PrintPage(dB: Box; pageNbr: INTEGER; pX, pY: LONGINT; P: LedaSys.Port; VAR stop: BOOLEAN);
+		VAR box: LedaBase.Box;	nbr: INTEGER;
+	BEGIN
+		box := dB.dsc; nbr := dB.number;
+		WHILE (box # NIL) & (nbr # pageNbr) DO INC(nbr); box := box.next END;	(* search page *)
+		IF box # NIL THEN
+			box.do(LedaBase.BoxHandler).draw(box, pX, pY, P)
+		END;
+		stop := (box = NIL) OR (box.next = NIL)
+	END PrintPage;
+	
+	PROCEDURE LocateChar(chars: ARRAY OF CHAR; ch: CHAR; def: INTEGER; VAR i: INTEGER);
+	BEGIN
+		i := 0; WHILE (chars[i] # 0X) & (ch # chars[i]) DO INC(i) END;
+		IF chars[i] = 0X THEN i := def END
+	END LocateChar;
+	
+	PROCEDURE ValidateDoc(dB: Box; VAR M: LedaBox.PageMsg; VAR bM: LedaBase.BoxMsg;
+												VAR X, dX: Longint2; chng: SET; P: LedaSys.Port);
+	(* validates the document dB by performing the changes needed according chng *)
+		VAR page, hdg, ftr: LedaBase.Box;	H: LONGINT;	pNbr, p: INTEGER;
+			m: LedaBox.PageMsg;	pM: LedaBox.Msg;	cM: LedaBase.CtrlMsg;
+	BEGIN
+		INCL(P.state, LedaSys.DrawFlag);	(* no drawing; redraw after change *)
+		IF FlowChng IN chng THEN		(* invalidate text flows *)
+			m.id := LedaBox.PgTexts; m.op := 0; LedaBox.Broadcast(dB, {}, m)
+		END;
+		IF FrmtChng IN chng THEN	(* adjust controls depending on dB.format *)
+			cM.id := LedaBase.ChangeId; cM.ctrl := dB.format;
+			LedaBase.NewStamp; LedaBase.LockStamp(1);	(* set new stamp and lock it *)
+			LedaBox.Broadcast(dB, {}, cM); LedaBase.LockStamp(-1)	(* unlock stamp *)
+		END;
+		IF SizeChng IN chng THEN
+			LedaBase.NewStamp; LedaBase.LockStamp(1);	(* set new stamp and lock it *)
+			bM.id := LedaBase.SizeId; LedaBox.Broadcast(dB, {LedaBox.BcTxt}, bM);
+			LedaBase.LockStamp(-1)	(* unlock stamp *)
+		END;
+		p := 1; page := dB.dsc; pNbr := dB.number;
+		WHILE page # NIL DO
+			InvalidateLettering(page);
+			GetLettering(page, hdg, ftr);
+			M.X := X[p]; M.dX := dX[p];	(* adjust values according page type [left/right] *)
+			IF (HdgChng IN chng) & (hdg # NIL) THEN	(* adjust heading *)
+				hdg.X := M.X; hdg.Y := dB.refs.topY;
+				H := dB.refs.topH; IF H = 0 THEN H := dB.format.data.lsp END;
+				SetBoxSize(dB, hdg, M.W, H)
+			END;
+			IF (FtrChng IN chng) & (ftr # NIL) THEN	(* adjust footer *)
+				ftr.X := M.X; ftr.Y := dB.refs.botY;
+				H := dB.refs.botH; IF H = 0 THEN H := dB.format.data.lsp END;
+				SetBoxSize(dB, ftr, M.W, H)
+			END;
+			IF PNbrChng IN chng THEN	(* set page number *)
+				pM.id := LedaBox.PageNbrId; pM.op := 2; pM.l1 := pNbr; page.do.handle(page, pM)
+			END;
+			IF (TAChng IN chng) OR (OvlChng IN chng) THEN		(* adjust type area *)
+				m := M; m.id := LedaBox.PgArea;
+				page.do.handle(page, m)
+			END;
+			ValidateLettering(page, hdg, ftr, dB.refs.topH > 0, dB.refs.botH > 0);
+			page := page.next; p := 1 - p; INC(pNbr)
+		END;
+		IF FlowChng IN chng THEN	(* validate text flows *)
+			m.id := LedaBox.PgTexts; m.op := 1; LedaBox.Broadcast(dB, {}, m)
+		END
+	END ValidateDoc;
+	
+	PROCEDURE CheckBaseData(oldCols: CHAR; VAR bd: LedaBase.BaseData);
+	(* checks the document format the line space and the column space for the given format base *)
+		VAR colW, margW: LONGINT;
+	BEGIN
+		GetDefWidth(bd.width, bd.cols, colW, margW);
+		IF ((bd.cols = "m") & (oldCols # "m")) OR ((bd.cols # "m") & (oldCols = "m")) THEN bd.sDX := "n" END;	(* marginal setting *)
+		IF (bd.cols # oldCols) & (bd.sLsp = "o") THEN bd.sLsp := "n" END;	(* adjust line spacing *)
+		IF bd.sLsp # "o" THEN
+			bd.lsp := LedaRules.LineSpace(colW);
+			IF bd.sLsp = "w" THEN INC(bd.lsp, 2*LedaSys.scnUnit)	(* extended line spacing *)
+			ELSIF bd.sLsp = "d" THEN DEC(bd.lsp, 2*LedaSys.scnUnit)	(* reduced line spacing *)
+			END
+		END;
+		IF bd.sDX = "n" THEN
+			IF bd.cols = "m" THEN bd.colDX := margW
+			ELSE bd.colDX := LONG(LedaBase.MM DIV 2) * LedaRules.FontSize(colW)
+			END
+		END;
+	END CheckBaseData;
+		
+	PROCEDURE CheckTypeArea(pageW, pageH: LONGINT; VAR ta: TypeArea);
+		VAR min: LONGINT;
+	BEGIN
+		min := Scale(pageW, TAMinLeft, TARefW); IF ta.left < min THEN ta.left := min END;
+		min := Scale(pageW, TAMinRight, TARefW); IF ta.right < min THEN ta.right := min END;
+		min := Scale(pageW, TAMinW, TARefW);	(* minimal width *)
+		IF pageW - ta.left - ta.right < min THEN
+			IF ta.left > ta.right THEN ta.left := pageW - ta.right - min
+			ELSE ta.right := pageW - ta.left - min
+			END
+		END;
+		min := Scale(pageH, TAMinTop, TARefH); IF ta.top < min THEN ta.top := min END;
+		min := Scale(pageH, TAMinBot, TARefH); IF ta.bot < min THEN ta.bot := min END;
+		min := Scale(pageH, TAMinH, TARefH);	(* minimal height *)
+		IF pageH - ta.top - ta.bot < min THEN
+			IF ta.top > ta.bot THEN ta.top := pageH - ta.bot - min
+			ELSE ta.bot := pageH - ta.top - min
+			END
+		END
+	END CheckTypeArea;
+
+	PROCEDURE SetDocAttr(dB: Box; VAR bd: LedaBase.BaseData; ta: TypeArea; raster: Raster; pNbr: INTEGER;
+											VAR X, dX: Longint2; VAR m: LedaBox.PageMsg; VAR bM: LedaBase.BoxMsg; VAR chng: SET);
+	(* sets the document attributes to the new settings given by bd, ta and pNbr *)
+	(* returns the changes to be performed in set chng and in message m [type area change] *)
+	(* and in message bM [size change (font, margin)] *)
+		VAR od: LedaBase.BaseData;	refs: RefLoc;	W, margW: LONGINT;	oRFields: INTEGER;
+	BEGIN
+		chng := {};
+		(*- text flow changes -*)
+		od := dB.format.data;
+		dB.format.data := bd; LedaBase.CheckControl(dB.format); bd := dB.format.data;
+		m.lspChng :=  bd.lsp # od.lsp;
+		m.colsChng := bd.cols # od.cols; m.colDXChng := bd.colDX # od.colDX;
+		SetRasterHeight(raster.set, dB.pageH, bd, raster.fields);
+		m.rstrChng := raster.fields # dB.raster.fields; dB.raster := raster;
+		IF m.rstrChng THEN INCL(chng, OvlChng); INCL(chng, FlowChng) END;
+		IF m.lspChng OR m.colsChng OR m.colDXChng THEN
+			INCL(chng, OvlChng); INCL(chng, FrmtChng); INCL(chng, FlowChng)
+		END;
+		IF bd.adj # od.adj THEN INCL(chng, FrmtChng); INCL(chng, FlowChng) END;
+		IF (bd.cols = "m") OR (bd.cols # od.cols) THEN INCL(chng, SizeChng);
+			bM.b := (bd.cols = "m"); bM.l2 := bd.colDX;	(* fields b, l2: change of margin setting *)
+			IF bd.cols = od.cols THEN bM.l1 := 0
+			ELSE
+				GetDefWidth(bd.width, bd.cols, W, margW); bM.l1 := LedaRules.FontSize(W);
+				GetDefWidth(od.width, od.cols, W, margW); bM.l1 := bM.l1 - LedaRules.FontSize(W)
+			END	(* field l1: change of font size *)
+		END;	
+		(*- type area -*)
+		ArrangeLayout(ta, dB.pageH, bd.lsp, ta.bot, refs);
+		m.X := ta.left; m.Y := ta.top;
+		m.W := dB.pageW - ta.left - ta.right; m.H := dB.pageH - ta.top - ta.bot;
+		m.dX := ta.left - dB.ta.left; m.dY := ta.top - dB.ta.top;
+		m.dW := dB.ta.left + dB.ta.right - ta.left - ta.right;
+		m.dH := dB.ta.top + dB.ta.bot - ta.top - ta.bot;
+		X[1] := ta.left; dX[1] := ta.left - dB.ta.left;	(* for right pages *)
+		IF ta.arr = "a" THEN X[0] := ta.right; dX[0] := ta.right - dB.ta.right	(* for left pages *)
+		ELSE X[0] := X[1]; dX[0] := dX[1]
+		END;
+		IF (m.dX # 0) OR (m.dY # 0) OR (m.dW # 0) OR (m.dH # 0) THEN INCL(chng, TAChng) END;
+		IF (m.dW # 0) OR (m.dH # 0) THEN INCL(chng, FlowChng) END;
+		IF (m.dX # 0) OR (m.dW # 0) OR (ta.arr # dB.ta.arr) THEN INCL(chng, HdgChng); INCL(chng, FtrChng) END;
+		IF ta.arr # dB.ta.arr THEN INCL(chng, TAChng) END;
+		dB.ta := ta;	(* set new type area *)
+		(*- letterings -*)
+		IF (refs.topY # dB.refs.topY) OR (refs.topH # dB.refs.topH) THEN INCL(chng, HdgChng) END;
+		IF (refs.botY # dB.refs.botY) OR (refs.botH # dB.refs.botH) THEN INCL(chng, FtrChng) END;
+		dB.refs := refs;	(* set lettering locations *)
+		(*- page number -*)
+		IF (pNbr # dB.number) & (pNbr >= 0) THEN
+			dB.number := pNbr; INCL(chng, PNbrChng); INCL(chng, FlowChng)
+		END
+	END SetDocAttr;
+
+	PROCEDURE ValidateAttr(VAR bd: LedaBase.BaseData; VAR ta: TypeArea; VAR raster: Raster;
+											   VAR pNbr: INTEGER; VAR a: LedaBox.Attributes): BOOLEAN;
+	(* scans the attributes a and sets the parameters bd, ta and pNbr accordingly *)
+	BEGIN
+		IF a[0].typ = LedaBox.Str THEN bd.sLsp := a[0].s[0];
+			IF ~ LedaSys.EqualCh("nwd", bd.sLsp) THEN RETURN FALSE END	(*###*)
+		ELSIF a[0].typ = LedaBox.Int THEN bd.sLsp := "o"; bd.lsp := a[0].i * LedaSys.scnUnit
+		END;
+		IF (a[1].typ = LedaBox.Str) & ((a[1].s = Left) OR (a[1].s = Adjust)) THEN bd.adj := a[1].s[0]; bd.sAdj := a[1].s[0] 
+		ELSE RETURN FALSE	(*###*)
+		END;
+		IF a[2].typ = LedaBox.Str THEN
+			IF a[2].s = Marginal THEN bd.cols := "m"; bd.sCols := "m" ELSE RETURN FALSE END	(*###*)
+		ELSIF a[2].typ = LedaBox.Int THEN bd.cols := CHR(ORD("0") + a[2].i); bd.sCols := bd.cols
+		END;
+		IF (a[3].typ = LedaBox.Str) & (a[3].s = Normal) THEN bd.sDX := "n"
+		ELSIF a[3].typ = LedaBox.Int THEN bd.sDX := "o"; bd.colDX := a[3].i * LedaBox.attrUnit
+		ELSE RETURN FALSE	(*###*)
+		END;
+		IF a[4].typ = LedaBox.Str THEN
+			IF a[4].s = Normal THEN raster.set := "d"
+			ELSIF a[4].s = Third THEN raster.set := "3"
+			ELSIF a[4].s = Quarter THEN raster.set := "4"
+			ELSIF a[4].s = Fifth THEN raster.set := "5"
+			ELSE RETURN FALSE	(*###*)
+			END
+		ELSIF a[4].typ = LedaBox.Int THEN raster.set := "o"; raster.fields := SHORT(a[4].i)
+		ELSE RETURN FALSE	(*###*)
+		END;
+		IF (a[5].typ # LedaBox.Int) THEN RETURN FALSE END;	(*###*)
+		ta.left := a[5].i * LedaBox.attrUnit;
+		IF (a[6].typ # LedaBox.Str) OR (a[6].s # Left) THEN RETURN FALSE END;	(*###*)
+		IF (a[7].typ # LedaBox.Int) THEN RETURN FALSE END;	(*###*)
+		ta.right := a[7].i * LedaBox.attrUnit;
+		IF (a[8].typ # LedaBox.Str) OR (a[8].s # Right) THEN RETURN FALSE END;	(*###*)
+		IF (a[9].typ # LedaBox.Int) THEN RETURN FALSE END;	(*###*)
+		ta.top := a[9].i * LedaBox.attrUnit;
+		IF (a[10].typ # LedaBox.Str) OR (a[10].s # Top) THEN RETURN FALSE END;	(*###*)
+		IF (a[11].typ # LedaBox.Int) THEN RETURN FALSE END;	(*###*)
+		ta.bot := a[11].i * LedaBox.attrUnit;
+		IF (a[12].typ # LedaBox.Str) OR (a[12].s # Bot) THEN RETURN FALSE END;	(*###*)
+		IF (a[13].typ # LedaBox.Str) THEN RETURN FALSE	(*###*)
+		ELSIF a[13].s = Alternate THEN ta.arr := "a"
+		ELSE ta.arr := "s"	(* steady *)
+		END;
+		IF a[14].typ # LedaBox.Int THEN RETURN FALSE END;	(*###*)
+		pNbr := SHORT(a[14].i);
+		RETURN TRUE
+	END ValidateAttr;
+
+	PROCEDURE GetAttributes(dB: Box; VAR M: LedaBox.AttributeMsg);
+	(* specifies the attributes of document dB in the attribute message M *)
+		VAR W: LONGINT;	i: INTEGER;	bd: LedaBase.BaseData;
+	BEGIN
+		IF dB.selLoc # NIL THEN
+			M.name := Document; M.nbr := 45; bd := dB.format.data;
+		(*- linespace -*)
+			LocateChar("nwdo", bd.sLsp, 0, i);
+			NewLn(M.a[0], "lines"); EnumAt(M.a[1], "-|-|-|-", i);	(* normal/wide/dense/own *)
+			StrAt(M.a[2], Normal, Stat); StrAt(M.a[3], Wide, Stat); StrAt(M.a[4], Dense, Stat);
+			IntAt(M.a[5], bd.lsp DIV LedaSys.scnUnit, Dyn);
+		(*- format mode -*) 
+			LocateChar("la", bd.sAdj, 0, i);
+			NewLn(M.a[6], "format"); EnumAt(M.a[7], "-|-", i);	(* left/adjust *)
+			StrAt(M.a[8], Left, Stat); StrAt(M.a[9], Adjust, Stat);
+		(*- columns -*)
+			LocateChar("123m", bd.sCols, 0, i);
+			NewLn(M.a[10], "columns"); EnumAt(M.a[11], "-|-|-|-", i);	(* 1/2/3/marginal *)
+			IntAt(M.a[12], 1, Stat); IntAt(M.a[13], 2, Stat); IntAt(M.a[14], 3, Stat); StrAt(M.a[15], Marginal, Stat);
+		(*- column distance -*)
+			LocateChar("no", bd.sDX, 0, i);
+			NewLn(M.a[16], "distance"); EnumAt(M.a[17], "-|-", i);	(* normal/own *)
+			StrAt(M.a[18], Normal, Stat); IntAt(M.a[19], bd.colDX DIV LedaBox.attrUnit, Dyn);
+		(*- raster height -*)
+			LocateChar("d345o", dB.raster.set, 0, i);
+			NewLn(M.a[20], "raster"); EnumAt(M.a[21], "-|-|-|-|-", i);	(* normal/3/4/5/own *)
+			StrAt(M.a[22], Normal, Stat); StrAt(M.a[23], Third, Stat); StrAt(M.a[24], Quarter, Stat);
+			StrAt(M.a[25], Fifth, Stat); IntAt(M.a[26], dB.raster.fields, Dyn);
+		(*- type area -*)
+			NewLn(M.a[27], "typearea"); IntAt(M.a[28], dB.ta.left DIV LedaBox.attrUnit, Dyn); StrAt(M.a[29], Left, Stat);
+			NewLn(M.a[30], ""); IntAt(M.a[31], dB.ta.right DIV LedaBox.attrUnit, Dyn); StrAt(M.a[32], Right, Stat);
+			NewLn(M.a[33], ""); IntAt(M.a[34], dB.ta.top DIV LedaBox.attrUnit, Dyn); StrAt(M.a[35], Top, Stat);
+			NewLn(M.a[36], ""); IntAt(M.a[37], dB.ta.bot  DIV LedaBox.attrUnit, Dyn); StrAt(M.a[38], Bot, Stat);
+			LocateChar("sa", dB.ta.arr, 0, i);
+			NewLn(M.a[39], "layout"); EnumAt(M.a[40], "-|-", i);	(* steady/alternate *)
+			StrAt(M.a[41], Steady, Stat); StrAt(M.a[42], Alternate, Stat);
+		(*- page number -*)
+			NewLn(M.a[43], "page#"); IntAt(M.a[44], dB.number, Dyn);
+		END
+	END GetAttributes;
+		
+	PROCEDURE SetAttributes(dB: Box; VAR M: LedaBox.AttributeMsg);
+	(* scans the attribute message M and set the attributes of document dB accordingly *)
+		VAR bd: LedaBase.BaseData;	ta: TypeArea;	raster: Raster;	X, dX: Longint2;	pNbr: INTEGER;
+			m: LedaBox.PageMsg;	bm: LedaBase.BoxMsg;	chng: SET;
+	BEGIN
+		IF (dB.selLoc # NIL) & (M.name = Document) THEN
+			bd.width := dB.format.data.width;
+			IF (M.nbr = 15) & ValidateAttr(bd, ta, raster, pNbr, M.a) THEN
+				CheckBaseData(dB.format.data.cols, bd);
+				CheckTypeArea(dB.pageW, dB.pageH, ta);
+				SetDocAttr(dB, bd, ta, raster, pNbr, X, dX, m, bm, chng);
+				ValidateDoc(dB, m, bm, X, dX, chng, M.P)
+			END
+		END
+	END SetAttributes;
+	
+	PROCEDURE FontChangeSize(dB: Box; dSize: LONGINT; P: LedaSys.Port);
+		VAR m: LedaBox.PageMsg;	bM: LedaBase.BoxMsg;
+	BEGIN
+		IF (dSize = 0) OR (dSize > 99) OR (dSize < -99) THEN RETURN END;	(*###*)
+		INCL(P.state, LedaSys.DrawFlag);	(* no drawing; redraw after change *)
+		(*- invalidate text flows -*)
+		m.id := LedaBox.PgTexts; m.op := 0; LedaBox.Broadcast(dB, {}, m);
+		(*- font size change -*)
+		LedaBase.NewStamp; LedaBase.LockStamp(1);	(* set new stamp and lock it *)
+		bM.id := LedaBase.SizeId; bM.l1 := dSize; bM.l2 := 0; bM.b := FALSE;
+		LedaBox.Broadcast(dB, {LedaBox.BcTxt}, bM);
+		LedaBase.LockStamp(-1);	(* unlock stamp *)
+		(*- validate text flows -*)
+		m.id := LedaBox.PgTexts; m.op := 1; LedaBox.Broadcast(dB, {}, m)
+	END FontChangeSize;
+		
+	PROCEDURE Execute(dB: Box; eX, eY: LONGINT; P: LedaSys.Port; VAR res: INTEGER);
+	(* execute command according parameters *)
+		VAR s: LedaSys.String;	i: LONGINT;
+	BEGIN
+		LedaBox.ParPopStr(s);
+		IF s = "font" THEN
+			res := LedaBase.Done; LedaBox.ParPopStr(s);
+			IF LedaSys.EqualStr("inc", s) THEN
+				LedaBox.ParPopStr(s);
+				IF s = "size" THEN LedaBox.ParPopInt(i); FontChangeSize(dB, i, P) END
+			ELSIF LedaSys.EqualStr("dec", s) THEN
+				LedaBox.ParPopStr(s);
+				IF s = "size" THEN LedaBox.ParPopInt(i); FontChangeSize(dB, -i, P) END
+			END
+		ELSE LedaBox.ParReset(LedaBox.Str)
+		END
+	END Execute;
+
+(*--- procedures attached to boxType ---*)
+	
+	PROCEDURE New*(bT: LedaBase.BoxType; caller, ref: LedaBase.Box): LedaBase.Box;
+	(** ref = NIL: create default box;  ref # NIL: copy box ref *)
+		VAR dB: Box;	box: LedaBase.Box;
+			fName, s: LedaSys.Name;	cols: LONGINT;	adj: CHAR;
+	BEGIN
+		IF ref # NIL THEN LedaSys.Halt(NotImpl) END;	(*###*)
+		cols := 1; adj := "l";
+		LedaBox.ParPopStr(fName);
+		LedaBox.ParPopStr(s);
+		IF LedaSys.EqualStr("col", s) THEN
+			LedaBox.ParPopInt(cols);
+			IF (cols < 2) OR (cols > 3) THEN cols := 1 ELSE adj := "a" END;
+			LedaBox.ParPopStr(s)
+		ELSIF LedaSys.EqualStr("marg", s) THEN	(* marginal *)
+			cols := 0; LedaBox.ParPopStr(s)
+		END;
+		IF LedaSys.EqualStr("form", s) OR LedaSys.EqualStr("mod", s) THEN
+			LedaBox.ParPopStr(s);
+			IF LedaSys.EqualStr("le", s) THEN adj := "l"
+			ELSIF LedaSys.EqualStr("adj", s) THEN adj := "a"
+			END
+		ELSIF s # "" THEN LedaBox.ParReset(LedaBox.Str) 
+		END;
+		AllocateDoc(dB, bT, fName, SHORT(cols), adj);
+		box := LedaBox.New(PageName, "", dB);
+		PutIn(dB, box);
+		ArrangePages(dB);
+		RETURN dB
+	END New;
+	
+	PROCEDURE Load*(VAR r: LedaBase.Rider; bT: LedaBase.BoxType; flags: SET; caller: LedaBase.Box): LedaBase.Box;
+		VAR dB: Box;	box: LedaBase.Box;
+			ctrl: LedaBase.Control;	pos: LONGINT;	ch, ver: CHAR;	
+	BEGIN
+		NEW(dB); LedaBox.Init(dB); dB.do := bT;
+		dB.flags := flags; dB.selLoc := NIL;
+		LedaBase.Load(r, ver);	(* current version tag *)
+		IF ver < 0A0X THEN pos := LedaBase.RiderPos(r); LedaSys.Halt("file error") END;
+		LedaBase.LoadVal(r, dB.pageW); LedaBase.LoadVal(r, dB.pageH);
+		LedaBase.LoadVal(r, dB.ta.top); LedaBase.LoadVal(r, dB.ta.bot);
+		LedaBase.LoadVal(r, dB.ta.left); LedaBase.LoadVal(r, dB.ta.right);
+		LedaBase.Load(r, dB.ta.arr);
+		LedaBase.LoadCtrl(r, ctrl); dB.format := ctrl(LedaBase.FormBase);
+		LedaBase.LoadCtrl(r, ctrl); dB.styles := ctrl(LedaCtrl.List);
+		LedaBase.LoadI(r, dB.number);
+		IF ver > 0A0X THEN LedaBase.LoadI(r, dB.raster.fields); LedaBase.Load(r, dB.raster.set)
+		ELSE dB.raster.set := "d"; SetRasterHeight(dB.raster.set, dB.pageH, dB.format.data, dB.raster.fields)
+		END;
+		dB.dscW := dB.pageW; dB.dscH := dB.pageH;	(* default descender size *)
+		ArrangeLayout(dB.ta, dB.pageH, dB.format.data.lsp, dB.ta.bot, dB.refs);
+		LedaBase.Load(r, ch);
+		WHILE ch = ObjTag DO
+			LedaBase.LoadBox(r, dB, box);
+			IF box = NIL THEN
+				LedaSys.OutT(" - ", 0); LedaSys.OutT(ModName, 0);  LedaSys.OutT(".Load: page skipped", 1)
+			ELSE
+				box.W := dB.pageW; box.H := dB.pageH;
+				LedaBox.Insert(box, dB, LedaBox.LastDsc)
+			END;
+			LedaBase.Load(r, ch)
+		END;
+		IF ch # EndTag THEN
+			LedaSys.OutT(" - ", 0); LedaSys.OutT(ModName, 0);  LedaSys.OutT(".Load: tag missing", 1)
+		END;
+		ArrangePages(dB);
+		RETURN dB
+	END Load;
+	
+	PROCEDURE Store*(self: LedaBase.Box; VAR r: LedaBase.Rider);
+		VAR dB: Box;	box: LedaBase.Box;
+	BEGIN
+		dB := self(Box);
+		LedaBase.Store(r, Version);	(* current version tag *)
+		LedaBase.StoreVal(r, dB.pageW); LedaBase.StoreVal(r, dB.pageH);
+		LedaBase.StoreVal(r, dB.ta.top); LedaBase.StoreVal(r, dB.ta.bot);
+		LedaBase.StoreVal(r, dB.ta.left); LedaBase.StoreVal(r, dB.ta.right);
+		LedaBase.Store(r, dB.ta.arr);
+		LedaBase.StoreCtrl(r, dB.format); 
+		LedaBase.StoreCtrl(r, dB.styles);
+		LedaBase.StoreI(r, dB.number);
+		LedaBase.StoreI(r, dB.raster.fields); LedaBase.Store(r, dB.raster.set);	(* new for version 0A1X *)
+		(* dB.refs not stored *)
+		box := dB.dsc;
+		WHILE box # NIL DO
+			LedaBase.Store(r, ObjTag);
+			LedaBase.StoreBox(r, box);
+			box := box.next
+		END;
+		LedaBase.Store(r, EndTag)
+	END Store;
+	
+	PROCEDURE Mark*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; kind, mode: SHORTINT);
+	(** kind = FocMark or SelMark ; mode = On or Off  *)
+	(** P # NIL: show mark / P = NIL: change of mark state [get/loose] *)
+		VAR dB: Box;
+	BEGIN
+		dB := self(Box);
+		IF kind = LedaBase.FocMark THEN	(* focus *)
+		ELSIF kind = LedaBase.SelMark THEN 	(* selection *)
+			IF P = NIL THEN		(* change of state *)
+				IF mode = LedaBase.On THEN
+					IF dB.selLoc = NIL THEN LedaSys.Halt(ProgErr) END
+				ELSIF mode = LedaBase.Off THEN dB.selLoc := NIL
+				END
+			ELSE		(* show selection *)
+				IF dB.selLoc # NIL THEN
+					LedaIO.out.area(P, eX, eY, dB.W, dB.H, LedaSys.Grey2, LedaSys.inv, ModeInv)
+				END
+			END
+		END
+	END Mark;
+	
+	PROCEDURE Draw*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port);
+		VAR dB: Box;	dX, dY: LONGINT;	box: LedaBase.Box;
+	BEGIN	(* dB.Y = 0 and dB.X = 0 *)
+		dB := self(Box); box := dB.dsc;
+		dX := dB.pageW DIV MargWFact;
+		dY := dB.pageH DIV MargHFact;
+		WHILE (box # NIL) & (box.Y + box.H <= P.Y) DO box := box.next END;	(* skip pages not visible *)
+		WHILE (box # NIL) & (box.Y - P.Y < P.H) DO		(* pages visible; boxY - P.Y < P.H to avoid overflow *)
+			DrawPage(box, dX, dY, P); box := box.next
+		END
+	END Draw;
+	
+	PROCEDURE Mouse*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port;
+											mX, mY: LONGINT; keys: SET; VAR res: INTEGER);
+		VAR dB: Box;	box: LedaBase.Box;
+	BEGIN	(* dB.Y = 0 and dB.X = 0  and res <= LedaBase.NotHandled *)
+		dB := self(Box); box := dB.dsc;
+		IF (keys = {LedaSys.MR}) & (dB.selLoc # NIL) THEN LedaBox.RemSel(dB, P) END;
+		WHILE box # NIL DO
+			IF (mY < box.Y) OR (mX < box.X) OR (mY > box.Y + box.H) OR (mX > box.X + box.W) THEN box := box.next
+			ELSE box.do(LedaBase.BoxHandler).mouse(box, box.X, box.Y, P, mX, mY, keys, res); box := NIL
+			END
+		END;
+		IF (keys = {LedaSys.MX}) & (res = LedaBase.NotHandled) THEN Execute(dB, eX, eY, P, res)
+		ELSIF (keys = {LedaSys.MR}) & ((res <= LedaBase.NotHandled) OR (res = LedaBase.DoHandle)) THEN
+			LedaBox.RemSel(dB, P);
+			NEW(dB.selLoc); dB.selLoc.X := mX - eX; dB.selLoc.Y := mY - eY;
+			LedaBox.SetSel(dB, P, LedaBox.NewSel);
+			LedaIO.in.waitNoKeys(P); res := LedaBase.Done
+		END
+	END Mouse;
+	
+	PROCEDURE Handle*(self: LedaBase.Box; VAR m: LedaBase.Msg);
+		VAR dB: Box;	box: LedaBase.Box;	P: LedaSys.Port;
+	BEGIN
+		dB := self(Box);
+		IF m IS LedaBox.Msg THEN
+			WITH m: LedaBox.Msg DO
+				IF (m.id > 0) & (m.id <= LedaBox.LocateId) THEN
+					CASE m.id OF LedaBox.SizeId:
+							IF m.op = 1 THEN m.id := LedaBox.DoneId; m.l1 := dB.dscW; m.l2 := dB.dscH	(* descender size *)
+							ELSIF m.op = 2 THEN	(* type area *)
+								m.id := LedaBox.DoneId; m.l1 := dB.ta.left; m.l2 := dB.ta.top;
+								m.l3 := dB.pageW - dB.ta.left - dB.ta.right; m.l4 := dB.pageH - dB.ta.top - dB.ta.bot - LedaSys.scnUnit
+							END
+					| LedaBox.TextId:
+							IF m.op = 1 THEN 	(* ask for reference data of text *)
+								m.id := LedaBox.DoneId; m.text := NIL;	(* no reference text *)
+								m.ctrl := dB.format; m.ctrl.link := dB.styles;	(* link controls *)
+								IF dB.styles # NIL THEN dB.styles.link := NIL END
+							ELSIF m.op = 2 THEN	(* ask text size *)
+								m.id := LedaBox.DoneId; m.l2 := dB.format.data.lsp;
+								m.l1 := dB.format.data.width DIV (ORD(dB.format.data.cols) - ORD("0"))
+							END
+					| LedaBox.PageNbrId:
+							IF m.op = 1 THEN GetPageNbr(dB, m) END
+					| LedaBox.CtrlId:
+							IF m.op = 1 THEN	(* ask for a control: m.l1: kind of control *)
+								IF m.l1 = 0 THEN m.ctrl := dB.styles; m.id := LedaBox.DoneId	(* styles *)
+								ELSIF m.l1 = 1 THEN m.ctrl := dB.format; m.id := LedaBox.DoneId	(* basic format *)
+								END
+							ELSIF m.op = 3 THEN	(* ask for overlay data *)
+								m.ctrl := dB.format; m.l1 := dB.raster.fields; m.id := LedaBox.DoneId
+							END
+					| LedaBox.BoxId:
+							IF m.op = 1 THEN	(* insert new box(es) *) 
+								LedaBox.GetPort(dB, P); AppendPage(dB, P, m.box1)
+							ELSIF m.op = 2 THEN 	(* delete box *)
+								LedaBox.GetPort(dB, P); DeletePage(dB, P, m.box1)
+							END
+					| LedaBox.LocateId:
+							IF m.op = 1 THEN	(* get text location [focus or first text] *)
+								box := LedaBox.GetFoc(dB); IF box = NIL THEN box := dB.dsc END;
+								box.do.handle(box, m)
+							END
+					ELSE
+					END
+				END
+			END
+		ELSIF m IS LedaBox.PageMsg THEN
+			WITH m: LedaBox.PageMsg DO
+				IF m.id = LedaBox.PgLettering THEN
+					IF m.op = 3 THEN AdjustLettering(dB, m.typ, m.box, m.all)
+					ELSIF m.op = 4 THEN	(* return lettering area *)
+						m.X := dB.ta.left; m.W := dB.pageW - dB.ta.left - dB.ta.right;
+						IF m.typ = LedaBox.PgHeading THEN
+							m.Y := dB.refs.topY; m.H := dB.refs.topH; m.avail := m.H > 0
+						ELSIF m.typ = LedaBox.PgFooter THEN
+							m.Y := dB.refs.botY; m.H := dB.refs.botH; m.avail := m.H > 0
+						ELSE m.Y := dB.ta.top; m.H := 0; m.avail := FALSE
+						END
+					END
+				END
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				CASE m.id OF LedaBase.DocRemSelId:  LedaBox.GetPort(dB, P); LedaBox.RemSel(dB, P)
+				| LedaBase.AdjustYId:  AdjustToLine(dB, m)
+				| LedaBase.DocOriginId:  m.l1 := dB.pageW DIV (2*MargWFact) + dB.ta.left; m.l2 := 0	(* page inset about dB.pageW DIV MargWFact *)
+				| LedaBase.SizeId:  IF dB.styles # NIL THEN SeqBroadcast(dB.styles.seq, m) END
+				| LedaBase.TypeInstId: 
+					IF (m.name = ModName) & (m.s = "DC") THEN	(* return box type instance *)
+						m.ctrl := dB.do; INCL(LedaBox.bcFlags, LedaBox.BcMsg)	(* stop broadcast *)
+					END
+				ELSE
+				END
+			END
+		ELSIF m IS LedaBox.AttributeMsg THEN	(* dB has selection *)
+			WITH m: LedaBox.AttributeMsg DO
+				IF m.id = LedaBox.GetValue THEN GetAttributes(dB, m)
+				ELSIF m.id = LedaBox.SetValue THEN SetAttributes(dB, m)
+				END
+			END
+		ELSIF m IS LedaIO.OutPageMsg THEN
+			WITH m: LedaIO.OutPageMsg DO PrintPage(dB, m.pageNbr, m.pX, m.pY, m.P, m.stop) END
+		END
+	END Handle;
+		
+(*--- box type control ---*)
+	
+	PROCEDURE NewType(ctrl: LedaBase.Control): LedaBase.BoxHandler;
+	(* return new instance of box type *)
+		VAR nT: LedaBase.BoxHandler;
+	BEGIN
+		NEW(nT);
+		LedaBase.InitControl(nT, typeDoOp);
+		LedaBox.InitType(nT);
+		nT.handle := Handle;
+		nT.new := New; 
+		nT.load := Load;
+		nT.store := Store;
+		nT.draw := Draw;
+		nT.mark := Mark;
+		nT.mouse := Mouse;
+		(* nT.key := ; *)
+		(* nT.insert := ; *)
+		(* nT.size := ; *)
+		nT.data := ctrl;	(* data of box type control *)
+		RETURN nT
+	END NewType;
+	
+	PROCEDURE PutType(bT: LedaBase.BoxType; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		IF bT.data # NIL THEN cM.id := LedaBase.RegisterId; bT.data.doOp(bT.data, cM) END;
+		LedaBase.PutToList(bT, refId)
+	END PutType;
+	
+	PROCEDURE *TypeDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* implements the basic behaviour of the box type control *)
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.RegisterId:  PutType(ctrl(LedaBase.BoxType), m.ctrlId)
+				| LedaBase.StoreId:  LedaBase.StoreCtrl(m.r, ctrl(LedaBase.BoxType).data)
+				| LedaBase.LoadId:
+						IF LedaBase.version > 0X THEN LedaBase.LoadCtrl(m.r, ctrl) ELSE ctrl := NIL END;
+						m.ctrl := NewType(ctrl)
+				| LedaBase.StoreModCmd:  LedaBase.StoreStr(m.r, ModName); LedaBase.StoreStr(m.r, "DC")
+				ELSE
+				END
+			END
+		END
+	END TypeDoOp;
+	
+	PROCEDURE DC*;
+	(** deposits own box type in the module LedaCtrl *)
+	BEGIN
+		LedaBase.depositedCtrl := NewType(NIL)
+	END DC;
+	
+BEGIN
+	updPage := NIL;
+	
+	(*--- box type control ---*)
+	typeDoOp := TypeDoOp
+	
+END LedaDoc.

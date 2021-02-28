@@ -1,0 +1,344 @@
+MODULE V24;
+(* ARD 19.1.94, compile with l option *)
+(* WDG 94.09.10, Work In Progress;  walter@chasque.apc.org *)
+(*						Suggestions: Exported LSR-Constants, changes in Send and Stop *)
+(* V24 handling procedures, IBM-PC DOS version                     *)
+(* ARD 29.09.94, newest update *)
+
+IMPORT SYSTEM, Kernel, DOS;
+
+CONST N = 4096;
+
+(* Bitrates *)
+			BPS110* = 1047;
+			BPS150* = 768;
+			BPS300* = 384;
+			BPS600* = 192;
+			BPS1200* = 96;
+			BPS2400* = 48;
+			BPS4800* = 24;
+			BPS9600* = 12;
+			BPS19200* = 6;
+			BPS38400* = 3;
+
+(* LCR-Constants *)
+			BREAK* = 64;
+			NOBREAK* = 0;
+			NOPAR* = 0;
+			ODDPAR* = 8;
+			ONEPAR* = 40;
+			ZEROPAR* = 56;
+			EVENPAR* = 24;
+			STOP1* = 0;
+			STOP2* = 4;
+			WL5* = 0;
+			WL6* = 1;
+			WL7* = 2;
+			WL8* = 3;
+			
+(* Ports *)	
+			COM1* = 03F8H; 
+			COM2* = 02F8H; 
+			
+(* MSR-Constants *)
+			DCD* = 7;
+			DSR* = 5;
+			CTS* = 4;
+			
+(* MCR-Constants *)
+			RTS* = 1;
+			DTS* = 0;
+			
+(* LSR-Constants *)
+			TSRE* = 6;
+			THRE* = 5;
+			BRK* = 4;
+			FRMERR* = 3;
+			PARERR* = 2;
+			OVLERR* = 1;
+			RDR* = 0;
+			
+	TYPE Buffer = RECORD in, out: INTEGER; oldmcr, enabled: CHAR; buf: ARRAY N OF CHAR END;
+
+	VAR com1: Buffer;
+			com2: Buffer;
+			proc: PROCEDURE;
+			com1off, com2off: INTEGER;
+			com1seg, com2seg: LONGINT;
+			com1installed, com2installed: BOOLEAN;
+			
+	PROCEDURE Init(port, baud, LCR: INTEGER);
+	VAR ch: CHAR; addr1, addr2, addr3, addr5, addr6: INTEGER;
+	BEGIN
+		addr1 := port+1; addr2 := port+2; addr3 := port+3; addr5 := port+5; addr6 := port+6;
+		SYSTEM.PORTOUT(addr3, 80X);
+		SYSTEM.PORTOUT(port, SHORT(baud));
+		SYSTEM.PORTOUT(addr1, SHORT(baud DIV 100H));
+		SYSTEM.PORTOUT(addr3, SHORT(LCR));
+		REPEAT
+			SYSTEM.PORTIN(addr5, ch);
+			SYSTEM.PORTIN(port, ch);
+			SYSTEM.PORTIN(addr6, ch);
+			SYSTEM.PORTIN(addr2, ch);
+			SYSTEM.PORTIN(addr2, ch)
+		UNTIL (0 IN SYSTEM.VAL(SET, ch));
+	END Init;
+	
+	PROCEDURE start(port: INTEGER);
+	VAR c: CHAR; addr1, addr4, addr5: INTEGER;
+	BEGIN
+		addr1 := port+1; addr4 := port+4; addr5 := port+5; 
+		SYSTEM.PORTIN(addr5, c);
+		IF c = 1X THEN SYSTEM.PORTIN(port, c) END;
+		IF port = COM1 THEN 
+			SYSTEM.PORTIN(addr4, com1.oldmcr);
+			SYSTEM.PORTOUT(addr4, SYSTEM.VAL(CHAR,  SYSTEM.VAL(SET, com1.oldmcr) + {0, 1, 3}));
+			SYSTEM.PORTOUT(addr1, 1X);	(* IRQ from RX only *)
+			SYSTEM.PORTIN(21H, com1.enabled);
+			SYSTEM.PORTOUT(21H, SYSTEM.VAL(CHAR,  SYSTEM.VAL(SET, com1.enabled) - {4}));
+		ELSIF port = COM2 THEN
+			SYSTEM.PORTIN(addr4, com2.oldmcr);
+			SYSTEM.PORTOUT(addr4, SYSTEM.VAL(CHAR,  SYSTEM.VAL(SET, com2.oldmcr) + {0, 1, 3}));
+			SYSTEM.PORTOUT(addr1, 1X);	(* IRQ from RX only *)
+			SYSTEM.PORTIN(21H, com2.enabled);
+			SYSTEM.PORTOUT(21H, SYSTEM.VAL(CHAR,  SYSTEM.VAL(SET, com2.enabled) - {3}));
+		(* ELSIF weitere ports ... *)
+		ELSE HALT(88) END;
+	END start;
+
+	PROCEDURE Stop*(port: INTEGER);
+	(* changed according to WDG 94.09.11 *)
+	BEGIN 
+		IF (port = COM1) & com1installed THEN 
+			INC(port); SYSTEM.PORTOUT(port, 0X); (* disable all IRQ from port*)
+			INC(port, 3);
+			SYSTEM.PORTOUT(port, com1.oldmcr);
+			SYSTEM.PORTOUT(21H, com1.enabled);
+			(* Restore original IRQ Vectors  *)
+			Kernel.Reg.AX := 250CH; 
+			Kernel.Reg.DS := com1seg;
+			Kernel.Reg.DX := com1off;
+			Kernel.INT(Kernel.Reg, 21H);
+			com1installed := FALSE;
+		ELSIF (port = COM2) & com2installed THEN
+			INC(port); SYSTEM.PORTOUT(port, 0X); (* disable all IRQ from port*)
+			INC(port, 3);
+			SYSTEM.PORTOUT(port, com2.oldmcr);
+			SYSTEM.PORTOUT(21H, com2.enabled);
+			Kernel.Reg.AX := 250BH; (* Interrupt 0BH, COM2 *)
+			Kernel.Reg.DS := com2seg;
+			Kernel.Reg.DX := com2off;
+			Kernel.INT(Kernel.Reg, 21H);	
+			com2installed := FALSE;
+		(* ELSIF weitere ports ... *)
+		ELSE HALT(89) END;
+	END Stop;
+	
+	PROCEDURE Stat*(port: INTEGER; VAR s: SHORTINT);
+	BEGIN INC(port, 5);
+		SYSTEM.PORTIN(port, s);
+	END Stat;
+	
+	PROCEDURE Send*(port: INTEGER; c: CHAR);
+	(* This procedure is blocking: Make sure that TSRE in LSR can be changed while waiting *)
+	VAR addr: INTEGER; ch: CHAR;
+	BEGIN 
+		addr := port; INC(addr, 5);
+		IF (port = COM1) & com1installed THEN 
+			REPEAT SYSTEM.PORTIN(addr, SYSTEM.VAL(CHAR, ch)) UNTIL (6 IN SYSTEM.VAL(SET, ch));
+			SYSTEM.PORTOUT(port, SYSTEM.VAL(CHAR, c))
+		ELSIF (port = COM2) & com2installed THEN
+			REPEAT SYSTEM.PORTIN(addr, SYSTEM.VAL(CHAR, ch)) UNTIL (6 IN SYSTEM.VAL(SET, ch));
+			SYSTEM.PORTOUT(port, SYSTEM.VAL(CHAR, c))
+		END
+	END Send;
+	
+	PROCEDURE SetOP*(port: INTEGER; s: SET);
+	VAR fill: LONGINT; c: CHAR;
+	BEGIN INC(port, 4);
+		SYSTEM.PORTIN(port, c);
+		SYSTEM.PORTOUT(port, SYSTEM.VAL(CHAR, SYSTEM.VAL(SET, c) + s));
+	END SetOP;
+	
+	PROCEDURE ClearOP*(port: INTEGER; s: SET);
+	VAR fill: LONGINT; c: CHAR;
+	BEGIN INC(port, 4);
+		SYSTEM.PORTIN(port, c);
+		SYSTEM.PORTOUT(port, SYSTEM.VAL(CHAR, SYSTEM.VAL(SET, c) - s));
+	END ClearOP;
+	
+	PROCEDURE IP*(port: INTEGER; n: INTEGER): BOOLEAN;
+	VAR c: CHAR;
+	BEGIN INC(port, 6);
+		SYSTEM.PORTIN(port, c);
+		RETURN (n IN SYSTEM.VAL(SET, c))
+	END IP;
+	
+	PROCEDURE SR*(port: INTEGER; n: INTEGER): BOOLEAN;
+	VAR c: CHAR;
+	BEGIN INC(port, 5);
+		SYSTEM.PORTIN(port, c);
+		RETURN (n IN SYSTEM.VAL(SET, c))
+	END SR;
+	
+	PROCEDURE Break*(port: INTEGER);
+	VAR i: LONGINT; c: CHAR;
+	BEGIN INC(port, 3);
+		SYSTEM.PORTIN(port, c);
+		SYSTEM.PORTOUT(port, SYSTEM.VAL(CHAR, SYSTEM.VAL(SET, c)+ {6}));
+		i := 50000;
+		WHILE i > 0 DO DEC(i) END;
+		SYSTEM.PORTOUT(port, c);
+	END Break;
+	
+	PROCEDURE -realcom1
+		1EH, 										(* PUSH DS *)
+		66H, 60H, 								(* PUSHAD *)
+		0BBH, 0FFH, 0FFH, 					(* MOV BX, segment buffer *)
+		8EH, 0DBH, 								(* MOV DS, BX *)
+		0BBH, 0FFH, 0FFH, 					(* MOV BX, offset buffer *)
+		0BAH, 0F8H, 03H, 					(* MOV DX, COM1 *)
+		0ECH, 										(* IN AL, DX *)
+		8BH, 37H, 								(* MOV SI, word ptr [BX] *)
+		88H, 40H, 06H,							(* MOV byte ptr [BX+SI*1+6], AL *)
+		0FFH, 07H, 								(* INC word ptr [BX] *)
+		81H, 27H,  0FFH, 0FH, 				(* AND word ptr [BX], $0FFF *)
+		0B0H, 20H, 								(* MOV AL, $20 *)
+		0E6H, 20H,  								(* OUT $20, AL *)
+		66H, 61H, 								(* POPAD *) 
+		1FH, 										(* POP DS *)
+		0CFH; 										(* IRET *)
+	
+	PROCEDURE RealCom1;
+	BEGIN END RealCom1;
+	
+	PROCEDURE -realcom2
+		1EH, 										(* PUSH DS *)
+		66H, 60H, 								(* PUSHAD *)
+		0BBH, 0FFH, 0FFH, 					(* MOV BX, segment buffer *)
+		8EH, 0DBH, 								(* MOV DS, BX *)
+		0BBH, 0FFH, 0FFH, 					(* MOV BX, offset buffer *)
+		0BAH, 0F8H, 02H, 					(* MOV DX, COM2 *)
+		0ECH, 										(* IN AL, DX *)
+		8BH, 37H, 								(* MOV SI, word ptr [BX] *)
+		88H, 40H, 06H,							(* MOV byte ptr [BX+SI*1+6], AL *)
+		0FFH, 07H, 								(* INC word ptr [BX] *)
+		81H, 27H,  0FFH, 0FH, 				(* AND word ptr [BX], $0FFF *)
+		0B0H, 20H, 								(* MOV AL, $20 *)
+		0E6H, 20H,  								(* OUT $20, AL *)
+		66H, 61H, 								(* POPAD *) 
+		1FH, 										(* POP DS *)
+		0CFH; 										(* IRET *)
+	
+	PROCEDURE RealCom2;
+	BEGIN END RealCom2;
+
+	PROCEDURE +IntCom1;
+	VAR c: CHAR; eax, ebx, edx: LONGINT;
+	BEGIN 
+		SYSTEM.GETREG(0, eax); SYSTEM.GETREG(3, ebx); SYSTEM.GETREG(2, edx);
+		SYSTEM.PORTIN(3F8H, c);
+		com1.buf[com1.in] := c; com1.in := (com1.in+1) MOD N; 
+		SYSTEM.PORTOUT(20H, 20H);		(* EOI *)
+		SYSTEM.PUTREG(0, eax); SYSTEM.PUTREG(3, ebx); SYSTEM.PUTREG(2, edx);
+	END IntCom1;
+	
+	PROCEDURE +IntCom2;
+	VAR c: CHAR; eax, ebx, edx: LONGINT;
+	BEGIN 
+		SYSTEM.GETREG(0, eax); SYSTEM.GETREG(3, ebx); SYSTEM.GETREG(2, edx);
+		SYSTEM.PORTIN(2F8H, c);
+		com2.buf[com2.in] := c; com2.in := (com2.in+1) MOD N; 
+		SYSTEM.PORTOUT(20H, 20H);		(* EOI *)
+		SYSTEM.PUTREG(0, eax); SYSTEM.PUTREG(3, ebx); SYSTEM.PUTREG(2, edx);
+	END IntCom2;
+	
+	PROCEDURE InstallRealIntCom1;
+	BEGIN
+		Kernel.Reg.AX := 350CH; (* Interrupt 0CH, COM1 *)
+		Kernel.INT(Kernel.Reg, 21H);
+		com1seg := Kernel.Reg.ES;
+		com1off := Kernel.Reg.BX;
+		proc := RealCom1;
+		Kernel.Reg.AX := 250CH; (* Interrupt 0CH, COM1 *)
+		Kernel.Reg.DS := SHORT((SYSTEM.VAL(LONGINT, proc)-34) DIV 16);
+		Kernel.Reg.DX := SHORT((SYSTEM.VAL(LONGINT, proc)-34) MOD 16);
+		Kernel.INT(Kernel.Reg, 21H);
+		SYSTEM.PORTOUT(20H, 20H);		(* EOI *)
+	END InstallRealIntCom1;
+	
+	PROCEDURE InstallRealIntCom2;
+	BEGIN
+		Kernel.Reg.AX := 350BH; (* Interrupt 0BH, COM2 *)
+		Kernel.INT(Kernel.Reg, 21H);
+		com2seg := Kernel.Reg.ES;
+		com2off := Kernel.Reg.BX;
+		proc := RealCom2;
+		Kernel.Reg.AX := 250BH; (* Interrupt 0BH, COM2 *)
+		Kernel.Reg.DS := SHORT((SYSTEM.VAL(LONGINT, proc)-34) DIV 16);
+		Kernel.Reg.DX := SHORT((SYSTEM.VAL(LONGINT, proc)-34) MOD 16);
+		Kernel.INT(Kernel.Reg, 21H);
+		SYSTEM.PORTOUT(20H, 20H);		(* EOI *)
+	END InstallRealIntCom2;
+	
+	PROCEDURE TerminateCom1;
+	BEGIN
+		Kernel.Reg.AX := 250CH; (* Interrupt 0CH, COM1 *)
+		Kernel.Reg.DS := SHORT(com1seg);
+		Kernel.Reg.DX := com1off;
+		Kernel.INT(Kernel.Reg, 21H);
+	END TerminateCom1;
+	
+	PROCEDURE TerminateCom2;
+	BEGIN
+		Kernel.Reg.AX := 250BH; (* Interrupt 0BH, COM2 *)
+		Kernel.Reg.DS := SHORT(com2seg);
+		Kernel.Reg.DX := com2off;
+		Kernel.INT(Kernel.Reg, 21H);
+	END TerminateCom2;
+
+	PROCEDURE Start*(port, wlength, stopbits, parity, baud: INTEGER);
+	BEGIN
+		IF (port = COM1) & ~com1installed THEN 
+			Kernel.InstallIP(IntCom1, 4); 
+			com1.in := 0; com1.out := 0; com1installed := TRUE;
+			InstallRealIntCom1; 
+			DOS.AllocTermProc(TerminateCom1);
+		ELSIF (port = COM2) & ~com2installed THEN 
+			Kernel.InstallIP(IntCom2, 3); 
+			com2.in := 0; com2.out := 0; com2installed := TRUE;
+			InstallRealIntCom2;
+			DOS.AllocTermProc(TerminateCom2);
+		(* ELSIF other ports ... *)
+		END;
+		Init(port, baud, wlength+stopbits+parity);
+		start(port);
+	END Start;
+
+	PROCEDURE Available*(port: INTEGER): INTEGER;
+	BEGIN  
+		IF (port = COM1) & com1installed THEN RETURN (com1.in-com1.out) MOD N
+		ELSIF (port = COM2) & com2installed THEN RETURN (com2.in-com2.out) MOD N
+		(* ELSIF weitere ports ... *)
+		ELSE HALT(91) END;
+	END Available;
+
+	PROCEDURE Receive*(port: INTEGER; VAR x: CHAR);
+	BEGIN
+		IF (port = COM1) & com1installed THEN 
+			REPEAT UNTIL com1.in # com1.out; x := com1.buf[com1.out]; com1.out := (com1.out+1) MOD N
+		ELSIF (port = COM2) & com2installed THEN 
+			REPEAT UNTIL com2.in # com2.out; x := com2.buf[com2.out]; com2.out := (com2.out+1) MOD N
+		(* ELSIF weitere ports ... *)
+		ELSE HALT(92) END;
+	END Receive;
+	
+BEGIN 
+	com1installed := FALSE; com2installed := FALSE;
+	proc := RealCom1; 
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-30, SHORT(SYSTEM.ADR(com1) DIV 16));	(* Segment *)
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-25, SHORT(SYSTEM.ADR(com1) MOD 16));	(* Offset *)
+	proc := RealCom2; 
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-30, SHORT(SYSTEM.ADR(com2) DIV 16));	(* Segment *)
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-25, SHORT(SYSTEM.ADR(com2) MOD 16));	(* Offset *)
+END V24.

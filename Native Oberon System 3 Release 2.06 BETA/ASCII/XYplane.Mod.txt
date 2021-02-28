@@ -1,0 +1,111 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE XYplane;
+IMPORT Objects, Display, MenuViewers, Oberon, TextFrames, Input;
+CONST 
+	max = 15630;  closed = 0;  displayed = 2;
+	black = Display.FG;  white = Display.BG;  replace = Display.replace;
+	erase* = 0;  draw* = 1; (* values for parameter mode in Dot *)
+
+TYPE 
+	XYframe = POINTER TO XYframeDesc;
+	XYframeDesc = RECORD (Display.FrameDesc) END;
+
+VAR 
+	F: XYframe;  V: MenuViewers.Viewer;
+	bitmap: ARRAY max OF SET;
+	X*, Y*, W*, H*: INTEGER;
+
+PROCEDURE Modify(F: XYframe; VAR M: Display.ModifyMsg);
+BEGIN
+	IF (M.id = Display.extend) & (M.dY > 0) THEN
+		Display.ReplConst(black, F.X, F.Y + F.H, F.W, M.dY, replace)
+	END;
+	IF M.Y < F.Y THEN
+		Display.ReplConst(black, F.X, M.Y, F.W, F.Y - M.Y, replace)
+	END;
+	X := F.X;  Y := M.Y;  W := F.W;  H := M.H
+END Modify;
+
+PROCEDURE XYhandle*(F: Objects.Object; VAR M: Objects.ObjMsg);
+BEGIN
+	WITH F: XYframe DO
+		IF M IS Oberon.InputMsg THEN
+			WITH M: Oberon.InputMsg DO
+				IF M.id = Oberon.track THEN
+					Oberon.DrawCursor(Oberon.Mouse, Oberon.Arrow, M.X, M.Y);
+				END
+			END
+		ELSIF M IS Display.ModifyMsg THEN
+			WITH M: Display.ModifyMsg DO
+				Modify(F, M)
+			END
+		END
+	END 
+END XYhandle;
+
+PROCEDURE Clear*;
+VAR j: LONGINT;
+BEGIN
+	Display.ReplConst(black, F.X, F.Y, F.X + F.W, F.Y + F.H, replace);
+	j := 0;  WHILE j < max DO  bitmap[j] := {}; INC(j) END
+END Clear;
+
+PROCEDURE Open*;
+VAR menuF: TextFrames.Frame;  x, y: INTEGER;  
+BEGIN
+	IF V.state # displayed THEN
+		Oberon.OpenTrack(Oberon.Pointer.X, 0);
+		menuF := TextFrames.NewMenu("XY Plane", "System.Close");
+		NEW(F);  F.handle := XYhandle;
+		V := MenuViewers.New(menuF, F, TextFrames.menuH, 
+												Oberon.Pointer.X, 
+												Oberon.DisplayHeight(Oberon.Pointer.X))
+	END;
+	Clear
+END Open;
+
+PROCEDURE Dot*(x, y, mode: INTEGER);
+VAR k, i, j: LONGINT;
+BEGIN 
+	IF (x >= F.X) & (x < F.X + F.W) & (y >= F.Y) & (y < F.Y + F.H) THEN
+		k := LONG(y)*F.W + x;  i := k DIV MAX(SET);  j := k MOD MAX(SET);
+		CASE mode OF
+			  0: Display.Dot(black, x, y, replace); EXCL(bitmap[i], j)
+			|1: Display.Dot(white, x, y, replace); INCL(bitmap[i], j)
+		END
+	END
+END Dot;
+
+PROCEDURE IsDot*(x, y: INTEGER): BOOLEAN;
+VAR k, i, j: LONGINT;
+BEGIN
+	IF (x >= F.X) & (x < F.X + F.W) & (y >= F.Y) & (y < F.Y + F.H) THEN
+		k := LONG(y)*F.W + x;  i := k DIV MAX(SET);  j := k MOD MAX(SET);  
+		IF j IN bitmap[i] THEN RETURN TRUE  ELSE RETURN FALSE END
+	ELSE RETURN FALSE
+	END
+END IsDot;
+
+PROCEDURE Key*(): CHAR;
+VAR ch: CHAR;
+BEGIN  ch := 0X;
+	IF Input.Available() > 0 THEN  Input.Read(ch)  END;
+	RETURN ch
+END Key;
+
+BEGIN  NEW(F);  F.H := 0;  NEW(V);  V.state := closed; 
+END XYplane.
+
+

@@ -1,0 +1,717 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Display;
+
+(* Type: Cirrus Logic	256 Colors 1024x768
+	Date: 2. 5. 96
+	Version: 1.0
+	Author: Joerg Derungs												*)
+
+(* works on 5430, not on 5420 *)
+
+IMPORT SYSTEM, Kernel, Objects;
+
+CONST
+	black* = 0; white* = 15; 
+	BG* = 0; FG* = 15;										(*background, foreground*)
+	replace* = 0; paint* = 1; invert* = 2;		   (*operation modes*)
+
+	remove* = 0; suspend* = 1; restore* = 2;	(*ControlMsg id*)
+	reduce* = 0; extend* = 1; move* = 2;	 	(*ModifyMsg id*)
+	display* = 0; state* = 1;							   (*ModifyMsg mode*)
+	frame* = 0; area* = 1;								 (*DisplayMsg id*)
+	contents* = 0; view* = 1;							 (*PrintMsg id*)
+	get* = 0; set* = 1; reset* = 2;					  (*SelectMsg id*)
+	drop* = 0; integrate* = 1;							(*ConsumeMsg id*)
+	
+	patterns = 240;
+	patMem = 0FH;
+
+TYPE Pattern* = LONGINT;
+		PatternPtr = POINTER TO RECORD w, h, pixmap: SHORTINT END;
+		List = POINTER TO ListDesc;
+		ListDesc = RECORD
+			next: List;
+			pat: PatternPtr
+		END;
+
+		Frame* = POINTER TO FrameDesc;
+		FrameDesc* = RECORD (Objects.ObjDesc)
+			next*, dsc*: Frame;
+			X*, Y*, W*, H*: INTEGER
+		END;
+
+		FrameMsg* = RECORD (Objects.ObjMsg)
+			F*: Frame; (*target*)
+			x*, y*, res*: INTEGER
+		END;
+
+		ControlMsg* = RECORD (FrameMsg)
+			id*: INTEGER
+		END;
+
+		ModifyMsg* = RECORD (FrameMsg)
+			id*, mode*: INTEGER;
+			dX*, dY*, dW*, dH*: INTEGER;
+			X*, Y*, W*, H*: INTEGER
+		END;
+
+		DisplayMsg* = RECORD (FrameMsg)
+			id*: INTEGER;
+			u*, v*, w*, h*: INTEGER
+		END;
+
+		PrintMsg* = RECORD (FrameMsg)
+			id*, pageno*: INTEGER
+		END;
+
+		LocateMsg* = RECORD (FrameMsg)
+			loc*: Frame;
+			X*, Y*, u*, v*: INTEGER
+		END;
+
+		SelectMsg* = RECORD (FrameMsg)
+			id*: INTEGER;
+			time*: LONGINT;
+			sel*: Frame;
+			obj*: Objects.Object
+		END;
+
+		ConsumeMsg* = RECORD (FrameMsg)
+			id*: INTEGER;
+			u*, v*: INTEGER;
+			obj*: Objects.Object
+		END;
+
+		MsgProc* = PROCEDURE (VAR M: FrameMsg);
+
+VAR Unit*: LONGINT; (* RasterUnit = Unit/36000 mm *)
+		Left*,			(* left margin of black-and-white maps *)
+		ColLeft*,	   (* left margin of color maps *)
+		Bottom*,	  (* bottom of primary map *)
+		UBottom*,	(* bottom of secondary map *)
+		Width*,		 (* map width *)
+		Height*:		(* map hight*)
+			INTEGER;
+
+		arrow*, star*, cross*, downArrow*, hook*: Pattern;
+		grey0*, grey1*, grey2*, ticks*, solid*: Pattern;
+
+		Broadcast*: MsgProc;
+
+		Pat: List;
+		clipx, clipy, clipright, cliptop : INTEGER;
+
+		CurBank : INTEGER;
+		PageSize : LONGINT;
+
+		BitBLT : POINTER TO RECORD
+			bg : ARRAY 4 OF SHORTINT;					(* Background Color for Patterns *)
+			fg : ARRAY 4 OF SHORTINT;					 (* Foreground Color for Patterns *)
+			Width, Height : INTEGER;						 (* BLT Width & Height *)
+			DestLen, SrcLen : INTEGER;					  (* Dest & Src Scanline Lenght *)
+			DestLo : INTEGER; DestHi : SHORTINT;	(* Dest address *)
+			SrcLo : INTEGER; SrcHi : SHORTINT;		 (* Src address *)
+			Mask : SHORTINT;									 (* Map Mask *)
+			Mode, dmy2 : SHORTINT;						 (* BLT Mode *)
+			Op : SHORTINT;										(* Raster Operation *)
+			dmy3 : ARRAY 37 OF CHAR;
+			Start : SHORTINT;									 (* Start / Reset *)
+		END;
+
+		DispMem : LONGINT;
+
+PROCEDURE Map*(X: INTEGER): LONGINT;
+BEGIN RETURN SYSTEM.VAL (LONGINT, DispMem)		(* Start of the video RAM of MS-DOS *)
+END Map;
+
+PROCEDURE Min (a, b : INTEGER) : INTEGER;
+BEGIN	IF a < b THEN RETURN a ELSE RETURN b END
+END Min;
+
+PROCEDURE Max (a, b : INTEGER) : INTEGER;
+BEGIN	IF a > b THEN RETURN a ELSE RETURN b END
+END Max;
+
+PROCEDURE AdjustClip*(X, Y, W, H: INTEGER);
+VAR right, top : INTEGER;	
+BEGIN
+	clipx := Max (clipx, X);	clipy := Max (clipy, Y);
+	clipright := Min (clipright, X+W);	cliptop := Min (cliptop, Y+H);
+END AdjustClip;
+
+PROCEDURE GetDim*(pat: Pattern; VAR w, h: INTEGER);
+VAR s: SHORTINT;
+BEGIN	SYSTEM.GET(pat, s); w := s; SYSTEM.GET(pat+1, s); h := s
+END GetDim;
+
+PROCEDURE ResetClip*;
+BEGIN	clipx := 0; clipy := UBottom; clipright := Width; cliptop := Height
+END ResetClip;
+
+PROCEDURE SetClip*(x, y, w, h: INTEGER);
+BEGIN
+	clipx := Max (x, 0);	clipy := Max (y, UBottom);
+	clipright := Min (x+w, Width);	cliptop := Min (y+h, Height);
+END SetClip;
+
+PROCEDURE GetClip*(VAR x, y, w, h: INTEGER);
+BEGIN	x:= clipx; y:= clipy; w:= clipright-clipx; h:= cliptop-clipy
+END GetClip;
+
+PROCEDURE SetColor*(col, red, green, blue: INTEGER);	(* 0 <= col, red, green, blue < 256 *)
+BEGIN
+	red := red DIV 4;
+	green := green DIV 4;
+	blue := blue DIV 4;
+	SYSTEM.PORTOUT(3C8H, CHR(col));			(* VGA - write color entry *)
+	SYSTEM.PORTOUT(3C9H, CHR(red));
+	SYSTEM.PORTOUT(3C9H, CHR(green));
+	SYSTEM.PORTOUT(3C9H, CHR(blue))
+END SetColor;
+
+PROCEDURE GetColor*(col: INTEGER; VAR red, green, blue: INTEGER);
+BEGIN
+	red := 0;  green := 0;  blue := 0;					(* only one byte is written *)
+	SYSTEM.PORTOUT(3C7H, CHR(col));			(* VGA - read color entry *)
+	SYSTEM.PORTIN(3C9H, SYSTEM.VAL(CHAR, red));
+	SYSTEM.PORTIN(3C9H, SYSTEM.VAL(CHAR, green));
+	SYSTEM.PORTIN(3C9H, SYSTEM.VAL(CHAR, blue));
+	red := red * 4;
+	green := green * 4;
+	blue := blue * 4
+END GetColor;
+
+PROCEDURE XOR (adr : LONGINT; val : SHORTINT);
+CODE
+	MOV EBX, adr[EBP]
+	MOV AL, val[EBP]
+	XOR 0[EBX], AL
+END XOR;
+
+PROCEDURE Dot*(col, x, y, mode: INTEGER);
+VAR Offset : LONGINT;
+		Bank : INTEGER;
+BEGIN
+	IF (y < clipy) OR (x < clipx) OR (y >= cliptop) OR (x >= clipright) THEN RETURN END;
+
+	Offset := LONG(Height-y-1)*Width + x;
+	Bank := SHORT (Offset DIV PageSize);
+	Offset := Offset MOD PageSize;
+	IF Bank # CurBank THEN
+		CurBank := Bank * SHORT(PageSize DIV 4092);
+		SYSTEM.PORTOUT (03CEH, 09H);
+		SYSTEM.PORTOUT (03CFH, SHORT (CurBank));
+	END;
+	IF mode = invert THEN XOR (DispMem+Offset, SHORT (col))
+	ELSE SYSTEM.PUT(DispMem+Offset, SYSTEM.VAL (CHAR, col)) END;
+END Dot;
+
+PROCEDURE CopyBlock*(SX, SY, W, H, DX, DY, mode: INTEGER);
+VAR  SourceAddr, DestAddr, delta : LONGINT;
+		Direction, Mode : SHORTINT;
+BEGIN
+	IF DX+W > clipright THEN W := clipright - DX END;
+	IF DY+H > cliptop THEN H := cliptop - DY END;
+	IF DX < clipx THEN W := W - (clipx-DX); SX := SX + (clipx-DX); DX := clipx END;
+	IF DY < clipy THEN H := H - (clipy-DY); SY := SY + (clipy-DY); DY := clipy END;
+	IF (W <= 0) OR (H <= 0) THEN RETURN END;
+
+	SourceAddr := LONG(Height-SY-H)*Width + SX;
+	DestAddr := LONG(Height-DY-H)*Width + DX;
+	IF DestAddr <= SourceAddr THEN BitBLT.Mode := 0
+	ELSE
+		delta := LONG(H-1)*Width + W-1;
+		SourceAddr := SourceAddr + delta;
+		DestAddr := DestAddr + delta;
+		BitBLT.Mode := 1
+	END;
+
+	BitBLT.Width := W-1;	BitBLT.Height := H-1;
+	BitBLT.DestLo := SHORT (DestAddr MOD (256*256));	BitBLT.DestHi := SHORT (SHORT (DestAddr DIV (256*256)));
+	BitBLT.SrcLo := SHORT (SourceAddr MOD (256*256));	BitBLT.SrcHi := SHORT (SHORT (SourceAddr DIV (256*256)));
+	IF mode < 2 THEN BitBLT.Op := 0DH ELSE BitBLT.Op := 59H END;	BitBLT.Start := 2;
+	REPEAT UNTIL (BitBLT.Start MOD 2 = 0);
+END CopyBlock;
+
+PROCEDURE SetMode*(X: INTEGER; s: SET);
+BEGIN END SetMode;
+
+PROCEDURE ReversePattern (pat, dest : LONGINT; len, minw, maxw, minh, maxh : INTEGER);
+VAR  a, b : INTEGER;
+		i, j, k, outlen : INTEGER;
+BEGIN
+	pat := pat+2+len*(maxh-1);
+	outlen := (maxw-minw+7) DIV 8;
+	FOR k := minh TO maxh-1 DO
+		i := minw;	a := 0;	SYSTEM.GET(pat + i DIV 8, SYSTEM.VAL(CHAR, a));
+		IF i MOD 8 # 0 THEN FOR j := 1 TO i MOD 8 DO a := a DIV 2 END END;
+		j := 0;	b := 0;
+		REPEAT	b := b*2 + a MOD 2;	a := a DIV 2;
+			INC (i);	IF i MOD 8 = 0 THEN SYSTEM.GET(pat + i DIV 8, SYSTEM.VAL(CHAR, a)) END;
+			IF j MOD 8 = 7 THEN SYSTEM.PUT(dest + j DIV 8, CHR(b)); b := 0 END;	INC (j)
+		UNTIL j = outlen*8;
+		SYSTEM.PUT(dest + j DIV 8, CHR(b));
+		pat := pat - len; dest := dest + outlen
+	END;
+END ReversePattern;
+
+PROCEDURE CopyPattern* (col : INTEGER; pat : LONGINT; X, Y, mode : INTEGER);
+VAR k : INTEGER;
+		w, h, len : INTEGER;
+		dst : LONGINT;
+		minh, maxh, minw, maxw : INTEGER;
+BEGIN
+	GetDim (pat, w, h);
+	len := (w+7) DIV 8;
+	
+	minh := 0; maxh := h; minw := 0; maxw := w;
+	IF X < clipx THEN minw := clipx-X END;	IF X+w > clipright THEN maxw := clipright-X END;
+	IF Y < clipy THEN minh := clipy-Y END;	IF Y+h > cliptop THEN maxh := cliptop-Y END;
+	IF (minh >= maxh) OR (minw >= maxw) THEN RETURN END;
+
+	IF CurBank # patterns THEN
+		CurBank := patterns;
+		SYSTEM.PORTOUT (03CEH, 09H);
+		SYSTEM.PORTOUT (03CFH, SYSTEM.VAL (CHAR, CurBank))
+	END;
+	ReversePattern (pat, 0A0000H, len, minw, maxw, minh, maxh);
+	dst := LONG(Height-Y-maxh)*Width + X + minw;
+
+	FOR k := 0 TO 3 DO BitBLT.fg[k] := SYSTEM.VAL (SHORTINT, col) END;
+	IF mode = replace THEN col := BG ELSE col := -col-1 END;
+	FOR k := 0 TO 3 DO BitBLT.bg[k] := SYSTEM.VAL(SHORTINT, col) END;
+	BitBLT.Width := maxw-minw-1;	BitBLT.Height := maxh-minh-1;
+	BitBLT.DestLo := SYSTEM.VAL (INTEGER, dst);	BitBLT.DestHi := SHORT (SHORT (dst DIV (256*256)));
+	BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+	IF mode = replace THEN BitBLT.Mode := SYSTEM.VAL (SHORTINT, 80H)
+	ELSE BitBLT.Mode := SYSTEM.VAL (SHORTINT, 88H) END;
+	IF mode = invert THEN BitBLT.Op := 59H ELSE BitBLT.Op := 0DH END;
+	BitBLT.Start := 2;
+	REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+END CopyPattern;
+
+PROCEDURE  ReplConst* (col, X, Y, W, H, mode : INTEGER);
+VAR fill : SET;
+		dest : LONGINT;
+BEGIN
+	IF X < clipx THEN W := W - (clipx-X); X := clipx END;
+	IF Y < clipy THEN H := H - (clipy-Y); Y := clipy END;
+	IF X+W > clipright THEN W := clipright-X END;
+	IF Y+H > cliptop THEN H := cliptop-Y END;
+	IF (H <= 0) OR (W <= 0) THEN RETURN END;
+	
+	IF CurBank # patterns THEN
+		CurBank := patterns;
+		SYSTEM.PORTOUT (03CEH, 09H);
+		SYSTEM.PORTOUT (03CFH, SYSTEM.VAL (CHAR, patterns))
+	END;
+	fill := {0..31};
+	SYSTEM.PUT(0A0000H, fill);
+	SYSTEM.PUT(0A0004H, fill);
+	dest := LONG(Height-Y-H)*Width + X;
+	
+	BitBLT.fg[0] := SHORT (col);
+	BitBLT.Width := W-1;	BitBLT.Height := H-1;
+	BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+	BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+	BitBLT.Mode := SYSTEM.VAL (SHORTINT, 0C0H);
+	IF mode = invert THEN BitBLT.Op := 59H ELSE BitBLT.Op := 0DH END;
+	BitBLT.Start := 2;
+	REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+END ReplConst;
+
+PROCEDURE FillPattern*(col: INTEGER; pat: Pattern; pX, pY, X, Y, W, H, mode: INTEGER);
+VAR dh, dw, dlen, w, h, len, rw, rh : INTEGER;
+		row, dest : LONGINT;
+		i, j : INTEGER;
+		bcol : INTEGER;
+BEGIN
+	IF X < clipx THEN W := W - (clipx-X); X := clipx END;	IF Y < clipy THEN H := H - (clipy-Y); Y := clipy END;
+	IF X+W > clipright THEN W := clipright-X END;	IF Y+H > cliptop THEN H := cliptop-Y END;
+	IF (H <= 0) OR (W <= 0) THEN RETURN END;
+	
+	IF CurBank # patterns THEN
+		CurBank := patterns;
+		SYSTEM.PORTOUT (03CEH, 09H);
+		SYSTEM.PORTOUT (03CFH, SYSTEM.VAL (CHAR, CurBank))
+	END;
+
+	GetDim (pat, w, h);	len := (w+7) DIV 8;
+	dw := w - (w + (X-pX) MOD w) MOD w;	dh := h - (h + (Y-pY) MOD h) MOD h;
+	FOR i := 0 TO 3 DO BitBLT.fg[i] := SHORT (col) END;
+	IF mode = replace THEN bcol := BG ELSE bcol := -col-1 END;
+	FOR i := 0 TO 3 DO BitBLT.bg[i] := SHORT(bcol) END;
+	IF mode = replace THEN BitBLT.Mode := SYSTEM.VAL (SHORTINT, 80H)
+	ELSE BitBLT.Mode := SYSTEM.VAL (SHORTINT, 88H) END;
+	IF mode = invert THEN BitBLT.Op := 59H ELSE BitBLT.Op := 0DH END;
+	
+	IF dh > H THEN h := h-(dh-H); dh := H END;	IF dw > W THEN w := w-(dw-W); dw := W END;
+	W := W-dw;	H := H-dh;	Y := Y+dh;
+	
+	IF (dh > 0) & (W > 0) THEN		(* lower row *)
+		ReversePattern (pat, 0A0000H, len, 0, w, h-dh, h);
+		BitBLT.Width := w-1;	BitBLT.Height := dh-1;
+		dest := LONG(Height-Y)*Width + X+dw;
+		FOR i := 1 TO (W) DIV w DO
+			BitBLT.DestLo := SYSTEM.VAL (INTEGER, dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+			BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+			BitBLT.Start := 2;
+			REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+			dest := dest + w;
+		END;
+		rw := (W) MOD w;
+		IF rw > 0 THEN
+			ReversePattern (pat, 0A0000H, len, 0, rw, h-dh, h);
+			BitBLT.Width := rw-1;
+			BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+			BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+			BitBLT.Start := 2;
+			REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+		END;
+	END;
+	
+	IF (dw > 0) & (H > 0) THEN		(* left column *)
+		ReversePattern (pat, 0A0000H, len, w-dw, w, 0, h);
+		BitBLT.Width := dw-1;	BitBLT.Height := h-1;
+		dest := LONG(Height-Y)*Width + X;
+		FOR i := 1 TO (H) DIV h DO
+			dest := dest - LONG(Width)*h;
+			BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+			BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+			BitBLT.Start := 2;
+			REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+		END;
+		rh := (H) MOD h;
+		IF rh > 0 THEN
+			ReversePattern (pat, 0A0000H, len, w-dw, w, 0, rh);
+			BitBLT.Height := rh-1;
+			dest := dest - LONG(Width)*rh;
+			BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+			BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+			BitBLT.Start := 2;
+			REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+		END;
+	END;
+	
+	IF (dw > 0) & (dh > 0) THEN		(* bottom left corner *)
+		ReversePattern (pat, 0A0000H, len, w-dw, w, h-dh, h);
+		BitBLT.Width := dw-1;	BitBLT.Height := dh-1;
+		dest := LONG(Height-Y)*Width + X;
+		BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+		BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+		BitBLT.Start := 2;
+		REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+	END;
+
+	X := X+dw;
+	ReversePattern (pat, 0A0000H, len, 0, w, 0, h);		(* easy rectangle *)	(*********************************)
+	row := LONG(Height-Y)*Width + X;
+	BitBLT.Width := w-1;	BitBLT.Height := h-1;
+	FOR i := 1 TO W DIV w DO
+		dest := row;
+		FOR j := 1 TO H DIV h DO
+			dest := dest - LONG(Width)*h;
+			BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+			BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+			BitBLT.Start := 2;
+			REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+		END;
+		row := row+w;
+	END;
+	rh := H MOD h;
+	IF rh > 0 THEN			(* top line *)
+		BitBLT.Height := rh-1;
+		SYSTEM.MOVE (0A0000H + (h-rh)*len, 0A0000H, rh*len);
+		dest := LONG(Height-Y-H)*Width + X;
+		FOR i := 1 TO W DIV w DO
+			BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+			BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+			BitBLT.Start := 2;
+			REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+			dest := dest + w
+		END;
+	END;
+	rw := W MOD w;
+	IF rw > 0 THEN			(* last column *)
+		ReversePattern (pat, 0A0000H, len, 0, rw, 0, h);
+		BitBLT.Width := rw-1;	BitBLT.Height := h-1;
+		dest := LONG(Height-Y)*Width + X+W-rw;
+		FOR i := 1 TO H DIV h DO
+			dest := dest - LONG(Width)*h;
+			BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+			BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+			BitBLT.Start := 2;
+			REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+		END;
+		IF rh > 0 THEN
+			BitBLT.Height := rh-1;
+			SYSTEM.MOVE (0A0000H + (h-rh)*((rw+7) DIV 8), 0A0000H, rh*((rw+7) DIV 8));
+			dest := dest - LONG(Width)*rh;
+			BitBLT.DestLo := SHORT (dest);	BitBLT.DestHi := SHORT (SHORT (dest DIV (256*256)));
+			BitBLT.SrcLo := 0;	BitBLT.SrcHi := patMem;
+			BitBLT.Start := 2;
+			REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+		END
+	END
+END FillPattern;
+	
+PROCEDURE ReplPattern*(col: INTEGER; pat: Pattern; X, Y, W, H, mode: INTEGER);
+BEGIN
+	FillPattern (col, pat, 0, 0, X, Y, W, H, mode)
+END ReplPattern;
+
+PROCEDURE NewPattern*(width, height: INTEGER; VAR image: ARRAY OF SET): Pattern;
+VAR srcLen, destLen, src, dest : LONGINT;
+		p : PatternPtr;  pl: List;
+		i : INTEGER;
+BEGIN
+	destLen := (width+7) DIV 8;
+	srcLen := ((destLen+3) DIV 4)*4;
+	SYSTEM.NEW (p, 4+destLen*height);
+	p.w := SHORT (width);	p.h := SHORT (height);
+	src := SYSTEM.ADR (image);	dest := SYSTEM.ADR (p.pixmap);
+	FOR i := 0 TO height-1 DO SYSTEM.MOVE (src, dest, destLen); INC (src, srcLen); INC (dest, destLen) END;
+	NEW(pl);  pl.pat := p;  pl.next := Pat;  Pat := pl;	(* put in list to avoid GC *)
+	RETURN SYSTEM.ADR (p.w)
+END NewPattern;
+	
+PROCEDURE CreatePatterns;
+VAR image: ARRAY 256 OF SET;
+BEGIN
+	image[0] := {13};
+	image[1] := {12..14};
+	image[2] := {11..13};
+	image[3] := {10..12};
+	image[4] := {9..11};
+	image[5] := {8..10};
+	image[6] := {7..9};
+	image[7] := {0, 6..8};
+	image[8] := {0, 1, 5..7};
+	image[9] := {0..2, 4..6};
+	image[10] := {0..5};
+	image[11] := {0..4};
+	image[12] := {0..5};
+	image[13] := {0..6};
+	image[14] := {0..7};
+	arrow := NewPattern(15, 15, image);
+	
+	image[0] := {0, 10};
+	image[1] := {1, 9};
+	image[2] := {2, 8};
+	image[3] := {3, 7};
+	image[4] := {4, 6};
+	image[5] := {};
+	image[6] := {4, 6};
+	image[7] := {3, 7};
+	image[8] := {2, 8};
+	image[9] := {1, 9};
+	image[10] := {0, 10};
+	cross := NewPattern(11, 11, image); 
+	
+	image[0] := {6};
+	image[1] := {5..7};
+	image[2] := {4..8};
+	image[3] := {3..9};
+	image[4] := {2..10};
+	image[5] := {5..7};
+	image[6] := {5..7};
+	image[7] := {5..7};
+	image[8] := {5..7};
+	image[9] := {5..7};
+	image[10] := {5..7};
+	image[11] := {5..7};
+	image[12] := {5..7};
+	image[13] := {5..7};
+	image[14] := {};
+	downArrow := NewPattern(15, 15, image);
+	
+	image[0] := {0, 4, 8, 12};
+	image[1] := {};
+	image[2] := {2, 6, 10, 14};
+	image[3] := {};
+	image[4] := {0, 4, 8, 12};
+	image[5] := {};
+	image[6] := {2, 6, 10, 14};
+	image[7] := {};
+	image[8] := {0, 4, 8, 12};
+	image[9] := {};
+	image[10] := {2, 6, 10, 14};
+	image[11] := {};
+	image[12] := {0, 4, 8, 12};
+	image[13] := {};
+	image[14] := {2, 6, 10, 14};
+	image[15] := {};
+	grey0 := NewPattern(16, 16, image);
+	
+	image[0] := {0, 2, 4, 6, 8, 10, 12, 14};
+	image[1] := {1, 3, 5, 7, 9, 11, 13, 15};
+	image[2] := {0, 2, 4, 6, 8, 10, 12, 14};
+	image[3] := {1, 3, 5, 7, 9, 11, 13, 15};
+	image[4] := {0, 2, 4, 6, 8, 10, 12, 14};
+	image[5] := {1, 3, 5, 7, 9, 11, 13, 15};
+	image[6] := {0, 2, 4, 6, 8, 10, 12, 14};
+	image[7] := {1, 3, 5, 7, 9, 11, 13, 15};
+	image[8] := {0, 2, 4, 6, 8, 10, 12, 14};
+	image[9] := {1, 3, 5, 7, 9, 11, 13, 15};
+	image[10] := {0, 2, 4, 6, 8, 10, 12, 14};
+	image[11] := {1, 3, 5, 7, 9, 11, 13, 15};
+	image[12] := {0, 2, 4, 6, 8, 10, 12, 14};
+	image[13] := {1, 3, 5, 7, 9, 11, 13, 15};
+	image[14] := {0, 2, 4, 6, 8, 10, 12, 14};
+	image[15] := {1, 3, 5, 7, 9, 11, 13, 15};
+	grey1 := NewPattern(16, 16, image);
+	
+	image[0] := {0, 1, 4, 5, 8, 9, 12, 13};
+	image[1] := {0, 1, 4, 5, 8, 9, 12, 13};
+	image[2] := {2, 3, 6, 7, 10, 11, 14, 15};
+	image[3] := {2, 3, 6, 7, 10, 11, 14, 15};
+	image[4] := {0, 1, 4, 5, 8, 9, 12, 13};
+	image[5] := {0, 1, 4, 5, 8, 9, 12, 13};
+	image[6] := {2, 3, 6, 7, 10, 11, 14, 15};
+	image[7] := {2, 3, 6, 7, 10, 11, 14, 15};
+	image[8] := {0, 1, 4, 5, 8, 9, 12, 13};
+	image[9] := {0, 1, 4, 5, 8, 9, 12, 13};
+	image[10] := {2, 3, 6, 7, 10, 11, 14, 15};
+	image[11] := {2, 3, 6, 7, 10, 11, 14, 15};
+	image[12] := {0, 1, 4, 5, 8, 9, 12, 13};
+	image[13] := {0, 1, 4, 5, 8, 9, 12, 13};
+	image[14] := {2, 3, 6, 7, 10, 11, 14, 15};
+	image[15] := {2, 3, 6, 7, 10, 11, 14, 15}; 
+	grey2 := NewPattern(16, 16, image);
+
+	image[0] := {0..2, 8..11};
+	image[1] := {0..2, 7..10};
+	image[2] := {0..2, 6..9};
+	image[3] := {0..2, 5..8};
+	image[4] := {0..2, 4..7};
+	image[5] := {0..6};
+	image[6] := {0..5};
+	image[7] := {0..4};
+	image[8] := {0..3};
+	image[9] := {0..2};
+	image[10] := {0, 1};
+	image[11] := {0};
+	hook:= NewPattern(12, 12, image);
+
+	image[0] := {7};
+	image[1] := {7};
+	image[2] := {2, 7, 12};
+	image[3] := {3, 7, 11};
+	image[4] := {4, 7, 10};
+	image[5] := {5, 7, 9};
+	image[6] := {6..8};
+	image[7] := {0..6, 8..14};
+	image[8] := {6..8};
+	image[9] := {5, 7, 9};
+	image[10] := {4, 7, 10};
+	image[11] := {3, 7, 11};
+	image[12] := {2, 7, 12};
+	image[13] := {7};
+	image[14] := {7};
+	star := NewPattern(15, 15, image);
+	
+	image[0] := {};
+	image[1] := {};
+	image[2] := {0};
+	image[3] := {};
+	image[4] := {};
+	image[5] := {};
+	image[6] := {};
+	image[7] := {};
+	image[8] := {};
+	image[9] := {};
+	image[10] := {};
+	image[11] := {};
+	image[12] := {};
+	image[13] := {};
+	image[14] := {};
+	image[15] := {};
+	ticks := NewPattern(16, 16, image);
+	
+	image[0] := -{};
+	image[1] := -{};
+	solid := NewPattern(16, 2, image);
+	
+END CreatePatterns;
+	
+PROCEDURE Depth*(X: INTEGER): INTEGER;
+BEGIN	RETURN 8
+END Depth;
+
+PROCEDURE DisplayBlock*(B:LONGINT; DX, DY, W, H, SX, SY, mode:INTEGER);
+TYPE LinePtr = POINTER TO ARRAY 1024 OF LONGINT;
+VAR BlockLen : LONGINT;
+		Source, Dest : LONGINT;
+		i, j, len : INTEGER;
+		Screen, Block : LinePtr;
+BEGIN	BlockLen := 0;
+	SYSTEM.GET(B+8, BlockLen);
+	len := (W+3) DIV 4;
+	SYSTEM.GET(B+12, Source);
+	Source := Source + LONG(DY)*BlockLen + DX;
+	Dest := LONG(Height-SY-2)*Width + SX;
+	Screen := SYSTEM.VAL (LinePtr, 0A0000H);
+	BitBLT.Width := W-1;	BitBLT.Height := 0;
+	BitBLT.Mode := 4;
+	IF mode = invert THEN BitBLT.Op := 59H ELSE BitBLT.Op := 0DH END;
+	FOR i := 0 TO H-1 DO
+		Block := SYSTEM.VAL (LinePtr, Source);
+		BitBLT.DestLo := SYSTEM.VAL (INTEGER, Dest);	BitBLT.DestHi := SHORT (SHORT (Dest DIV (256*256)));
+		BitBLT.Start := 2;
+		FOR j := 0 TO len-1 DO Screen[j] := Block[j] END;
+		REPEAT UNTIL BitBLT.Start MOD 2 = 0;
+		Dest := Dest-Width;	Source := Source+BlockLen;
+	END;
+END DisplayBlock;
+
+PROCEDURE InitRegister;
+CODE
+	MOV AX, 0017H			; map BLT engine to 0B 80 00H
+	MOV DX, 03C4H
+	OUT DX, AL
+	MOV DX, 03C5H
+	IN AL, DX						; GD5430 - map BitBLT to memory
+	OR AX, 0044H
+	OUT DX, AL
+	MOV BitBLT, 0B8000H
+	MOV DispMem, 0A0000H
+
+	MOV EBX, BitBLT			; reset BLT engine
+	MOV AX, 4
+	MOV 40H[EBX], AL
+END InitRegister;
+
+BEGIN
+	Width := 1024;	Height := 768;
+	UBottom := -192;
+	Left:= 0; ColLeft:= 0; Bottom:= 0;
+	Pat := NIL;
+
+	ResetClip;
+	CreatePatterns;
+	Unit := 10000;
+
+	CurBank:= patterns;
+	SYSTEM.PORTOUT (03CEH, 09H);
+	SYSTEM.PORTOUT (03CFH, SYSTEM.VAL (CHAR, CurBank));
+	PageSize := 256 * 256;
+
+	InitRegister;
+	BitBLT.DestLen := Width;	BitBLT.SrcLen := Width;
+	BitBLT.Mask := 0;
+	ReplConst(1, 512, 384, 512, 384, replace);
+END Display.
+
+System.CopyFiles Display.Obj => GD54xx.Display.Obj ~

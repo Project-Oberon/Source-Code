@@ -1,0 +1,171 @@
+MODULE Input;	(* ARD 16.10.92 *)
+(* Based on DOS System *)
+
+	IMPORT DOS;
+
+	CONST
+		TimeUnit* = 300;	(* resolution of Time() is one millisecond *)
+		ML = 2; MM = 1; MR = 0;
+		QueueLen = 128;
+		
+	VAR
+		Keys*: SET;
+		
+		KeyTrans*: ARRAY 512 OF CHAR; (* Translationbuffer for different keyboardsettings *)
+		keyQueue: ARRAY QueueLen OF CHAR;
+		kin, kout: INTEGER;
+		maxX, maxY: INTEGER;
+		TwoButtons, set: BOOLEAN; state: INTEGER; count, delay: LONGINT;
+		oldx, oldy : INTEGER;
+
+	PROCEDURE Poll;
+	VAR ch: CHAR; ext: BOOLEAN;
+	BEGIN
+		WHILE DOS.KBAvail() DO
+			IF ((kin - kout) MOD QueueLen) # (QueueLen - 1) THEN
+				DOS.GetChar(ch, ext); 
+				IF ext THEN keyQueue[kin] := 0X; kin := (kin + 1) MOD QueueLen END;
+				keyQueue[kin] := ch; kin := (kin + 1) MOD QueueLen;
+			END;
+		END;
+	END Poll;
+		
+	PROCEDURE Available*(): INTEGER;
+	BEGIN
+		Poll;
+		RETURN (kin - kout) MOD QueueLen
+	END Available;
+	
+	PROCEDURE Wait(s : LONGINT);
+	VAR t : LONGINT;
+	BEGIN t := DOS.GetTicks (); REPEAT UNTIL DOS.GetTicks () - t > s END Wait;
+	
+	PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
+		VAR k: SET; buttons: INTEGER; key: INTEGER; 
+		
+	BEGIN
+		DOS.GetMouseInfo(x, y, buttons);
+		k := {};
+		IF ((buttons DIV 2) MOD 2) = 1 THEN INCL(k, MR) END;					(* MR *)
+		IF (buttons MOD 2) = 1 THEN INCL(k, ML) END;								(* ML *)	
+		IF ((buttons DIV 4) MOD 2) = 1 THEN INCL(k, MM) END;					(* MM *)
+		IF TwoButtons THEN 
+			DOS.ControlKeys(key);
+			IF ((key DIV 8) MOD 2) = 1 THEN INCL(k, MM) END
+		END;
+		keys := k;
+	END Mouse;
+
+	PROCEDURE Read*(VAR ch: CHAR);
+	VAR i: INTEGER;
+	BEGIN
+		WHILE kout = kin DO Poll END;
+		i := ORD(keyQueue[kout]); kout := (kout + 1) MOD QueueLen;
+		IF i = 0 THEN i := ORD(keyQueue[kout]) + 256; kout := (kout + 1) MOD QueueLen END;
+		ch := KeyTrans[i];
+	END Read;
+
+	PROCEDURE Time*(): LONGINT;
+	BEGIN
+		RETURN DOS.GetTicks()
+	END  Time;
+	
+	PROCEDURE SetMouseLimits*(w, h: INTEGER);
+	BEGIN  maxX := w - 1; maxY := h - 1
+	END SetMouseLimits;
+
+	PROCEDURE Init;
+	VAR i: INTEGER;
+	BEGIN
+		kin := 0; kout := 0; 
+		DOS.InitMouse; TwoButtons := ~DOS.Done; state := 0;
+		IF TwoButtons THEN Keys := {ML,MR} ELSE Keys := {ML,MM,MR} END;
+		i := 0; WHILE i < 128 DO KeyTrans[i] := CHR(i); INC(i) END;
+		
+		KeyTrans[1] := 83X (* CTRL-a --> É *); 
+		KeyTrans[15] := 84X (* CTRL-o --> Ñ *);
+		KeyTrans[19] := 96X (* CTRL-s --> double-s *);
+		KeyTrans[21] := 85X (* CTRL-u --> Ö *);
+		KeyTrans[8] := 7FX (* DEL *);
+		
+		i := 128; WHILE i < 512 DO KeyTrans[i] := 0X (* not defined *);  INC(i) END;
+		
+		KeyTrans[128] := 0X (* not defined *);
+		KeyTrans[129] := 85X (* Ö *);
+		KeyTrans[130] := 90X (* ê *); 
+		KeyTrans[131] := 86X (* Ü *);
+		KeyTrans[132] := 83X (* É *);
+		KeyTrans[133] := 8BX (* ã *); 
+		KeyTrans[134] := 0X (* not defined *);
+		KeyTrans[135] := 93X (* ì *); 
+		KeyTrans[136] := 87X (* á *);
+		KeyTrans[137] := 91X (* ë *); 
+		KeyTrans[138] := 8CX (* å *);
+		KeyTrans[139] := 92X (* í *); 
+		KeyTrans[140] := 88X (* à *);
+		KeyTrans[141] := 8DX (* ç *);
+		KeyTrans[142] := 80X (* Ä *);
+		KeyTrans[143] := 0X (* not defined *); 
+		KeyTrans[144] := 0X (* not defined *);
+		KeyTrans[145] := 0X (* not defined *); 
+		KeyTrans[146] := 0X (* not defined *);
+		KeyTrans[147] := 89X (* â *);
+		KeyTrans[148] := 84X (* Ñ *);
+		KeyTrans[149] := 8EX (* é *);
+		KeyTrans[150] := 8AX (* ä *);
+		KeyTrans[151] := 8FX (* è *); 
+		KeyTrans[152] := 20X (* not defined *);
+		KeyTrans[153] := 81X (* Å *); 
+		KeyTrans[154] := 82X (* Ç *);
+		KeyTrans[155] := 0X (* not defined *);
+		KeyTrans[156] := 0X (* not defined *); 
+		KeyTrans[157] := 0X (* not defined *);
+		KeyTrans[158] := 0X (* not defined *); 
+		KeyTrans[159] := 0X (* not defined *);
+		KeyTrans[160] := 94X (* î *);
+		KeyTrans[161] := 0X (* not defined *); 
+		KeyTrans[162] := 0X (* not defined *);
+		KeyTrans[163] := 0X (* not defined *); 
+		KeyTrans[164] := 95X (* ï *);
+		
+		KeyTrans[225] := 0ABX (* Doppel-s *);
+		
+		KeyTrans[315] (* F1 *) := 0A4X (* SETUP *);
+		KeyTrans[316] (* F2 *) := 91X (* NO SCROLL --> Draw *); 
+		KeyTrans[317] (* F3 *) := 0AX (* LF --> Write *);
+		KeyTrans[318] (* F4 *) := 0ACX (* BREAK --> Write *);
+		KeyTrans[319] (* F5 *) := 95X (*  ColorSystem.InitColors *);
+		KeyTrans[320] (* F6 *) := 9AX (*  Black Screen *); 
+		KeyTrans[321] (* F7 *) := 97X (*  Change Black/White *);
+		KeyTrans[322] (* F8 *) := 80X (* Ä *);
+		KeyTrans[323] (* F9 *) := 81X (* Å *); 
+		KeyTrans[324] (* F10 *) := 82X (* Ç *);
+		
+		KeyTrans[328] (* up *) := 0C1X (* up *);
+		KeyTrans[331] (* <- *) := 0C4X (* <- *);
+		KeyTrans[333] (* -> *) := 0C3X (* -> *); 
+		KeyTrans[336] (* down *) := 0C2X (* down *);
+		KeyTrans[339] (* DEL *) := 7FX (* DEL *);
+		
+		KeyTrans[286] (* ALT-A *) := 80X (* Ä *);
+		KeyTrans[280] (* ALT-O *) := 81X (* Å *); 
+		KeyTrans[278] (* ALT-U *) := 82X (* Ç *);
+		
+		KeyTrans[350] (* Ctrl-F1 *) := 9AX (*  Black Screen *);
+		KeyTrans[351] (* Ctrl-F2 *) := 93X (*  CTRL- NO SCROLL *);
+		KeyTrans[353] (* Ctrl-F4 *) := 95X (*  ColorSystem.InitColors *);
+		KeyTrans[354] (* Ctrl-F5 *) := 0X (* not defined *);
+		KeyTrans[355] (* Ctrl-F6 *) := 0X (* not defined *);
+		KeyTrans[359] (* Ctrl-F10 *) := 99X (*  System.Quit *);
+	END Init;
+	
+	PROCEDURE Calibrate*;
+	BEGIN
+	END Calibrate;
+	
+	PROCEDURE TermProc;
+	BEGIN
+	END TermProc;
+	
+BEGIN Init
+END Input.

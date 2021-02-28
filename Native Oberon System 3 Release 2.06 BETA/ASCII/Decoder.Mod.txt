@@ -1,0 +1,2494 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Decoder; (* NM 2.3.93 / 26.10.93 *)
+(*  
+	Intel i386, i387 Decoder
+	Diplomarbeit ETH-Zurich WS 92/93 by Niklaus Mannhart, 87-913-117I
+	author's address: 	Himmelrich 22
+		6340 Baar, Switzerland
+		e-mail: mannhart@inf.ethz.ch	phone: +41 (0)42 31 40 33
+
+This program is distributed in the hope that it will be useful, 
+but WITHOUT ANY WARRANTY; without even the implied warranty of 
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+	
+	March the 2nd 1993
+	Release 24.10.93 / Beta 1.2
+
+	Detailed Description of i386 addressing modes and opcodes see: 
+		Programming the 80386 by John H. Crawford, Patrick P. Gelsinger 
+		SYBEX 1987, ISBN: 0-89588-381-3
+
+	found mistakes in the book:
+		page 718
+			IMUL = Integer Multiply (signed)
+			Accumulator with Register/Memory	1111011w   mod 101 r/rm
+		
+		page 721
+			REP INS = Input String	11110011   0110110w
+			REP LODS = Load String	11110011   1010110w
+			REP MOVS = Move String	11110011   1010010w
+			
+		page 722
+			JMP = Unconditional Jump
+			Short	11101011   8-bit displacement
+			
+		page 755
+			FSTP = Store and Pop
+				ST (0) to ST (i)	ESC 101   11011 ST(i)
+
+		12.2.96 prk (reali@inf.ethz.ch)
+			TEST operand are decoded wrong		(* bug1 *)
+			INC Reg: wrong reg is dumped, size wasn't set		(* bug2 *)
+
+		07.03.96 pjm
+			export DecodeObjFile
+			clear global pointers at end of procedures to save memory
+
+		12.03.96 pjm
+			added Shift
+			removed global T
+			Bug in Element: the new struct is defined at REC/OBJ, not at FLIST
+			Bug in Element: elements 04X and 17X: the varno parameter is only 1 byte long
+		
+		14.03.96 prk
+			Bug in Decode: if no text is generated, nothing is dumped
+		
+		15.03.96 prk
+			Name of the procedure is dumped at the entry point in the code
+		
+		18.03.96 prk
+			Data section changed
+		
+		21.03.96 prk
+			Bug in Bit: BT/BTC/BTR/BTS had the registers inverted
+		
+		26.03.96 prk
+			shl is equivalent to sal
+			bug: MOV SReg, Reg -> Reg is 16 bits, not 32 wide
+		
+		4.04.96 prk
+			MOV Reg, SReg -> Res is 16 bits, not 32
+			Grp6/Grp7 implemented yet!
+			Hex immediate for OR, XOR, AND
+			hex values followed by "H" (only in the code)
+*)
+
+	IMPORT Files, Fonts, Texts, Oberon, Out, SYSTEM;
+
+	CONST
+		(* prefix *)
+		pCS = 2EH; pDS = 3EH; pES = 26H; pFS = 64H; pGS = 65H; pSS = 36H;
+		AdrSize = 67H; OpSize = 66H; none = -1;
+
+		(* output *)
+		PCpos = 0; HexPos = 7; OpPos = 43; RMPos = 52; Pos1 = 4;
+
+		(* addressing modes *)
+		Reg = 0; (* Register *)
+		Mem1 = 1; (* addressing mode 1 *)
+		Mem2 = 2; (* addressing mode 2 *)
+		RegImm = 3; (* immediate to register *)
+		MemImm = 4; (* memory to register *)
+		MemFull = 5; (* full 32 bit adr *)
+
+		(* i386 Register *)
+		EAX = 0; ECX = 1; EDX = 2; EBX = 3; ESP = 4; EBP = 5; ESI = 6; EDI = 7; (* 32 bit register *)
+		AX = 0; CX = 1; DX = 2; BX = 3; SP =  4; BP = 5; SI = 6; DI = 7; (* 16 bit register *)
+		AL = 0; CL = 1; DL = 2; BL = 3; AH = 4; CH = 5; DH = 6; BH = 7; (* 8 bit register *)
+		ES = 20; CS = 21; SS = 22; DS = 23; FS = 24; GS = 25;  (* 6, 7 reserved *) (* Segment register *)
+		CR = 0; DR = 8; TR = 16;
+
+		(* i387 *)
+		SReal = 0; (* single real 32 bit*)
+		LReal = 1; (* long real 64 bit *)
+		EReal = 2; (* extended real 80 bit *)
+		WInt = 3; (* word integer 16 bit *)
+		SInt = 4; (* single integer 32 bit *)
+		LInt = 5; (* long integer 64 bit *)
+		Byte14 = 6; Byte28 = 7; Byte94 = 8; Byte108 = 9;
+		Decimal = 10; (* BCD *)
+		nothing = 11;
+
+		(* size *)
+		Byte = 0; SignExt = 1; (* sign extended *)
+
+		BUG = 40;
+
+	TYPE
+		ProcEntry = RECORD
+				name: ARRAY 32 OF CHAR;
+				point: LONGINT
+		END;
+		
+	VAR
+		R, Ref: Files.Rider; (* Rider for Object file *)
+		W: Texts.Writer; (* Writer for output on screen *)
+		pc, breakpos: LONGINT; column: INTEGER; (* curser position in the current line *)
+		prefix, w: INTEGER; adrPrefix, opPrefix: BOOLEAN;
+		defaultFont, titleFont: Fonts.Font;
+		PE: ARRAY 128 OF ProcEntry;
+		nofPE: INTEGER;
+		StrN: INTEGER;
+		StrName: ARRAY 128 OF ARRAY 32 OF CHAR;
+		ModN: INTEGER;
+		ModName: ARRAY 128 OF ARRAY 32 OF CHAR;
+		suppressH: BOOLEAN;
+		
+
+(* general Procedures *)
+
+	PROCEDURE Bug (no: INTEGER);
+	BEGIN
+		Texts.WriteLn(W);  Texts.WriteString(W, "*** decode error ***");
+		Texts.WriteLn(W);
+		(*Texts.Append(T, W.buf);
+		HALT(BUG)*)
+	END Bug;
+
+	PROCEDURE Next (VAR ch: CHAR);
+	BEGIN
+		INC(pc); Files.Read(R, ch);
+		(* IF pc = breakpos THEN Texts.SetFont(W, Fonts.This("Syntax12b.Scn.Fnt"))
+		ELSE Texts.SetFont(W, defaultFont)
+		END *)
+	END Next;
+
+	PROCEDURE GetByte (VAR b: INTEGER);
+		VAR ch: CHAR;
+	BEGIN
+		Next(ch);
+		b:= ORD(ch)
+	END GetByte;
+
+	PROCEDURE GetWord (VAR w: LONGINT);
+		VAR ch: CHAR;
+	BEGIN
+		Next(ch); w:= ORD(ch);
+		Next(ch);  w:= LONG(ORD(ch)) * 100H + w
+	END GetWord;
+	
+	PROCEDURE GetDWord (VAR dw: LONGINT);
+		VAR ch: CHAR; byte: INTEGER;
+	BEGIN 
+		Next(ch); dw:= LONG(ORD(ch));
+		Next(ch); dw:= LONG(ORD(ch)) * 100H + dw;
+		Next(ch); dw:= LONG(ORD(ch)) * 10000H + dw;
+		GetByte(byte); 
+		IF byte >= 128 THEN byte:= byte - 256 END;
+		dw:= LONG(byte) * 1000000H + dw
+	END GetDWord;
+	
+	PROCEDURE WriteLn; 
+	BEGIN
+		Texts.WriteLn(W); column:= 0
+	END WriteLn;
+
+	PROCEDURE WriteString (str: ARRAY OF CHAR);
+	BEGIN
+		Texts.WriteString(W, str); column:= column + SHORT(LEN(str))
+	END WriteString;
+	
+	PROCEDURE Write (ch: CHAR);
+	BEGIN
+		Texts.Write(W, ch); INC(column)
+	END Write;
+	
+	PROCEDURE WriteByte (byte: INTEGER);
+	(* write byte in hexadecimal form *)
+
+		PROCEDURE WriteHex(d: INTEGER);
+		BEGIN
+			IF d > 9 THEN Write(CHR(41H + d - 10))
+			ELSE Write(CHR(30H + d))
+			END
+		END WriteHex;
+
+	BEGIN (* WriteByte *)
+		WriteHex(byte DIV 16); WriteHex(byte MOD 16);
+		IF (~suppressH) & (column >= OpPos) THEN Write("H") END
+	END WriteByte;
+	
+	PROCEDURE WriteWord (word: LONGINT);
+	(* write word in byte form, little endian notation *)
+	BEGIN
+		WriteByte(SHORT(word MOD 100H)); Write(" ");
+		WriteByte(SHORT(word DIV 100H) MOD 100H)
+	END WriteWord;
+	
+	PROCEDURE WriteDWord (dword: LONGINT);
+	(* write dword in byte form, little endian notation *)
+	BEGIN
+		WriteWord(dword MOD 10000H); Write(" ");
+		WriteWord((dword DIV 10000H) MOD 10000H)
+	END WriteDWord;
+	
+	PROCEDURE WriteWHex (word: LONGINT);
+	(* write word hexadecimal *)
+		VAR b: BOOLEAN;
+	BEGIN
+		b := suppressH; suppressH := TRUE;
+		WriteByte(SHORT(word DIV 100H)); WriteByte(SHORT(word MOD 100H));
+		IF ~b & (column >= OpPos) THEN Write("H") END;
+		suppressH := b;
+	END WriteWHex;
+	
+	PROCEDURE WriteDWHex (dword: LONGINT);
+		VAR b: BOOLEAN;
+	BEGIN
+		b := suppressH; suppressH := TRUE;
+		WriteWHex(dword DIV 10000H MOD 10000H); WriteWHex(dword MOD 10000H);
+		IF ~b & (column >= OpPos) THEN Write("H") END;
+		suppressH := b;
+	END WriteDWHex;
+	
+	PROCEDURE WriteDisp (disp: LONGINT);
+	BEGIN
+		Texts.WriteInt(W, disp, 1);
+		IF disp = MIN(LONGINT) THEN INC(column, 12)	(* " -2147483648" *)
+		ELSE
+			IF disp <= 0 THEN INC(column) END;
+			disp:= ABS(disp);
+			WHILE disp # 0 DO
+				disp:= disp DIV 10;
+				INC(column)
+			END
+		END
+	END WriteDisp;
+	
+	PROCEDURE Tab (pos: INTEGER);
+	BEGIN
+		WHILE column < pos DO Write(" ") END
+	END Tab;
+
+	PROCEDURE WriteOp (opStr: ARRAY OF CHAR);
+	BEGIN
+		Tab(OpPos); WriteString(opStr); Tab(RMPos)
+	END WriteOp;
+
+	PROCEDURE WriteReg (reg: INTEGER);
+	(* w = 0: 8 bit; w = 1: 16/32 bit *)
+	BEGIN
+		IF reg >= ES (*DS*) THEN 					(*  <<<< MH 15.3.1994 *)
+			IF reg = CS THEN WriteString("cs")
+			ELSIF reg = DS THEN WriteString("ds")
+			ELSIF reg = ES THEN WriteString("es")
+			ELSIF reg = SS THEN WriteString("ss")
+			ELSIF reg = FS THEN WriteString("fs")
+			ELSIF reg = GS THEN WriteString("gs")
+			ELSE Bug(BUG)
+			END
+		ELSIF w = 0 THEN
+			IF reg = 0 THEN WriteString("al")
+			ELSIF reg = 1 THEN WriteString("cl")
+			ELSIF reg = 2 THEN WriteString("dl")
+			ELSIF reg = 3 THEN WriteString("bl")
+			ELSIF reg = 4 THEN WriteString("ah")
+			ELSIF reg = 5 THEN WriteString("ch")
+			ELSIF reg = 6 THEN WriteString("dh")
+			ELSIF reg = 7 THEN WriteString("bh")
+			ELSE Bug(BUG)
+			END
+		ELSIF opPrefix THEN
+			IF reg = 0 THEN WriteString("ax")
+			ELSIF reg = 1 THEN WriteString("cx")
+			ELSIF reg = 2 THEN WriteString("dx")
+			ELSIF reg = 3 THEN WriteString("bx")
+			ELSIF reg = 4 THEN WriteString("sp")
+			ELSIF reg = 5 THEN WriteString("bp")
+			ELSIF reg = 6 THEN WriteString("si")
+			ELSIF reg = 7 THEN WriteString("di")
+			ELSE Bug(BUG)
+			END
+		ELSE
+			IF reg = 0 THEN WriteString("eax")
+			ELSIF reg = 1 THEN WriteString("ecx")
+			ELSIF reg = 2 THEN WriteString("edx")
+			ELSIF reg = 3 THEN WriteString("ebx")
+			ELSIF reg = 4 THEN WriteString("esp")
+			ELSIF reg = 5 THEN WriteString("ebp")
+			ELSIF reg = 6 THEN WriteString("esi")
+			ELSIF reg = 7 THEN WriteString("edi")
+			ELSE Bug(BUG)
+			END
+		END
+	END WriteReg;
+
+	PROCEDURE WriteAdrReg(reg: INTEGER);
+	BEGIN
+		IF adrPrefix THEN
+			IF reg = 0 THEN WriteString("ax")
+			ELSIF reg = 1 THEN WriteString("cx")
+			ELSIF reg = 2 THEN WriteString("dx")
+			ELSIF reg = 3 THEN WriteString("bx")
+			ELSIF reg = 4 THEN WriteString("sp")
+			ELSIF reg = 5 THEN WriteString("bp")
+			ELSIF reg = 6 THEN WriteString("si")
+			ELSIF reg = 7 THEN WriteString("di")
+			ELSE Bug(BUG)
+			END
+		ELSE
+			IF reg = 0 THEN WriteString("eax")
+			ELSIF reg = 1 THEN WriteString("ecx")
+			ELSIF reg = 2 THEN WriteString("edx")
+			ELSIF reg = 3 THEN WriteString("ebx")
+			ELSIF reg = 4 THEN WriteString("esp")
+			ELSIF reg = 5 THEN WriteString("ebp")
+			ELSIF reg = 6 THEN WriteString("esi")
+			ELSIF reg = 7 THEN WriteString("edi")
+			ELSE Bug(BUG)
+			END
+		END
+	END WriteAdrReg;
+	
+	PROCEDURE WriteSpecialReg(reg: INTEGER);
+	BEGIN
+		IF reg >= TR THEN
+			WriteString("tr"); Write(CHR( reg-TR + ORD("0")))
+		ELSIF reg >= DR THEN
+			WriteString("dr"); Write(CHR( reg-DR + ORD("0")))
+		ELSE
+			WriteString("cr"); Write(CHR( reg-CR + ORD("0")))
+		END
+	END WriteSpecialReg;
+	
+	PROCEDURE WritePrefix (prefix: INTEGER);
+	BEGIN
+		IF prefix = pCS THEN WriteString("CS:")
+		ELSIF prefix = pDS THEN WriteString("DS: ")
+		ELSIF prefix = pES THEN WriteString("ES: ")
+		ELSIF prefix = pFS THEN WriteString("FS: ")
+		ELSIF prefix = pGS THEN WriteString("GS: ")
+		ELSIF prefix = pSS THEN WriteString("SS: ")
+		ELSE
+		END
+	END WritePrefix;
+
+	PROCEDURE WriteRegReg (d, reg1, reg2: INTEGER);
+	BEGIN
+		IF d = 1 THEN
+			WriteReg(reg1); Write(","); WriteReg(reg2)
+		ELSE
+			WriteReg(reg2); Write(","); WriteReg(reg1)
+		END
+	END WriteRegReg;
+
+	PROCEDURE WriteMem (base, inx, scale: INTEGER; disp: LONGINT);
+	BEGIN
+		WritePrefix(prefix);
+		IF base # none THEN(* register relative *)
+			WriteDisp(disp);
+			Write("["); WriteAdrReg(base)
+		ELSE (* absolute *)
+			Write("["); WriteDisp(disp)
+		END;
+		IF (inx # none) & ~((inx = ESP) & (base = ESP))(* !! 15.4.93 Bug? & (base # ESP) *) THEN (* indexed *)
+			IF scale = 0 THEN WriteString(" + 1 * ")
+			ELSIF scale = 1 THEN WriteString(" + 2 * ")
+			ELSIF scale = 2 THEN WriteString(" + 4 * ")
+			ELSE WriteString(" +  8* ")
+			END;
+			WriteAdrReg(inx)
+		END;
+		Write("]")
+	END WriteMem;
+
+	PROCEDURE WriteMem1 (d, reg, base: INTEGER; disp: LONGINT);
+	(* d = TRUE: reg, mem ; d = FALSE: mem, reg *)
+	BEGIN
+		IF d = 1 THEN 
+			WriteReg(reg); Write(",")
+		END;
+		WriteMem(base, none, 0, disp);
+		IF d = 0 THEN 
+			Write(","); WriteReg(reg)
+		END
+	END WriteMem1;
+
+	PROCEDURE WriteMem2 (d, reg, base, inx: INTEGER; scale: SHORTINT; disp: LONGINT);
+	(* d = TRUE: reg, mem; d= FALSE: mem, reg *)
+	BEGIN
+		IF d = 1 THEN
+			WriteReg(reg); Write(",")
+		END;
+		WriteMem(base, inx, scale, disp);
+		IF d = 0 THEN
+			Write(","); WriteReg(reg)
+		END
+	END WriteMem2;
+	
+	PROCEDURE WriteRegImm (reg: INTEGER; imm: LONGINT; hex: BOOLEAN);
+	BEGIN
+		WriteReg(reg); Write(","); 
+		IF hex THEN WriteDWHex(imm) ELSE WriteDisp(imm) END
+	END WriteRegImm;
+	
+	PROCEDURE WriteMemImm (reg, base, inx: INTEGER; scale: SHORTINT; disp, imm: LONGINT; hex: BOOLEAN);
+	BEGIN
+		WritePrefix(prefix);
+		WriteMem(base, inx, scale, disp);
+		Write(",");
+		IF hex THEN WriteDWHex(imm) ELSE WriteDisp(imm) END
+	END WriteMemImm;
+	
+	PROCEDURE WriteRM (mode: SHORTINT; d, reg, base, inx, scale: INTEGER; disp, imm: LONGINT; hex: BOOLEAN);
+	BEGIN
+		CASE mode OF
+			RegImm:
+				WriteRegImm(reg, imm, hex)
+		  | MemImm:
+				WriteMemImm(reg, base, inx, SHORT(scale), disp, imm, hex)
+		  | Reg:
+				WriteRegReg(d, reg, base)
+		  | Mem1:
+				WriteMem1(d, reg, base, disp)
+		  | Mem2:
+				WriteMem2(d, reg, base, inx, SHORT(scale), disp)
+		  | MemFull:
+				IF d = 1 THEN 
+					WriteReg(reg); Write(",")
+				END;
+				Write("["); WriteDisp(disp); Write("]");
+				IF d = 0 THEN
+					Write(","); WriteReg(reg)
+				END
+		ELSE Bug(BUG)
+		END
+	END WriteRM;
+
+(* Decode part *)
+
+	PROCEDURE GetImm (w: INTEGER; VAR imm: LONGINT);
+		VAR byte: INTEGER;
+	BEGIN
+		IF w = 0 THEN (* 8 bit *)
+			GetByte(byte); WriteByte(byte); Write(" ");
+			IF  byte >= 128 THEN byte:= byte - 256 END;
+			imm:= byte
+		ELSIF opPrefix THEN (* 16 bit *)
+			GetWord(imm); WriteWord(imm); Write(" ");
+			IF imm >= 32768 THEN imm:= imm - 65536 END
+		ELSE (* 32 bit *)
+			GetDWord(imm); WriteDWord(imm); Write(" ")
+		END
+	END GetImm;
+
+	PROCEDURE ModRm (VAR mode: SHORTINT; VAR reg, base, inx: INTEGER; VAR scale: SHORTINT; VAR disp: LONGINT);
+		VAR mod, byte, temp: INTEGER;
+	BEGIN
+		GetByte(byte); WriteByte(byte); Write(" ");
+		mod:= byte DIV 40H;
+		reg:=(byte DIV 8) MOD 8; 
+		base:= byte MOD 8;
+		IF mod = 3 THEN (* reg *)
+			mode:= Reg; inx:= none
+		ELSE
+			IF base = 4 THEN (* escape to two bytes *)
+				mode:= Mem2;
+				GetByte(byte);
+				WriteByte(byte); Write(" ");
+				scale:= SHORT(byte DIV 40H);
+				inx:= (byte DIV 8) MOD 8;
+				base:= byte MOD 8
+			ELSE (* one byte addressing mode *)
+				mode:= Mem1; inx:= none
+			END;
+			IF mod = 0 THEN (* no displ, or 32 bit address *)
+				IF base = 5 THEN (* disp32 *)
+					base:= none;
+					GetDWord(disp); 
+					WriteDWord(disp); Write(" ")
+				ELSE disp:= 0
+				END
+			ELSIF mod = 1 THEN (* 8 bit displ *)
+				GetImm(0, disp) 
+			ELSE (* 32 bit displacement *)
+				GetDWord(disp); 
+				WriteDWord(disp); Write(" ")
+			END
+		END
+	END ModRm;
+
+	PROCEDURE Type1 (op: INTEGER; VAR mode: SHORTINT; VAR d, reg, base, inx: INTEGER;
+								VAR scale: SHORTINT; VAR disp, imm: LONGINT);
+	(* type 1: add, or, adc, sbb, and, sub, xor, cmp *)
+	BEGIN
+		IF op = 4 THEN
+			mode:= RegImm; w:= 0; reg:= AL; GetImm(0, imm)
+		ELSIF op = 5 THEN
+			mode:= RegImm; w:= 1; reg:= AX; GetImm(1, imm)
+		ELSE
+			CASE op OF
+				0: w:= 0; d:= 0
+			  | 1: w:= 1; d:= 0
+			  | 2: w:= 0; d:= 1
+			  | 3: w:= 1; d:= 1
+			ELSE Bug(BUG)
+			END;
+			ModRm(mode, reg, base, inx, scale, disp)
+		END
+	END Type1;
+	
+	PROCEDURE Add (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		Type1(op, mode, d, reg, base, inx, scale, disp, imm);
+		WriteOp("add");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, FALSE)
+	END Add;
+
+	PROCEDURE Push (op: INTEGER);
+		VAR imm: LONGINT;
+	BEGIN
+		w:= 1;
+		IF op = 60H THEN 
+			IF opPrefix THEN WriteOp("pusha") ELSE WriteOp("pushad") END;
+		ELSIF op = 68H THEN
+			IF adrPrefix THEN
+				GetWord(imm); WriteWord(imm)
+			ELSE
+				GetDWord(imm); WriteDWord(imm)
+			END;
+			WriteOp("push"); WriteDisp(imm)
+		ELSIF op = 6AH THEN
+			GetImm(0, imm);
+			WriteOp("push"); WriteDisp(imm)
+		ELSIF op = 9CH THEN 
+			IF opPrefix THEN WriteOp("pushf") ELSE WriteOp("pushfd") END;
+		ELSE
+			WriteOp("push");
+			CASE op OF
+				6: WriteReg(ES)
+			  | 0EH: WriteReg(CS)
+			  | 16H: WriteReg(SS)
+			  | 1EH: WriteReg(DS)
+			  | 50H..57H: WriteReg(op - 50H)
+			ELSE Bug(BUG)
+			END
+		END
+	END Push;
+	
+	PROCEDURE Push2 (op: INTEGER);
+	BEGIN
+	END Push2;
+
+	PROCEDURE Pop(op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		IF op = 61H THEN 
+			IF opPrefix THEN WriteOp("popa") ELSE WriteOp("popad") END;
+		ELSIF op = 8FH THEN
+			ModRm(mode, reg, base, inx, scale, disp);
+			WriteOp("pop");
+			IF opPrefix THEN WriteString("word ptr ")
+			ELSE WriteString("dword ptr ")
+			END;
+			WriteMem(base, inx, scale, disp)
+		ELSIF op = 9DH THEN 
+			IF opPrefix THEN WriteOp("popf") ELSE WriteOp("popfd") END;
+		ELSE
+			WriteOp("pop");
+			w := 1;	(* pop takes only 16 or 32 bit ops *)
+			CASE op OF
+				7: WriteReg(ES)
+			  | 17H: WriteReg(SS)
+			  | 1FH: WriteReg(DS)
+			  | 58H..5FH: WriteReg(op - 58H)
+			 ELSE Bug(BUG)
+			 END
+		END
+	END Pop;
+
+	PROCEDURE Pop2 (op: INTEGER);
+	BEGIN
+	END Pop2;
+
+	PROCEDURE Or (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		Type1(op - 08H, mode, d, reg, base, inx, scale, disp, imm);
+		WriteOp("or");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, TRUE)
+	END Or;
+	
+	PROCEDURE Adc (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		Type1(op -10H, mode, d, reg, base, inx, scale, disp, imm);
+		WriteOp("adc");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, FALSE)
+	END Adc;
+
+	PROCEDURE Sbb (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		Type1(op - 18H, mode, d, reg, base, inx, scale, disp, imm);
+		WriteOp("sbb");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, FALSE)
+	END Sbb;
+
+	PROCEDURE  And (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		Type1(op - 20H, mode, d, reg, base, inx, scale, disp, imm);
+		WriteOp("and");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, TRUE)
+	END And;
+
+	PROCEDURE Sub (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		Type1(op - 28H, mode, d, reg, base, inx, scale, disp, imm);
+		WriteOp("sub");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, FALSE)
+	END Sub;
+
+	PROCEDURE Xor (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		Type1(op - 30H, mode, d, reg, base, inx, scale, disp, imm);
+		WriteOp("xor");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, TRUE)
+	END Xor;
+
+	PROCEDURE Cmp (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		Type1(op - 38H, mode, d, reg, base, inx, scale, disp, imm);
+		WriteOp("cmp");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, FALSE)
+	END Cmp ;
+
+	PROCEDURE Inc (op: INTEGER);
+	BEGIN
+		WriteOp("inc"); w := 1;		(* set width to 16/32 bits, bug2 *)
+		WriteReg(op - 40H)
+	END Inc;
+
+	PROCEDURE Dec (op: INTEGER);
+	BEGIN
+		WriteOp("dec");
+		WriteReg(op - 48H)
+	END Dec;
+
+	PROCEDURE Bound (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		w:= 1;
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("bound");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE)
+	END Bound;
+
+	PROCEDURE Imul (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		w:= 1;
+		IF op = 69H THEN GetImm(1, imm)
+		ELSIF op = 6BH THEN GetImm(0, imm) (* sign extended *)
+		END;
+		WriteOp("imul");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE);
+		Write(","); WriteDisp(imm)
+	END Imul;
+
+	PROCEDURE Imul2 (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		w:= 1;
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("imul");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE)
+	END Imul2;
+
+	PROCEDURE Ins (op: INTEGER);
+	BEGIN
+		IF op =  6CH THEN WriteOp("insb")
+		ELSIF opPrefix THEN WriteOp("insw")
+		ELSE WriteOp("insd")
+		END	
+	END Ins;
+
+	PROCEDURE Outs (op: INTEGER);
+	BEGIN
+		IF op = 6EH THEN WriteOp("outsb")
+		ELSIF opPrefix THEN WriteOp("outsw")
+		ELSE WriteOp("outsd")
+		END
+	END Outs;
+
+	PROCEDURE Jcc (op: INTEGER);
+		VAR disp: INTEGER;
+	BEGIN
+		GetByte(disp); WriteByte(disp);
+		IF disp >= 128 THEN disp:= disp - 256 END;
+		CASE op OF
+			70H: WriteOp("jo")
+		  | 71H: WriteOp("jno")
+		  | 72H: WriteOp("jb")
+		  | 73H: WriteOp("jnb")
+		  | 74H: WriteOp("jz")
+		  | 75H: WriteOp("jnz")
+		  | 76H: WriteOp("jbe")
+		  | 77H: WriteOp("jnbe")
+		  | 78H: WriteOp("js")
+		  | 79H: WriteOp("jns")
+		  | 7AH: WriteOp("jp")
+		  | 7BH: WriteOp("jnp")
+		  | 7CH: WriteOp("jl")
+		  | 7DH: WriteOp("jnl")
+		  | 7EH: WriteOp("jle")
+		  | 7FH: WriteOp("jnle")
+		ELSE Bug(BUG)
+		END;
+		WriteDisp(disp); WriteString("  ("); (*Texts.*)WriteDWHex(pc + disp); Write(")")
+	END Jcc;
+	
+	PROCEDURE Jcc2 (op: INTEGER);
+		VAR disp: LONGINT;
+	BEGIN
+		IF adrPrefix THEN 
+			GetWord(disp); WriteWord(disp)
+		ELSE
+			GetDWord(disp); WriteDWord(disp)
+		END;
+		CASE op OF
+			80H: WriteOp("jo")
+		  | 81H: WriteOp("jno")
+		  | 82H: WriteOp("jb")
+		  | 83H: WriteOp("jnb")
+		  | 84H: WriteOp("jz")
+		  | 85H: WriteOp("jnz")
+		  | 86H: WriteOp("jbe")
+		  | 87H: WriteOp("jnbe")
+		  | 88H: WriteOp("js")
+		  | 89H: WriteOp("jns")
+		  | 8AH: WriteOp("jp")
+		  | 8BH: WriteOp("jnp")
+		  | 8CH: WriteOp("jl")
+		  | 8DH: WriteOp("jnl")
+		  | 8EH: WriteOp("jle")
+		  | 8FH: WriteOp("jnle")
+		ELSE Bug(BUG)
+		END;
+		WriteDisp(disp); WriteString("  ("); (*Texts.*)WriteDWHex(pc + disp); Write(")")
+	END Jcc2;
+
+	PROCEDURE Test (op: INTEGER);
+		VAR reg, base, inx, byte: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		IF (op = 0A8H) OR (op = 0A9H) THEN
+			IF op = 0A8H THEN 
+				w:= 0; reg:= AL
+			ELSE 
+				w:= 1; reg:= AX
+			END;
+			GetImm(w, imm);
+			mode:= RegImm
+		ELSE
+			ModRm(mode, reg, base, inx, scale, disp);
+			IF op = 84H THEN w:= 0
+			ELSE w:= 1
+			END
+		END;
+		WriteOp("test");
+		WriteRM(mode, 0, reg, base, inx, scale, disp, imm, FALSE)			(* bug1 *)
+	END Test;
+
+	PROCEDURE Xchg (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		IF (op >= 91H) & (op <= 97H) THEN (* xchg .ax, reg *)
+			w:= 1; reg:= AX; base:= op MOD 8;
+			mode:= Reg
+		ELSE
+			ModRm(mode, reg, base, inx, scale, disp);
+			IF op = 86H THEN w:= 0
+			ELSE w:= 1
+			END
+		END;
+		WriteOp("xchg");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE)
+	END Xchg;
+
+	PROCEDURE Mov (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		IF (op >= 88H) & (op <= 8BH) THEN
+			Type1(op - 88H, mode, d, reg, base, inx, scale, disp, imm)
+		ELSIF (op >= 0B0H) & (op <= 0B7H) THEN
+			mode:= RegImm; w:= 0; reg:= op - 0B0H; GetImm(w, imm)
+		ELSIF (op >= 0B8H) & (op <= 0BFH) THEN
+			mode:= RegImm; w:= 1; reg:= op - 0B8H; GetImm(w, imm)
+		ELSIF (op >= 0A0H) & (op <= 0A3H) THEN
+			CASE op OF
+				0A0H: w:= 0; d:= 1; reg:= AL
+			  | 0A1H: w:= 1; d:= 1; reg:= AX
+			  | 0A2H: w:= 0; d:= 0; reg:= AL
+			  | 0A3H: w:= 1; d:= 0; reg:= AX
+			END;
+			mode:= MemFull; 
+			IF adrPrefix THEN 
+				GetWord(disp); WriteWord(disp)
+			ELSE 
+				GetDWord(disp); WriteDWord(disp)
+			END
+		ELSIF op = 8CH THEN (* mov mem, seg *)
+			w:= 1; d:= 0; opPrefix:= TRUE;
+			ModRm(mode, reg, base, inx, scale, disp);
+			reg:= reg + ES (* reg is a segment register *)
+		ELSIF op = 8EH THEN (* mov seg, mem *)
+			w:= 1; d:= 1; opPrefix:= TRUE;
+			ModRm(mode, reg, base, inx, scale, disp);
+			reg:= reg + ES (* reg is segment register *)
+		ELSIF (op = 0C6H) OR (op = 0C7H) THEN
+			d:= 1;
+			IF op = 0C6H THEN w:= 0
+			ELSE w:= 1
+			END;
+			ModRm(mode, reg, base, inx, scale, disp);
+			IF mode = Reg THEN
+				reg:= base; mode:= RegImm
+			ELSE mode:= MemImm
+			END;
+			GetImm(w, imm)
+		END;
+		WriteOp("mov");
+		WriteRM(mode, d, reg, base, inx, scale, disp, imm, FALSE)
+	END Mov;
+
+	PROCEDURE Mov2 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN (* reg, base only used, because Mov2 op codes contains special registers (debug/test/controll) *)
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("mov");
+		CASE op OF
+		 	20H: WriteReg(base); Write(","); WriteSpecialReg(CR+reg)
+		  | 21H: WriteReg(base); Write(","); WriteSpecialReg(DR+reg)
+		  | 22H: WriteSpecialReg(CR+reg); Write(","); WriteReg(base)
+		  | 23H: WriteSpecialReg(DR+reg); Write(","); WriteReg(base)
+		  | 24H: WriteReg(base); Write(","); WriteSpecialReg(TR+reg)
+		  | 26H: WriteSpecialReg(TR+reg); Write(","); WriteReg(base)
+		ELSE Bug(BUG)
+		END
+	END Mov2;
+
+	PROCEDURE Movzx (op: INTEGER);
+		VAR VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("movzx");
+		WriteReg(reg); Write(",");
+		IF mode = Reg THEN WriteReg(base)
+		ELSE
+			IF op = 0B6H THEN WriteString("byte ptr ")
+			ELSE WriteString("word ptr ")
+			END;
+			WriteMem(base, inx, scale, disp)
+		END 
+	END Movzx;
+	
+	PROCEDURE Movsx (op: INTEGER);
+		VAR VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("movsx");
+		w:= 1;
+		WriteReg(reg); Write(",");
+		IF mode = Reg THEN 
+			IF op = 0BEH THEN 
+				w:= 0; WriteReg(base)
+			ELSE
+				w:= 1; opPrefix:= TRUE; WriteReg(base)
+			END;
+		ELSE
+			IF op = 0BEH THEN WriteString("byte ptr ")
+			ELSE WriteString("word ptr ")
+			END;
+			WriteMem(base, inx, scale, disp)
+		END 
+	END Movsx;
+
+	PROCEDURE Lea (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		w:= 1;
+		WriteOp("lea");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, TRUE)
+	END Lea;
+
+	PROCEDURE Call (op: INTEGER);
+		VAR imm, sel: LONGINT;
+	BEGIN
+		IF op = 0E8H THEN
+			IF adrPrefix THEN
+				GetWord(imm); WriteWord(imm)
+			ELSE
+				GetDWord(imm); WriteDWord(imm)
+			END
+		ELSE (* intrasegment *)
+			IF adrPrefix THEN
+				GetWord(sel); GetWord(imm); WriteWord(sel); Write(" "); WriteWord(imm)
+			ELSE
+				GetWord(sel); GetDWord(imm); WriteWord(sel); Write(" "); WriteDWord(imm)
+			END
+		END;
+		WriteOp("call");
+		IF op = 09AH THEN 
+			WriteDisp(sel); Write(":") 
+		END;
+		WriteDisp(imm); WriteString("  ("); (*Texts.*)WriteDWHex(pc + imm); Write(")")
+	END Call;
+
+	PROCEDURE Movs (op: INTEGER);
+	BEGIN
+		IF op = 0A4H THEN WriteOp("movsb")
+		ELSIF (op = 0A5H) & opPrefix THEN WriteOp("movsw")
+		ELSIF op  = 0A5H THEN WriteOp("movsd")
+		ELSE Bug(BUG)
+		END
+	END Movs;
+
+	PROCEDURE Cmps (op: INTEGER);
+	BEGIN
+		IF op = 0A6H THEN WriteOp("cmpsb")
+		ELSIF (op = 0A7H) & opPrefix THEN WriteOp("cmpsb")
+		ELSIF op = 0A7H THEN WriteOp("cmpsw")
+		ELSE Bug(BUG)
+		END
+	END Cmps;
+
+	PROCEDURE Stos (op: INTEGER);
+	BEGIN
+		IF op = 0AAH THEN WriteOp("stosb")
+		ELSIF (op = 0ABH) & opPrefix THEN WriteOp("stosw")
+		ELSIF op = 0ABH THEN WriteOp("stosd")
+		ELSE Bug(BUG)
+		END
+	END Stos;
+
+	PROCEDURE Lods (op: INTEGER);
+	BEGIN
+		IF op = 0ACH THEN WriteOp("lodsb")
+		ELSIF (op = 0ABH) & opPrefix THEN WriteOp("lodsw")
+		ELSIF op = 0ABH THEN WriteOp("lodsd")
+		ELSE Bug(BUG)
+		END
+	END Lods;
+
+	PROCEDURE Scas (op: INTEGER);
+	BEGIN
+		IF op = 0AEH THEN WriteOp("scasb")
+		ELSIF (op = 0AFH) & opPrefix THEN WriteOp("scasw")
+		ELSIF op = 0AFH THEN WriteOp("scasd")
+		ELSE Bug(BUG)
+		END
+	END Scas;
+
+	PROCEDURE Ret (op: INTEGER);
+		VAR imm: LONGINT;
+	BEGIN
+		IF (op = 0C2H) OR (op = 0CAH) THEN 
+			GetWord(imm); WriteWord(imm) 
+		END;
+		IF (op = 0CAH) OR (op = 0CBH) THEN WriteOp("ret far")
+		ELSE WriteOp("ret")
+		END;
+		IF (op = 0C2H) OR (op = 0CAH) THEN WriteDisp(imm) END
+	END Ret;
+
+	PROCEDURE Enter (op: INTEGER);
+		VAR l: LONGINT; b: INTEGER;
+	BEGIN
+		GetWord(l); WriteWord(l); Write(" ");
+		GetByte(b); WriteByte(b); Write(" ");
+		WriteOp("enter");
+		WriteDisp(l); Write(","); WriteDisp(b)
+	END Enter;
+
+	PROCEDURE Les (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("les");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE)
+	END Les;
+
+	PROCEDURE Lds (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("lds");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE)
+	END Lds;
+	
+	PROCEDURE Ldseg (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		IF op = 0B2H THEN WriteOp("lss")
+		ELSIF op = 0B4H THEN WriteOp("lfs")
+		ELSE WriteOp("lgs")
+		END;
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE)
+	END Ldseg;
+
+	PROCEDURE Int (op: INTEGER);
+		VAR imm: INTEGER;
+	BEGIN
+		IF op = 0CDH THEN 
+			GetByte(imm); WriteByte(imm)
+		ELSE imm := 3
+		END;
+		WriteOp("int");
+		WriteDisp(imm)
+	END Int;
+
+	PROCEDURE Loop (op: INTEGER);
+		VAR imm: LONGINT;
+	BEGIN
+		GetImm(0, imm);
+		CASE op OF
+			0E0H: WriteOp("loopne")
+		  | 0E1H: WriteOp("loope")
+		  | 0E2H: WriteOp("loop")
+		  | 0E3H: WriteOp("jcxz")
+		ELSE Bug(BUG)
+		END;
+		WriteDisp(imm)
+	END Loop;
+
+	PROCEDURE InOut (op: INTEGER);
+		VAR port: INTEGER; in, dx: BOOLEAN;
+	BEGIN
+		in := op MOD 4 < 2;
+		dx := op MOD 16 >= 8;
+		IF ~dx THEN GetByte(port); WriteByte(port) END;
+		IF in THEN WriteOp("in") ELSE WriteOp("out") END;
+		IF ~in & dx THEN WriteString("dx,")
+		ELSIF ~in THEN WriteDisp(port); Write(",") END;
+		IF ODD(op) THEN
+			IF opPrefix THEN WriteString("ax") ELSE WriteString("eax") END
+		ELSE WriteString("al") END;
+		IF in THEN
+			IF dx THEN WriteString(",dx") ELSE WriteString(","); WriteDisp(port) END
+		END
+	END InOut;
+
+	PROCEDURE Jmp (op: INTEGER);
+		VAR imm: LONGINT; byte: INTEGER;
+	BEGIN
+		IF (op = 0E9H) OR (op = 0EAH) THEN 
+			GetDWord(imm); WriteDWord(imm)
+		ELSE
+			GetByte(byte); WriteByte(byte); 
+			IF byte >= 128 THEN imm:= byte - 256
+			ELSE imm:= byte
+			END;
+		END;
+		Tab(OpPos);
+		IF op = 0EAH THEN WriteOp("jmp far")
+		ELSE WriteOp("jmp")
+		END;
+		Tab(RMPos); WriteDisp(imm); WriteString ("  ("); (*Texts.*)WriteDWHex(pc + imm); Write(")")
+	END Jmp;
+
+	PROCEDURE Lar (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("lar");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE)
+	END Lar;
+
+	PROCEDURE Lsl (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		WriteOp("lsl");
+		WriteRM(mode, 1, reg, base, inx, scale, disp, 0, FALSE)
+	END Lsl;
+
+	PROCEDURE Setcc (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		w:= 0; (* always 8 bit wide *)
+		ModRm(mode, reg, base, inx, scale, disp);
+		(* not nice but necessary -> no more constant memory for case table *)
+		IF op = 90H THEN WriteOp("seto")
+		ELSIF op = 91H THEN WriteOp("setno")
+		ELSIF op = 92H THEN WriteOp("setb/setc/setnae")
+		ELSIF op = 93H THEN WriteOp("setnb/setae/setnc")
+		ELSIF op = 94H THEN WriteOp("setz/sete")
+		ELSIF op = 95H THEN WriteOp("setnz/setne")
+		ELSIF op = 96H THEN WriteOp("setbe/setna")
+		ELSIF op = 97H THEN WriteOp("setnbe/seta")
+		ELSIF op = 98H THEN WriteOp("sets")
+		ELSIF op = 99H THEN WriteOp("setns")
+		ELSIF op = 9AH THEN WriteOp("setp/setpe")
+		ELSIF op = 9BH THEN WriteOp("setnp/setnp")
+		ELSIF op = 9CH THEN WriteOp("setl/setnge")
+		ELSIF op = 9DH THEN WriteOp("setnl/setge")
+		ELSIF op = 9EH THEN WriteOp("setle/setng")
+		ELSIF op = 9FH THEN WriteOp("setnle/setg")
+		ELSE Bug(BUG)
+		END;
+		IF mode = Reg THEN WriteReg(base)
+		ELSE WriteMem(base, inx, scale, disp)
+		END
+	END Setcc;
+
+	PROCEDURE Bit (op: INTEGER);
+		VAR reg, base, inx, d: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		w:= 1;
+		ModRm(mode, reg, base, inx, scale, disp);
+		IF op = 0A3H THEN 
+			WriteOp("bt"); d:= 1
+		ELSIF op = 0ABH THEN 
+			WriteOp("bts"); d:= 1
+		ELSIF op = 0B3H THEN 
+			WriteOp("btr"); d:= 1
+		ELSIF op = 0BBH THEN 
+			WriteOp("btc"); d:= 1
+		ELSIF op = 0BCH THEN
+			WriteOp("bsf"); d:= 1
+		ELSE
+			WriteOp("bsr"); d:= 1
+		END;
+		IF mode = Reg THEN WriteRM(Reg, d, base, reg, none, 0, 0, 0, FALSE)
+		ELSE WriteRM(mode, d, reg, base, inx, scale, disp, 0, FALSE)
+		END
+	END Bit;
+
+	PROCEDURE Shift (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		IF (op = 0A4H) OR (op = 0ACH) THEN (* immediate byte *)
+			w:= 0; GetImm(0, imm)
+		ELSE
+			imm := -1
+		END;
+		IF (op = 0A4H) OR (op = 0A5H) THEN WriteOp("shld")
+		ELSIF (op = 0ACH) OR (op = 0ADH) THEN WriteOp("shrd")
+		ELSE Bug(BUG)
+		END;
+		w := 1;
+		WriteRM(mode, 0, reg, base, inx, scale, disp, imm, FALSE);
+		Write(",");
+		IF imm = -1 THEN WriteString("cl")
+		ELSE WriteDisp(imm)
+		END
+	END Shift;
+
+	PROCEDURE Grp1 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		IF op = 80H THEN (* byte *)
+			w:= 0; GetImm(0, imm)
+		ELSIF op = 81H THEN (* full immediate *)
+			w:= 1; GetImm(w, imm)
+		ELSE (* op = 83H, signed extendes *)
+			w:= 1; GetImm(0, imm)
+		END;
+		CASE reg OF
+			0: WriteOp("add")
+		  | 1: WriteOp("or")
+		  | 2: WriteOp("adc")
+		  | 3: WriteOp("sbb")
+		  | 4: WriteOp("and")
+		  | 5: WriteOp("sub")
+		  | 6: WriteOp("xor")
+		  | 7: WriteOp("cmp")
+		ELSE Bug(BUG)
+		END;
+		IF mode = Reg THEN WriteReg(base)
+		ELSE WriteMem(base, inx, scale, disp)
+		END;
+		Write(","); 
+		IF (reg = 0) OR (reg = 2) OR (reg = 3) OR (reg = 5) OR (reg = 7) THEN WriteDisp(imm)
+		ELSE WriteDWHex(imm)
+		END
+	END Grp1;
+
+	PROCEDURE Grp2 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		IF (op >= 0D0H) & (op <= 0D3H) THEN
+			IF (op = 0D0H) OR (op = 0D2H) THEN w:= 0
+			ELSE w:= 1
+			END
+		ELSE
+			IF op = 0C0H THEN w:= 0
+			ELSE w:= 1
+			END;
+			GetImm(0, imm); (* only 8 bit possible *)
+		END;
+		CASE reg OF
+			0: WriteOp("rol")
+		  | 1: WriteOp("ror")
+		  | 2: WriteOp("rcl")
+		  | 3: WriteOp("rcr")
+		  | 4: WriteOp("shl/sal")
+		  | 5: WriteOp("shr")
+		  | 7: WriteOp("sar")
+		ELSE Bug(BUG)
+		END;
+		IF mode = Reg THEN WriteReg(base)
+		ELSE WriteMem(base, inx, scale, disp)
+		END;
+		Write(","); 
+		IF (op = 0D0H) OR (op = 0D1H) THEN Write("1")
+		ELSIF (op = 0D2H) OR (op = 0D3H) THEN WriteString("cl")  
+		ELSE WriteDisp(imm)
+		END
+	END Grp2;
+
+	PROCEDURE Grp3 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		ModRm(mode, reg, base, inx, scale, disp);
+		IF op = 0F6H THEN w:= 0
+		ELSE w:= 1
+		END;
+		IF reg = 0 (* test *) THEN GetImm(w, imm) END;
+		CASE reg OF 
+			0: WriteOp("test")
+		  | 2: WriteOp("not")
+		  | 3: WriteOp("neg")
+		  | 4: WriteOp("mul")
+		  | 5: WriteOp("imul")
+		  | 6: WriteOp("div")
+		  | 7: WriteOp("idiv")
+		ELSE Bug(BUG)
+		END;
+		IF mode = Reg THEN WriteReg(base)
+		ELSE WriteMem(base, inx, scale, disp)
+		END;
+		IF reg = 0 THEN 
+			Write(","); WriteDisp(imm)
+		END
+	END Grp3;
+
+	PROCEDURE Grp4 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		w:= 0;
+		ModRm(mode, reg, base, inx, scale, disp);
+		IF reg = 0 THEN WriteOp("inc")
+		ELSE WriteOp("dec")
+		END;
+		IF mode # Reg THEN
+			WriteString("byte ptr "); WriteMem(base, inx, scale, disp)
+		ELSE WriteReg(base)
+		END
+	END Grp4;
+
+	PROCEDURE Grp5 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		w:= 1;
+		ModRm(mode, reg, base, inx, scale, disp);
+		IF reg = 0 THEN WriteOp("inc")
+		ELSIF reg = 1 THEN WriteOp("dec")
+		ELSIF reg = 2 THEN WriteOp("call")
+		ELSIF reg = 3 THEN WriteOp("call far")
+		ELSIF reg = 4 THEN WriteOp("jmp")
+		ELSIF reg = 5 THEN WriteOp("jmp far")
+		ELSIF reg = 6 THEN WriteOp("push")
+		ELSE Bug(BUG)
+		END;
+		IF mode = Reg THEN WriteReg(base)
+		ELSE WriteMem(base, inx, scale, disp)
+		END
+	END Grp5;
+	
+	PROCEDURE Grp6 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		w := 1;
+		ModRm(mode, reg, base, inx, scale, disp);
+		CASE reg OF
+		|  0: WriteOp("sldt")
+		|  1: WriteOp("str")
+		|  2: WriteOp("lldt")
+		|  3: WriteOp("ltr")
+		|  4: WriteOp("verr")
+		|  6: WriteOp("verw")
+		ELSE Bug(BUG)
+		END;
+		IF mode = Reg THEN WriteReg(base)
+		ELSE WriteMem(base, inx, scale, disp)
+		END;
+	END Grp6;
+	
+	PROCEDURE Grp7 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		w := 1;
+		ModRm(mode, reg, base, inx, scale, disp);
+		CASE reg OF
+		|  0: WriteOp("sgdt")
+		|  1: WriteOp("sidt")
+		|  2: WriteOp("lgdt")
+		|  3: WriteOp("lidt")
+		|  4: WriteOp("smsw")
+		|  6: WriteOp("lmsw")
+		|  7: WriteOp("invlpg")
+		ELSE Bug(BUG)
+		END;
+		IF mode = Reg THEN WriteReg(base)
+		ELSE WriteMem(base, inx, scale, disp)
+		END;
+	END Grp7;
+	
+	PROCEDURE Grp8 (op: INTEGER);
+		VAR reg, base, inx: INTEGER; scale, mode: SHORTINT; disp, imm: LONGINT;
+	BEGIN
+		w:= 1;
+		ModRm(mode, reg, base, inx, scale, disp);
+		GetImm(0, imm); (* always 8 bit wide *)
+		CASE reg OF
+			4: WriteOp("bt")
+		  | 5: WriteOp("bts")
+		  | 6: WriteOp("btr")
+		  | 7: WriteOp("btc")
+		ELSE Bug(BUG)
+		END;
+		IF mode = Reg THEN WriteReg(base)
+		ELSE WriteMem(base, inx, scale, disp)
+		END;
+		Write(","); WriteDisp(imm)
+	END Grp8;
+
+	PROCEDURE Escape (op: INTEGER);
+	BEGIN
+		GetByte(op); WriteByte(op); Write(" ");
+		IF op < 40H THEN (* because of DOSOberon *)
+			CASE op OF
+				0: 
+					Grp6(op)
+			  | 1: 
+					Grp7(op)
+			  | 2: 
+					Lar(op)
+			  | 3:
+					Lsl(op)
+			  | 6: 
+					WriteOp("clts")
+			  | 20H..24H, 26H:
+					Mov2(op)
+			ELSE Bug(BUG)
+			END
+		ELSIF op < 0C0H THEN
+			CASE op OF
+			  | 80H..8FH:
+					Jcc2(op)
+			  | 90H..9FH:
+					Setcc(op)
+			  | 0A0H, 0A8H:
+					Push2(op)
+			  | 0A1H, 0A9H:
+					Pop2(op)
+			  | 0A3H, 0ABH, 0B3H, 0BBH..0BDH:
+					Bit(op)
+			  | 0A4H, 0A5H, 0ACH, 0ADH:
+					Shift(op)
+			  | 0AFH:
+					Imul2(op)
+			  | 0B2H, 0B4H, 0B5H:
+					Ldseg(op)
+			  | 0B6H, 0B7H:
+					Movzx(op)
+			  | 0BEH, 0BFH:
+					Movsx(op)
+			  | 0BAH:
+					Grp8(op)
+			ELSE Bug(BUG)
+			END
+		ELSE Bug(BUG)
+		END
+	END Escape;
+
+(* floating point i387 instruction set *)
+
+	PROCEDURE WriteFReg (freg: INTEGER);
+	BEGIN
+		IF freg = 0 THEN WriteString("st")
+		ELSE
+			WriteString("st("); WriteDisp(freg); Write(")")
+		END
+	END WriteFReg;
+
+	PROCEDURE WriteFloat (form: SHORTINT; base, inx: INTEGER; scale: SHORTINT; disp: LONGINT);
+	BEGIN
+		(* not nice but necessary -> no more constant memory for case table *)
+		IF form = SReal THEN WriteString("single ")
+		ELSIF form = LReal THEN WriteString("double ")
+		ELSIF form = EReal THEN WriteString("extended ")
+		ELSIF form = WInt THEN WriteString("word ")
+		ELSIF form = SInt THEN WriteString("short ")
+		ELSIF form = LInt THEN WriteString("long ")
+		ELSIF (form = Byte14) OR (form = Byte94) THEN WriteString("small ")
+		ELSIF (form = Byte28) OR (form = Byte108) THEN WriteString("big ")
+		ELSIF form = Decimal THEN WriteString("bcd ")
+		END;
+		WriteMem(base, inx, scale, disp)
+	END WriteFloat;
+
+	PROCEDURE Float0 (op: INTEGER);
+	(* op is 0D8H *)
+		VAR stat, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, stat, base, inx, scale, disp);
+		IF mode # Reg THEN (* memory *)
+			CASE stat OF
+				0: WriteOp("fadd")
+			  | 1: WriteOp("fmul")
+			  | 2: WriteOp("fcom")
+			  | 3: WriteOp("fcomp")
+			  | 4: WriteOp("fsub")
+			  | 5: WriteOp("fsubr")
+			  | 6: WriteOp("fdiv")
+			  | 7: WriteOp("fdivr")
+			ELSE Bug(BUG)
+			END;
+			WriteFloat(SReal, base, inx, scale, disp)
+		ELSE
+			CASE stat OF
+				0: WriteOp("fadd"); WriteFReg(0); Write(",")
+			  | 1: WriteOp("fmul"); WriteFReg(0); Write(",")
+			  | 2: WriteOp("fcom")
+			  | 3: WriteOp("fcomp")
+			  | 4: WriteOp("fsub"); WriteFReg(0); Write(",")
+			  | 5: WriteOp("fsubr"); WriteFReg(0); Write(",")
+			  | 6: WriteOp("fdiv"); WriteFReg(0); Write(",")
+			  | 7: WriteOp("fdivr"); WriteFReg(0); Write(",")
+			ELSE Bug(BUG)
+			END;
+			WriteFReg(base)
+		END
+	END Float0;
+	
+	PROCEDURE Float1 (op: INTEGER);
+	(* op is 0D9H *)
+		VAR stat, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, stat, base, inx, scale, disp);
+		IF mode # Reg THEN
+			CASE stat OF
+				0: WriteOp("fld")
+			  | 2: WriteOp("fst")
+			  | 3: WriteOp("fstp")
+			  | 4: WriteOp("fldenv")
+			  | 5: WriteOp("fldcw")
+			  | 6: WriteOp("fstenv")
+			  | 7: WriteOp("fstcw")
+			ELSE Bug(BUG)
+			END;
+			IF (stat = 4) OR (stat = 6) THEN
+				IF opPrefix THEN WriteFloat(Byte14, base, inx, scale, disp)
+				ELSE WriteFloat(Byte28, base, inx, scale, disp)
+				END
+			ELSIF (stat = 2) OR (stat = 3) THEN WriteFloat(SReal, base, inx, scale, disp)
+			ELSE WriteFloat(nothing, base, inx, scale, disp)
+			END
+		ELSIF stat = 0 THEN 
+			WriteOp("fld"); WriteFReg(base)
+		ELSIF stat = 1 THEN
+			WriteOp("fxch"); WriteFReg(base)
+		ELSE
+			stat:= stat * 8 + base;
+			IF stat = 10H THEN WriteOp("fnop")
+			ELSE
+				CASE stat OF
+					20H: WriteOp("fchs")
+				  | 21H: WriteOp("fabs")
+				  | 24H: WriteOp("ftst")
+				  | 25H: WriteOp("fxam")
+				  | 28H: WriteOp("fld1")
+				  | 29H: WriteOp("fldl2t")
+				  | 2AH: WriteOp("fldl2e")
+				  | 2BH: WriteOp("fldpi")
+				  | 2CH: WriteOp("fldlg2")
+				  | 2DH: WriteOp("fldln2")
+				  | 2EH: WriteOp("fldz")
+				  | 30H: WriteOp("f2xm1")
+				  | 31H: WriteOp("fyl2x")
+				  | 32H: WriteOp("fptan")
+				  | 33H: WriteOp("fpatan")
+				  | 34H: WriteOp("fxtract")
+				  | 35H: WriteOp("fprem1")
+				  | 36H: WriteOp("fdecstp")
+				  | 37H: WriteOp("fincstp")
+				  | 38H: WriteOp("fprem")
+				  | 39H: WriteOp("fyl2xp1")
+				  | 3AH: WriteOp("fsqrt")
+				  | 3BH: WriteOp("fsincos")
+				  | 3CH: WriteOp("frndint")
+				  | 3DH: WriteOp("fscale")
+				  | 3EH: WriteOp("fsin")
+				  | 3FH: WriteOp("fcos")
+				ELSE Bug(BUG)
+				END
+			END
+		END
+	END Float1;
+
+	PROCEDURE Float2 (op: INTEGER);
+	(* op is 0DAH *)
+		VAR stat, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, stat, base, inx, scale, disp);
+		IF mode # Reg THEN
+			CASE stat OF
+				0: WriteOp("fiadd")
+			  | 1: WriteOp("fimul")
+			  | 2: WriteOp("ficom")
+			  | 3: WriteOp("ficomp")
+			  | 4: WriteOp("fisub")
+			  | 5: WriteOp("fisubr")
+			  | 6: WriteOp("fidiv")
+			  | 7: WriteOp("fidivr")
+			ELSE Bug(BUG)
+			END;
+			WriteFloat(SInt, base, inx, scale, disp)
+		ELSIF stat = 5 THEN WriteOp("fucompp")
+		ELSE Bug(BUG)
+		END
+	END Float2;
+
+	PROCEDURE Float3 (op: INTEGER);
+	(* op is 0DBH *)
+		VAR stat, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, stat, base, inx, scale, disp);
+		IF mode # Reg THEN
+			CASE stat OF
+				0: WriteOp("fild")
+			  | 2: WriteOp("fist")
+			  | 3: WriteOp("fistp")
+			  | 5: WriteOp("fld")
+			  | 7: WriteOp("fstp")
+			ELSE Bug(BUG)
+			END;
+			IF (stat = 5) OR (stat = 7) THEN WriteFloat(EReal, base, inx, scale, disp)
+			ELSE WriteFloat(SInt, base, inx, scale, disp)
+			END
+		ELSIF base = 2 THEN WriteOp("fclex")
+		ELSIF base = 3 THEN WriteOp("finit")
+		ELSE Bug(BUG)
+		END
+	END Float3;
+
+	PROCEDURE Float4 (op: INTEGER);
+	(* op is 0DCH *)
+		VAR stat, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, stat, base, inx, scale, disp);
+		IF mode # Reg THEN
+			CASE stat OF
+				0: WriteOp("fadd")
+			  | 1: WriteOp("fmul")
+			  | 2: WriteOp("fcom")
+			  | 3: WriteOp("fcomp")
+			  | 4: WriteOp("fsub")
+			  | 5: WriteOp("fsubr")
+			  | 6: WriteOp("fdiv")
+			  | 7: WriteOp("fdivr")
+			ELSE Bug(BUG)
+			END;
+			WriteFloat(LReal, base, inx, scale, disp)
+		ELSE
+			CASE stat OF
+				0: WriteOp("fadd")
+			  | 1: WriteOp("fmul")
+			  | 4: WriteOp("fsubr")
+			  | 5: WriteOp("fsub")
+			  | 6: WriteOp("fdivr")
+			  | 7: WriteOp("fdiv")
+			ELSE Bug(BUG)
+			END;
+			WriteFReg(base); Write(","); WriteFReg(0)
+		END
+	END Float4;
+
+	PROCEDURE Float5 (op: INTEGER);
+	(* op is 0DDH *)
+		VAR stat, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, stat, base, inx, scale, disp);
+		IF mode # Reg THEN (* memory *)
+			CASE stat OF
+				0: WriteOp("fld")
+			  | 2: WriteOp("fst")
+			  | 3: WriteOp("fstp")
+			  | 4: WriteOp("frstor")
+			  | 6: WriteOp("fsave")
+			  | 7: WriteOp("fstsw")
+			ELSE Bug(BUG)
+			END;
+			IF (stat = 4) OR (stat = 6) THEN
+				IF opPrefix THEN WriteFloat(Byte94, base, inx, scale, disp)
+				ELSE WriteFloat(Byte108, base, inx, scale, disp)
+				END
+			ELSIF stat = 7 THEN WriteFloat(nothing, base, inx, scale, disp)
+			ELSE WriteFloat(LReal, base, inx, scale, disp)
+			END
+		ELSE
+			CASE stat OF
+				0: WriteOp("ffree")
+			  | 2: WriteOp("fst")
+			  | 3: WriteOp("fstp")
+			  | 4: WriteOp("fucom")
+			  | 5: WriteOp("fucomp")
+			ELSE Bug(BUG)
+			END;
+			WriteFReg(base)
+		END
+	END Float5;
+
+	PROCEDURE Float6(op: INTEGER);
+	(* op is 0DEH *)
+		VAR stat, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, stat, base, inx, scale, disp);
+		IF mode # Reg THEN (* memory *)
+			CASE stat OF
+				0: WriteOp("fiadd")
+			  | 1: WriteOp("fimul")
+			  | 2: WriteOp("ficom")
+			  | 3: WriteOp("ficomp")
+			  | 4: WriteOp("fisub")
+			  | 5: WriteOp("fisubr")
+			  | 6: WriteOp("fidiv")
+			  | 7: WriteOp("fidivr")
+			ELSE Bug(BUG)
+			END;
+			WriteFloat(WInt, base, inx, scale, disp)
+		ELSE
+			CASE stat OF
+				0: WriteOp("faddp")
+			  | 1: WriteOp("fmulp")
+			  | 3: WriteOp("fcompp")
+			  | 4: WriteOp("fsubrp")
+			  | 5: WriteOp("fsubp")
+			  | 6: WriteOp("fdivrp")
+			  | 7: WriteOp("fdivp")
+			ELSE Bug(BUG)
+			END;
+			IF stat # 3 THEN
+				WriteFReg(base); Write(","); WriteFReg(0)
+			END
+		END
+	END Float6;
+	
+	PROCEDURE Float7(op: INTEGER);
+	(* op is 0DFH *)
+		VAR stat, base, inx: INTEGER; scale, mode: SHORTINT; disp: LONGINT;
+	BEGIN
+		ModRm(mode, stat, base, inx, scale, disp);
+		IF mode # Reg THEN (* memory *)
+			CASE stat OF
+				0, 5: WriteOp("fild")
+			  | 2: WriteOp("fist")
+			  | 3, 7: WriteOp("fistp")
+			  | 4: WriteOp("fbld")
+			  | 6: WriteOp("fbstp")
+			ELSE Bug(BUG)
+			END;
+			IF (stat = 4) OR (stat = 6) THEN WriteFloat(Decimal, base, inx, scale, disp)
+			ELSIF (stat = 5) OR (stat = 7) THEN WriteFloat(LInt, base, inx, scale, disp)
+			ELSE WriteFloat(WInt, base, inx, scale, disp)
+			END
+		ELSIF stat = 4 THEN WriteOp("fstsw"); WriteString("ax")
+		ELSE Bug(BUG)
+		END
+	END Float7;
+
+	PROCEDURE Prefix (VAR op: INTEGER);
+	BEGIN
+		IF (op = pCS) OR (op = pDS) OR (op = pES) OR (op = pFS) OR (op = pGS) OR (op = pSS) THEN
+			prefix:= op;
+			WriteByte(op); Write("|");
+			GetByte(op);
+			Prefix(op)
+		ELSIF op =  AdrSize THEN 
+			adrPrefix:= TRUE;
+			WriteByte(op); Write("|");
+			GetByte(op);
+			Prefix(op)
+		ELSIF op = OpSize THEN 
+			opPrefix:= TRUE;
+			WriteByte(op); Write("|");
+			GetByte(op);
+			Prefix(op)
+		END
+	END Prefix;
+
+	PROCEDURE Dump (size: LONGINT);
+		VAR op, pe: INTEGER;
+	BEGIN
+		pc:= 0; pe := 0;
+		WHILE pc < size DO
+			WriteLn;
+			adrPrefix:= FALSE; opPrefix:= FALSE; prefix:= none;
+			IF pc >= PE[pe].point THEN
+				WriteLn; Texts.SetFont(W, titleFont);
+				WriteString("PROCEDURE "); WriteString(PE[pe].name); WriteLn; Texts.SetFont(W, defaultFont); INC(pe)
+			END;
+			Tab(PCpos); WriteWHex(pc); Write("H"); Write(":"); Tab(HexPos);
+			GetByte(op);
+			Prefix(op);
+			WriteByte(op); Write(" ");
+			IF op < 40H THEN (* because of the DOSOberon *)
+				CASE op OF
+					0..5: 
+						Add(op)
+				  | 6, 0EH, 16H, 1EH: 
+						Push(op)
+				  | 7, 17H, 1FH:
+				 		Pop(op)
+				  | 8..0DH:
+						Or(op)
+				  | 0FH:
+						Escape(op)
+				  | 10H..15H:
+						Adc(op)
+				  | 18H..1DH:
+						Sbb(op)
+				  | 20H..25H:
+						And(op)
+				  | 27H:
+						WriteOp("daa")
+				  | 28H..2DH:
+						Sub(op)
+				  | 2FH:
+						WriteOp("das")
+				  | 30H..35H:
+						Xor(op)
+				  | 37H:
+						WriteOp("aaa")
+				  | 38H..3DH:
+						Cmp(op)
+				  | 3FH:
+						WriteOp("aas")
+				ELSE Bug(BUG)
+				END
+			ELSIF op < 80H THEN
+				CASE op OF
+					40H..47H:
+						Inc(op)
+				  | 48H..4FH:
+						Dec(op)
+				  | 50H..57H, 60H, 68H, 6AH:
+						Push(op)
+				  | 58H..5FH, 61H:
+						Pop(op)
+				  | 62H:
+						Bound(op)
+				  | 69H, 6BH:
+						Imul(op)
+				  | 6CH, 6DH:
+						Ins(op)
+				  | 6EH, 06FH:
+						Outs(op)
+				  | 70H..7FH:
+						Jcc(op)
+				ELSE Bug(BUG)
+				END
+			ELSIF op < 0C0H THEN
+				CASE op OF
+					80H..81H, 83H:
+						Grp1(op)
+				  | 84H..85H:
+						Test(op)
+				  | 86H..87H, 91H..97H:
+						Xchg(op)
+				  | 88H..8CH, 8EH, 0A0H..0A3H, 0B0H..0BFH:
+						Mov(op)
+				  | 8DH:
+						Lea(op)
+				  | 8FH, 9DH:
+						Pop(op)
+				  | 90H:
+						WriteOp("nop")
+				  | 98H:
+						WriteOp("cbw")
+				  | 99H:
+						WriteOp("cwd")
+				  | 9AH:
+						Call(op)
+				  | 9BH:
+						WriteOp("wait")
+				  | 9CH:
+						Push(op)
+				  | 9EH:
+						WriteOp("sahf")
+				  | 9FH:
+						WriteOp("lahf")
+				  | 0A4H..0A5H:
+						Movs(op)
+				  | 0A6H..0A7H:
+						Cmps(op)
+				  | 0A8H..0A9H:
+						Test(op)
+				  | 0AAH..0ABH:
+						Stos(op)
+				  | 0ACH..0ADH:
+						Lods(op)
+				  | 0AEH..0AFH:
+						Scas(op)
+				ELSE Bug(BUG)
+				END
+			ELSIF op <= 0FFH THEN
+				CASE op OF
+					0C0H..0C1H:
+						Grp2(op)
+				  | 0C2H..0C3H, 0CAH, 0CBH:
+						Ret(op)
+				  | 0C4H:
+						Les(op)
+				  | 0C5H:
+						Lds(op)
+				  | 0C6H..0C7H:
+						Mov(op)
+				  | 0C8H:
+						Enter(op)
+				  | 0C9H:
+						WriteOp("leave")
+				  | 0CCH..0CDH:
+						Int(op)
+				  | 0CEH:
+						WriteOp("into")
+				  | 0CFH:
+						WriteOp("iret")
+				  | 0D0H..0D3H:
+						Grp2(op)
+				  | 0D4H:
+						WriteOp("aam")
+				  | 0D5H:
+						WriteOp("aad")
+				  | 0D7H:
+						WriteOp("xlat")
+				  | 0D8H:
+						Float0(op)
+				  | 0D9H, 0D6H:
+						Float1(op)
+				  | 0DAH:
+						Float2(op)
+				  | 0DBH:
+						Float3(op)
+				  | 0DCH:
+						Float4(op)
+				  | 0DDH:
+						Float5(op)
+				  | 0DEH:
+						Float6(op)
+				  | 0DFH:
+						Float7(op)
+				  | 0E0H..0E3H:
+						Loop(op) (* and jcxz *)
+				  | 0E4H..0E7H, 0ECH..0EFH:
+						InOut(op)
+				  | 0E8H:
+						Call(op)
+				  | 0E9H..0EBH:
+						Jmp(op)
+				  | 0F0H:
+						WriteOp("Lock")
+				  | 0F2H:
+						WriteOp("repne")
+				  | 0F3H:
+						WriteOp("rep")
+				  | 0F4H:
+						WriteOp("hlt")
+				  | 0F5H:
+						WriteOp("cmc")
+				  | 0F6H..0F7H:
+						Grp3(op)
+				  | 0F8H:
+						WriteOp("clc")
+				  | 0F9H:
+						WriteOp("stc")
+				  | 0FAH:
+						WriteOp("cli")
+				  | 0FBH:
+						WriteOp("sti")
+				  | 0FCH:
+						WriteOp("cld")
+				  | 0FDH:
+						WriteOp("std")
+				  | 0FEH:
+						Grp4(op)
+				  | 0FFH:
+						Grp5(op)
+				ELSE Bug(BUG)
+				END
+			ELSE Bug(BUG)			
+			END
+		END
+	END Dump;
+
+	PROCEDURE Reference;
+		VAR 
+			offs: LONGINT;
+			name: ARRAY 64 OF CHAR;
+			b, typeForm: CHAR;
+			
+			PROCEDURE GetName(VAR name: ARRAY OF CHAR);
+				VAR i: LONGINT;
+			BEGIN
+				i:= 0;
+				REPEAT
+					Next(name[i]);
+					INC(i);
+				UNTIL name[i-1] = 0X
+			END GetName;
+
+	BEGIN
+		Next(b);
+		nofPE := 0;
+		WHILE ~R.eof DO
+			IF b # 0F8X THEN
+				WriteString("wrong sign!"); WriteByte(ORD(b)); WriteLn;
+				RETURN
+			ELSE
+				WriteLn;
+				Files.ReadNum(R, PE[nofPE].point); 
+				GetName(PE[nofPE].name);
+				WriteString(PE[nofPE].name); WriteString("   "); Texts.WriteHex(W, PE[nofPE].point); WriteLn;
+				INC(nofPE);
+				Next(b);
+				WHILE (b = 1X) OR (b = 3X) DO
+					Next(typeForm);
+					Files.ReadNum(R, offs); GetName(name);
+					Tab(Pos1);
+					IF b = 1X THEN WriteString("     ")
+					ELSE WriteString("VAR  ")
+					END;
+					WriteString(name); WriteString(": ");
+					CASE typeForm OF
+						1X: WriteString("BYTE  ")
+					  | 2X: WriteString("BOOLEAN  ")
+					  | 3X: WriteString("CHAR  ")
+					  | 4X: WriteString("SHORTINT  ")
+					  | 5X: WriteString("INTEGER  ")
+					  | 6X: WriteString("LONGINT  ")
+					  | 7X: WriteString("REAL  ")
+					  | 8X: WriteString("LONGREAL  ")
+					  | 9X: WriteString("SET  ")
+					  | 0DX: WriteString("POINTER  ")
+					  | 0FX: WriteString("ARRAY  ")
+					ELSE Bug(BUG)
+					END;
+					WriteDisp(offs);
+					WriteLn;
+					Next(b)
+				END
+			END
+		END;
+		PE[nofPE].point := MAX(LONGINT)
+	END Reference;
+
+
+	PROCEDURE Check (ch: CHAR; str: ARRAY OF CHAR);
+		VAR b: CHAR;
+	BEGIN
+		Next(b); Texts.SetFont(W, titleFont); WriteString(str);
+		IF b = ch THEN WriteLn ELSE WriteString(" wrong sign! "); WriteByte(ORD(b)); WriteLn END;
+		Texts.SetFont(W, defaultFont)
+	END Check;
+
+	PROCEDURE DumpData(VAR a: ARRAY OF CHAR; len: INTEGER);
+		VAR i: INTEGER;
+	BEGIN
+		i := 0;
+		WHILE i<len DO 
+			IF (a[i] >= " ") & (a[i] <= "~") THEN Write(a[i]) ELSE Write(".") END;
+			INC(i)
+		END
+	END DumpData;
+
+	PROCEDURE DecodeObjFile*(objName : ARRAY OF CHAR; VAR T : Texts.Text);
+		VAR
+			f: Files.File;
+			byte, i: INTEGER;
+			word, dword, nofVarEntries, nofEntries, nofCmds, nofPtrs, notTypes, nofImports,
+			nofVarConsLinks, nofLinks, conssize, codesize, nofTypes, j, ptrs, newMths, refPos: LONGINT;
+			name: ARRAY 32 OF CHAR;
+			ch: CHAR;
+			WW: Texts.Writer; pos: LONGINT;
+			data: ARRAY 16 OF CHAR;
+	BEGIN
+		f := Files.Old(objName);
+		IF f = NIL THEN
+			T := NIL
+		ELSE
+			NEW(T); Texts.Open(T, "");
+			Files.Set(R, f, 0);
+			Texts.SetFont(W, defaultFont);
+			suppressH := TRUE;
+			Check(0F8X, "Header:");
+			WriteString("  Version:         "); GetByte(byte); WriteByte(byte); WriteLn;
+			WriteString("  RefSize:         "); GetDWord(dword); WriteDWHex(dword); WriteLn;
+			WriteString("  nofVarEntries:   "); GetWord(nofVarEntries); WriteWHex(nofVarEntries); WriteLn;
+			WriteString("  nofEntries:      "); GetWord(nofEntries); WriteWHex(nofEntries); WriteLn;
+			WriteString("  nofCommands:     "); GetWord(nofCmds); WriteWHex(nofCmds); WriteLn;
+			WriteString("  nofPointers:     "); GetWord(nofPtrs); WriteWHex(nofPtrs); WriteLn;
+			WriteString("  nofTypes:        "); GetWord(nofTypes); WriteWHex(nofTypes); WriteLn;
+			WriteString("  nofImports:      "); GetWord(nofImports); WriteWHex(nofImports); WriteLn;
+			WriteString("  nofVarConsLinks: "); GetWord(nofVarConsLinks); WriteWHex(nofVarConsLinks); WriteLn;
+			WriteString("  nofLinks:        "); GetWord(nofLinks); WriteWHex(nofLinks); WriteLn;
+			WriteString("  datasize:        "); GetDWord(dword); WriteDWHex(dword); WriteLn;
+			WriteString("  constsize:       "); GetWord(conssize); WriteWHex(conssize); WriteLn;
+			WriteString("  codesize:        "); GetWord(codesize); WriteWHex(codesize); WriteLn;
+			WriteString("  key:             "); GetDWord(dword); WriteDWHex(dword); WriteLn;
+			WriteString("  Modulename:      ");
+			i:= 0;
+			REPEAT
+  			Next(name[i]);
+  			INC(i)
+  		UNTIL name[i-1] = 0X;
+  		WriteString(name); WriteLn; WriteLn;
+		(* VarEntry block *)
+			Check(8CX, "VarEntries:");
+			i:= 0;
+			WHILE i < nofVarEntries DO
+				Tab(Pos1); GetDWord(dword); WriteDWHex(dword); WriteLn;
+				INC(i)
+			END;
+			WriteLn;
+		(* entry block *)
+			Check(82X, "Entries:");
+			i:= 0;
+			WHILE i < nofEntries DO
+				Tab(Pos1); GetWord(word); WriteWHex(word); WriteLn;
+				INC(i)
+			END;
+			WriteLn;
+		(* Command block *)
+			Check(83X, "Commands:");
+			i:= 0;
+			WHILE i < nofCmds DO
+				Tab(Pos1);
+				Next(ch);
+				WHILE ch # 0X DO
+					Write(ch); Next(ch)
+				END;
+				Tab(column + 4); GetWord(word); WriteWHex(word); WriteLn;
+				INC(i)
+			END;
+			WriteLn;
+		(* pointer block *)
+			Check(84X, "Pointers:");
+			i:= 0;
+			WHILE i < nofPtrs DO
+				Tab(Pos1); GetDWord(dword); WriteDWHex(dword); WriteLn;
+				INC(i)
+			END;
+			WriteLn;
+		(* import block *)
+			Check(85X, "Imports:");
+			i:= 0;
+			WHILE i < nofImports DO
+				Tab(Pos1); GetDWord(dword); WriteDWHex(dword); Tab(column + 4);
+				Next(ch);
+				WHILE ch # 0X DO
+					Write(ch); Next(ch)
+				END;
+				WriteLn;
+				INC(i)
+			END;
+			WriteLn;
+		(* VarConsLink block *)
+			Check(8DX, "VarConsLinks:");
+			i:= 0;
+			WHILE i < nofVarConsLinks DO
+				WriteString("  modNr: "); GetByte(byte); WriteByte(byte);
+				WriteString("  entryNr: "); GetWord(word); WriteWHex(word);
+				WriteString("  noffixups: "); GetWord(word); WriteWHex(word); 
+				WriteLn; Tab(Pos1);
+				j:= SHORT(word);
+				WHILE j > 0 DO
+					IF j MOD 8 = 0 THEN 
+						WriteLn; Tab(Pos1)
+					END;
+					GetWord(word); WriteWHex(word); Tab(column + 2);
+					DEC(j)
+				END;
+				WriteLn; 
+				INC(i)
+			END;
+			WriteLn;
+		(* Link block *)
+			Check(86X, "Links:");
+			i:= 0;
+			WHILE i < nofLinks DO
+				Tab(Pos1); GetByte(byte); WriteByte(byte); Tab(column + 2);
+				GetByte(byte); WriteByte(byte); Tab(column + 2);
+				GetWord(word); WriteWHex(word); WriteLn;
+				INC(i)
+			END;
+			WriteLn;
+		(* Data block *)
+			Check(87X, "Data:");
+			i:= 0;
+			WHILE i < conssize DO
+				IF i MOD 16 = 0 THEN
+				IF i > 0 THEN Tab(60); DumpData(data, 16) END;
+					WriteLn; Tab(Pos1); WriteWHex(i); Write(":"); Tab(column + 2)
+				END;
+				GetByte(byte); WriteByte(byte); Tab(column + 1); data[i MOD 16] := CHR(byte);
+				INC(i)
+			END;
+			IF conssize > 0 THEN Tab(60); DumpData(data, (i-1) MOD 16 + 1) END;
+			WriteLn; WriteLn;
+		(* Code block *)
+			Check(88X, "Code:");
+			pos := Files.Pos(R);
+			Files.Set(R, f, pos+codesize);
+			Texts.Append(T, W.buf);
+			(* Dump(codesize);
+			WriteLn; WriteLn;*)
+		(* type block *)
+			Check(89X, "Type:");
+			i:= 0;
+			WHILE i < nofTypes DO
+				WriteLn; 
+				WriteString("  rec: "); GetDWord(dword); WriteDWHex(dword);
+				WriteString("  entry: "); GetWord(word); WriteWHex(word);
+				WriteString("  basetypMod: "); GetWord(word); WriteWHex(word);
+				WriteString("  basetypEntry: "); GetWord(word); WriteWHex(word);
+				WriteLn;
+				WriteString("  nofMths: "); GetWord(word (*newMths*)); WriteWHex(word (*newMths*)); 
+				WriteString("  nofInhMths: "); GetWord(word); WriteWHex(word);
+				WriteString("  nofnewMths: "); GetWord(newMths (*word*)); WriteWHex(newMths (*word*));
+				WriteString("  nofPtrs: "); GetWord(ptrs); WriteWHex(ptrs);
+				WriteLn; WriteString("  ");
+				Next(ch);
+				WHILE ch # 0X DO
+					Write(ch); Next(ch)
+				END;
+				j:= 0;
+				WHILE j < newMths DO
+					WriteLn; WriteString("  mthNr: ");
+					GetWord(word); WriteWHex(word); WriteString("  entryNr: ");
+					GetWord(word); WriteWHex(word);
+					INC(j)
+				END;
+				j:= 0;
+				WHILE j < ptrs DO
+					IF j MOD 8 = 0 THEN WriteLn END;
+					GetDWord(dword); WriteDWHex(dword); WriteString("  ");
+					INC(j)
+				END;
+				INC(i)
+			END;
+			WriteLn;
+		(* reference block *)
+			Check(8BX, "Reference:");
+			Reference;
+		(* output *)
+			WW := W;
+			Texts.OpenWriter(W); Texts.SetFont(W, defaultFont);
+			suppressH := FALSE;
+			Files.Set(R, f, pos); Dump(codesize); WriteLn; WriteLn;
+			suppressH := TRUE;
+			Texts.Append(T, W.buf); Texts.Append(T, WW.buf);
+			Files.Set(R, NIL, 0)
+		END
+	END DecodeObjFile;
+
+	PROCEDURE Decode*;
+		VAR
+			i: INTEGER;
+			name: ARRAY 32 OF CHAR;
+			ch: CHAR;
+			S: Texts.Scanner;
+			beg, end, time: LONGINT;
+			T: Texts.Text;
+	BEGIN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "^") THEN
+			Oberon.GetSelection(T, beg, end, time);
+			IF (T = NIL) OR (time <= 0) THEN S.class := Texts.Inval
+			ELSE Texts.OpenScanner(S, T, beg); Texts.Scan(S)
+			END
+		END;
+		IF S.class = Texts.Name THEN i := 0; ch := S.s[0];
+			WHILE ("A" <= CAP(ch)) & (CAP(ch) <= "Z") OR ("0" <= ch) & (ch <= "9") DO
+				name[i] := ch; INC(i); ch := S.s[i]
+			END;
+			name[i] := "."; name[i+1] := "O"; name[i+2] := "b"; name[i+3] := "j"; name[i+4] := 0X;
+			Texts.Scan(S); 
+			IF S.class = Texts.Int THEN breakpos:= S.i
+			ELSE breakpos:= -1
+			END;
+			DecodeObjFile(name, T);
+			IF T # NIL THEN
+				name[i+1] := "D"; name[i+2] := "e"; name[i+3] := "c";
+				Oberon.OpenText(name, T, 600, 300);
+				breakpos := -1
+			ELSE
+				Out.String("Decoder error: ");Out.String(name); Out.String(" doesn't exist"); Out.Ln;
+			END;
+			T := NIL
+		END
+	END Decode;
+
+(* ======================================================================================== *)
+
+	PROCEDURE GetName(VAR str: ARRAY OF CHAR);
+		VAR i: LONGINT;
+	BEGIN
+		i := -1;
+		REPEAT
+			INC(i); Next(str[i])
+		UNTIL str[i] =0X
+	END GetName;
+
+	PROCEDURE Constant;
+		VAR id: CHAR; name: ARRAY 256 OF CHAR; w, dw: LONGINT; b: INTEGER;
+	BEGIN
+		Next(id);
+		CASE id OF
+			| 01X:	WriteString(" BYTE "); GetByte(b); WriteByte(b);
+			| 02X:	WriteString(" BOOL "); Next(id); IF id = 0X THEN WriteString("FALSE") ELSE WriteString("TRUE") END;
+			| 03X:	WriteString(" CHAR "); Next(id); Write(id);
+			| 04X:	WriteString(" SINT "); GetByte(b); WriteByte(b);
+			| 05X:	WriteString(" INT "); GetWord(w); WriteWord(w);
+			| 06X:	WriteString(" LINT "); GetDWord(dw); WriteDWord(dw);
+			| 07X:	WriteString(" REAL "); GetDWord(dw); WriteDWord(dw);
+			| 08X:	WriteString(" LREAL "); GetDWord(dw); WriteDWord(dw); GetDWord(dw); WriteDWord(dw)
+			| 09X:	WriteString(" SET "); GetDWord(dw); WriteDWord(dw);
+			| 0AX:	WriteString(" STRING "); GetName(name); WriteString(name)
+			| 0BX:	WriteString(" NIL")
+		ELSE WriteString(" ERROR IN CONST!! ")
+		END
+	END Constant;
+
+	PROCEDURE StrNr(new: BOOLEAN);
+	BEGIN
+		IF new THEN Write("("); WriteByte(StrN); WriteString(") "); INC(StrN)
+		ELSE WriteString("     ")
+		END
+	END StrNr;
+
+	PROCEDURE WriteSet(s: LONGINT);
+		CONST
+			hasBody = 1; isRedef = 2; slNeeded = 3; passiveObj = 4; activeObj  = 5; locked = 6; guarded = 7;
+		VAR
+			set: SET;
+	BEGIN
+		set := SYSTEM.VAL(SET, s);
+		IF hasBody IN set THEN WriteString("hasBody ") END;
+		IF isRedef IN set THEN WriteString("isRedef ") END;
+		IF slNeeded IN set THEN WriteString("slNeeded ") END;
+		IF passiveObj IN set THEN WriteString("passiveObj ") END;
+		IF activeObj IN set THEN WriteString("activeObj ") END;
+		IF locked IN set THEN WriteString("locked ") END;
+		IF guarded IN set THEN WriteString("guarded ") END;
+	END WriteSet;
+
+	PROCEDURE WriteMod(n: INTEGER);
+	BEGIN
+		IF (n<0) OR (n>=ModN) THEN WriteString("Undefined Module")
+		ELSE WriteString(ModName[n])
+		END
+	END WriteMod;
+	
+	PROCEDURE WriteStr(ref, mod: INTEGER);
+	BEGIN
+		IF (ref > 15) THEN WriteMod(mod); Write(".") END;
+		IF (ref < 0) OR (ref > StrN) THEN WriteString("Undefined Structure");Write("("); WriteByte(ref); Write(")")
+		ELSE 
+			IF StrName[ref] = "" THEN Write("("); WriteByte(ref); Write(")")
+			ELSE WriteString(StrName[ref])
+			END
+		END
+	END WriteStr;
+	
+	PROCEDURE Element(VAR id: CHAR; tab: INTEGER);
+		VAR name : ARRAY 32 OF CHAR; stay: BOOLEAN;
+			varno, size, off, set, key: LONGINT; mthno, tdno: LONGINT; p0, p1, ref, ref2, procno, modno: INTEGER;
+	BEGIN
+		stay := TRUE;
+		WHILE stay DO
+			WriteLn; Tab(tab);
+			Next(id);
+			CASE id OF
+				| 01X:	StrNr(FALSE);
+							WriteString("CON");
+							Constant; GetName(name); WriteString(name)
+				| 02X, 03X:	StrNr(FALSE);
+							IF id = 02X THEN WriteString("TYPE") ELSE WriteString("HDTYPE") END;
+							GetByte(ref); GetByte(modno); GetName(name);
+							Write(" "); WriteString(name); WriteString(" = "); WriteStr(ref,modno);
+							COPY(name, StrName[ref]);
+				| 04X, 17X:	StrNr(FALSE);
+							IF id = 04X THEN WriteString("VAR") ELSE WriteString("RVAR") END;
+							GetByte(ref); GetByte(p0); GetName(name);
+							Write(" "); WriteStr(ref,0); Write(" "); WriteByte(p0); WriteString(name)
+				| 08X: 	StrNr(TRUE);
+							WriteString("PTR");
+							GetByte(ref); GetByte(modno);
+							Write(" "); WriteStr(ref,modno);
+				| 0AX, 0BX:	StrNr(TRUE);
+							IF id = 0AX THEN WriteString("ARR") ELSE WriteString("DARR") END;
+							GetByte(ref); GetByte(modno); GetDWord(size);
+							Write(" "); WriteStr(ref,modno); Write(" "); WriteDWHex(size);
+							IF id = 0BX THEN GetWord(off); Write(" "); WriteWHex(off) END
+				| 10X:	StrNr(FALSE);
+							WriteString("FLIST");
+							Element(id, tab+2);
+							IF id = 0CX THEN
+								StrNr(TRUE);
+								WriteString("REC");
+								GetByte(ref); GetByte(modno); GetDWord(size); GetWord(tdno);
+								Write(" "); WriteStr(ref,modno); Write(" "); WriteDWHex(size);
+								Write(" "); WriteWHex(tdno);
+							ELSIF id = 1CX THEN
+								StrNr(TRUE);
+								WriteString("OBJ");
+								GetByte(ref); GetByte(modno); GetDWord(size); GetWord(tdno); GetDWord(set); GetByte(p0); GetByte(p1);
+								Write(" "); WriteByte(ref); Write(" "); WriteMod(modno); Write(" "); WriteDWHex(size);
+								Write(" "); WriteWHex(tdno); Write(" "); WriteSet(set); Write(" "); WriteByte(p0); Write(" "); WriteByte(p1)
+							ELSE
+								WriteString("Error in record")
+							END;
+							COPY(StrName[StrN-1], name);
+				| 11X, 18X:	StrNr(FALSE);
+							IF id = 11X THEN WriteString("FLD") ELSE WriteString("RFLD") END;
+							GetByte(ref); GetDWord(varno); GetName(name);
+							Write(" "); WriteStr(ref, 0); Write(" "); WriteDWHex(varno); Write(" "); WriteString(name)
+				| 12X, 13X:	StrNr(FALSE);
+							IF id = 12X THEN WriteString("HDPTR") ELSE WriteString("HDPROC") END;
+							GetDWord(off); Write(" "); WriteDWHex(off)
+				| 0EX, 0FX:	StrNr(FALSE);
+							IF id = 0EX THEN WriteString("VAR") ELSE WriteString("VARPAR") END;
+							GetByte(ref); GetName(name);
+							Write(" "); WriteStr(ref, 0); Write(" "); WriteString(name)
+				| 0DX:	StrNr(FALSE);
+							WriteString("PLIST"); Element(id, tab+2);
+							IF id = 06X THEN 
+								StrNr(FALSE); WriteString("XPROC");
+								GetByte(ref); GetByte(procno); GetName(name);
+								Write(" "); WriteStr(ref, 0); Write(" "); WriteByte(procno); Write(" "); WriteString(name)
+							ELSIF id = 05X THEN
+								StrNr(FALSE); WriteString("IPROC");
+								GetByte(ref); GetByte(procno); GetName(name);
+								Write(" "); WriteStr(ref, 0); Write(" "); WriteByte(procno); Write(" "); WriteString(name)
+							ELSIF id = 19X THEN
+								StrNr(FALSE); WriteString("TPROC");
+								GetByte(ref); GetByte(ref2); GetWord(mthno); GetName(name);
+								Write(" "); WriteStr(ref, 0); Write(" "); WriteStr(ref2, 0); Write(" "); WriteWHex(mthno);
+								Write(" "); WriteString(name)
+							ELSIF id = 1BX THEN
+								StrNr(FALSE); WriteString("HDTPROC");
+								GetByte(ref); GetWord(mthno);
+								Write(" "); WriteStr(ref, 0); Write(" "); WriteWHex(mthno)
+							ELSIF id = 09X THEN
+								StrNr(TRUE); WriteString("PROC");
+								GetByte(ref); GetByte(modno);
+								Write(" "); WriteStr(ref, modno);
+								COPY(StrName[StrN-1], name);
+							ELSE
+								WriteString("???PROC")
+							END
+					| 14X:	StrNr(FALSE);
+							WriteString("FIX");
+							GetByte(ref); GetByte(ref2);
+							Write(" "); WriteStr(ref, 0); WriteString("==>"); WriteStr(ref2, 0)
+					| 15X:	StrNr(FALSE);
+							WriteString("SYSFLAG");
+							GetByte(ref); GetByte(p0);
+							Write(" "); WriteStr(ref, 0); Write(" "); WriteByte(p0)
+					| 1AX:	StrNr(FALSE);
+							WriteString("N OF METHODS");
+							GetByte(ref); GetByte(p0);
+							Write(" "); WriteStr(ref, 0); Write(" "); WriteByte(p0)
+					| 16X:	StrNr(FALSE);
+							WriteString("MOD");
+							GetDWord(key); GetName(name);
+							Write(" "); WriteDWHex(key); Write(" "); WriteString(name);
+							COPY(name, ModName[ModN]); INC(ModN);
+				ELSE stay := FALSE;
+			END
+		END
+	END Element;
+
+	PROCEDURE SymFile;
+		VAR key: LONGINT; name : ARRAY 32 OF CHAR; id: CHAR;
+	BEGIN
+		Check(0F7X, "Symbol File");
+		Check(16X, "MODULE");
+		GetDWord(key); GetName(name);
+		ModN := 1; COPY(name, ModName[0]);
+		WriteString(name); WriteString(" Key = "); WriteDWHex(key); WriteLn;
+		WHILE ~R.eof DO 
+			Element(id, 0);
+			IF ~R.eof THEN WriteString("!!! Uninterpreted value "); WriteByte(ORD(id)) END;
+		END
+	END SymFile;
+
+
+	PROCEDURE Sym*;
+		VAR S: Texts.Scanner; i, beg, end, time: LONGINT; name: ARRAY 32 OF CHAR; ch: CHAR;
+			f: Files.File; T: Texts.Text;
+	BEGIN
+		StrN := 16;
+		StrName[0] := "undef"; StrName[1] := "BYTE"; StrName[2] := "BOOLEAN";
+		StrName[3] := "CHAR"; StrName[4] := "SHORTINT"; StrName[5] := "INTEGER";
+		StrName[6] := "LONGINT"; StrName[7] := "REAL"; StrName[8] := "LONGREAL";
+		StrName[9] := "SET"; StrName[10] := "STRING"; StrName[11] := "NIL";
+		StrName[12] := "NoTyp"; StrName[13] := "POINTER"; StrName[14] := "PROCEDURE";
+		StrName[15] := "???-> mail me!!!";
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF (S.class = Texts.Char) & (S.c = "^") THEN
+			Oberon.GetSelection(T, beg, end, time);
+			IF (T = NIL) OR (time <= 0) THEN S.class := Texts.Inval
+			ELSE Texts.OpenScanner(S, T, beg); Texts.Scan(S)
+			END
+		END;
+		IF S.class = Texts.Name THEN
+			i := 0; ch := S.s[0];
+			WHILE ("A" <= CAP(ch)) & (CAP(ch) <= "Z") OR ("0" <= ch) & (ch <= "9") DO
+				name[i] := ch; INC(i); ch := S.s[i]
+			END;
+			name[i] := "."; name[i+1] := "S"; name[i+2] := "y"; name[i+3] := "m"; name[i+4] := 0X;
+			f := Files.Old(name);
+			IF f = NIL THEN
+				Out.String("error: cannot open file "); Out.String(name); Out.Ln; RETURN
+			END;
+			Files.Set(R, f, 0);
+			Texts.SetFont(W, defaultFont);
+			NEW(T); Texts.Open(T, ""); 
+			Oberon.OpenText("", T, 600, 300);
+			SymFile;
+			Texts.Append(T, W.buf);
+			Files.Set(R, NIL, 0); T := NIL
+		END;
+	END Sym;
+
+BEGIN
+	Out.String("Decoder  NM / prk / pjm 04.04.96"); Out.Ln;
+	breakpos := -1; suppressH := FALSE;
+	Texts.OpenWriter(W);  defaultFont := Fonts.This("Courier10.Scn.Fnt"); titleFont := Fonts.This("Oberon12b.Scn.Fnt")
+END Decoder.

@@ -1,0 +1,2353 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE iASM; (* PRK *)
+
+(*
+	ASM - i80386 assembler module for the OP2 compiler
+----------------------------------------------------------------------------	
+	Documentation on this module:
+		AssemblerGuide.Text
+---------------------------------------------------------------------------		
+	Created by Patrik Reali.
+	
+	5.2.96 prk / reali@inf.ethz.ch
+		first release
+	
+	9.2.96 prk 
+		bug fixes
+	
+	206 prk
+		BSWAP -> 0F C8 +r
+		SETx -> 90H (not 90)
+		[E?X * 2 + E?X] also accepted
+		[E?X * 1] is now accepted
+		off[ESP] OK.
+		bug: jmp back with -130 was generated as 1-byte.
+		MOV RM16, SReg / MOV SReg, RM16
+		DIV RMxx and MUL RMxx are accepted as shortcuts for DIV ?AX, RMxx and MUL ?AX, RMxx
+		REPZ/REPNZ added
+		more flexible parsing of REPx string-instruction
+		move to/from special registers (CDx/DRx/TRx)
+		SHLD added
+		bug in SHLD/SHRD (need OmRM)
+		accepts constants as relative arguments
+		added RET near
+		added LGDT, LIDT
+		bug in BT (needed /r, book error)
+		bug in Match routine (M -> RM mode)
+		undocumented SAL removed
+		MOV SReg doesn't need the 66H prefix
+		LEA takes Mx as argument (was RMx). IsModRMMode is true just for RMx, not Mx
+		no size cast is done if more then one matching opcodes exist -> err 512
+		intel-like operands in DumpMode
+		inserted new mode SImm8 and Imm8 for instructions with implicit sign extension
+		[E?X] doens't generate a 0[E?X]. Changes disp. Not used = 0 (was none)
+		Module initialisation is delayed to the first call
+		accepts Oberon-like comments
+		global variables
+		SIB byte
+		DB/DW/DD value
+		QWORD/TBYTE
+		
+	N207
+		bug in comment (oberon comment containing ";")
+		DB "a" accepted
+		DS "abc"	(define string)
+		err 513 -> string expected
+		MOV AX, SS doesn't need 66H prefix
+		MOVSW fixed (wrong opcode)
+		MOV SpecReg, Reg / MOV Reg, SpecReg was wrong: the Reg should be coded in the RM , not in the Reg field. -> special mode
+		wrong opcode generated for INSB, INSW, INSD
+		bug in Evaluate. every imm matched Rel8
+		JMP Rel16 is removed
+		RET imm16 should not generate a 66H prefix
+		JMP RMx, wrong opcode generated (needs /4)
+		CALL Rel16 removed
+		LEA Reg32, RM16 removed
+		const[Reg] was wrong when const size = 2
+		m32 must match m
+		486 instructions removed (CMPXCHG, INVD, WBINVD, XADD)
+		16-bit instructions removed (PUSHA, POPA, PUSHF, POPF, IRET)
+		removing OUTS and INS forms with parameters (parameters not used anyway)
+		ARPL, BOUND, LDS, LSS, LES, LFS, LGS, LOCK, SCASB, SCASW, SCASD, SAHF, SGDT, SIDT, XLATB added
+		bug fixed in FDIVP, FMULP: parameters were inverted
+		STR doesn't need 66H prefix
+		disp[reg], disp > 255 was generated incorrectly.
+		
+	to be done / ideas:
+		Instructions with 3 opcodes: FSTSW AX / FINIT
+		
+	interface:
+		Nassembler
+		Ncode
+		Nfixup
+		
+		This module generates an node of class Nassembler. The left child of the node is
+		a lists of nodes of class Ncode, which contain the inline code in the conval.ext
+		field. The first byte of conval.ext contains the number of used bytes.
+		The right child of the Nassembler node contains the fixup list of all the fixups
+		to be done in the code. The obj field contains the object to be fixed up
+		(can be a Var, VarPar, ...), while conval.intval contains the position relative
+		to the beginning of the inlined code to be fixed up. The size is given by the
+		type of the object.
+	
+	
+---------------------------------------------------------------------------			
+			
+*)
+
+
+	IMPORT	SYSTEM, OPM:=iOPM, OPS:=iOPS, OPT:=iOPT, OPB := iOPB;
+
+
+	CONST 
+		Version = "1.07B / 3.07.96   PRK";
+		debug1 = FALSE;	(* dump trace information *)
+		debug2 = FALSE;	(* dump opcode identification *)
+		debug3 = FALSE;	(* dump call trace *)
+		debug4 = FALSE;	(* tables insertion dump *)
+		debug5 = FALSE;	(* symbol table *)
+		debug6 = FALSE;	(* dump code generation *)
+		debug7 = FALSE;	(* dump scanner info *)
+		
+		none = -1;
+	
+		(* node classes for inline instructions*)
+		Nassembler = 29;
+		Ncode = 30;
+		Nfixup = 31;
+		
+		(* Own Symbol Table types *)
+		StLabel = 0; StFwdLabel = 1;
+		StConst = 3; StType = 4; StVar = 5; StVarPar = 6; StGlobal = 7;
+
+		(* Own Addressing modes, also used in the St and Sc *)
+		Reg8 = 08H; Reg16 = 10H; Reg32 = 20H;
+		RegAL = 09H; RegAX = 11H; RegEAX = 21H;
+		RegDX = 12H;								(* special case for IN/OUT *)
+		RegCL = 13H;								(* special case for rotate/shift *)
+		Imm8 = 30H; Imm16 = 31H; Imm32 = 32H; SImm8 = 35H; Imm = 36H;
+		Const1 = 33H;								(* special case for rotate/shift *)
+		Const3 = 34H;								(* special case for INT 3 *)
+		RM = 40H; RM8 = 41H; RM16 = 42H; RM32 = 43H; 
+		M = 48H; M8 = 49H; M16 = 4AH; M32 = 4BH; M64 = 4CH; M80 = 4DH;
+		(*M2 = 4EH;*)
+		SReg = 50H;	(* Segment Register *)
+		RegCS = 51H; RegDS = 52H; RegES = 53H; RegFS = 54H;
+		RegGS = 55H; RegSS = 56H;
+		Rel8 = 60H; Rel16 = 61H; Rel32 = 62H; FwdJmp = 63H;
+		CRReg = 70H; DRReg = 71H; TRReg = 72H;
+		FReg = 80H; FRegST = 81H;
+		
+		(* Scanner: ASCII codes *)
+		TAB = 09X;
+		CR = 0DX;
+		SPACE = 20X;
+		(* Scanner: Sym values *)
+		ScUndef = 0;
+		ScIdent = 1; 
+		ScSemicolon = 2;	(* ; *)
+		ScAt = 3;	(* @ *)
+		ScNumber = 4;
+		ScComma = 5; 	(* , *)
+		ScLBrak = 6;	(* [ *)
+		ScRBrak = 7;	(* ] *)
+		ScCR = 8;
+		ScMult = 9;	(* * *)
+		ScEnd = 10;
+		ScLabel = 11;
+		ScColon = 12;	(* : *)
+		ScPlus = 13;
+		ScMinus = 14;
+		ScDiv = 15;
+		ScLPar = 16;
+		ScRPar = 17;
+		ScString = 18;
+		
+		(* Structure sizes *)
+		NameLen = 32;
+		MaxStrLen = 256;
+		MnemoLen = 8;
+		OpTabLen = 650;
+		InstrTabLen = 403;
+		
+		(* Opcodes modifiers *)
+		OmRM = 1;	OmOp = 2;		(* register stored in the RM byte / register added to the opcode *)
+		
+		(* Match evaluation *)
+		NoMatch = 0; SizeCast = 1; TypeCast = 2; ConstCast = 3; Hit = 4;
+
+	TYPE 
+		Name = ARRAY NameLen OF CHAR;
+		Mnemo = ARRAY MnemoLen OF CHAR;
+		
+		(*Object: The symbol table. It's an ordered binary tree. First element is root.right *)
+		Object = POINTER TO ObjDesc;
+		FixPnt = POINTER TO FixPntDesc;
+		
+		InstrDesc = RECORD
+					name: Mnemo;
+					start, end: INTEGER;	 (* index in the opcode-tab *)
+				END;
+
+		(* Opcode: this structure contains the definition of an opcode, with the
+			expected dst/src operands and the information needed to encode it.
+			Ex:
+				if opc # -1 => modr/m . opc = opc. ( extension of the opcode )
+		*)
+		OpCode = RECORD
+				op: ARRAY 3 OF INTEGER;		(* mode of the dst/src operands, if needed *)
+				op0, op1: INTEGER;	   (* opcode *)
+				opc: INTEGER;			(* value stored in reg/opcode of modr/m. -1 = none *)
+				reg: INTEGER;			(* where is the register stored: none / rm /op *)
+			END;
+		
+		Operand = RECORD
+					mode: INTEGER;		(* the mode: Reg8.... *)
+					imm: LONGINT;		(* the constant *)
+					disp: LONGINT;
+					index, base, reg: INTEGER;
+					seg, scale: INTEGER;	(* segment override *)
+					obj: Object;			(* the jmp label for forward jumps / the object referenced *)
+				END;
+				
+		ObjDesc = RECORD
+							typ: INTEGER;
+							val, size:  LONGINT;		(* if typ <0 => pos of first use of this label *)
+							name: Name;
+							left, right, next: Object;
+							fix: FixPnt;
+							obj: OPT.Object
+					 END;
+		
+		FixPntDesc = RECORD
+						pc: LONGINT;
+						node: OPT.Node;
+						pos: LONGINT;
+						next: FixPnt;
+					END;
+
+VAR
+	(* Global structures *)
+		root:  Object;	(* symbol table *)
+		OpTab: ARRAY OpTabLen OF OpCode;	(* Table with the opcodes *)
+		OpTabN: INTEGER;		(* nof opcodes in the table *)
+		Average: LONGINT;		(* debug: access average *)
+		InstrTab: ARRAY InstrTabLen OF InstrDesc;	(* Table with the instructions !!Hash *)
+		SizeTab: ARRAY 16 OF SHORTINT;		(* size of the oberon types *)
+		
+		FirstTime: BOOLEAN;		(* First time the module is used *)
+		
+		pc: LONGINT;	(* program counter. Should be used only for pc-rel jumps !! *)
+		
+	(* Scanner variables *)
+		(*ch: CHAR;*)			(* look-ahead char is OPS.ch*)
+		sym: INTEGER; 	(* last token read *)
+		ident: Name;		(* last identifier read *)
+		val: LONGINT;	  (* last value read *)
+		str: ARRAY MaxStrLen OF CHAR;
+		errpos: LONGINT;	(* starting position of the last instruction *)
+	
+	(* Instruction nodes *)
+		first, last: OPT.Node;	(* first and last nodes in the instruction stream *)
+		fixlist: OPT.Node;	(* list of fixups to be done by the back-end *)
+
+(* ------------------------------------------------------------------- *)
+(* Special functions *)
+
+	PROCEDURE AND(a,b: LONGINT):LONGINT;
+	BEGIN RETURN(SYSTEM.VAL(LONGINT, SYSTEM.VAL(SET,a) * SYSTEM.VAL(SET,b)))
+	END AND;
+
+
+	PROCEDURE OutXDigit(i: LONGINT);
+	BEGIN
+		IF i<10 THEN OPM.LogW(CHR(i+ORD("0"))) ELSE OPM.LogW(CHR(i+ORD("A")-10)) END
+	END OutXDigit;
+		
+	PROCEDURE OutHex(i: LONGINT);
+	BEGIN
+		OutXDigit( i DIV 16); OutXDigit(i MOD 16)
+	END OutHex;
+
+(* ------------------------------------------------------------------- *)
+(* Addressing Mode functions *)
+
+	PROCEDURE DumpMode(mode: INTEGER);
+	BEGIN
+		CASE mode OF
+		  Reg8: OPM.LogWStr("r8 ")
+		| Reg16: OPM.LogWStr("r16 ")
+		| Reg32: OPM.LogWStr("r32 ")
+		| RegAL: OPM.LogWStr("AL ")
+		| RegAX: OPM.LogWStr("AX ")
+		| RegEAX: OPM.LogWStr("EAX ")
+		| RegDX: OPM.LogWStr("DX ")
+		| RegCL: OPM.LogWStr("CL ")
+		| RegCS: OPM.LogWStr("CS ")
+		| RegDS: OPM.LogWStr("DS ")
+		| RegES: OPM.LogWStr("ES ")
+		| RegFS: OPM.LogWStr("FS ")
+		| RegGS: OPM.LogWStr("GS ")
+		| RegSS: OPM.LogWStr("SS ")
+		| Imm8: OPM.LogWStr("imm8 ")
+		| Imm16: OPM.LogWStr("imm16 ")
+		| Imm32: OPM.LogWStr("imm32 ")
+		| SImm8: OPM.LogWStr("imm8 (signed) ")
+		| Imm: OPM.LogWStr("imm (generic) ")
+		| Const1: OPM.LogWStr("1 ")
+		| Const3: OPM.LogWStr("t3 ")
+		| RM: OPM.LogWStr("r/m ")
+		| RM8: OPM.LogWStr("r/m8 ")
+		| RM16: OPM.LogWStr("r/m16 ")
+		| RM32: OPM.LogWStr("r/m32 ")
+		| SReg: OPM.LogWStr("Sreg ")
+		| Rel8: OPM.LogWStr("rel8 ")
+		| Rel16: OPM.LogWStr("rel16 ")
+		| Rel32: OPM.LogWStr("rel32 ")
+		| FwdJmp: OPM.LogWStr("FwdJmp ")
+		| none: OPM.LogWStr("none ")
+		| M: OPM.LogWStr("m ")
+		| M8: OPM.LogWStr("m8 ")
+		| M16: OPM.LogWStr("m16 ")
+		| M32: OPM.LogWStr("m32 ")
+		| M64: OPM.LogWStr("m64 ")
+		| M80: OPM.LogWStr("m80 ")
+		| CRReg: OPM.LogWStr("CR0/CR2-3 ")
+		| DRReg: OPM.LogWStr("DR0-3/DR6/DR7 ")
+		| TRReg: OPM.LogWStr("TR6/TR7 ")
+		| FReg: OPM.LogWStr("ST(i) ")
+		| FRegST: OPM.LogWStr("ST ")
+		ELSE OPM.LogWStr("unknown mode ")
+		END
+	END DumpMode;
+
+	PROCEDURE DumpOp(VAR o: Operand);
+	BEGIN
+		DumpMode(o.mode);
+		OPM.LogWNum(o.imm, 4); OPM.LogWNum(o.disp, 4); OPM.LogWNum(o.reg,4); OPM.LogWNum(o.base,4); OPM.LogWNum(o.index, 4);
+	END DumpOp;
+	
+	PROCEDURE ModeSize(mode: INTEGER): INTEGER;
+	BEGIN
+		CASE mode OF
+		  Imm8, Const1, Const3, Rel8, RegAL, RegCL, Reg8, RM8, M8, SImm8:
+				RETURN(1)
+		| Imm16, Rel16, RegAX, RegDX, Reg16, RM16, M16, SReg, RegCS, RegDS, RegES, RegFS, RegGS, RegSS:
+				RETURN(2)
+		| Imm32, Rel32, FwdJmp, RegEAX, Reg32, RM32, M32:
+				RETURN(4)
+		| M64:
+				RETURN(8)
+		| M80:
+				RETURN(10)
+		| RM:
+				RETURN(0)
+		ELSE RETURN(0)
+		END
+	END ModeSize;
+	
+	PROCEDURE ConstSize(i: LONGINT; signed: BOOLEAN):INTEGER;
+	BEGIN
+		IF (MIN(SHORTINT) <= i) & (MAX(SHORTINT) >= i) OR (~signed & (AND(i,0FFFFFF00H)=0)) THEN
+			RETURN(1)
+		ELSIF (MIN(INTEGER) <= i) & (MAX(INTEGER) >= i) OR (~signed & (AND(i,0FFFF0000H)=0))THEN
+			RETURN(2)
+		ELSE
+			RETURN(4)
+		END
+	END ConstSize;
+	
+	PROCEDURE IsRegMode(m: INTEGER; strict: BOOLEAN):BOOLEAN;
+	BEGIN
+		RETURN((m=Reg8)OR(m=Reg16)OR(m=Reg32)OR
+			(~strict &((m=RegAL)OR(m=RegAX)OR(m=RegEAX)OR(m=RegDX))))
+	END IsRegMode;
+	
+	PROCEDURE IsSRegMode(m: INTEGER; strict: BOOLEAN):BOOLEAN;
+	BEGIN
+		RETURN((m=SReg)OR (~strict &(m=RegCS)OR(m=RegDS)OR(m=RegES)OR
+			(m=RegFS)OR(m=RegGS)OR(m=RegSS)))
+	END IsSRegMode;
+	
+	PROCEDURE IsSpecRegMode(m: INTEGER):BOOLEAN;
+	BEGIN
+		RETURN((m=CRReg)OR(m=DRReg)OR(m=TRReg))
+	END IsSpecRegMode;
+	
+	PROCEDURE IsMMode(m: INTEGER):BOOLEAN;
+	BEGIN
+		RETURN((m=M)OR(m=M8)OR(m=M16)OR(m=M32)OR(m=M64)OR(m=M80))
+	END IsMMode;
+	
+	PROCEDURE IsModRmMode(m: INTEGER):BOOLEAN;
+	BEGIN
+		RETURN((m=RM)OR(m=RM8)OR(m=RM16)OR(m=RM32) (*OR IsMMode(m)*))
+	END IsModRmMode;
+	
+	PROCEDURE IsFRegMode(m: INTEGER; strict: BOOLEAN):BOOLEAN;
+	BEGIN
+		RETURN((m=FReg) OR (~strict & (m=FRegST)))
+	END IsFRegMode;
+
+	PROCEDURE NeedModRM(mode, regpos: INTEGER): BOOLEAN;
+	BEGIN
+		RETURN(IsModRmMode(mode) OR IsMMode(mode) OR
+						((regpos = OmRM) & (IsRegMode(mode,TRUE) OR IsSRegMode(mode, FALSE) OR IsSpecRegMode(mode))))
+	END NeedModRM;
+	
+	PROCEDURE IsImmMode(m: INTEGER):BOOLEAN;
+	BEGIN
+		RETURN((m=Imm8)OR(m=Imm16)OR(m=Imm32)OR(m=SImm8)OR(m=Imm))
+	END IsImmMode;
+	
+	PROCEDURE IsRelMode(m: INTEGER):BOOLEAN;
+	BEGIN
+		RETURN((m=Rel8)OR(m=Rel16)OR(m=Rel32))
+	END IsRelMode;
+	
+	PROCEDURE Evaluate(VAR op: Operand; mode: INTEGER):INTEGER;
+	BEGIN
+		IF mode = op.mode THEN RETURN(Hit)	(* 80% of the checks, now the 20% special cases *)
+		ELSIF IsModRmMode(mode) THEN
+			IF IsMMode(op.mode) THEN
+				IF ModeSize(op.mode)=ModeSize(mode) THEN RETURN Hit
+				ELSIF (op.mode = RM) OR (op.mode = M) THEN RETURN SizeCast
+				ELSE RETURN NoMatch END
+			ELSIF IsRegMode(op.mode, FALSE) & (ModeSize(op.mode)=ModeSize(mode)) THEN RETURN TypeCast
+			ELSE RETURN NoMatch END
+		ELSIF IsRegMode(mode,TRUE) THEN	(* cannot be a specific reg (AL,AX,EAX) *)
+			IF ModeSize(op.mode)=ModeSize(mode) THEN
+				IF IsRegMode(op.mode,TRUE) THEN RETURN Hit
+				ELSIF IsRegMode(op.mode, FALSE) THEN RETURN TypeCast
+				ELSE RETURN NoMatch END
+			ELSE RETURN NoMatch
+			END
+		ELSIF mode = RegDX THEN
+			IF (op.mode = Reg16) & (op.reg = 2) THEN RETURN Hit ELSE RETURN NoMatch END	(* special case for IN/OUT which uses DX *)
+		ELSIF mode = RegCL THEN
+			IF (op.mode = Reg8) & (op.reg = 1) THEN RETURN Hit ELSE RETURN NoMatch END	(* special case for shift/rotate which uses CL *)
+		ELSIF IsRegMode(mode, FALSE) THEN RETURN NoMatch
+		ELSIF IsImmMode(mode) THEN
+			IF op.mode = Imm THEN
+				IF ModeSize(mode)  > ConstSize(op.imm, mode = SImm8) THEN RETURN ConstCast
+				ELSIF ModeSize(mode)  = ConstSize(op.imm, mode = SImm8) THEN RETURN Hit
+				ELSE RETURN NoMatch END
+			ELSIF IsImmMode(op.mode) THEN
+				IF ModeSize(mode)  > ModeSize(op.mode) THEN RETURN ConstCast
+				ELSIF ModeSize(mode)  = ModeSize(op.mode) THEN RETURN Hit
+				ELSE RETURN NoMatch END
+			ELSE RETURN NoMatch END
+		ELSIF mode = Const1 THEN
+			IF IsImmMode(op.mode) & (op.imm = 1) THEN RETURN Hit ELSE RETURN NoMatch END
+		ELSIF mode = Const3 THEN
+			IF IsImmMode(op.mode) & (op.imm = 3) THEN RETURN Hit ELSE RETURN NoMatch END
+		ELSIF IsMMode(mode) THEN
+			IF IsMMode(op.mode) THEN
+				IF ModeSize(op.mode)=ModeSize(mode) THEN RETURN Hit
+				ELSIF (op.mode = M) OR (mode = M) THEN RETURN SizeCast
+				ELSE RETURN NoMatch END
+			ELSE RETURN NoMatch END
+		ELSIF mode = SReg THEN
+			IF IsSRegMode(op.mode,FALSE) THEN RETURN Hit ELSE RETURN NoMatch END
+		ELSIF IsRelMode(mode) THEN
+			IF (mode = Rel32) & (op.mode = FwdJmp) THEN RETURN Hit
+			ELSIF IsImmMode(op.mode) THEN
+				IF ModeSize(mode) = ConstSize(op.imm, TRUE) (*ModeSize(op.mode)*) THEN RETURN Hit
+				ELSIF ModeSize(mode) > ConstSize(op.imm, TRUE) (*ModeSize(op.mode)*) THEN RETURN ConstCast
+				ELSE RETURN NoMatch END
+			ELSE RETURN NoMatch END 
+			
+		ELSIF mode = FReg THEN
+			IF IsFRegMode(op.mode, TRUE) THEN RETURN Hit 
+			ELSIF IsFRegMode(op.mode, FALSE) THEN RETURN TypeCast
+			ELSE RETURN NoMatch END
+		ELSE RETURN NoMatch
+		END
+
+	END Evaluate;
+	
+	
+	PROCEDURE Match(VAR ind: INTEGER; VAR op: ARRAY OF Operand);
+		VAR start, end, i, j, k, best: INTEGER;
+		
+	BEGIN
+IF debug2 THEN
+	OPM.LogWStr("Match "); OPM.LogWStr(InstrTab[ind].name); DumpMode(op[0].mode); DumpMode(op[1].mode); DumpMode(op[2].mode);
+	OPM.LogWLn
+END;
+		start := InstrTab[ind].start; end := InstrTab[ind].end; ind := -1; best := 0;
+		WHILE start < end DO
+			i := Evaluate(op[0], OpTab[start].op[0]);
+			IF (i = NoMatch) THEN 
+			ELSE
+				j := Evaluate(op[1], OpTab[start].op[1]);
+				IF j = NoMatch  THEN i := NoMatch
+				ELSE
+					k := Evaluate(op[2], OpTab[start].op[2]);
+					IF (i < j) & (i < k) THEN
+					ELSIF j < k THEN i :=  j
+					ELSE i := k
+					END
+				END
+			END;
+IF debug2 THEN
+	OPM.LogWStr("---> "); DumpMode(OpTab[start].op[0]); DumpMode(OpTab[start].op[1]); DumpMode(OpTab[start].op[2]);
+	OPM.LogWNum(i,4); OPM.LogWLn
+END;
+			IF i # NoMatch THEN
+				IF i = Hit THEN ind := start; RETURN
+				ELSIF i > best THEN ind := start; best := i
+				ELSIF (i = best) & (i = SizeCast) THEN OPM.Mark(512, errpos); ind := -1; RETURN
+				END
+			END;
+			INC(start)
+		END;
+		IF ind = -1 THEN OPM.Mark(501, errpos) END
+	END Match;
+	
+
+(* ------------------------------------------------------------------- *)
+(* Symbol Table / Instr Table / Op Table  functions *)
+
+	PROCEDURE insert(VAR name: Name; VAR obj: Object);
+		VAR ob0, ob1: Object; d: INTEGER;
+	BEGIN ob0 := root; ob1 := ob0.right; d := 1;
+		LOOP
+			IF ob1 = NIL THEN (*insert undefined label*)
+				NEW(ob1); ob1.name := name; ob1.typ := StFwdLabel;
+				ob1.left := NIL; ob1.right := NIL; ob1.fix := NIL; ob1.obj := NIL;
+				ob1.next := root.next; root.next := ob1;
+				ob1.val := OPM.errpos;
+				IF d < 0 THEN ob0.left := ob1 ELSE ob0.right := ob1 END;
+			ELSIF name < ob1.name THEN d := -1; ob0 := ob1; ob1 := ob1.left
+			ELSIF name > ob1.name THEN d :=  1; ob0 := ob1; ob1 := ob1.right
+			ELSE (*found, no insertion*) EXIT END
+		END;
+IF debug5 THEN
+	OPM.LogWStr("ST insert: "); OPM.LogWStr(name); OPM.LogWLn
+END;
+		obj := ob1
+	END insert;
+
+	PROCEDURE find(VAR name: Name; VAR obj: Object);
+		VAR ob0: Object; ob : OPT.Object;
+	BEGIN ob0 := root.right;
+IF debug5 THEN
+	OPM.LogWStr("ST find "); OPM.LogWStr(name); OPM.LogWLn
+END;
+		WHILE (ob0 # NIL) & (ob0.name # name) DO
+IF debug5 THEN
+	OPM.LogWStr("ST find, checking "); OPM.LogWStr(ob0.name); OPM.LogWLn 
+END;
+			IF name < ob0.name THEN ob0 := ob0.left ELSE ob0 := ob0.right END
+		END;
+IF debug5 THEN
+	IF ob0 = NIL THEN OPM.LogWStr("ST Not found") END; OPM.LogWLn
+END;
+		obj := ob0;
+		IF obj = NIL THEN
+			COPY(name,OPS.name); OPT.Find(ob);
+			IF ob # NIL THEN
+				NEW(ob0);
+				CASE ob.mode OF
+				  1: (* Var *)
+						ob0.val := 1; ob0.size := SizeTab[ob.typ.form];
+						IF ob.mnolev <= 0 THEN
+							ob0.typ := StGlobal
+						ELSE
+							ob0.typ := StVar 
+						END
+				| 2: (* VarPar *)
+						ob0.typ := StVarPar; ob0.val := 1; ob0.size := 4
+				| 3: (* Con *)
+						ob0.typ := StConst; ob0.val := ob.conval.intval;
+						IF (ob.typ.form > 6) OR (ob.typ.form = 2) THEN OPM.err(51)
+						END
+				| 5: (* Type *)
+						ob0.typ := StType; ob0.size := SizeTab[ob.typ.form]; OPM.err(-606)
+				ELSE ob0.typ := StConst; ob0.val := 0; OPM.err(-607)
+				END;
+				ob0.obj := ob; obj := ob0
+			ELSE insert(name, obj)		(* create forward jump *)
+			END;
+		END;
+	END find;
+
+	(* Generates the hash index k for the n-th try. n>=0 *)
+	PROCEDURE HashFn(VAR name: ARRAY OF CHAR; VAR k, n: INTEGER);
+		VAR i: INTEGER;
+	BEGIN
+		IF n = 0 THEN
+			i := 0; k := 0;
+			WHILE name[i] # 0X DO
+				k := (k*16 + ORD(name[i])) MOD InstrTabLen; INC(i)
+			END;
+			n := 1
+		ELSE
+				k := (k + n) MOD InstrTabLen; INC(n, 1)
+		END
+	END HashFn;
+	
+	PROCEDURE FindInstruction(VAR name: ARRAY OF CHAR; VAR inx: INTEGER);
+		VAR n: INTEGER;
+	BEGIN
+		n := 0;
+		REPEAT
+			HashFn(name, inx, n)
+		UNTIL (name = InstrTab[inx].name) OR (InstrTab[inx].name[0] = 0X) OR (n >InstrTabLen);
+		IF (InstrTab[inx].name[0] = 0X) OR (n >InstrTabLen) THEN inx := -1 END
+	END FindInstruction;
+	
+(* ------------------------------------------------------------------- *)
+(* Scanner functions *)
+
+	PROCEDURE skipBlanks;
+	BEGIN
+		WHILE (OPS.ch = SPACE) OR (OPS.ch = TAB) DO OPM.Get(OPS.ch) END;
+		IF OPS.ch = ";" THEN
+			WHILE (OPS.ch # CR) DO OPM.Get(OPS.ch) END	(* Skip comments *)
+		END
+	END skipBlanks;
+
+	PROCEDURE GetIdent(VAR name: Name);
+		VAR i: INTEGER;
+	BEGIN i := 0; OPM.errpos := OPM.curpos - 1;
+		REPEAT
+			IF i < NameLen-1 THEN name[i] := OPS.ch; INC(i) END;
+			OPM.Get(OPS.ch)
+		UNTIL ~(("A" <= CAP(OPS.ch)) & (CAP(OPS.ch) <= "Z") OR ("0" <= OPS.ch) & (OPS.ch <= "9"));
+		name[i] := 0X
+	END GetIdent;
+
+	PROCEDURE Get(VAR sym: INTEGER);
+	
+		PROCEDURE Comment;
+		BEGIN
+IF debug7 THEN
+	OPM.LogWStr("Start of Comment"); OPM.LogWLn
+END;
+			OPM.Get(OPS.ch);	(* skip "*" *)
+			REPEAT
+				REPEAT
+					OPM.Get(OPS.ch);
+					IF OPS.ch = "(" THEN
+						OPM.Get(OPS.ch);
+						IF OPS.ch = "*" THEN Comment END
+					END;
+				UNTIL (OPS.ch = "*") OR (OPS.ch = OPM.Eot);
+				OPM.Get(OPS.ch)
+			UNTIL (OPS.ch = ")") OR (OPS.ch = OPM.Eot);
+			OPM.Get(OPS.ch)
+;IF debug7 THEN
+	OPM.LogWStr("End of Comment"); OPM.LogWLn
+END
+		END Comment;
+		
+		PROCEDURE Str;
+			VAR och: CHAR; i: LONGINT;
+		BEGIN
+			och := OPS.ch; i := 0;
+			LOOP
+				OPM.Get(OPS.ch);
+				IF OPS.ch = och THEN EXIT
+				ELSIF OPS.ch < " " THEN OPM.err(3); EXIT
+				ELSIF i = MaxStrLen-1 THEN OPM.err(241); EXIT
+				END;
+				str[i] := OPS.ch; INC(i)
+			END;
+			OPM.Get(OPS.ch);
+			str[i] := 0X; val := i;
+		END Str;
+		
+	BEGIN
+		skipBlanks;
+		OPM.errpos := OPM.curpos;
+		CASE OPS.ch OF
+		  "A" .. "Z", "a" .. "z" :
+				GetIdent(ident); 
+				IF OPS.ch = ":" THEN 
+					OPM.Get(OPS.ch); sym := ScLabel
+        		ELSIF ident = "END" THEN
+        			sym := ScEnd
+        		ELSE
+					sym := ScIdent(*; find(ident, obj);
+					IF obj # NIL THEN type := SHORT(obj.typ); val := obj.val 
+					ELSE type := none END*)
+				END
+		| "0".."9":
+				val := 0; sym := ScNumber;
+				OPS.Number;
+				ASSERT(OPS.numtyp <= 2);
+				val := OPS.intval
+		| ";":   OPM.Get(OPS.ch); sym := ScSemicolon
+		| "@": OPM.Get(OPS.ch); sym := ScAt
+		| ",":   OPM.Get(OPS.ch); sym := ScComma
+		| "[":   OPM.Get(OPS.ch); sym := ScLBrak
+		| "]":   OPM.Get(OPS.ch); sym := ScRBrak
+		| CR:	OPM.Get(OPS.ch); sym := ScCR
+		| "*":	OPM.Get(OPS.ch); sym := ScMult
+		| "/":	OPM.Get(OPS.ch); sym := ScDiv
+		| "+":	OPM.Get(OPS.ch); sym := ScPlus
+		| "-":	OPM.Get(OPS.ch); sym := ScMinus
+		| "(":   OPM.Get(OPS.ch);
+					IF OPS.ch = "*" THEN Comment; Get(sym)
+					ELSE sym := ScLPar
+					END;
+		| ")":   OPM.Get(OPS.ch); sym := ScRPar
+		| ":":	OPM.Get(OPS.ch); sym := ScColon
+		| 22X, 27X: Str; sym := ScString;
+		ELSE  sym := ScUndef; OPM.Get(OPS.ch)
+		END
+;IF debug7 THEN
+	OPM.LogWStr("Scanner.Get ==>"); OPM.LogWNum(sym, 1); OPM.LogWStr("   ");
+	IF sym = ScIdent THEN OPM.LogWStr(ident)
+	ELSIF sym = ScNumber THEN OPM.LogWNum(val, 4)
+	END;
+	OPM.LogWLn
+END
+	END Get;
+	
+	PROCEDURE Check(s: INTEGER);
+	BEGIN IF sym # s THEN OPM.err(s) END;
+		Get(sym)
+	END Check;
+
+	PROCEDURE ^ Expression(VAR x: LONGINT);
+
+	PROCEDURE Factor(VAR x: LONGINT);
+	BEGIN
+		IF sym = ScNumber THEN x := val; Get(sym)
+		ELSIF sym = ScLPar THEN
+			Get(sym); Expression(x);
+			Check(ScRPar)
+		ELSE OPM.err(601)
+		END
+	END Factor;
+
+	PROCEDURE Term(VAR x: LONGINT);
+		VAR y: LONGINT; op : INTEGER;
+	BEGIN
+		Factor(x);
+		WHILE (sym = ScMult) OR (sym = ScDiv) DO
+			op := sym; Get(sym);
+			Factor(y);
+			IF op = ScMult THEN x := x * y ELSE x := x DIV y END
+		END
+	END Term;
+
+	PROCEDURE Expression(VAR x: LONGINT);
+		VAR y: LONGINT; op : INTEGER;
+	BEGIN
+		IF sym = ScMinus THEN op := sym; Get(sym); Term(x); x := -x
+		ELSE Term(x)
+		END;
+		WHILE (sym = ScPlus) OR (sym = ScMinus) DO
+			op := sym; Get(sym);
+			Term(y);
+			IF op = ScPlus THEN x := x + y ELSE x := x - y END
+		END
+	END Expression;
+
+	PROCEDURE GetBaseIndex(VAR o: Operand; size: LONGINT);
+		VAR obj: Object;
+	BEGIN
+		CASE size OF
+			  0: o.mode := M
+			| 1: o.mode := M8
+			| 2: o.mode := M16
+			| 4: o.mode := M32
+			| 8: o.mode := M64
+			| 10: o.mode := M80
+		END;
+		o.disp := o.imm; o.imm := 0;		(* this is not a const but a rm !! *)
+		WHILE (sym = ScLBrak) OR (sym = ScPlus) DO
+			Get(sym);
+			IF sym = ScIdent THEN find(ident, obj) ELSE obj := NIL END;
+			IF (obj = NIL) OR ~IsRegMode(obj.typ, FALSE) OR (ModeSize(obj.typ) # 4) THEN 
+				OPM.err(506); RETURN
+			END;
+			Get(sym);
+			IF sym = ScMult THEN		(* This is the index, get the scale *)
+				IF o.index # none THEN OPM.err(509); RETURN END;
+				o.index := SHORT(obj.val);
+				Get(sym);
+				IF (sym # ScNumber) OR ((val # 1) & (val # 2) & (val # 4) & (val # 8)) THEN 
+					OPM.err(508); RETURN
+				END;
+				o.scale := SHORT(val);
+				Get(sym);
+			ELSIF (sym = ScRBrak) OR (sym = ScPlus) THEN
+				IF o.base = none THEN o.base := SHORT(obj.val)
+				ELSIF o.index = none THEN o.index := SHORT(obj.val)
+				ELSE OPM.err(509)
+				END;
+			ELSE OPM.err(510); RETURN
+			END;
+			IF sym = ScRBrak THEN Get(sym) END
+		END; (* WHILE ScLBrak *)
+		END GetBaseIndex;
+
+	PROCEDURE GetOperand(VAR o: Operand);
+		VAR obj: Object; size: LONGINT;
+	BEGIN
+		o.reg := none; o.disp := 0; o.base := none; o.index := none; o.imm := 0;
+		o.seg := none; o.scale := none; o.obj := NIL;
+		size := 0;	(* unknown size *)
+		IF sym = ScIdent THEN
+			find(ident, obj);
+			IF (obj # NIL) & (obj.typ = SReg) THEN
+				o.seg := SHORT(obj.val); Get(sym); Check(ScColon);
+				IF sym = ScIdent THEN find(ident, obj) END
+			END
+		END;
+		IF (sym = ScIdent) & (obj # NIL) & (obj.typ = StType) THEN
+			size := SHORT(obj.size); Get(sym);
+			IF (sym # ScIdent) OR (ident # "PTR") THEN (* OPM.err(511) *)	(* PTR is optional *)
+			ELSE Get(sym)
+			END;
+			IF sym = ScIdent THEN find(ident, obj) END
+		END;
+		CASE sym OF
+		  ScAt:
+				Get(sym);
+				IF sym # ScNumber THEN OPM.err(-601) END;
+				o.disp := val; o.mode := RM32;
+				Get(sym);
+		| ScLBrak:
+				GetBaseIndex(o, size)
+		| ScIdent, ScNumber, ScMinus:
+IF debug3 THEN OPM.LogWStr("ScIdent, ScNumber:"); OPM.LogWLn END;
+				IF sym = ScIdent THEN
+					IF obj = NIL THEN OPM.err(500); RETURN END;
+					
+					IF size = 0 THEN size := obj.size END;		(* don't override the xyz PTR command *)
+					
+					IF IsRegMode(obj.typ, FALSE) THEN
+						o.mode := obj.typ; o.reg := SHORT(obj.val); Get(sym); RETURN
+					ELSIF IsSRegMode(obj.typ, FALSE) THEN
+						o.mode := obj.typ; o.reg := SHORT(obj.val); Get(sym); RETURN
+					ELSIF IsSpecRegMode(obj.typ) THEN
+						o.mode := obj.typ; o.reg := SHORT(obj.val); Get(sym); RETURN
+					ELSIF IsFRegMode(obj.typ, FALSE) THEN
+						o.mode := obj.typ; Get(sym);
+						IF sym = ScLPar THEN Expression(size); o.reg := SHORT(size) ELSE o.reg := 0; o.mode := FRegST END;
+						RETURN
+					ELSIF obj.typ = StLabel THEN
+						o.imm := obj.val; o.mode := Rel8; Get(sym); RETURN
+					ELSIF obj.typ = StFwdLabel THEN
+						o.obj := obj; o.mode := FwdJmp; Get(sym); RETURN
+					ELSIF obj.typ = StConst THEN
+						o.imm := obj.val; Get(sym);
+					ELSIF (obj.typ = StVar) OR (obj.typ = StVarPar) THEN
+						o.imm := obj.val; o.obj := obj; Get(sym)
+					ELSIF (obj.typ = StGlobal) THEN
+						o.disp := 012345678H; o.obj := obj; 
+						CASE size OF
+						  1: o.mode := M8
+						| 2: o.mode := M16
+						| 4: o.mode := M32
+						| 8: o.mode := M64
+						| 10: o.mode := M80
+						ELSE o.mode := M32
+						END;
+						Get(sym); RETURN		(* Global Var *)
+					ELSE OPM.err(600); RETURN END
+				ELSE Expression(o.imm)
+				END;
+IF debug3 THEN OPM.LogWStr(" a value"); OPM.LogWNum(o.imm,5); OPM.LogWLn END;
+				CASE size OF
+(*				CASE ConstSize(o.imm, FALSE) OF	*)
+				  1: o.mode := Imm8
+				| 2: o.mode := Imm16
+				| 4: o.mode := Imm32
+				ELSE o.mode := Imm
+				END;
+				IF sym = ScLBrak THEN GetBaseIndex(o, size) END;
+		ELSE
+			o.mode := none; OPM.err(511)
+		END;  (* CASE sym OF *)
+	END GetOperand;
+	
+(* ------------------------------------------------------------------- *)
+(* Fixpoint handling functions *)
+
+	PROCEDURE CheckLabels;
+		VAR obj, obj1, obj2: Object;
+	BEGIN obj1 := root.next; obj := NIL; (* invert list *)
+		WHILE obj1 # NIL DO
+			obj2 := obj1.next; obj1.next := obj; obj := obj1; obj1 := obj2
+		END;
+		WHILE obj # NIL DO
+			IF obj.typ = StFwdLabel THEN
+				OPM.Mark(128, obj.val)	(* unsatisfied forward reference *)
+			END;
+			obj := obj.next
+		END
+	END CheckLabels;
+
+	PROCEDURE InsertFix(VAR obj: Object; pc: LONGINT);
+		VAR fix: FixPnt; x: OPT.Node;
+	BEGIN
+		CASE obj.typ OF
+		  StFwdLabel:
+			NEW(fix); fix.pc := pc;
+			fix.node := last; fix.pos := ORD(last.conval.ext[0])-3;	(* displacement position *)
+			fix.next := obj.fix; obj.fix := fix
+		| StVar, StVarPar, StGlobal:
+			x := OPT.NewNode(Nfixup);
+			x.obj := obj.obj; x.conval := OPT.NewConst();
+			x.conval.intval := pc; x.conval.intval2 := OPM.errpos;
+			x.link := fixlist; fixlist := x
+		ELSE
+			OPM.err(607)
+		END
+	END InsertFix;
+
+	PROCEDURE FixDisp(VAR fix: FixPnt);
+		VAR pos, disp: LONGINT;
+	BEGIN
+		disp := pc - fix.pc;
+		FOR pos := fix.pos TO fix.pos+3 DO
+			fix.node.conval.ext[pos] := CHR(disp); disp := disp DIV 256
+		END;
+	END FixDisp;
+	
+(* ------------------------------------------------------------------- *)
+(* Code Generation functions *)
+
+PROCEDURE NewNode;
+	VAR x: OPT.Node;
+BEGIN
+	x := OPT.NewNode(Ncode); x.conval := OPT.NewConst(); 
+	x.conval.ext := OPT.NewExt(); x.conval.ext[0] := 0X;	(* Instr length *)
+	x.conval.intval := OPM.errpos;
+	OPB.Link(first, last, x)
+END NewNode;
+
+PROCEDURE PutByte(b: LONGINT);
+	VAR pos: INTEGER;
+BEGIN
+	pos := ORD(last.conval.ext[0]) + 1;
+	IF pos > 255 THEN
+		NewNode; pos := 1
+	END;
+	last.conval.ext[pos] := CHR(b);
+	last.conval.ext[0] := CHR(pos);
+	INC(pc)
+END PutByte;
+
+PROCEDURE PutBytes(b, size: LONGINT);
+	VAR pos: INTEGER;
+BEGIN
+	pos := ORD(last.conval.ext[0]);
+	IF pos > 255-size THEN
+		NewNode; pos := 0
+	END;
+	WHILE size>0 DO
+		INC(pos); last.conval.ext[pos] := CHR(b); b := b DIV 256; INC(pc); DEC(size);
+	END;
+	last.conval.ext[0] := CHR(pos)
+END PutBytes;
+
+PROCEDURE ModRM(VAR modrm: LONGINT; VAR op: Operand; mode: INTEGER; UseSpecReg: BOOLEAN);
+	VAR mod: LONGINT;
+BEGIN
+IF debug6 THEN
+	OPM.LogWStr("  ModRM "); DumpMode(mode); DumpMode(op.mode); OPM.LogWLn
+END;
+	IF (IsRegMode(mode,TRUE) & ~UseSpecReg) OR IsSRegMode(mode, FALSE) OR IsSpecRegMode(mode) THEN 
+		(* put reg index into the reg/opcode field *)
+		ASSERT(op.reg # none);
+		modrm := modrm + op.reg * 8H;
+	ELSIF IsModRmMode(mode) OR IsMMode(mode) OR (IsRegMode(mode,TRUE) & UseSpecReg) THEN
+		IF op.reg # none THEN
+			(* put reg index into the r/m field, 3H into the Mod field *)
+			modrm := modrm + op.reg + 0C0H;
+		ELSE
+			(* set the mod field *)
+			IF op.disp = 0 THEN 
+				mod := 0
+			ELSIF ConstSize(op.disp, TRUE)=1 THEN
+				mod := 1
+			ELSIF (op.base = none) & (op.index = none) THEN
+				mod := 0
+			ELSE
+				mod := 2
+			END;
+			modrm := modrm + mod * 40H;
+			IF op.index # none THEN
+				modrm := modrm + 4		(* use the sib byte *)
+			ELSIF op.base # none THEN
+				modrm := modrm + op.base
+			ELSE 
+				modrm := modrm + 5			(* special case: disp32 *)
+			END
+		END
+	ELSE OPM.err(1000)
+	END
+END ModRM;
+
+PROCEDURE SIB(op: Operand): SHORTINT;
+	VAR val: INTEGER;
+BEGIN
+	IF op.index = 5 THEN 	(* ESP not allowed *)
+		OPM.err(501)
+	ELSIF op.index # none THEN
+		val := op.base + op.index*08H;
+		CASE op.scale OF
+		  none, 1: 
+		|2: val := val + 1 * 40H
+		|4: val := val + 2 * 40H
+		|8: val := val + 3 * 40H
+		END
+	ELSE
+		val := op.base + 04H*08H;
+	END;
+	RETURN(SHORT(val))
+END SIB;
+
+PROCEDURE GenCode(ind: INTEGER; VAR op: ARRAY OF Operand);
+	VAR i: LONGINT; name: Mnemo; fixobj: Object;
+		UseRM, UseImm, UseSpecReg, UseSegReg: BOOLEAN; seg, reg, modrm, sib, imm, immSize, disp: LONGINT;
+BEGIN
+(* Initialisation *)
+	disp := 0;
+	IF IsRelMode(op[0].mode) THEN		(* compute the size of the rel operand *)
+		CASE ConstSize(op[0].imm-2 - pc, TRUE) OF		(* +2 = place for prefix & opcode0 *)
+		  1: op[0].mode := Rel8
+(*		| 2: op[0].mode := Rel16		==> not used, because it cuts the resulting address to 16-bits *)
+		| 2, 4: op[0].mode := Rel32
+		END
+	END;
+	COPY(InstrTab[ind].name, name);
+	
+	Match(ind, op);
+	
+IF debug1 OR debug6 THEN 
+	IF ind < 0 THEN 
+		OPM.LogWStr("  No match"); OPM.LogWLn; RETURN
+	ELSE
+		OPM.LogWStr(name); DumpMode(op[0].mode); DumpMode(op[1].mode); OPM.LogWLn;
+		DumpOp(op[0]); OPM.LogWLn; DumpOp(op[1]); OPM.LogWLn
+	END
+END;
+
+	IF ind < 0 THEN RETURN END;	(* no matching opcode found *)
+	
+(* Instruction prefix *)
+	UseSpecReg := IsSpecRegMode(OpTab[ind].op[0]) OR IsSpecRegMode(OpTab[ind].op[1]);
+	UseSegReg := IsSRegMode(OpTab[ind].op[0], FALSE) OR IsSRegMode(OpTab[ind].op[1], FALSE);
+	
+		IF (ModeSize(OpTab[ind].op[0]) = 2) & ~UseSpecReg & ~UseSegReg THEN	(* 16-bit mode *)
+	(* address-size prefix
+			special cases:
+				LEA/OUTS with 16-bit source
+	*)
+			IF (OpTab[ind].op[0] = Rel16) OR (((name ="LEA")OR(name="OUTS")) & (OpTab[ind].op[1] = RM16)) THEN PutByte(67H);
+	(* operand size prefix *)
+			ELSIF (name # "RET") & (name # "ARPL") & (name # "STR") THEN PutByte(66H) 
+			END
+		END;
+		
+(* prepare the instruction*)
+		seg := none; reg := none; modrm := 0; UseRM := FALSE; sib := none;
+		UseImm := FALSE; fixobj := NIL;
+		i := 0;
+		WHILE (i<3) & (OpTab[ind].op[i] # none) DO
+			(* segment prefix *)
+			IF op[i].seg # none THEN
+IF debug6 THEN
+	OPM.LogWStr("op"); OPM.LogWNum(i,0); OPM.LogWStr(" -> segment override "); OPM.LogWNum(op[i].seg,3); OPM.LogWLn;
+END;
+				IF seg # none THEN OPM.err(504) ELSE seg := op[i].seg END;
+			END;
+			(* register to be added to the opcode *)
+			IF (OpTab[ind].reg = OmOp) & (IsRegMode(OpTab[ind].op[i], TRUE) OR IsFRegMode(OpTab[ind].op[i], TRUE)) THEN
+IF debug6 THEN
+	OPM.LogWStr("op"); OPM.LogWNum(i,0); OPM.LogWStr(" -> register "); OPM.LogWNum(op[i].reg,3); OPM.LogWLn;
+END;
+				reg := op[i].reg
+			END;
+			(* modrm byte *)
+			IF NeedModRM(OpTab[ind].op[i], OpTab[ind].reg) THEN
+IF debug6 THEN
+	OPM.LogWStr("op"); OPM.LogWNum(i,0); OPM.LogWStr(" -> modrm "); OPM.LogWLn;
+END;
+				ModRM(modrm, op[i], OpTab[ind].op[i], UseSpecReg); UseRM := TRUE; 
+				IF IsModRmMode(OpTab[ind].op[i]) OR IsMMode(OpTab[ind].op[i]) THEN 
+					disp := op[i].disp; fixobj := op[i].obj 
+				END
+			END;
+			(* sib byte *)
+			IF (op[i].index # none) OR (op[i].base = 4) THEN			(* process the escape ESP *)
+IF debug6 THEN
+	OPM.LogWStr("op"); OPM.LogWNum(i,0); OPM.LogWStr(" -> sib "); OPM.LogWLn;
+END;
+				ASSERT (sib = none);
+				sib := SIB(op[i])
+			END;
+			IF IsImmMode(OpTab[ind].op[i]) OR (IsRelMode(OpTab[ind].op[i]) & IsImmMode(op[i].mode)) THEN
+IF debug6 THEN
+	OPM.LogWStr("op"); OPM.LogWNum(i,0); OPM.LogWStr(" -> imm "); OPM.LogWLn;
+END;
+				ASSERT( ~UseImm);
+				UseImm := TRUE; imm := op[i].imm; immSize := ModeSize(OpTab[ind].op[i]) 
+			END;
+			INC(i);
+		END;
+
+IF debug6 THEN
+	OPM.LogWStr("seg: "); OPM.LogWNum(seg,1); OPM.LogWLn;
+	OPM.LogWStr("reg: "); OPM.LogWNum(reg,1); OPM.LogWLn;
+END;
+(* segment override *)
+		IF seg # none THEN PutByte(seg) END;
+		
+(* opcode *)
+		IF reg = none THEN reg := 0 END;
+		IF OpTab[ind].op1 # none THEN
+			PutByte(OpTab[ind].op0); PutByte(OpTab[ind].op1 + reg)
+		ELSE
+			PutByte(OpTab[ind].op0 + reg)
+		END;
+
+	(* modr/m *)
+		IF OpTab[ind].opc # none THEN
+			ASSERT( AND(modrm, 38H) = 0);		(* reg/opcode field not used *)
+			modrm := modrm + OpTab[ind].opc * 8H;
+			UseRM := TRUE
+		END;
+		IF UseRM THEN PutByte(modrm) END;
+		
+	(* sib *)
+		IF sib # none THEN PutByte(sib) END;
+		
+	(* displacement / immediate *)
+		IF UseRM & (disp # 0)THEN
+			IF fixobj # NIL THEN InsertFix(fixobj, pc) END;
+			IF ConstSize(disp, TRUE) = 1 THEN PutByte(disp) ELSE PutBytes(disp, 4) END
+		END;
+		IF IsRelMode(OpTab[ind].op[0]) & ~IsImmMode(op[0].mode) THEN
+			PutBytes(op[0].imm-pc-ModeSize(OpTab[ind].op[0]), ModeSize(OpTab[ind].op[0]));
+			IF op[0].mode = FwdJmp THEN InsertFix(op[0].obj, pc) END
+		END;
+		IF UseImm THEN PutBytes(imm, immSize) END;
+END GenCode;
+
+
+(* ------------------------------------------------------------------- *)
+(* Parser functions *)
+
+	PROCEDURE ParseLabel;
+		VAR obj: Object; fix: FixPnt;
+	BEGIN
+IF debug3 THEN OPM.LogWStr("IN ParseLabel"); OPM.LogWLn END;
+		ASSERT(sym = ScLabel);		(* Test done by the caller *)
+		insert(ident, obj);
+		IF obj.typ = StFwdLabel THEN
+			fix := obj.fix;
+			WHILE fix # NIL DO
+				FixDisp(fix); fix := fix.next
+			END;
+			obj.typ := StLabel; obj.val := pc
+		ELSE OPM.err(512)
+		END;
+		Get(sym)
+	END ParseLabel;
+
+	PROCEDURE ParseInstruction;
+		VAR	ind, size: INTEGER; i: LONGINT; op: ARRAY 3 OF Operand; name: Name;
+	BEGIN
+IF debug3 THEN OPM.LogWStr("IN ParseInstruction"); OPM.LogWLn END;
+		(* Read Mnemonic *)
+			IF (ident = "DB") OR (ident = "DW") OR (ident = "DD") THEN
+				CASE ident[1] OF
+				   "B": size := 1
+				| "W": size := 2
+				| "D": size := 4
+				END;
+				Get(sym);
+				WHILE (sym = ScNumber) OR (sym = ScString) DO
+					IF (sym = ScString) & (val = 1) THEN PutBytes(ORD(str[0]), size)
+					ELSIF (sym = ScNumber) & (ConstSize(val, FALSE) <= size) THEN PutBytes(val, size)
+					ELSE OPM.err(203)
+					END;
+					Get(sym);
+					IF sym = ScComma THEN Get(sym) 
+					ELSE RETURN
+					END
+				END
+			ELSIF (ident = "DS") THEN
+				Get(sym);
+				IF (sym = ScString) THEN
+					FOR i := 0 TO val DO PutBytes(ORD(str[i]), 1) END;
+					Get(sym)
+				ELSE OPM.err(513)
+				END
+			ELSE
+				FOR i := 0 TO 2 DO op[i].mode := none END;
+				FindInstruction(ident, ind);	(* index in the hash tab *)
+				COPY(ident, name);
+				errpos := OPM.errpos;
+				Get(sym);
+				IF ind < 0 THEN OPM.err(502); RETURN END;
+				
+				name[3] := 0X;
+				IF name = "REP" THEN	(* REP/REPE/REPZ/REPNE/REPNZ *)
+					GenCode(ind, op);
+					IF sym = ScCR THEN Get(sym) END;		(* there should be no label here *)
+					FindInstruction(ident, ind);	(* index in the hash tab *)
+					errpos := OPM.errpos;
+					Get(sym);
+					IF ind < 0 THEN OPM.err(502); RETURN END
+				END;
+				
+				i := 0;
+				IF sym # ScCR THEN
+					LOOP
+						GetOperand(op[i]); INC(i);
+						IF sym # ScComma THEN EXIT END;
+						Get(sym)
+					END
+				END;
+				
+				GenCode(ind, op);
+			END (* IF DB *)
+	END ParseInstruction;
+(* ------------------------------------------------------------------- *)
+(* Initialisation functions *)
+
+	PROCEDURE InsertReg(name: Name; t, v: INTEGER);
+		VAR obj: Object;
+	BEGIN
+		insert(name, obj); obj.typ := t; obj.val := v; obj.size := 0
+	END InsertReg;
+	
+	PROCEDURE InsertType(name: Name; s: INTEGER);
+		VAR obj: Object;
+	BEGIN
+		insert(name, obj); obj.typ := StType; obj.val := none; obj.size := s
+	END InsertType;
+
+	PROCEDURE InsertMnemo(name: Mnemo; VAR k: INTEGER);
+		VAR n: INTEGER;
+	BEGIN
+		n := 0;
+		REPEAT HashFn(name, k, n)
+		UNTIL (InstrTab[k].name[0] = 0X) OR (n > 2*InstrTabLen) OR (InstrTab[k].name = name);
+		IF n > 2*InstrTabLen THEN
+			OPM.LogWStr("iASM, internal instruction table too small!!"); OPM.LogWLn
+		END;
+		IF InstrTab[k].name = name THEN 
+			OPM.LogWStr(name); OPM.LogWStr(" already in the table"); OPM.LogWLn;
+			RETURN
+		END;
+		COPY(name, InstrTab[k].name);
+		InstrTab[k].start := OpTabN; InstrTab[k].end := OpTabN
+;IF debug4 THEN
+	INC(Average, LONG(n));
+	OPM.LogWStr(name); OPM.LogWStr(" inserted at "); OPM.LogWNum(k, 4); OPM.LogWNum(n,8); OPM.LogWLn
+END
+	END InsertMnemo;
+	
+	PROCEDURE InsertAlias(name, alias: Mnemo);
+		VAR n,a: INTEGER;
+	BEGIN
+		FindInstruction(name, n);
+		IF n = -1 THEN OPM.LogWStr("InsertAlias: the name doesn't exist "); OPM.LogWStr(name); OPM.LogWLn; RETURN END;
+		InsertMnemo(alias, a);
+		InstrTab[a].start := InstrTab[n].start; InstrTab[a].end := InstrTab[n].end;
+	END InsertAlias;
+	
+	PROCEDURE InsertOp3(idx, dest, src, o3, op0, op1, opc, om: INTEGER);
+		VAR pos: INTEGER;
+	BEGIN
+		pos := InstrTab[idx].end;
+		IF OpTab[pos].op0 # -1 THEN OPM.LogWStr("Op Table, overwriting"); OPM.LogWLn END;
+		OpTab[pos].op[0] := dest; OpTab[pos].op[1] := src; OpTab[pos].op[2] := o3;	(* dest / src addressing mode *)
+		OpTab[pos].op0 := op0; OpTab[pos].op1 := op1;	(* opcodes *)
+		OpTab[pos].opc := opc; OpTab[pos].reg := om;	(* opcode modifier (rm.opcode) / register storing place (opcode /rm byte) *)
+		IF OpTabN < OpTabLen-1 THEN INC(InstrTab[idx].end); INC(OpTabN)
+		ELSE OPM.LogWStr("Op Table FULL"); OPM.LogWLn
+		END
+	END InsertOp3;
+	
+	PROCEDURE InsertOp(idx, dest, src, op0, op1, opc, om: INTEGER);
+		VAR pos: INTEGER;
+	BEGIN
+		pos := InstrTab[idx].end;
+		IF OpTab[pos].op0 # -1 THEN OPM.LogWStr("Op Table, overwriting"); OPM.LogWLn END;
+		OpTab[pos].op[0] := dest; OpTab[pos].op[1] := src; OpTab[pos].op[2] := none;	(* dest / src addressing mode *)
+		OpTab[pos].op0 := op0; OpTab[pos].op1 := op1;	(* opcodes *)
+		OpTab[pos].opc := opc; OpTab[pos].reg := om;	(* opcode modifier (rm.opcode) / register storing place (opcode /rm byte) *)
+		IF OpTabN < OpTabLen-1 THEN INC(InstrTab[idx].end); INC(OpTabN)
+		ELSE OPM.LogWStr("Op Table FULL"); OPM.LogWLn
+		END
+	END InsertOp;
+	
+	PROCEDURE Init;
+	BEGIN 
+		(* Internal Symbol-Table *)
+			root.next := NIL; root.left := NIL; root.right := NIL;
+			InsertReg("AL", RegAL, 0); InsertReg("AH", Reg8, 4);
+			InsertReg("AX", RegAX, 0); InsertReg("EAX", RegEAX, 0);
+			InsertReg("BL", Reg8, 3); InsertReg("BH", Reg8, 7);
+			InsertReg("BX", Reg16, 3); InsertReg("EBX", Reg32, 3);
+			InsertReg("CL", Reg8, 1); InsertReg("CH", Reg8, 5);
+			InsertReg("CX", Reg16, 1); InsertReg("ECX", Reg32, 1);
+			InsertReg("DL", Reg8, 2); InsertReg("DH", Reg8, 6);
+			InsertReg("DX", Reg16, 2); InsertReg("EDX", Reg32, 2);
+			InsertReg("SP", Reg16, 4); InsertReg("ESP", Reg32, 4);
+			InsertReg("BP", Reg16, 5); InsertReg("EBP", Reg32, 5);
+			InsertReg("SI", Reg16, 6); InsertReg("ESI", Reg32, 6);
+			InsertReg("DI", Reg16, 7); InsertReg("EDI", Reg32, 7);
+			
+			InsertReg("CS", RegCS, 1H); InsertReg("SS", RegSS, 2H);
+			InsertReg("DS", RegDS, 3H); InsertReg("ES", RegES, 0H);
+			InsertReg("FS", RegFS, 4H); InsertReg("GS", RegGS, 5H);
+			
+
+(*			InsertReg("CS", RegCS, 2EH); InsertReg("SS", RegSS, 36H);
+			InsertReg("DS", RegDS, 3EH); InsertReg("ES", RegES, 26H);
+			InsertReg("FS", RegFS, 64H); InsertReg("GS", RegGS, 65H);
+*)			
+
+			InsertReg("CR0", CRReg, 0); InsertReg("CR2", CRReg, 2); InsertReg("CR3", CRReg, 3);
+			InsertReg("DR0", DRReg, 0); InsertReg("DR1", DRReg, 1); InsertReg("DR2", DRReg, 2);
+			InsertReg("DR3", DRReg, 3); InsertReg("DR6", DRReg, 6); InsertReg("DR7", DRReg, 7);
+			InsertReg("TR6", TRReg, 6); InsertReg("TR7", TRReg, 7);
+			
+			InsertReg("ST", FReg, 0);
+
+			InsertType("BYTE", 1);
+			InsertType("WORD", 2);
+			InsertType("DWORD", 4);
+			InsertType("QWORD", 8);
+			InsertType("TBYTE", 10);
+			
+		(* Synchronizing scanner *)
+(*			ch := OPS.ch;	*)
+			WHILE OPS.ch # CR DO OPM.Get(OPS.ch) END;
+		
+		(* Global variables *)
+			pc := 0;
+	END Init;
+	
+	PROCEDURE Close;
+	BEGIN root.right := NIL;
+(*		OPS.ch := ch *)
+	END Close;
+
+	PROCEDURE InsertFloatInstr;
+		VAR k: INTEGER;
+	BEGIN
+		
+		InsertMnemo("F2XM1", k);
+		InsertOp(k, none, none, 0D9H, 0F0H, none, none);
+		
+		InsertMnemo("FABS", k);
+		InsertOp(k, none, none, 0D9H, 0E1H, none, none);
+		
+		InsertMnemo("FADD", k);
+		InsertOp(k, M32, none, 0D8H, none, 0, none);
+		InsertOp(k, M64, none, 0DCH, none, 0, none);
+		InsertOp(k, FRegST, FReg, 0D8H, 0C0H, none, OmOp);
+		InsertOp(k, FReg, FRegST, 0DCH, 0C0H, none, OmOp);
+
+		InsertMnemo("FADDP", k);
+		InsertOp(k, FReg, FRegST, 0DEH, 0C0H, none, OmOp);
+		InsertOp(k, none, none, 0DEH, 0C1H, none, none);
+
+		InsertMnemo("FIADD", k);
+		InsertOp(k, M32, none, 0DAH, none, 0, none);
+		InsertOp(k, M16, none, 0DEH, none, 0, none);
+
+		InsertMnemo("FBLD", k);
+		InsertOp(k, M80, none, 0DFH, none, 4, none);
+		
+		InsertMnemo("FBSTP", k);
+		InsertOp(k, M80, none, 0DFH, none, 6, none);
+		
+		InsertMnemo("FCHS", k);
+		InsertOp(k, none, none, 0D9H, 0E0H, none, none);
+
+		InsertMnemo("FNCLEX", k);
+		InsertOp(k, none, none, 0DBH, 0E2H, none, none);
+
+		InsertMnemo("FCOM", k);
+		InsertOp(k, M32, none, 0D8H, none, 2, none);
+		InsertOp(k, M64, none, 0DCH, none, 2, none);
+		InsertOp(k, FReg, none, 0D8H, 0D0H, none, OmOp);
+		InsertOp(k, none, none, 0DCH, 0D1H, none, none);
+
+		InsertMnemo("FCOMP", k);
+		InsertOp(k, M32, none, 0D8H, none, 3, none);
+		InsertOp(k, M64, none, 0DCH, none, 3, none);
+		InsertOp(k, FReg, none, 0D8H, 0D8H, none, OmOp);
+		InsertOp(k, none, none, 0D8H, 0D9H, none, none);
+
+		InsertMnemo("FCOMPP", k);
+		InsertOp(k, none, none, 0DEH, 0D9H, none, none);
+		
+		InsertMnemo("FCOS", k);
+		InsertOp(k, none, none, 0D9H, 0FFH, none, none);
+		
+		InsertMnemo("FDECSTP", k);
+		InsertOp(k, none, none, 0D9H, 0F6H, none, none);
+		
+		InsertMnemo("FDIV", k);
+		InsertOp(k, M32, none, 0D8H, none, 6, none);
+		InsertOp(k, M64, none, 0DCH, none, 6, none);
+		InsertOp(k, FRegST, FReg, 0D8H, 0F0H, none, OmOp);
+		InsertOp(k, FReg, FRegST, 0DCH, 0F8H, none, OmOp);
+
+		InsertMnemo("FDIVP", k);
+		InsertOp(k, FReg, FRegST, 0DEH, 0F8H, none, OmOp);
+		InsertOp(k, none, none, 0DEH, 0F9H, none, none);
+
+		InsertMnemo("FIDIV", k);
+		InsertOp(k, M32, none, 0DAH, none, 6, none);
+		InsertOp(k, M16, none, 0DEH, none, 6, none);
+
+		InsertMnemo("FDIVR", k);
+		InsertOp(k, M32, none, 0D8H, none, 7, none);
+		InsertOp(k, M64, none, 0DCH, none, 7, none);
+		InsertOp(k, FRegST, FReg, 0D8H, 0F8H, none, OmOp);
+		InsertOp(k, FReg, FRegST, 0DCH, 0F0H, none, OmOp);
+
+		InsertMnemo("FDIVRP", k);
+		InsertOp(k, FReg, FRegST, 0DEH, 0F0H, none, OmOp);
+		InsertOp(k, none, none, 0DEH, 0F1H, none, none);
+
+		InsertMnemo("FIDIVR", k);
+		InsertOp(k, M32, none, 0DAH, none, 7, none);
+		InsertOp(k, M16, none, 0DEH, none, 7, none);
+
+		InsertMnemo("FFREE", k);
+		InsertOp(k, none, none, 0DDH, 0C0H, none, OmOp);
+
+		InsertMnemo("FICOM", k);
+		InsertOp(k, M16, none, 0DEH, none, 2, none);
+		InsertOp(k, M32, none, 0DAH, none, 2, none);
+
+		InsertMnemo("FICOMP", k);
+		InsertOp(k, M16, none, 0DEH, none, 3, none);
+		InsertOp(k, M32, none, 0DAH, none, 3, none);
+
+		InsertMnemo("FILD", k);
+		InsertOp(k, M16, none, 0DFH, none, 0, none);
+		InsertOp(k, M32, none, 0DBH, none, 0, none);
+		InsertOp(k, M64, none, 0DFH, none, 5, none);
+		
+		InsertMnemo("FINCSTP", k);
+		InsertOp(k, none, none, 0D9H, 0F7H, none, none);
+		
+		InsertMnemo("FNINIT", k);
+		InsertOp(k, none, none, 0DBH, 0E3H, none, none);
+
+		InsertMnemo("FIST", k);
+		InsertOp(k, M16, none, 0DFH, none, 2, none);
+		InsertOp(k, M32, none, 0DBH, none, 2, none);
+
+		InsertMnemo("FISTP", k);
+		InsertOp(k, M16, none, 0DFH, none, 3, none);
+		InsertOp(k, M32, none, 0DBH, none, 3, none);
+		InsertOp(k, M64, none, 0DFH, none, 7, none);
+
+		InsertMnemo("FLD", k);
+		InsertOp(k, M32, none, 0D9H, none, 0, none);
+		InsertOp(k, M64, none, 0DDH, none, 0, none);
+		InsertOp(k, M80, none, 0DBH, none, 5, none);
+		InsertOp(k, FReg, none, 0D9H, 0C0H, none, OmOp);
+		
+		InsertMnemo("FLD1", k);
+		InsertOp(k, none, none, 0D9H, 0E8H, none, none);
+
+		InsertMnemo("FLDL2T", k);
+		InsertOp(k, none, none, 0D9H, 0E9H, none, none);
+		
+		InsertMnemo("FLDL2E", k);
+		InsertOp(k, none, none, 0D9H, 0EAH, none, none);
+
+		InsertMnemo("FLDPI", k);
+		InsertOp(k, none, none, 0D9H, 0EBH, none, none);
+
+		InsertMnemo("FLDLG2", k);
+		InsertOp(k, none, none, 0D9H, 0ECH, none, none);
+
+		InsertMnemo("FLDLN2", k);
+		InsertOp(k, none, none, 0D9H, 0EDH, none, none);
+
+		InsertMnemo("FLDZ", k);
+		InsertOp(k, none, none, 0D9H, 0EEH, none, none);
+
+		InsertMnemo("FLDCW", k);
+		InsertOp(k, M, none, 0D9H, none, 5, none);
+
+		InsertMnemo("FLDENV", k);
+		InsertOp(k, M, none, 0D9H, none, 4, none);
+
+		InsertMnemo("FMUL", k);
+		InsertOp(k, M32, none, 0D8H, none, 1, none);
+		InsertOp(k, M64, none, 0DCH, none, 1, none);
+		InsertOp(k, FRegST, FReg, 0D8H, 0C8H, none, OmOp);
+		InsertOp(k, FReg, FRegST, 0DCH, 0C8H, none, OmOp);
+
+		InsertMnemo("FMULP", k);
+		InsertOp(k, FReg, FRegST, 0DEH, 0C8H, none, OmOp);
+		InsertOp(k, none, none, 0DEH, 0C9H, none, none);
+
+		InsertMnemo("FIMUL", k);
+		InsertOp(k, M32, none, 0DAH, none, 1, none);
+		InsertOp(k, M16, none, 0DEH, none, 1, none);
+
+		InsertMnemo("FNOP", k);
+		InsertOp(k, none, none, 0D9H, 0D0H, none, none);
+
+		InsertMnemo("FPATAN", k);
+		InsertOp(k, none, none, 0D9H, 0F3H, none, none);
+
+		InsertMnemo("FPREM", k);
+		InsertOp(k, none, none, 0D9H, 0F8H, none, none);
+
+		InsertMnemo("FPREM1", k);
+		InsertOp(k, none, none, 0D9H, 0F5H, none, none);
+
+		InsertMnemo("FPTAN", k);
+		InsertOp(k, none, none, 0D9H, 0F2H, none, none);
+
+		InsertMnemo("FRNDINT", k);
+		InsertOp(k, none, none, 0D9H, 0FCH, none, none);
+
+		InsertMnemo("FRSTOR", k);
+		InsertOp(k, M, none, 0DDH, none, 4, none);
+
+		InsertMnemo("FSAVE", k);
+		InsertOp(k, M, none, 09BH, 0DDH, 4, none);
+
+		InsertMnemo("FNSAVE", k);
+		InsertOp(k, M, none, 0DDH, none, 6, none);
+
+		InsertMnemo("FSCALE", k);
+		InsertOp(k, none, none, 0D9H, 0FDH, none, none);
+
+		InsertMnemo("FSIN", k);
+		InsertOp(k, none, none, 0D9H, 0FEH, none, none);
+
+		InsertMnemo("FSINCOS", k);
+		InsertOp(k, none, none, 0D9H, 0FBH, none, none);
+
+		InsertMnemo("FSQRT", k);
+		InsertOp(k, none, none, 0D9H, 0FAH, none, none);
+
+		InsertMnemo("FST", k);
+		InsertOp(k, M32, none, 0D9H, none, 2, none);
+		InsertOp(k, M64, none, 0DDH, none, 2, none);
+		InsertOp(k, FReg, none, 0DDH, 0D0H, none, OmOp);
+
+		InsertMnemo("FSTP", k);
+		InsertOp(k, M32, none, 0D9H, none, 3, none);
+		InsertOp(k, M64, none, 0DDH, none, 3, none);
+		InsertOp(k, M80, none, 0DBH, none, 7, none);
+		InsertOp(k, FReg, none, 0D9H, 0D8H, none, OmOp);
+
+		InsertMnemo("FSTCW", k);
+		InsertOp(k, M, none, 09BH, 0D9H, 7, none);
+
+		InsertMnemo("FNSTCW", k);
+		InsertOp(k, M, none, 0D9H, none, 7, none);
+
+		InsertMnemo("FSTENV", k);
+		InsertOp(k, M, none, 09BH, 0D9H, 6, none);
+
+		InsertMnemo("FNSTENV", k);
+		InsertOp(k, M, none, 0D9H, none, 6, none);
+
+		InsertMnemo("FSTSW", k);
+		InsertOp(k, M, none, 09BH, 0DDH, 7, none);
+
+		InsertMnemo("FNSTSW", k);
+		InsertOp(k, M, none, 0DDH, none, 7, none);
+		InsertOp(k, RegAX, none, 0DFH, 0E0H, 7, none);
+
+		InsertMnemo("FSUB", k);
+		InsertOp(k, M32, none, 0D8H, none, 4, none);
+		InsertOp(k, M64, none, 0DCH, none, 4, none);
+		InsertOp(k, FRegST, FReg, 0D8H, 0E0H, none, OmOp);
+		InsertOp(k, FReg, FRegST, 0DCH, 0E8H, none, OmOp);
+
+		InsertMnemo("FSUBP", k);
+		InsertOp(k, FReg, FRegST, 0DEH, 0E8H, none, OmOp);
+		InsertOp(k, none, none, 0DEH, 0E9H, none, none);
+
+		InsertMnemo("FISUB", k);
+		InsertOp(k, M32, none, 0DAH, none, 4, none);
+		InsertOp(k, M16, none, 0DEH, none, 4, none);
+
+		InsertMnemo("FSUBR", k);
+		InsertOp(k, M32, none, 0D8H, none, 5, none);
+		InsertOp(k, M64, none, 0DCH, none, 5, none);
+		InsertOp(k, FRegST, FReg, 0D8H, 0E8H, none, OmOp);
+		InsertOp(k, FReg, FRegST, 0DCH, 0E0H, none, OmOp);
+
+		InsertMnemo("FSUBRP", k);
+		InsertOp(k, FReg, FRegST, 0DEH, 0E0H, none, OmOp);
+		InsertOp(k, none, none, 0DEH, 0E1H, none, none);
+
+		InsertMnemo("FISUBR", k);
+		InsertOp(k, M32, none, 0DAH, none, 5, none);
+		InsertOp(k, M16, none, 0DEH, none, 5, none);
+
+		InsertMnemo("FTST", k);
+		InsertOp(k, none, none, 0D9H, 0E4H, none, none);
+
+		InsertMnemo("FUCOM", k);
+		InsertOp(k, FReg, none, 0DDH, 0E0H, none, OmOp);
+		InsertOp(k, none, none, 0DDH, 0E1H, none, none);
+
+		InsertMnemo("FUCOMP", k);
+		InsertOp(k, FReg, none, 0DDH, 0E8H, none, OmOp);
+		InsertOp(k, none, none, 0DDH, 0E9H, none, none);
+
+		InsertMnemo("FUCOMPP", k);
+		InsertOp(k, none, none, 0DAH, 0E9H, none, none);
+
+		InsertMnemo("FWAIT", k);
+		InsertOp(k, none, none, 09BH, none, none, none);
+
+		InsertMnemo("FXAM", k);
+		InsertOp(k, none, none, 0D9H, 0E5H, none, none);
+
+		InsertMnemo("FXCH", k);
+		InsertOp(k, FReg, none, 0D9H, 0C8H, none, OmOp);
+		InsertOp(k, none, none, 0D9H, 0C9H, none, none);
+
+		InsertMnemo("FXTRACT", k);
+		InsertOp(k, none, none, 0D9H, 0F4H, none, none);
+
+		InsertMnemo("FYL2X", k);
+		InsertOp(k, none, none, 0D9H, 0F1H, none, none);
+
+		InsertMnemo("FYL2XP1", k);
+		InsertOp(k, none, none, 0D9H, 0F9H, none, none);
+	END InsertFloatInstr;
+	
+	
+	PROCEDURE BodyInit;
+		VAR i,k: INTEGER;
+	BEGIN
+		OPM.LogWLn; OPM.LogWStr("  using iOP2-iASM add-on "); OPM.LogWStr(Version);
+		NEW(root); root.left := NIL; root.right := NIL; root.next := NIL;
+		
+		FOR k:= 0 TO OpTabLen-1 DO OpTab[k].op0 := -1 END;
+		FOR k:= 0 TO InstrTabLen-1 DO InstrTab[k].name[0] := 0X END;
+	
+		OpTabN := 0; Average := 0;
+		InsertMnemo("AAA", k);
+		InsertOp(k, none, none, 37H, none, none, none);
+		
+		InsertMnemo("AAD", k);
+		InsertOp(k, none, none, 0D5H, 0AH, none, none);
+		
+		InsertMnemo("AAM", k);
+		InsertOp(k, none, none, 0D4H, 0AH, none, none);
+		
+		InsertMnemo("AAS", k);
+		InsertOp(k, none, none, 3FH, none, none, none);
+		
+		FOR i:=0 TO 7 DO				(* similar integer ops *)
+			CASE i OF
+			  0: InsertMnemo("ADD", k)
+			|1: InsertMnemo("OR", k)
+			|2: InsertMnemo("ADC", k)
+			|3: InsertMnemo("SBB", k)
+			|4: InsertMnemo("AND", k)
+			|5: InsertMnemo("SUB", k)
+			|6: InsertMnemo("XOR", k)
+			|7: InsertMnemo("CMP", k)
+			END;
+			InsertOp(k, RegAL, Imm8, 04H + i*08H, none, none, none);
+			InsertOp(k, RegAX, Imm16, 05H + i*08H, none, none, none);
+			InsertOp(k, RegEAX, Imm32, 05H + i*08H, none, none, none);
+			InsertOp(k, RM8, Imm8, 80H, none, i, none);
+			InsertOp(k, RM16, Imm16, 81H, none, i, none);
+			InsertOp(k, RM32, Imm32, 81H, none, i, none);
+			InsertOp(k, RM16, SImm8, 83H, none, i, none);
+			InsertOp(k, RM32, SImm8, 83H, none, i, none);
+			InsertOp(k, RM8, Reg8, i * 08H, none, none, OmRM);
+			InsertOp(k, RM16, Reg16, 01H + i * 08H, none, none, OmRM);
+			InsertOp(k, RM32, Reg32, 01H + i * 08H, none, none, OmRM);
+			InsertOp(k, Reg8, RM8, 02H + i * 08H, none, none, OmRM);
+			InsertOp(k, Reg16, RM16, 03H + i * 08H, none, none, OmRM);
+			InsertOp(k, Reg32, RM32, 03H + i * 08H, none, none, OmRM);
+		END;
+		
+		InsertMnemo("ARPL", k);
+		InsertOp(k, RM16, Reg16, 63H, none, none, OmRM);
+		
+		InsertMnemo("BOUND", k);
+		InsertOp(k, Reg16, M16, 62H, none, none, OmRM);
+		InsertOp(k, Reg32, M32, 62H, none, none, OmRM);
+		
+		InsertMnemo("BSF", k);
+		InsertOp(k, Reg16, RM16, 0FH, 0BCH, none, none);
+		InsertOp(k, Reg32, RM32, 0FH, 0BCH, none, none);
+
+		InsertMnemo("BSR", k);
+		InsertOp(k, Reg16, RM16, 0FH, 0BDH, none, none);
+		InsertOp(k, Reg32, RM32, 0FH, 0BDH, none, none);
+
+		InsertMnemo("BSWAP", k);
+		InsertOp(k, Reg32, none, 0FH, 0C8H, none, OmOp);
+		
+		FOR i := 0 TO 3 DO
+			CASE i OF
+				  0: InsertMnemo("BT", k)
+				| 1: InsertMnemo("BTS", k)
+				| 2: InsertMnemo("BTR", k)
+				| 3: InsertMnemo("BTC", k)
+			END;
+			InsertOp(k, RM16, Reg16, 0FH, 0A3H + i*8, none, OmRM);
+			InsertOp(k, RM32, Reg32, 0FH, 0A3H + i*8, none, OmRM);
+			InsertOp(k, RM16, Imm8, 0FH, 0BAH, i+4, none);
+			InsertOp(k, RM32, Imm8, 0FH, 0BAH, i+4, none)
+		END;
+
+		InsertMnemo("CALL", k);
+(*		InsertOp(k, Rel16, none, 0E8H, none, none, none);	*)
+		InsertOp(k, RM16, none, 0FFH, none, 2, none);
+		InsertOp(k, Rel32, none, 0E8H, none, none, none);
+		InsertOp(k, RM32, none, 0FFH, none, 2, none);
+		
+		InsertMnemo("CBW", k);
+		InsertOp(k, none, none, 066H, 098H, none, none);
+		
+		InsertMnemo("CWDE", k);
+		InsertOp(k, none, none, 098H, none, none, none);
+		
+		FOR i := 8 TO 0DH DO
+			CASE i OF
+				  8: InsertMnemo("CLC", k)
+				| 9: InsertMnemo("STC", k)
+				| 0AH: InsertMnemo("CLI", k)
+				| 0BH: InsertMnemo("STI", k)
+				| 0CH: InsertMnemo("CLD", k)
+				| 0DH: InsertMnemo("STD", k)
+			END;
+			InsertOp(k, none, none, 0F0H + i, none, none, none)
+		END;
+		
+		InsertMnemo("CLTS", k);
+		InsertOp(k, none, none, 0FH, 06H, none, none);
+		
+		InsertMnemo("CMC", k);
+		InsertOp(k, none, none, 0F5H, none, none, none);
+		
+		InsertMnemo("CMPSB", k);
+		InsertOp(k, none, none, 0A6H, none, none, none);
+		
+		InsertMnemo("CMPSW", k);
+		InsertOp(k, none, none, 066H, 0A7H, none, none);
+		
+		InsertMnemo("CMPSD", k);
+		InsertOp(k, none, none, 0A7H, none, none, none);
+		
+(*		InsertMnemo("CMPXCHG", k);
+		InsertOp(k, RM8, Reg8, 0FH, 0A6H, none, OmRM);
+		InsertOp(k, RM16, Reg16, 0FH, 0A7H, none, OmRM);
+		InsertOp(k, RM32, Reg32, 0FH, 0A7H, none, OmRM);
+*)		
+		InsertMnemo("CWD", k);
+		InsertOp(k, none, none, 066H, 099H, none, none);
+		InsertMnemo("CDQ", k);
+		InsertOp(k, none, none, 099H, none, none, none);
+		
+		InsertMnemo("DAA", k);
+		InsertOp(k, none, none, 027H, none, none, none);
+		InsertMnemo("DAS", k);
+		InsertOp(k, none, none, 02FH, none, none, none);
+
+		InsertMnemo("DEC", k);
+		InsertOp(k, RM8, none, 0FEH, none, 1, none);
+		InsertOp(k, RM16, none, 0FFH, none, 1, none);
+		InsertOp(k, RM32, none, 0FFH, none, 1, none);
+		InsertOp(k, Reg16, none, 48H, none, none, OmOp);
+		InsertOp(k, Reg32, none, 48H, none, none, OmOp);
+		
+		InsertMnemo("DIV", k);
+		InsertOp(k, RegAL, RM8, 0F6H, none, 6, none);
+		InsertOp(k, RegAX, RM16, 0F7H, none, 6, none);
+		InsertOp(k, RegEAX, RM32, 0F7H, none, 6, none);
+		InsertOp(k, RM8, none, 0F6H, none, 6, none);
+		InsertOp(k, RM16, none, 0F7H, none, 6, none);
+		InsertOp(k, RM32, none, 0F7H, none, 6, none);
+		
+		InsertMnemo("HLT", k);
+		InsertOp(k, none, none, 0F4H, none, none, none);
+		
+		InsertMnemo("IDIV", k);
+		InsertOp(k, RegAX, RM16, 0F7H, none, 7, none);
+		InsertOp(k, RegEAX, RM32, 0F7H, none, 7, none);
+		InsertOp(k, RM8, none, 0F6H, none, 7, none);
+
+
+		InsertMnemo("IMUL", k);
+		InsertOp(k, RM8, none, 0F6H, none, 5, none);
+		InsertOp(k, RM16, none, 0F7H, none, 5, none);
+		InsertOp(k, RM32, none, 0F7H, none, 5, none);
+		InsertOp(k, Reg16, RM16, 0FH, 0AFH, none, OmRM);
+		InsertOp(k, Reg32, RM32, 0FH, 0AFH, none, OmRM);
+		InsertOp(k, Reg16, SImm8, 06BH, none, none, OmRM);
+		InsertOp(k, Reg32, SImm8, 06BH, none, none, OmRM);
+		InsertOp(k, Reg16, Imm16, 069H, none, none, OmRM);
+		InsertOp(k, Reg32, Imm32, 069H, none, none, OmRM);
+		InsertOp3(k, Reg16, RM16, SImm8, 06BH, none, none, OmRM);
+		InsertOp3(k, Reg32, RM32, SImm8, 06BH, none, none, OmRM);
+		InsertOp3(k, Reg16, RM16, Imm16, 069H, none, none, OmRM);
+		InsertOp3(k, Reg32, RM32, Imm32, 069H, none, none, OmRM);
+
+		
+		InsertMnemo("IN", k);
+		InsertOp(k, RegAL, Imm8, 0E4H, none, none, none);
+		InsertOp(k, RegAX, Imm8, 0E5H, none, none, none);
+		InsertOp(k, RegEAX, Imm8, 0E5H, none, none, none);
+		InsertOp(k, RegAL, RegDX, 0ECH, none, none, none);
+		InsertOp(k, RegAX, RegDX, 0EDH, none, none, none);
+		InsertOp(k, RegEAX, RegDX, 0EDH, none, none, none);
+
+		InsertMnemo("INC", k);
+		InsertOp(k, RM8, none, 0FEH, none, 0, none);
+		InsertOp(k, RM16, none, 0FFH, none, 0, none);
+		InsertOp(k, RM32, none, 0FFH, none, 0, none);
+		InsertOp(k, Reg16, none, 040H, none, none, OmOp);
+		InsertOp(k, Reg32, none, 040H, none, none, OmOp);
+(*		
+		InsertMnemo("INS", k);
+		InsertOp(k, RM8, RegDX, 06CH, none, 0, none);
+		InsertOp(k, RM16, RegDX, 06DH, none, 0, none);
+		InsertOp(k, RM32, RegDX, 06DH, none, 0, none);
+*)
+		InsertMnemo("INSB", k);
+		InsertOp(k, none, none, 06CH, none, none, none);
+
+		InsertMnemo("INSW", k);
+		InsertOp(k, none, none, 066H, 06DH, none, none);
+		
+		InsertMnemo("INSD", k);
+		InsertOp(k, none, none, 06DH, none, none, none);
+		
+		InsertMnemo("INT", k);
+		InsertOp(k, Const3, none, 0CCH, none, none, none);
+		InsertOp(k, Imm8, none, 0CDH, none, none, none);
+		
+		InsertMnemo("INTO", k);
+		InsertOp(k, none, none, 0CEH, none, none, none);
+		
+(*		InsertMnemo("INVD", k);
+		InsertOp(k, none, none, 0FH, 08H, none, none);
+		
+		InsertMnemo("IRET", k);
+		InsertOp(k, none, none, 0CFH, none, none, none);
+*)		
+		InsertMnemo("IRETD", k);
+		InsertOp(k, none, none, 0CFH, none, none, none);
+		
+
+		FOR i := 0 TO 15 DO
+			CASE i OF
+			0: InsertMnemo("JO", k)
+			| 1: InsertMnemo("JNO", k)
+			| 2: InsertMnemo("JB", k)
+			| 3: InsertMnemo("JNB", k)
+			| 4: InsertMnemo("JZ", k)
+			| 5: InsertMnemo("JNZ", k)
+			| 6: InsertMnemo("JBE", k)
+			| 7: InsertMnemo("JNBE", k)
+			| 8: InsertMnemo("JS", k)
+			| 9: InsertMnemo("JNS", k)
+			| 10: InsertMnemo("JP", k)
+			| 11: InsertMnemo("JNP", k)
+			| 12: InsertMnemo("JL", k)
+			| 13: InsertMnemo("JNL", k)
+			| 14: InsertMnemo("JLE", k)
+			| 15: InsertMnemo("JNLE", k)
+			END;
+			InsertOp(k, Rel8, none, 70H + i, none, none, none);
+			InsertOp(k, Rel16, none, 0FH, 80H + i, none, none);
+			InsertOp(k, Rel32, none, 0FH, 80H + i, none, none);
+		END;
+		InsertAlias("JB", "JC"); InsertAlias("JB", "JNAE");
+		InsertAlias("JNB", "JNC"); InsertAlias("JNB", "JAE");
+		InsertAlias("JZ", "JE");
+		InsertAlias("JNZ", "JNE");
+		InsertAlias("JBE", "JNA");
+		InsertAlias("JNBE", "JA");
+		InsertAlias("JP", "JPE");
+		InsertAlias("JNP", "JPO");
+		InsertAlias("JL", "JNGE");
+		InsertAlias("JNL", "JGE");
+		InsertAlias("JLE", "JNG");
+		InsertAlias("JNLE", "JG");
+		
+		InsertMnemo("JMP", k);
+		InsertOp(k, Rel8, none, 0EBH, none, none, none);
+(*		InsertOp(k, Rel16, none, 0E9H, none, none, none);*)
+		InsertOp(k, RM16, none, 0FFH, none, 4, none);
+		InsertOp(k, Rel32, none, 0E9H, none, none, none);
+		InsertOp(k, RM32, none, 0FFH, none, 4, none);
+		
+		InsertMnemo("LAHF", k);
+		InsertOp(k, none, none, 09FH, none, none, none);
+		
+		InsertMnemo("LAR", k);
+		InsertOp(k, Reg16, RM16, 0FH, 02H, none, OmRM);
+		InsertOp(k, Reg32, RM32, 0FH, 02H, none, OmRM);
+
+		InsertMnemo("LEA", k);
+		InsertOp(k, Reg16, M16, 08DH, none, none, OmRM);
+		InsertOp(k, Reg16, M32, 08DH, none, none, OmRM);
+		(*InsertOp(k, Reg32, M16, 08DH, none, none, OmRM);*)
+		InsertOp(k, Reg32, M32, 08DH, none, none, OmRM);
+
+		InsertMnemo("LEAVE", k);
+		InsertOp(k, none, none, 0C9H, none, none, none);
+
+		InsertMnemo("LDS", k);
+		InsertOp(k, Reg16, M16, 0C5H, none, none, OmRM);
+		InsertOp(k, Reg32, M32, 0C5H, none, none, OmRM);
+		InsertMnemo("LSS", k);
+		InsertOp(k, Reg16, M16, 0FH, 0B2H, none, OmRM);
+		InsertOp(k, Reg32, M32, 0FH, 0B2H, none, OmRM);
+		InsertMnemo("LES", k);
+		InsertOp(k, Reg16, M16, 0C4H, none, none, OmRM);
+		InsertOp(k, Reg32, M32, 0C4H, none, none, OmRM);
+		InsertMnemo("LFS", k);
+		InsertOp(k, Reg16, M16, 0FH, 0B4H, none, OmRM);
+		InsertOp(k, Reg32, M32, 0FH, 0B4H, none, OmRM);
+		InsertMnemo("LGS", k);
+		InsertOp(k, Reg16, M16, 0FH, 0B5H, none, OmRM);
+		InsertOp(k, Reg32, M32, 0FH, 0B5H, none, OmRM);
+		
+		InsertMnemo("LGDT", k);
+		InsertOp(k, M, none, 0FH, 01H, 2, none);
+		
+		InsertMnemo("LIDT", k);
+		InsertOp(k, M, none, 0FH, 01H, 3, none);
+
+		InsertMnemo("LOCK", k);
+		InsertOp(k, none, none, 0F0H, none, none, none);
+
+		InsertMnemo("LLDT", k);
+		InsertOp(k, RM16, none, 0FH, 00H, 2, none);
+		
+		InsertMnemo("LMSW", k);
+		InsertOp(k, RM16, none, 0FH, 01H, 6, none);
+
+		InsertMnemo("LODSB", k);
+		InsertOp(k, none, none, 0ACH, none, none, none);
+
+		InsertMnemo("LODSW", k);
+		InsertOp(k, none, none, 066H, 0ADH, none, none);
+
+		InsertMnemo("LODSD", k);
+		InsertOp(k, none, none, 0ADH, none, none, none);
+
+		InsertMnemo("LOOP", k);
+		InsertOp(k, Rel8, none, 0E2H, none, none, none);
+		
+		InsertMnemo("LOOPE", k);
+		InsertOp(k, Rel8, none, 0E1H, none, none, none);
+		InsertAlias("LOOPE", "LOOPZ");
+		
+		InsertMnemo("LOOPNE", k);
+		InsertOp(k, Rel8, none, 0E0H, none, none, none);
+		InsertAlias("LOOPNE", "LOOPNZ");
+
+		InsertMnemo("LSL", k);
+		InsertOp(k, Reg16, RM16, 0FH, 03H, none, OmRM);
+		InsertOp(k, Reg32, RM32, 0FH, 03H, none, OmRM);
+
+		InsertMnemo("LTR", k);
+		InsertOp(k, RM16, none, 0FH, 00H, 3, none);
+
+		InsertMnemo("MOV", k);
+		InsertOp(k, RM8, Reg8, 88H, none, none, OmRM);
+		InsertOp(k, RM16, Reg16, 89H, none, none, OmRM);
+		InsertOp(k, RM32, Reg32, 89H, none, none, OmRM);
+		InsertOp(k, Reg8, RM8,  8AH, none, none, OmRM);
+		InsertOp(k, Reg16, RM16, 8BH, none, none, OmRM);
+		InsertOp(k, Reg32, RM32, 8BH, none, none, OmRM);
+		InsertOp(k, RM16, SReg, 8CH, none, none, OmRM);
+		InsertOp(k, SReg, RM16, 8EH, none, none, OmRM);
+		InsertOp(k, Reg8, Imm8,  0B0H, none, none, OmOp);
+		InsertOp(k, Reg16, Imm16,  0B8H, none, none, OmOp);
+		InsertOp(k, Reg32, Imm32,  0B8H, none, none, OmOp);
+		InsertOp(k, RM8, Imm8,  0C6H, none, none, none);
+		InsertOp(k, RM16, Imm16,  0C7H, none, none, none);
+		InsertOp(k, RM32, Imm32,  0C7H, none, none, none);
+		InsertOp(k, Reg32, CRReg, 0FH, 20H, none, OmRM);
+		InsertOp(k, CRReg, Reg32, 0FH, 22H, none, OmRM);
+		InsertOp(k, Reg32, DRReg, 0FH, 21H, none, OmRM);
+		InsertOp(k, DRReg, Reg32, 0FH, 23H, none, OmRM);
+		InsertOp(k, Reg32, TRReg, 0FH, 24H, none, OmRM);
+		InsertOp(k, TRReg, Reg32, 0FH, 26H, none, OmRM);
+
+		InsertMnemo("MOVSB", k);
+		InsertOp(k, none, none, 0A4H, none, none, none);
+		
+		InsertMnemo("MOVSW", k);
+		InsertOp(k, none, none, 066H, 0A5H, none, none);
+		
+		InsertMnemo("MOVSD", k);
+		InsertOp(k, none, none, 0A5H, none, none, none);
+		
+		InsertMnemo("MOVSX", k);
+		InsertOp(k, Reg16, RM8, 0FH, 0BEH, none, OmRM);
+		InsertOp(k, Reg32, RM8, 0FH, 0BEH, none, OmRM);
+		InsertOp(k, Reg32, RM16, 0FH, 0BFH, none, OmRM);
+		
+		InsertMnemo("MOVZX", k);
+		InsertOp(k, Reg16, RM8, 0FH, 0B6H, none, OmRM);
+		InsertOp(k, Reg32, RM8, 0FH, 0B6H, none, OmRM);
+		InsertOp(k, Reg32, RM16, 0FH, 0B7H, none, OmRM);
+
+		InsertMnemo("MUL", k);
+		InsertOp(k, RegAL, RM8, 0F6H, none, 4, none);
+		InsertOp(k, RegAX, RM16, 0F7H, none, 4, none);
+		InsertOp(k, RegEAX, RM32, 0F7H, none, 4, none);
+		InsertOp(k, RM8, none, 0F6H, none, 4, none);
+		InsertOp(k, RM16, none, 0F7H, none, 4, none);
+		InsertOp(k, RM32, none, 0F7H, none, 4, none);
+		
+		InsertMnemo("NEG", k);
+		InsertOp(k, RM8, none, 0F6H, none, 3, none);
+		InsertOp(k, RM16, none, 0F7H, none, 3, none);
+		InsertOp(k, RM32, none, 0F7H, none, 3, none);
+
+		InsertMnemo("NOP", k);
+		InsertOp(k, none, none, 090H, none, none, none);
+		
+		InsertMnemo("NOT", k);
+		InsertOp(k, RM8, none, 0F6H, none, 2, none);
+		InsertOp(k, RM16, none, 0F7H, none, 2, none);
+		InsertOp(k, RM32, none, 0F7H, none, 2, none);
+
+		InsertMnemo("OUT", k);
+		InsertOp(k, Imm8, RegAL, 0E6H, none, none, none);
+		InsertOp(k, Imm8, RegAX, 0E7H, none, none, none);
+		InsertOp(k, Imm8, RegEAX, 0E7H, none, none, none);
+		InsertOp(k, RegDX, RegAL, 0EEH, none, none, none);
+		InsertOp(k, RegDX, RegAX, 0EFH, none, none, none);
+		InsertOp(k, RegDX, RegEAX, 0EFH, none, none, none);
+(*
+		InsertMnemo("OUTS", k);
+		InsertOp(k, RegDX, RM8, 06EH, none, none, none);
+		InsertOp(k, RegDX, RM16, 06FH, none, none, none);
+		InsertOp(k, RegDX, RM32, 06FH, none, none, none);
+*)
+		InsertMnemo("OUTSB", k);
+		InsertOp(k, none, none, 06EH, none, none, none);
+		InsertMnemo("OUTSW", k);
+		InsertOp(k, none, none, 066H, 06FH, none, none);
+		InsertMnemo("OUTSD", k);
+		InsertOp(k, none, none, 06FH, none, none, none);
+
+		InsertMnemo("POP", k);
+		InsertOp(k, M16, none, 08FH, none, 0, none);
+		InsertOp(k, M32, none, 08FH, none, 0, none);
+		InsertOp(k, Reg16, none, 058H, none, none, OmOp);
+		InsertOp(k, Reg32, none, 058H, none, none, OmOp);
+		InsertOp(k, RegDS, none, 01FH, none, none, none);
+		InsertOp(k, RegES, none, 07H, none, none, none);
+		InsertOp(k, RegSS, none, 017H, none, none, none);
+		InsertOp(k, RegFS, none, 0FH, 0A1H, none, none);
+		InsertOp(k, RegGS, none, 0FH, 0A9H, none, none);
+		
+(*		InsertMnemo("POPA", k);
+		InsertOp(k, none, none, 066H, 061H, none, none);
+*)		InsertMnemo("POPAD", k);
+		InsertOp(k, none, none, 061H, none, none, none);
+
+(*		InsertMnemo("POPF", k);
+		InsertOp(k, none, none, 066H, 09DH, none, none);
+*)		InsertMnemo("POPFD", k);
+		InsertOp(k, none, none, 09DH, none, none, none);
+
+		InsertMnemo("PUSH", k);
+		InsertOp(k, Reg16, none, 050H, none, none, OmOp);
+		InsertOp(k, Reg32, none, 050H, none, none, OmOp);
+		InsertOp(k, SImm8, none, 06AH, none, none, none);
+		InsertOp(k, Imm16, none, 068H, none, none, none);
+		InsertOp(k, Imm32, none, 068H, none, none, none);
+		InsertOp(k, RegCS, none, 0EH, none, none, none);
+		InsertOp(k, RegDS, none, 01EH, none, none, none);
+		InsertOp(k, RegES, none, 06H, none, none, none);
+		InsertOp(k, RegSS, none, 016H, none, none, none);
+		InsertOp(k, RegFS, none, 0FH, 0A0H, none, none);
+		InsertOp(k, RegGS, none, 0FH, 0A8H, none, none);
+		
+(*		InsertMnemo("PUSHA", k);
+		InsertOp(k, none, none, 066H, 060H, none, none);
+*)		InsertMnemo("PUSHAD", k);
+		InsertOp(k, none, none, 060H, none, none, none);
+
+(*		InsertMnemo("PUSHF", k);
+		InsertOp(k, none, none, 066H, 09CH, none, none);
+*)		InsertMnemo("PUSHFD", k);
+		InsertOp(k, none, none, 09CH, none, none, none);
+
+		FOR i := 0 TO 7 DO
+			CASE i OF
+				  0: InsertMnemo("ROL", k)
+				| 1: InsertMnemo("ROR", k)
+				| 2: InsertMnemo("RCL", k)
+				| 3: InsertMnemo("RCR", k)
+				| 4: InsertMnemo("SHL", k)
+				| 5: InsertMnemo("SHR", k)
+				| 6:  (* InsertMnemo("SAL", k) *)
+				| 7: InsertMnemo("SAR", k)
+			END;
+			IF i = 6 THEN ELSE
+				InsertOp(k, RM8, Const1, 0D0H, none, i, none);
+				InsertOp(k, RM8, RegCL, 0D2H, none, i, none);
+				InsertOp(k, RM8, Imm8, 0C0H, none, i, none);
+				InsertOp(k, RM16, Const1, 0D1H, none, i, none);
+				InsertOp(k, RM16, RegCL, 0D3H, none, i, none);
+				InsertOp(k, RM16, Imm8, 0C1H, none, i, none);
+				InsertOp(k, RM32, Const1, 0D1H, none, i, none);
+				InsertOp(k, RM32, RegCL, 0D3H, none, i, none);
+				InsertOp(k, RM32, Imm8, 0C1H, none, i, none)
+			END
+		END;
+		InsertAlias("SHL", "SAL");
+		
+		InsertMnemo("REP", k);
+		InsertOp(k, none, none, 0F3H, none, none, none);
+		InsertAlias("REP", "REPE"); InsertAlias("REP", "REPZ");
+		InsertMnemo("REPNE", k);
+		InsertOp(k, none, none, 0F2H, none, none, none);
+		InsertAlias("REPNE", "REPNZ");
+
+		InsertMnemo("RET", k);
+		InsertOp(k, none, none, 0C3H, none, none, none);
+		InsertOp(k, Imm16, none, 0C2H, none, none, none);
+
+		InsertMnemo("SAHF", k);
+		InsertOp(k, none, none, 09EH, none, none, none);
+
+		InsertMnemo("SCASB", k);
+		InsertOp(k, none, none, 0AEH, none, none, none);
+		InsertMnemo("SCASW", k);
+		InsertOp(k, none, none, 66H, 0AFH, none, none);
+		InsertMnemo("SCASD", k);
+		InsertOp(k, none, none, 0AFH, none, none, none);
+
+		FOR i:=0 TO 0FH DO
+			CASE i OF
+				   0: InsertMnemo("SETO", k)
+				| 1: InsertMnemo("SETNO", k)
+				| 2: InsertMnemo("SETB", k)
+				| 3: InsertMnemo("SETNB", k)
+				| 4: InsertMnemo("SETZ", k)
+				| 5: InsertMnemo("SETNZ", k)
+				| 6: InsertMnemo("SETBE", k)
+				| 7: InsertMnemo("SETNBE", k)
+				| 8: InsertMnemo("SETS", k)
+				| 9: InsertMnemo("SETNS", k)
+				| 0AH: InsertMnemo("SETP", k)
+				| 0BH: InsertMnemo("SETNP", k)
+				| 0CH: InsertMnemo("SETL", k)
+				| 0DH: InsertMnemo("SETNL", k)
+				| 0EH: InsertMnemo("SETLE", k)
+				| 0FH: InsertMnemo("SETNLE", k)
+			END;
+			InsertOp(k, RM8, none, 0FH, 90H + i, none, none);
+		END;
+		InsertAlias("SETB", "SETC");
+		InsertAlias("SETNB", "SETAE");
+		InsertAlias("SETZ", "SETE");
+		InsertAlias("SETNBE", "SETA");
+		InsertAlias("SETNL", "SETGE");
+		InsertAlias("SETNLE", "SETG");
+		InsertAlias("SETBE", "SETNA");
+		InsertAlias("SETB", "SETNAE");
+		InsertAlias("SETNB", "SETNC");
+		InsertAlias("SETNZ", "SETNE");
+		InsertAlias("SETLE", "SETNG");
+		InsertAlias("SETL", "SETNGE");
+		InsertAlias("SETP", "SETPE");
+		InsertAlias("SETNP", "SETPO");
+
+		InsertMnemo("SGDT", k);
+		InsertOp(k, M, none, 0FH, 01H, 0, none);
+		InsertMnemo("SIDT", k);
+		InsertOp(k, M, none, 0FH, 01H, 1, none);
+
+		InsertMnemo("SHLD", k);
+		InsertOp3(k, RM16, Reg16, Imm8, 0FH, 0A4H, none, OmRM);
+		InsertOp3(k, RM32, Reg32, Imm8, 0FH, 0A4H, none, OmRM);
+		InsertOp3(k, RM16, Reg16, RegCL, 0FH, 0A5H, none, OmRM);
+		InsertOp3(k, RM32, Reg32, RegCL, 0FH, 0A5H, none, OmRM);
+
+		InsertMnemo("SHRD", k);
+		InsertOp3(k, RM16, Reg16, Imm8, 0FH, 0ACH, none, OmRM);
+		InsertOp3(k, RM32, Reg32, Imm8, 0FH, 0ACH, none, OmRM);
+		InsertOp3(k, RM16, Reg16, RegCL, 0FH, 0ADH, none, OmRM);
+		InsertOp3(k, RM32, Reg32, RegCL, 0FH, 0ADH, none, OmRM);
+
+		InsertMnemo("SMSW", k);
+		InsertOp(k, RM16, none, 0FH, 01H, 4, none);
+
+		InsertMnemo("SLDT", k);
+		InsertOp(k, RM16, none, 0FH, 00H, 0, none);
+
+		InsertMnemo("STOSB", k);
+		InsertOp(k, none, none, 0AAH, none, none, none);
+
+		InsertMnemo("STOSW", k);
+		InsertOp(k, none, none, 066H, 0ABH, none, none);
+
+		InsertMnemo("STOSD", k);
+		InsertOp(k, none, none,  0ABH, none, none, none);
+
+		InsertMnemo("STR", k);
+		InsertOp(k, RM16, none,  0FH, 00H, 1, none);
+
+		InsertMnemo("TEST", k);
+		InsertOp(k, RegAL, Imm8,  0A8H, none, none, none);
+		InsertOp(k, RegAX, Imm8,  0A9H, none, none, none);
+		InsertOp(k, RegEAX, Imm8,  0A9H, none, none, none);
+		InsertOp(k, RM8, Imm8,  0F6H, none, 0, none);
+		InsertOp(k, RM16, Imm16,  0F7H, none, 0, none);
+		InsertOp(k, RM32, Imm32,  0F7H, none, 0, none);
+		InsertOp(k, RM8, Reg8,  084H, none, none, OmRM);
+		InsertOp(k, RM16, Reg16,  085H, none, none, OmRM);
+		InsertOp(k, RM32, Reg32,  085H, none, none, OmRM);
+
+		InsertMnemo("VERR", k);
+		InsertOp(k, RM16, none,  0FH, 00H, 4, none);
+
+		InsertMnemo("VERW", k);
+		InsertOp(k, RM16, none,  0FH, 00H, 5, none);
+
+		InsertMnemo("WAIT", k);
+		InsertOp(k, none, none,  09BH, none, none, none);
+
+(*		InsertMnemo("WBINVD", k);
+		InsertOp(k, none, none,  0FH, 09H, none, none);
+
+		InsertMnemo("XADD", k);
+		InsertOp(k, RM8, Reg8, 0FH, 0C0H, none, OmRM);
+		InsertOp(k, RM16, Reg16, 0FH, 0C1H, none, OmRM);
+		InsertOp(k, RM32, Reg32, 0FH, 0C1H, none, OmRM);
+*)
+		InsertMnemo("XLATB", k);
+		InsertOp(k, none, none,  0D7H, none, none, none);
+
+		InsertMnemo("XCHG", k);
+		InsertOp(k, RegAX, Reg16, 090H, none, none, OmOp);
+		InsertOp(k, Reg16, RegAX, 090H, none, none, OmOp);
+		InsertOp(k, RegEAX, Reg32, 090H, none, none, OmOp);
+		InsertOp(k, Reg32, RegEAX, 090H, none, none, OmOp);
+		InsertOp(k, RM8, Reg8, 086H, none, none, OmRM);
+		InsertOp(k, Reg8, RM8, 086H, none, none, OmRM);
+		InsertOp(k, RM16, Reg16, 087H, none, none, OmRM);
+		InsertOp(k, Reg16, RM16, 087H, none, none, OmRM);
+		InsertOp(k, RM32, Reg32, 087H, none, none, OmRM);
+		InsertOp(k, Reg32, RM32, 087H, none, none, OmRM);
+		
+		InsertFloatInstr;
+
+IF debug4 THEN OPM.LogWStr("Opcodes inserted: "); OPM.LogWNum(OpTabN,5); OPM.LogWLn;
+	k := 0;
+	FOR i:= 0 TO InstrTabLen-1 DO
+		IF InstrTab[i].name[0] # 0X THEN INC(k) END
+	END;
+	OPM.LogWStr("Instr Tab statistics: "); OPM.LogWNum(k,1); OPM.LogWStr("/"); OPM.LogWNum(InstrTabLen,1);
+	OPM.LogWLn;
+	OPM.LogWStr("Instr Tab average: ");  OPM.LogWNum(Average DIV k,1); OPM.LogWStr("."); 
+	OPM.LogWNum((Average*1000) DIV k MOD 1000,1); OPM.LogWLn
+END;
+		
+		SizeTab[0] := 0; SizeTab[1] := 1; SizeTab[2] := 1; SizeTab[3] := 1;
+		SizeTab[4] := 1; SizeTab[5] := 2; SizeTab[6] := 4; SizeTab[7] := 4;
+		SizeTab[8] := 8; SizeTab[9] := 4; SizeTab[10] := 4; SizeTab[11] := 4;
+		SizeTab[12] := 0; SizeTab[13] := 4; SizeTab[14] := 4; SizeTab[15] := 0;
+	END BodyInit;
+	
+(* ------------------------------------------------------------------- *)
+(* Entry points and exported functions *)
+
+	PROCEDURE Assemble*(VAR x: OPT.Node);
+	BEGIN
+		IF FirstTime THEN BodyInit; FirstTime := FALSE END;
+		Init; 
+		first := NIL; last := NIL; NewNode;
+		fixlist := NIL;
+		Get(sym);
+		WHILE (sym # ScEnd) & (sym # ScUndef) DO
+				IF sym = ScLabel THEN ParseLabel END;
+				IF sym = ScIdent THEN ParseInstruction END;
+				WHILE (sym # ScEnd) & (sym # ScCR) DO
+					Get(sym); OPM.err(510)
+				END;
+				Get(sym)
+		END;
+IF debug3 THEN OPM.LogWStr("Quitting ASM parser"); OPM.LogWLn END;
+		IF OPM.noerr THEN CheckLabels END;	(* check for undefined forward jumps *)
+		Close;
+		OPB.Construct(Nassembler, first, fixlist); x := first; x.conval := NIL;
+	END Assemble;
+
+	PROCEDURE DumpInstructions;
+		VAR i,j,k: INTEGER;
+	BEGIN
+		IF FirstTime THEN BodyInit; FirstTime := FALSE END;
+		FOR i:= 0 TO InstrTabLen-1 DO
+			IF InstrTab[i].name # "" THEN
+				FOR j := InstrTab[i].start TO InstrTab[i].end-1 DO
+					OPM.LogWStr(InstrTab[i].name);
+					k := 0;
+					WHILE (k < 3) & (OpTab[j].op[k] # none) DO
+						IF k = 0 THEN OPM.LogWStr("   ") ELSE OPM.LogWStr(" , ") END;
+						DumpMode(OpTab[j].op[k]);
+						INC(k)
+					END;
+					OPM.LogWLn
+				END
+			END
+		END
+	END DumpInstructions;
+	
+BEGIN
+	FirstTime := TRUE;	(* the module initialisation is delayed to the first call *)
+
+END iASM.
+
+
+iASM.DumpInstructions
+
+
+Compiler.Compile N206.iASM.Mod/sc ~
+Compiler.Compile N206a.iASM.Mod/sc ~
+
+System.Free iDecoder iCompiler iOPV  iOPC iOPL  iOPO iOPP  iASM iOPB iOPT  iOPS iOPM  StatProf ~
+
+iCompiler.DoWatch
+iCompiler.Compile */s 
+
+iDecoder.Decode Display ~
+
+Analyzer.Analyze *\iuvxs

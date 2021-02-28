@@ -1,0 +1,382 @@
+MODULE Diskette; (*JG Ceres-2 version/14.2.90*)
+
+	IMPORT SYSTEM, Kernel, Files;
+
+	CONST 
+
+        Oberon* = 0E9X;
+        MSDOS* = 0F9X;
+
+		(*WD1002-05 registers*)
+		DRdata       = 0FFFF8000H;  (*R/W data*)
+		DRerrst      = 0FFFF8004H;  (*R error status*)
+		DRprecomp    = 0FFFF8004H;  (*W write precomp*)
+		DRseccnt     = 0FFFF8008H;  (*R/W sector count*)
+		DRsecno      = 0FFFF800CH;  (*R/W sector number*)
+		DRcyllo      = 0FFFF8010H;  (*R/W cylinder low byte*)
+		DRcylhi      = 0FFFF8014H;  (*R/W cylinder high byte*)
+		DRsdh        = 0FFFF8018H;  (*R/W side/drive/head*)
+		DRstatus     = 0FFFF801CH;  (*R status*)
+		DRcommand    = 0FFFF801CH;  (*W command*)
+
+		(*bits in DRstatus,  bits in DRerrst*)
+		DSbusy       = 7;    DEbadblk     = 7;  (*bad block mark*)
+		DSready      = 6;    DEuncorr     = 6;  (*unreadable sector*)
+		DSwrfault    = 5;    DEcrcID      = 5;  (*unreadable ID field*)
+		DSseekcompl  = 4;    DEnoID       = 4;  (*specified ID not found*)
+		DSdatareq    = 3;    DEaborted    = 2;  (*command aborted*)
+		DScorrected  = 2;    DETR000      = 1;  (*track 0 not reached*)
+		DSerror      = 0;    DEnoDAM      = 0;  (*data adr mark not found*)
+
+		(*WD1002-05 commands*)
+		DCread       = 20X;
+		DCwrite      = 30X;
+
+		(*FD command and drive spex*)
+		restore = 13X;
+		format = 50X;
+		surfaces = 2;
+		tracks = 80;  (*per surface*)
+		sectors = 9;   (*per track*)
+		sectorsize = 512;
+		steprate = 3;
+
+	 	 (* MS-DOS format 0F9H for 3.5 inch diskettes:
+ 
+							parameters                 sector allocation
+
+				surfaces                  2          0        descriptor
+				tracks/surface      80          1..3     FAT
+				sectors/track          9          4..6     FAT copy
+				bytes/sector       512          7..13    directory
+				sectors/cluster      2         14..1439  file data
+				directory entries  112*)
+
+	TYPE 
+
+		FileDesc = RECORD (*image of dir entry*)
+			name: ARRAY 22 OF CHAR;
+			time, date: INTEGER;
+		    head: INTEGER;
+			size: LONGINT
+		END;
+
+		File = POINTER TO FileHandle;
+
+		FileHandle = RECORD
+			prev, next: File;
+			file: FileDesc
+		END;
+
+        EntryHandler* = PROCEDURE (name: ARRAY OF CHAR; date, time, size: LONGINT);
+
+	VAR
+
+        SecSize*: INTEGER;
+
+        res*: INTEGER;
+        err*: SHORTINT;
+        sect*: LONGINT; busy*: BOOLEAN;
+		dir: File; trailer: FileDesc;
+		d, t: LONGINT;
+        usedF, usedC: INTEGER;
+ 	   FAT: ARRAY 720 OF INTEGER;
+
+(*driver*)
+
+	PROCEDURE wait;
+	BEGIN
+		REPEAT UNTIL ~SYSTEM.BIT(DRstatus, DSbusy)
+	END wait;
+
+	PROCEDURE SetPars (sec, cnt: INTEGER; cmd: CHAR);
+		VAR secno, track, cyl, surf: INTEGER;
+	BEGIN
+		secno := sec MOD sectors + 1;
+		track := sec DIV sectors;
+		cyl  := track DIV surfaces;
+		surf := track MOD surfaces;
+		SYSTEM.PUT(DRsecno, secno); SYSTEM.PUT(DRcyllo, cyl MOD 256);
+		SYSTEM.PUT(DRcylhi, cyl DIV 256); SYSTEM.PUT(DRsdh, surf + 38H);
+		SYSTEM.PUT(DRseccnt, cnt); SYSTEM.PUT(DRcommand, cmd)
+	END SetPars;
+
+   PROCEDURE Reset*;
+   END Reset;
+
+	PROCEDURE GetSector* (sec: INTEGER; VAR buf: ARRAY OF SYSTEM.BYTE; off: INTEGER);
+		VAR retry, I, i: INTEGER;
+	BEGIN retry := 3; busy := TRUE;
+		LOOP
+			SetPars(sec, 1, DCread); wait;
+			i := off; I := off + 512;
+			REPEAT SYSTEM.GET(DRdata, buf[i]); INC(i) UNTIL i = I;
+			IF ~SYSTEM.BIT(DRstatus, DSerror) THEN busy := FALSE; EXIT END ;
+			SYSTEM.GET(DRerrst, err); sect := sec; DEC(retry);
+			IF retry = 0 THEN busy := FALSE; HALT(28) END
+		END
+	END GetSector;
+
+	PROCEDURE PutSector* (sec: INTEGER; VAR buf: ARRAY OF SYSTEM.BYTE; off: INTEGER);
+		VAR retry, I, i: INTEGER;
+	BEGIN retry := 3; busy := TRUE;
+		LOOP
+			SetPars(sec, 1, DCwrite);
+			i := off; I := off + 512;
+			REPEAT SYSTEM.PUT(DRdata, buf[i]); INC(i) UNTIL i = I;
+			wait;
+			IF ~SYSTEM.BIT(DRstatus, DSerror) THEN busy := FALSE; EXIT END ;
+			SYSTEM.GET(DRerrst, err); sect := sec; DEC(retry);
+			IF retry = 0 THEN busy := FALSE; HALT(28) END
+		END
+	END PutSector;
+
+	PROCEDURE Format*;
+		VAR track, i: INTEGER;
+	BEGIN track := 0;
+		REPEAT i := 0;
+			SetPars(track*sectors, sectors, format);
+			REPEAT
+				SYSTEM.PUT(DRdata, 0); SYSTEM.PUT(DRdata, i MOD sectors + 1); INC(i, 2)
+			UNTIL i = 2 * sectors;
+			REPEAT SYSTEM.PUT(DRdata, 0); INC(i)
+			UNTIL i = sectorsize;
+			wait; INC(track)
+		UNTIL track = surfaces * tracks
+	END Format;
+
+(*directory*)
+
+	PROCEDURE InitDir*;
+		VAR i: INTEGER;
+	BEGIN
+		NEW(dir); dir.file.name[0] := 0FFX;
+		dir.file.name[11] := 8X; (*def as vol label*)
+		dir.next := dir; dir.prev := dir;
+		usedF := 1; usedC := 7;
+		FAT[0] := -1; FAT[1] := -1;
+		i := 2;
+		REPEAT FAT[i] := 0; FAT[i+1] := 0; i := i+2 UNTIL i = 720
+	END InitDir;
+
+	PROCEDURE Clusters (size: LONGINT): INTEGER;
+	BEGIN RETURN SHORT((size + 1023) DIV 1024)
+	END Clusters;
+
+	PROCEDURE findFile (name: ARRAY OF CHAR; VAR f: File);
+	BEGIN f := dir.next;
+		WHILE f.file.name < name DO f := f.next END
+	END findFile;
+
+	PROCEDURE ReadDir*;
+		VAR f, g: File; n: LONGINT; s, i, j, n0, n1: INTEGER;
+			buf: ARRAY 1536 OF CHAR;
+			dBuf: ARRAY 16 OF FileDesc;
+	BEGIN
+        (*read boot sector*)
+		GetSector(0, buf, 0);
+		IF (buf[21] # 0F9X) & (buf[21] # 0E9X) THEN HALT(54) END;
+		GetSector(7, dBuf, 0); (*read volume label*)
+		NEW(f); f.file := dBuf[0];
+		IF f.file.name[11] # 8X THEN HALT(54) END; (*not vol label*)
+        IF (f.file.name[0] < 0E5X) & (f.file.name[0] # 0X) THEN HALT(55) END; (*not Oberon format*)
+        f.file.name[0] := 0FFX;
+        (*read dir*)
+		f.prev := f; f.next := f; dir := f;
+		usedF := 1; usedC := 7;
+		s := 7; j := 1;
+        LOOP
+		    IF (dBuf[j].name[0] = 0X) OR (dBuf[j].name[0] = 0E5X) THEN EXIT END;
+			NEW(f); f.file := dBuf[j];
+			findFile(f.file.name, g);
+			f.next := g; g.prev.next := f; f.prev := g.prev; g.prev := f;
+			INC(usedF); usedC := usedC + Clusters(f.file.size);
+			INC(j);
+			IF j = 16 THEN INC(s); j := 0;
+                IF s = 14 THEN EXIT END;
+                GetSector(s, dBuf, 0)
+            END
+		END;
+		(*read FAT*)
+		GetSector(1, buf, 0);
+		GetSector(2, buf, 512);
+		GetSector(3, buf, 1024);
+		FAT[0] := -1; FAT[1] := -1;
+		i := 2; j := 3;
+		REPEAT
+			n :=     ORD(buf[j+2]); n := n*256;
+			n := n + ORD(buf[j+1]); n := n*256;
+			n := n + ORD(buf[j]);
+			n0 := SHORT(n MOD 4096); n1 := SHORT(n DIV 4096);
+			IF n0 > 2047 THEN n0 := n0 - 4096 END;
+			IF n1 > 2047 THEN n1 := n1 - 4096 END;
+			FAT[i] := n0; FAT[i+1] := n1;
+			i := i + 2; j := j + 3
+		UNTIL i = 720
+	END ReadDir;
+
+	PROCEDURE WriteDir*;
+		VAR f: File; n: LONGINT; s, i, j, n0, n1: INTEGER;
+			buf: ARRAY 1536 OF CHAR;
+			dBuf: ARRAY 16 OF FileDesc;
+	BEGIN
+        (*write boot sector*)
+        buf[21] := 0F9X;
+		PutSector(0, buf, 0);
+		(*write FAT*)
+		buf[0] := 0F9X;
+		buf[1] := 0FFX;
+		buf[2] := 0FFX;
+	    i := 2; j := 3;
+		REPEAT
+			n0 := FAT[i]; n1 := FAT[i+1];
+			IF n0 < 0 THEN n0 := n0 + 4096 END;
+			IF n1 < 0 THEN n1 := n1 + 4096 END;
+			n := n1; n := n*4096 + n0;
+			buf[j] := CHR(SHORT(n MOD 256)); n := n DIV 256;
+			buf[j+1] := CHR(SHORT(n MOD 256)); n := n DIV 256;
+			buf[j+2] := CHR(SHORT(n));
+			i := i + 2; j := j + 3
+		UNTIL i = 720;
+		PutSector(1, buf, 0);
+		PutSector(2, buf, 512);
+		PutSector(3, buf, 1024);
+		(*write dir*)
+		s := 7; j := 0; f := dir;
+		REPEAT
+		    dBuf[j] := f.file; INC(j);
+			IF j = 16 THEN PutSector(s, dBuf, 0); INC(s); j := 0 END;
+			f := f.next
+		UNTIL f = dir;
+        IF s # 14 THEN
+		    dBuf[j] := trailer;
+		    PutSector(s, dBuf, 0)
+        END
+	END WriteDir;
+
+    PROCEDURE GetData* (VAR date, time: LONGINT; VAR nofFiles, nofClusters: INTEGER);
+    BEGIN date := dir.file.date; time := LONG(dir.file.time)*2; nofFiles := usedF; nofClusters := usedC
+    END GetData;
+
+    PROCEDURE Enumerate* (proc: EntryHandler);
+        VAR f: File;
+    BEGIN f := dir.next;
+        WHILE f # dir DO proc(f.file.name, f.file.date, LONG(f.file.time)*2, f.file.size); f := f.next END
+    END Enumerate;
+
+	PROCEDURE readFile (f: File; g: Files.File);
+		VAR Wg: Files.Rider;
+			size: LONGINT; i: INTEGER;
+			buf: ARRAY 1024 OF CHAR;
+	BEGIN Files.Set(Wg, g, 0);
+		size := f.file.size;
+		IF size # 0 THEN
+			i := f.file.head;
+			LOOP
+				GetSector(10 + 2*i, buf, 0);
+				GetSector(11 + 2*i, buf, 512);
+				IF FAT[i] = -1 THEN EXIT END;
+				Files.WriteBytes(Wg, buf, 1024);
+				size := size - 1024; i := FAT[i]
+			END;
+			Files.WriteBytes(Wg, buf, SHORT(size))
+		END
+	END readFile;
+
+	PROCEDURE deleteFile (f: File);
+		VAR i, j: INTEGER;
+	BEGIN
+		f.prev.next := f.next; f.next.prev := f.prev;
+		i := f.file.head;
+		REPEAT j := FAT[i]; FAT[i] := 0; i := j UNTIL i = -1
+	END deleteFile;
+
+	PROCEDURE addFile (f: Files.File; g, h: File);
+		VAR Rf: Files.Rider;
+			need, i, j: INTEGER;
+			buf: ARRAY 1024 OF CHAR;
+	BEGIN Files.Set(Rf, f, 0);
+		need := Clusters(g.file.size);
+		IF need # 0 THEN
+			j := 2;
+			WHILE FAT[j] # 0 DO INC(j) END;
+			g.file.head := j;
+			LOOP i := j;
+				Files.ReadBytes(Rf, buf, 1024);
+				PutSector(10 + 2*i, buf, 0);
+				PutSector(11 + 2*i, buf, 512);
+				DEC(need);
+				IF need = 0 THEN EXIT END;
+				INC(j);
+				WHILE FAT[j] # 0 DO INC(j) END;
+				FAT[i] := j
+			END;
+			FAT[i] := -1
+		END;
+		g.next := h; h.prev.next := g; g.prev := h.prev; h.prev := g
+	END addFile;
+
+	PROCEDURE ReadAll*;
+		VAR f: File; g: Files.File;
+	BEGIN
+		ReadDir;
+		f := dir.next;
+		WHILE f # dir DO
+			g := Files.New(f.file.name); readFile(f, g); Files.Register(g); f := f.next
+		END
+	END ReadAll;
+
+	PROCEDURE ReadFile* (name: ARRAY OF CHAR);
+		VAR f: File; g: Files.File;
+	BEGIN
+		findFile(name, f);
+		IF f.file.name = name THEN
+			g := Files.New(name); readFile(f, g); Files.Register(g); res := 0
+		ELSE res := 1
+		END
+	END ReadFile;
+
+	PROCEDURE WriteFile* (name: ARRAY OF CHAR);
+		VAR f: Files.File; g, h: File; d, t: LONGINT; needC: INTEGER;
+	BEGIN res := 0;
+		NEW(g); g.file.name[11] := 0X; (*attributes*)
+		COPY(name, g.file.name);
+		f := Files.Old(name);
+		IF f # NIL THEN
+			g.file.size := Files.Length(f);
+			Kernel.GetClock(t, d);
+			g.file.date := SHORT(d); g.file.time := SHORT(t DIV 2);
+			findFile(g.file.name, h);
+			IF h.file.name = g.file.name THEN
+				needC := Clusters(g.file.size) - Clusters(h.file.size);
+				IF usedC + needC <= 720 THEN
+					deleteFile(h); addFile(f, g, h.next);
+					usedC := usedC + needC
+				ELSE res := 2
+				END
+    		ELSE needC := Clusters(g.file.size);
+			    IF (usedF < 112) & (usedC + needC <= 720) THEN
+				    addFile(f, g, h);
+				    INC(usedF); usedC := usedC + needC
+			    ELSE res := 2
+                END
+			END
+		ELSE res := 1
+		END
+	END WriteFile;
+
+	PROCEDURE DeleteFile* (name: ARRAY OF CHAR);
+		VAR g: File;
+	BEGIN
+	    findFile(name, g);
+		IF g.file.name = name THEN
+		    deleteFile(g); DEC(usedF); usedC := usedC - Clusters(g.file.size); res := 0
+		ELSE res := 1
+		END
+	END DeleteFile;
+
+BEGIN trailer.name[0] := 0X
+END Diskette.
+
+
+

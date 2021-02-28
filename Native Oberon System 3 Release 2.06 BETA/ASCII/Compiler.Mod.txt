@@ -1,0 +1,419 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Compiler;	(* iOP2: RC, NM 6.3.89 / 12.1.94 / jm 18.2.95 / prk 3.6.96 *)
+
+(*	code generator for Intel i386, i387/ i486 - Diplomarbeit ETH-Z…rich WS 92/93
+	by Niklaus Mannhart, 87-913-117I
+	author's address: 	Himmelrich 22
+		6340 Baar, Switzerland
+		e-mail: mannhart@inf.ethz.ch	phone: +41 42 31 40 33
+
+This program is distributed in the hope that it will be useful, 
+but WITHOUT ANY WARRANTY; without even the implied warranty of 
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+
+To my parents enabling me to study at the ETH.
+
+Acknowledgements
+
+Many thanks go to my "compiler construction" teacher Marc Brandis. He had the idea of writing such a
+compiler and answered many questions during the development. Mattias Hausner, developer of the
+WinOberon System, was patiently guiding me fixing the bugs. Without his support, the compiler
+would never have been finished - It was great pleasure to work with them.
+
+Niklaus Mannhart, December 1993
+
+
+	March the 2nd 1993
+	Release 12.12.93 / Release 1.0
+	Release 12.1.94 / Release 1.1 (fixed: bugs in iOPL.LoadProc and floating point compare (iOPL.FloadCmp))
+	Release 13.3.94 / Release 1.2 (fixed: bug in iOPC.Index)
+	Release 23.6.94  / Release 1.3 (fixed: bug in iOPL.Load, iOPC.SYSgetputReg, floating point problem in iOPL.PushRegs);
+	Release 30.8.94 / 1.4 (mh fixes: iOPC.Index, iOPC.NewSys, iOPL.OutRefs)
+	Release 7.12.94 / 1.5 (fixed: iOPC.NewSys, iOPC.Convert (IntToInt)
+	29.02.96 dVdW
+		Changes for Scope
+
+	27.4.96 (prk / reali@inf.ethz.ch)
+		Intel common release (Native + Linux + Windows)
+
+	3.6.96 (prk / reali@inf.ethz.ch)
+		Merging with active compiler
+	
+	17.07.97 pjm
+		added OPS.Init in Module
+*)
+
+	IMPORT
+
+		Modules,
+
+		Kernel, Files,
+		Objects, Display, Texts, Oberon,
+
+		OPP := iOPP, OPB := iOPB, OPV := iOPV, OPT := iOPT,
+		OPS := iOPS, OPC := iOPC, OPL := iOPL, OPO := iOPO, OPM := iOPM;
+
+	
+	CONST
+		ShowCommand = "OPdump.ShowProg";
+		ShowTableCommand = "OPdump.ShowTable";
+		
+
+		SignOnMessage = "iOP2   RC/NM/PRK  03.07.96";
+
+
+		(* compiler options: *)
+		inxchk = 0;	(* index check on *)
+		ovflchk = 1;	(* overflow check on *)
+		typchk = 3;	(* type check on *)
+		newsf = 4;	(* generation of new symbol file allowed *)
+		ptrinit = 5;	(* pointer initialization *)
+		assert = 6;	(* assert evaluation *)
+		findpc = 7;	(* find text position of breakpc *)
+		systemchk = 8;	(* prevent compilation of modules that import SYSTEM *) (* jm *)
+		nofiles = 9;	(* don't create any files (dVdW) *)
+		defopt = {inxchk, typchk, ptrinit, assert};
+
+	VAR
+		prog*: OPT.Node;
+		ModName*: ARRAY 32 OF CHAR;
+		showTree, showTable, watch: BOOLEAN;
+		(* global because of the GC call *)
+		source: Texts.Text;
+		sourceR: Texts.Reader;
+		S: Texts.Scanner;
+		W: Texts.Writer;
+		time: LONGINT;
+		timer: BOOLEAN;
+		
+
+	PROCEDURE Loaded(name: ARRAY OF CHAR): BOOLEAN;
+	VAR m: Modules.Module;
+	BEGIN
+		m := Kernel.modules;
+		WHILE m # NIL DO
+			IF m.name = name THEN RETURN TRUE END;
+			m := m.next
+		END;
+		RETURN FALSE
+	END Loaded;
+
+	
+	PROCEDURE Module*(source: Texts.Reader; options: ARRAY OF CHAR; breakpc: LONGINT;
+										log: Texts.Text; VAR error: BOOLEAN);
+		VAR key: LONGINT; opt: SET; ch: CHAR; newSF: BOOLEAN;
+			p: OPT.Node; modName: OPS.Name;
+			res, i: INTEGER;
+			command: ARRAY 32 OF CHAR;
+	BEGIN
+		IF watch THEN command := "System.Watch"; Oberon.Call(command, Oberon.Par, FALSE, res) END ;
+		opt := defopt; i := 0;
+		REPEAT
+			ch := options[i]; INC(i);
+			IF ch = "x" THEN opt := opt / {inxchk}
+			ELSIF ch = "v" THEN opt := opt / {ovflchk}
+			ELSIF ch = "t" THEN opt := opt / {typchk}
+			ELSIF ch = "s" THEN opt := opt / {newsf}
+			ELSIF ch = "p" THEN opt := opt / {ptrinit}
+			ELSIF ch = "a" THEN opt := opt / {assert}
+			ELSIF ch = "f" THEN opt := opt / {findpc}
+			ELSIF ch = "S" THEN opt := opt / {systemchk}
+			ELSIF ch = "n" THEN opt := opt / {nofiles}	(* dVdW *)
+			END
+		UNTIL ch = 0X;
+		IF nofiles IN opt THEN EXCL(opt, newsf) END;	(* dVdW *)
+		OPM.Init(source, log);  OPS.Init;	(* pjm *)
+		OPT.Init; OPB.typSize := OPV.TypSize;
+		newSF := newsf IN opt;
+		OPT.OpenScope(0, NIL);
+		OPP.Module(p, modName, systemchk IN opt);
+		IF OPM.noerr THEN
+			OPL.Init;
+			OPV.AdrAndSize(OPT.topScope);
+			OPM.errpos := 0;
+			key := OPM.NewKey();
+			OPT.Export(modName, newSF, key);
+			IF newSF THEN OPM.LogWStr(" new symbol file") END ;
+			IF showTree THEN prog := p; command := ShowCommand;
+				Oberon.Call(command, Oberon.Par, FALSE, res); prog := NIL
+			END ;
+			IF showTable THEN prog := p; command := ShowTableCommand;
+				Oberon.Call(command, Oberon.Par, FALSE, res); prog := NIL
+			END ;
+			IF OPM.noerr THEN
+				OPM.OpenRefObj(modName);
+				OPC.Init(opt); OPV.Init(opt, breakpc);
+				OPV.Module(p);
+				IF OPM.noerr THEN
+					OPL.OutCode(modName, key);
+					IF OPM.noerr THEN 
+						IF ~(nofiles IN opt) THEN OPM.CloseRefObj END;	(* dVdW *)
+						OPM.LogWStr ("   "); OPM.LogWNum(OPO.pc, 1); 
+
+						IF Loaded(modName) THEN OPM.LogWStr("  (in use)") END	(* pjm *)
+
+					END
+				END
+			END ;
+			OPL.Close
+		END ;
+		OPT.CloseScope; OPT.Close;
+		OPM.LogWLn; error := ~OPM.noerr;
+		OPT.Init; OPM.Close;	(* << jm *)
+
+		Kernel.GC;	(* << jm *)
+		IF watch THEN command := "System.Watch"; Oberon.Call(command, Oberon.Par, FALSE, res) END;
+		OPS.Init; (* << jm *)
+	END Module;
+	
+	PROCEDURE CompileFile*(name, options: ARRAY OF CHAR; breakpc: LONGINT; log: Texts.Text; VAR error: BOOLEAN);
+	CONST SourceCoder = 011FFH;
+	VAR F: Files.File; R: Files.Rider; tag: INTEGER; cmd: ARRAY 64 OF CHAR; par: Texts.Text; pos: LONGINT;
+	BEGIN
+		source := NIL; F := Files.Old(name);
+		IF F # NIL THEN
+			Files.Set(R, F, 0); Files.ReadInt(R, tag);
+			IF tag = SourceCoder THEN
+				OPS.Get := NIL;
+				Files.ReadString(R, cmd);
+				par := Oberon.Par.text; pos := Oberon.Par.pos;
+				NEW(Oberon.Par.text); Texts.Open(Oberon.Par.text, ""); Oberon.Par.pos := 0; Texts.WriteString(W, name);
+				Texts.Append(Oberon.Par.text, W.buf);
+				Oberon.Call(cmd, Oberon.Par, FALSE, tag);
+				Oberon.Par.text := par; Oberon.Par.pos := pos;
+				IF OPS.Get # NIL THEN NEW(source); Texts.Open(source, "")
+				ELSE
+					Texts.WriteString(W, cmd); Texts.WriteString(W, " not found");
+					Texts.WriteLn(W); Texts.Append(log, W.buf)
+				END
+			ELSE NEW(source); Texts.Open(source, name)
+			END
+		ELSE
+			Texts.WriteString(W, name); Texts.WriteString(W, " not found");
+			Texts.WriteLn(W); Texts.Append(log, W.buf)
+		END;
+		IF source # NIL THEN
+			error := FALSE;
+			Texts.OpenReader(sourceR, source, 0); Module(sourceR, options, breakpc, log, error)
+		ELSE error := TRUE;
+		END
+	END CompileFile;
+	
+	(* << jm changes *)
+	(* Returns the frame that is at X, Y on the display. u, v contain the relative coordinates inside this frame *)
+	PROCEDURE ThisFrame(X, Y: INTEGER; VAR F: Display.Frame);
+	VAR M: Display.LocateMsg;
+	BEGIN M.X := X; M.Y := Y; M.F := NIL; M.loc := NIL; Display.Broadcast(M); F := M.loc
+	END ThisFrame;
+	
+	(* Get the marked text *)
+	PROCEDURE GetText(VAR par: Display.Frame): Texts.Text;
+	VAR M: Objects.LinkMsg; t: Texts.Text;
+	BEGIN
+		t := NIL;
+		ThisFrame(Oberon.Pointer.X, Oberon.Pointer.Y, par);
+		IF par # NIL THEN
+			M.id := Objects.get; M.name := "Model"; M.obj := NIL; M.res := -1; par.handle(par, M);
+			IF (M.obj # NIL) & (M.obj IS Texts.Text) THEN t := M.obj(Texts.Text) END
+		END;
+		RETURN t
+	END GetText;
+	(* << end jm changes *)
+
+	PROCEDURE Compile*;
+		VAR beg, end, time: LONGINT; error: BOOLEAN; ch: CHAR; F: Display.Frame;
+
+		PROCEDURE Locate(F: Display.Frame;  T: Texts.Text;  pos: LONGINT);
+		VAR M: Oberon.CaretMsg;  N: Oberon.ControlMsg;
+		BEGIN
+			IF pos < 0 THEN pos := 0
+			ELSIF pos > T.len THEN pos := T.len
+			END;
+            N.F := NIL; N.id := Oberon.neutralize; Display.Broadcast(N);
+            Oberon.FadeCursor(Oberon.Pointer);
+			M.id := Oberon.set; M.F := F; M.car := F; M.text := T; M.pos := pos; Display.Broadcast(M)
+		END Locate;
+
+		PROCEDURE Do(filename: ARRAY OF CHAR; beg: LONGINT;  F: Display.Frame);
+			VAR S1: Texts.Scanner; line, i: INTEGER; options: ARRAY 32 OF CHAR;
+				fbeg, fend, ftime, breakpc: LONGINT; ftext: Texts.Text; f: BOOLEAN;
+		BEGIN
+			Texts.WriteString(W, filename); Texts.WriteString(W, "  compiling  ");
+			Texts.OpenScanner(S1, source, beg); Texts.Scan(S1);
+			WHILE ~S1.eot & ((S1.class # Texts.Name) OR (S1.s # "MODULE")) DO Texts.Scan(S1) END;
+			IF (S1.class = Texts.Name) & (S1.s = "MODULE") THEN
+				Texts.Scan(S1);
+				WHILE (S1.class = Texts.Char) & (S1.c = "(") DO
+					i := 0;
+					REPEAT
+						IF (S1.class = Texts.Char) & (S1.c = "(") THEN INC(i) END;
+						IF (S1.class = Texts.Char) & (S1.c = ")") THEN DEC(i) END;
+						Texts.Scan (S1)
+					UNTIL (i = 1) & (S1.class = Texts.Char) & (S1.c = ")");
+					Texts.Scan (S1)
+				END;	(* skip PROTECTED *)
+				IF S1.class = Texts.Name THEN Texts.WriteString(W, S1.s); COPY (S1.s, ModName) END
+			ELSE COPY (filename, ModName)
+			END ;
+			Texts.Append(Oberon.Log, W.buf);
+			line := S.line; i := 0; f := FALSE;
+			Texts.Scan(S);
+			IF (S.line = line) & (S.class = Texts.Char) & ((S.c = Oberon.OptionChar) OR (S.c = "%")) THEN
+				ch := S.nextCh;
+				WHILE ((ch >= "0") & (ch <= "9") OR (ch >= "a") & (ch <= "z") OR (ch = "S")) & (i < LEN(options) - 1) DO
+					options[i] := ch; INC(i);
+					IF ch = "f" THEN f := ~f END ;
+					Texts.Read(S, ch)
+				END ;
+				S.nextCh := ch; Texts.Scan(S)
+			END ;
+			options[i] := 0X;
+			IF f THEN
+				OPM.breakpos := beg;
+				Oberon.GetSelection(ftext, fbeg, fend, ftime);
+				IF ftime >= 0 THEN
+					Texts.OpenScanner(S1, ftext, fbeg); Texts.Scan(S1); line := S1.line;
+					WHILE (S1.class # Texts.Int) & (S1.line = line) DO Texts.Scan(S1) END
+				ELSE S1.class := Texts.Inval
+				END;
+				IF S1.class = Texts.Int THEN breakpc := S1.i
+				ELSE
+					Texts.WriteString(W, "  pc not selected"); Texts.WriteLn(W);
+					Texts.Append(Oberon.Log, W.buf); error := TRUE;
+					RETURN
+				END
+			END;
+			Texts.OpenReader(sourceR, source, beg);
+			Module(sourceR, options, breakpc, Oberon.Log, error);
+			IF f & (F # NIL) THEN Locate(F, source, OPM.breakpos) END
+			(*Kernel.GC*)
+		END Do;
+
+		PROCEDURE OpenSource(VAR name: ARRAY OF CHAR; VAR text: Texts.Text);	(* ejz, 19.4.95 *)
+		CONST SourceCoder = 011FFH;
+		VAR F: Files.File; R: Files.Rider; tag: INTEGER; cmd: ARRAY 64 OF CHAR; par: Texts.Text; pos: LONGINT;
+		BEGIN
+			par := NIL;
+			F := Files.Old(name);
+			IF F # NIL THEN
+				Files.Set(R, F, 0);
+				Files.ReadInt(R, tag);
+				IF tag = SourceCoder THEN
+					OPS.Get := NIL;
+					Files.ReadString(R, cmd);
+					par := Oberon.Par.text; pos := Oberon.Par.pos;
+					NEW(Oberon.Par.text); Texts.Open(Oberon.Par.text, ""); Oberon.Par.pos := 0; Texts.WriteString(W, name);
+					Texts.Append(Oberon.Par.text, W.buf);
+					Oberon.Call(cmd, Oberon.Par, FALSE, tag);
+					Oberon.Par.text := par; Oberon.Par.pos := pos;
+					IF OPS.Get # NIL THEN Texts.Open(text, "")
+					ELSE text := NIL
+					END
+				ELSE Texts.Open(text, name)
+				END
+			ELSE text := NIL
+			END;
+			IF (par = NIL) & ((text = NIL) OR (text.len = 0)) THEN error := TRUE;
+				Texts.WriteString(W, name); Texts.WriteString(W, " not found");
+				Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+			ELSE Do(name, 0, NIL)
+			END
+		END OpenSource;
+
+	BEGIN
+		IF timer THEN time := Oberon.Time() END;
+		error := FALSE;
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+		IF S.class = Texts.Char THEN
+			IF S.c = "*" THEN
+				source := GetText(F);
+				IF source # NIL THEN Do("", 0, F) END
+			ELSIF S.c = "^" THEN
+				Oberon.GetSelection(source, beg, end, time);
+				IF time >= 0 THEN
+					Texts.OpenScanner(S, source, beg); Texts.Scan(S); NEW(source); 
+					WHILE (S.class = Texts.Name) & (Texts.Pos(S) - S.len <= end) & ~error DO
+						OpenSource(S.s, source)	(* ejz, 19.4.95 *)
+					END
+				END
+			ELSIF S.c = "@" THEN
+				Oberon.GetSelection(source, beg, end, time);
+				IF time >= 0 THEN Do("", beg, NIL) END
+			END
+		ELSE NEW(source);
+			WHILE (S.class = Texts.Name) & ~error DO
+				OpenSource(S.s, source) (* ejz, 19.4.95 *)
+			END
+		END;
+		IF timer THEN time := Oberon.Time() - time;
+			Texts.WriteLn(W); Texts.WriteString(W, "time to compile = "); Texts.WriteInt(W, time, 4); Texts.WriteLn(W);
+			Texts.Append(Oberon.Log, W.buf);
+		END
+	END Compile;
+
+
+	
+	PROCEDURE ShowTree*;
+	BEGIN showTree := TRUE
+	END ShowTree;
+
+	PROCEDURE HideTree*;
+	BEGIN showTree := FALSE
+	END HideTree;
+
+	PROCEDURE ShowTable*;
+	BEGIN showTable := TRUE
+	END ShowTable;
+
+	PROCEDURE HideTable*;
+	BEGIN showTable := FALSE
+	END HideTable;
+
+	PROCEDURE DoWatch*;
+	BEGIN watch := TRUE
+	END DoWatch;
+
+	PROCEDURE DontWatch*;
+	BEGIN watch := FALSE
+	END DontWatch;
+
+	PROCEDURE ShowCode*;
+	BEGIN
+		OPV.dumpCode := TRUE
+	END ShowCode;
+
+	PROCEDURE HideCode*;
+	BEGIN
+		OPV.dumpCode := FALSE
+	END HideCode;
+
+	PROCEDURE ShowTime*;
+	BEGIN
+		timer := TRUE
+	END ShowTime;
+
+	PROCEDURE HideTime*;
+	BEGIN
+		timer := FALSE
+	END HideTime;
+
+BEGIN
+	HideTree; HideTable; DontWatch; HideCode; prog := NIL; Texts.OpenWriter(W);
+	Texts.WriteString(W, SignOnMessage); Texts.WriteLn(W); 
+	Texts.Append(Oberon.Log, W.buf)
+
+END Compiler.
+

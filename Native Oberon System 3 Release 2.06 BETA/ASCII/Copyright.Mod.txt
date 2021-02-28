@@ -1,0 +1,93 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Copyright;
+	IMPORT Files, Fonts, Texts, Oberon;
+
+	VAR
+		W: Texts.Writer;
+
+	PROCEDURE Add*;
+		VAR
+			S: Texts.Scanner;
+			C, T: Texts.Text;
+			B: Texts.Buffer;
+			F: Files.File;
+			len: LONGINT;
+	BEGIN
+		NEW(C); Texts.Open(C, "Copyright.Text");
+		NEW(B); Texts.OpenBuf(B);
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+		Texts.Scan(S);
+		WHILE S.class IN {Texts.Name, Texts.String} DO
+			Texts.Save(C, 0, C.len, B);
+			Texts.WriteString(W, S.s); Texts.Append(Oberon.Log, W.buf);
+			NEW(T); Texts.Open(T, S.s);
+			Texts.Insert(T, 0, B);
+			F := Files.New(S.s); len := 0;
+			Texts.Store(T, F, 0, len); Files.Register(F);
+			Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+			Texts.Scan(S)
+		END
+	END Add;
+
+	PROCEDURE Remove*;
+		VAR
+			S: Texts.Scanner;
+			T: Texts.Text;
+			F: Files.File;
+			len: LONGINT;
+			R: Texts.Reader;
+			copy: ARRAY 5 OF CHAR;
+			ch: CHAR;
+	BEGIN
+		Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos);
+		Texts.Scan(S); copy[4] := 0X;
+		WHILE S.class IN {Texts.Name, Texts.String} DO
+			Texts.WriteString(W, S.s); Texts.Append(Oberon.Log, W.buf);
+			NEW(T); Texts.Open(T, S.s);
+			Texts.OpenReader(R, T, 0);
+			Texts.Read(R, copy[0]); Texts.Read(R, copy[1]);
+			Texts.Read(R, copy[2]); Texts.Read(R, copy[3]);
+			IF copy = "(*$C" THEN
+				WHILE ~R.eot & (ch # "*") DO
+					Texts.Read(R, ch)
+				END;
+				IF ch = "*" THEN
+					Texts.Read(R, ch); Texts.Read(R, ch);
+					WHILE ~R.eot & (ch <= " ") & (R.lib IS Fonts.Font) DO
+						Texts.Read(R, ch)
+					END
+				END;
+				Texts.Delete(T, 0, Texts.Pos(R)-1);
+				F := Files.New(S.s); len := 0;
+				Texts.Store(T, F, 0, len);
+				Files.Register(F);
+			ELSE
+				Texts.WriteString(W, " no copyright found")
+			END;
+			Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf);
+			Texts.Scan(S)
+		END
+	END Remove;
+
+BEGIN
+	Texts.OpenWriter(W)
+END Copyright.
+
+Copyright.Add Copyright.Mod ~
+Copyright.Remove Copyright.Mod ~
+
+Copyright.Text
+
+System.Directory *.Mod

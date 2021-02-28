@@ -1,0 +1,191 @@
+MODULE DebugT;
+
+(* Module: DebugT, trap handler which writes a dump of allocated memory to disk *)
+(* Author: Martin Buechi *)
+(* Language: Oberon(-1) including FOR loops *)
+(* System: Oberon System 3 DOS Release 1.5 *)
+(* Version: 1.0 *)
+(* Date of last change: 18.02.1995 *)
+
+	IMPORT
+		SYSTEM, Kernel, Modules, Files;
+		
+	CONST
+		N=9; (* # of free lists [as in Kernel] *)
+		nofBlocks*= 8192; (* number of partitions of the main memory *)
+		ByteLen*=8; (* number of bits per byte *)
+		WordLen*=4*ByteLen; (* number of bits per word *)
+		K=1024; (* block size is multiple of K [must be multiple of 16] *)
+		MagicNo*=1234H; (* magic number for dump files [should be 2 bytes long for optimal alignment] *)
+		NameLen*=SIZE(Kernel.Name); (* length of identifiers *)
+		RLEIndicator*=0D5X; (* indicates that compression has occured *)
+		
+	TYPE
+		Name*=Kernel.Name;
+		Mem*=POINTER TO ARRAY MAX(LONGINT) OF CHAR; (* used to write memory with Files.WriteBytes *)
+		TrapViewer=PROCEDURE(); (* type of procedure to be called for displaying dump information *)
+				
+	VAR
+		Show, Recursive: TrapViewer; (* procedure to be called for displaying dump information/recursive trap *)
+		trapped: SHORTINT; (* trap level, to catch recursive traps *)
+		lens: ARRAY nofBlocks OF INTEGER; (* dump mask and lengths of compressed blocks *)
+		BlockSize, heapSize: LONGINT;
+		DumpFileName: Name;
+		FullDump*, RunGC*: BOOLEAN; (* all memory allocated to Oberon will be dumped if true, GC will be run *)
+		GCTrap*: BOOLEAN; (* indicates that GC is source of recursive trap *)
+		pc*, fp*: LONGINT;
+		error*: INTEGER;
+		
+		
+	(* ______________________________ dump mask ____________________________ *)
+		
+	PROCEDURE Exclude(from, to: LONGINT);
+	(* exclude memory region from dump *)
+		VAR i: LONGINT;
+	BEGIN
+		IF to>nofBlocks*BlockSize THEN to:=nofBlocks*BlockSize END;
+		IF from#0 THEN from:=((from-1) DIV BlockSize)+1 END;
+		FOR i:=from TO (to DIV BlockSize)-1 DO lens[i]:=0 END
+	END Exclude;
+	
+	PROCEDURE Include(from, to: LONGINT);
+	(* include memory region in dump *)
+		VAR i: LONGINT;
+	BEGIN
+		FOR i:=from DIV BlockSize TO (to-1) DIV BlockSize DO lens[i]:=1 END
+	END Include;
+
+	PROCEDURE InitDumpMask;
+	(* initialize dump mask: ~FullDump => Heap included, rest excluded; FullDump => everything included *)
+		VAR i: LONGINT;
+	BEGIN
+		IF FullDump THEN
+			FOR i:=0 TO nofBlocks-1 DO lens[i]:=1 END;
+		ELSE
+			FOR i:=0 TO (Kernel.heapAdr DIV BlockSize)-1 DO lens[i]:=0 END;
+			FOR i:=Kernel.heapAdr DIV BlockSize TO nofBlocks-1 DO lens[i]:=1 END
+		END;
+		Exclude(Kernel.heapAdr+heapSize, nofBlocks*BlockSize)
+	END InitDumpMask;
+	
+	
+	(* ______________________________ memory regions ____________________________ *)
+	
+	PROCEDURE FreeList;
+	(* exclude memory in free list N *)
+		VAR adr, size: LONGINT;
+	BEGIN
+		IF RunGC THEN GCTrap:=TRUE; Kernel.GC; GCTrap:=FALSE END;
+		SYSTEM.GET(SYSTEM.ADR(Kernel.FontRoot)-28, adr); (* adr:=Kernel.A[N] *) 
+		WHILE adr#0 DO
+			SYSTEM.GET(adr+4, size); Exclude(adr, adr+size+4);
+			SYSTEM.GET(adr+8, adr)
+		END
+	END FreeList;
+	
+	PROCEDURE Mods;
+	(* exclude code, include global variables and module descriptor *)
+		VAR
+			adr: LONGINT;
+			mod: Modules.Module;
+	BEGIN
+		SYSTEM.GET(Kernel.modules, adr); mod:=SYSTEM.VAL(Modules.Module, adr); 
+		WHILE mod#NIL DO
+			Exclude(mod.code, mod.refs);
+			IF mod.imports<Kernel.heapAdr THEN Include(mod.imports, mod.code) END;
+			IF SYSTEM.VAL(LONGINT, mod)<Kernel.heapAdr THEN
+				Include(SYSTEM.VAL(LONGINT, mod)-4, SYSTEM.VAL(LONGINT, mod)+SIZE(Modules.ModuleDesc))
+			END;
+			mod:=mod.link
+		END
+	END Mods;
+	
+	PROCEDURE Stack(sp: LONGINT);
+	(* include stack *)
+	BEGIN
+		Include(sp, Kernel.StackOrg)
+	END Stack;
+	
+	
+	(* ______________________________ trap handler ____________________________ *)
+				
+	PROCEDURE* Handler;
+	(* trap handler which is installed with Kernel.InstallTrap *)
+		VAR
+			V: LONGINT; (* this variable must be declared first, its address is given as parameter to the Kernel *) 
+			sp, i, ModAnchor: LONGINT;
+			F: Files.File;
+			R: Files.Rider;
+			buffer: Mem;
+			start, read, end, write, count: LONGINT;
+			cc, ch, nextch: CHAR;		
+	BEGIN
+		IF trapped=0 THEN INC(trapped); (* prevent recursive traps *)
+			SYSTEM.GETREG(4, sp);
+			heapSize:=00800000H-Kernel.heapAdr; (* memory size fix 8 MB as Kernel.heapSize is wrong! *)
+			error:=Kernel.err(SYSTEM.ADR(V)); (*  needs addr of first local var *)
+			fp := Kernel.fp(); pc := Kernel.pc(SYSTEM.ADR(V));
+			IF error IN {2, 4, 7, 17} THEN DEC(pc, 10) END; (* subtract 10 to get correct procedure, see documentation *)
+			IF error < 0 THEN error := 10 END;
+			F:=Files.New(DumpFileName); Files.Set(R, F, 0); Files.WriteInt(R, MagicNo);
+			Files.WriteInt(R, error); Files.WriteLInt(R, pc); Files.WriteLInt(R, fp);
+			Files.WriteLInt(R, Kernel.StackOrg); Files.WriteLInt(R, sp);
+			BlockSize:=(((Kernel.heapAdr+heapSize) DIV nofBlocks -1) DIV K + 1) * K;
+			Files.WriteLInt(R, BlockSize); Files.WriteLInt(R, Kernel.heapAdr+heapSize);
+			SYSTEM.GET(Kernel.modules, ModAnchor); Files.WriteLInt(R, ModAnchor);
+			InitDumpMask;
+			IF ~FullDump THEN
+				FreeList;
+				Mods;
+				Stack(sp)
+			END;
+			SYSTEM.NEW(buffer, BlockSize*2); start:=SYSTEM.VAL(LONGINT, buffer);
+			FOR i:=0 TO nofBlocks-1 DO
+				IF lens[i]#0 THEN
+					read:=i*BlockSize; end:=read+BlockSize; write:=start;
+					SYSTEM.GET(read, ch); INC(read);
+					LOOP
+						IF read=end THEN
+							IF ch=RLEIndicator THEN
+								SYSTEM.PUT(write, RLEIndicator); SYSTEM.PUT(write+1, RLEIndicator); SYSTEM.PUT(write+2, 0); INC(write, 3)
+							ELSE SYSTEM.PUT(write, ch); INC(write)
+							END; EXIT
+						END;
+						SYSTEM.GET(read, nextch); INC(read); count:=0;
+						WHILE (ch=nextch) & (read<end) & (count<255) DO SYSTEM.GET(read, nextch); INC(read); INC(count) END;
+						IF (count>0) OR (ch=RLEIndicator) THEN
+							IF (read=end) & (ch=nextch) THEN
+								SYSTEM.PUT(write, RLEIndicator); SYSTEM.PUT(write+1, ch); cc:=CHR(count+1);
+								SYSTEM.PUT(write+2, cc); INC(write, 3); EXIT
+							ELSIF (count=1) & (ch#RLEIndicator) THEN SYSTEM.PUT(write, ch); SYSTEM.PUT(write+1, ch); INC(write, 2)
+							ELSE
+								SYSTEM.PUT(write, RLEIndicator); SYSTEM.PUT(write+1, ch); cc:=CHR(count);
+								SYSTEM.PUT(write+2, cc); INC(write, 3)
+							END
+						ELSE SYSTEM.PUT(write, ch); INC(write)
+						END; ch:=nextch
+					END;
+					Files.WriteBytes(R, buffer^, write-start); lens[i]:=SHORT(write-start)
+				ELSE lens[i]:=0;
+				END
+			END;
+			Files.WriteBytes(R, lens, nofBlocks*SIZE(INTEGER));
+			Files.Register(F);
+			(* FPA.Reset; *)
+			Show
+		ELSIF trapped=1 THEN INC(trapped);
+			Recursive
+		END;
+		trapped:=0;
+		SYSTEM.PORTOUT(20H, 20H);
+	END Handler;
+	
+	PROCEDURE Install*(ShowTrap, ShowRecursiveTrap: TrapViewer; DumpName: ARRAY OF CHAR);
+	(* install trap handler *)
+	BEGIN
+		Kernel.InstallTrap(Handler); Show:=ShowTrap; Recursive:=ShowRecursiveTrap; COPY(DumpName, DumpFileName)
+	END Install;
+	
+BEGIN
+	trapped:=0; FullDump:=FALSE; RunGC:=FALSE; GCTrap:=FALSE
+END DebugT.

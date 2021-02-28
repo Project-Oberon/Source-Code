@@ -1,0 +1,1031 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaBox;	(* uh, Thu, 21-Oct-1993 *)
+
+(* pjm 28.06.96 changed to Oberon font *)
+
+	(*--- remarks:
+		- provides procedures to maintain data structure of boxes
+		- provides the handling for marks [selection and focus]
+		- provides attribute mechansime for boxes and cotnrols
+		- provides mechanism to reference boxes [multiple]
+		- box types are externaly defined controls with a predefined
+			data structure; there exists just one instance of a  box type;
+			however many box instances can exist of a box type
+		- to implement for a box type: procedure LedaBase.CtrlProc that handles
+			the LedaBase.CtrlMsg		[id: RegisterCtrl/CopyCtrl/StoreModCmd]
+			[id: StoreData/LoadData not needed because control has no instance data]
+	---*)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaFrames;
+	
+CONST
+	(*--- flags used in LedaCtr.BoxDsc ---*)	(* 12 <= private flags <= 30 *)
+	SysMsg* = LedaFrames.SysMsg;
+	Height* = 1;	(* used for planes *)
+	NoFlow* = 3;	(* used for text flow *)
+	Structure* = 7;	
+	BcMsg* = 8;	(* set if broadcast message is received *)
+
+	(*--- flags used as broadcast info [see bcFlags] *---*)
+	BcTxt* = 1;	(* broadcast in text stream *)
+	
+	(*--- kind values for SetSel and SetFoc ---*)
+	NewSel* = 1;	AppendSel* = 2;	NewFoc* = 1;	PassFoc* = 2;
+	
+	(*--- kind values for GetSel ---*)
+	First* = 0;	Self* = 1;	Dsc* = 2;	InBox* = 3;
+	
+	(*--- kind values for Insert ---*)
+	FirstDsc* = 0;	LastDsc* = 1;	Last* = 2;	Before* = 3;	After* = 4;
+	
+	(*--- id's for Msg ---*)
+	DoneId* = 0;	(* serves as result code: message handled *) 
+	SizeId* = 1;	(* information about sizes *)
+		(* id: serves as result code: id = DoneId: message handled *)
+		(* op = 1:  ask descender size: l1: width; l2: height *)
+		(* op = 2:  ask type area: l1: x; l2: y; l3: width; l4: height *)
+	TextId* = 2;	(* information about text *)
+		(* id: serves as result code: id = DoneId: message handled *)
+		(* op = 1:  ask for reference data of text [returns text else ctrl] *)
+		(*            text: reference text to continue flow; ctrl: linked controls [format, style list] *)
+		(* op = 1:  ask for reference text [to continue flow]: text *)
+		(* op = 2:  ask text size: l1: column width; l2: line space *)
+		(* op = 3:  unpoured text available: text: text stream;  l1, l2: begin and length; box1: directly/indirectly contains text *)
+		(* op = 4:  text becomes empty: text: empty text;  box1: directly contains text *)
+	PageNbrId* = 3;	(* page number *)
+		(* id: serves as result code: id = DoneId: message handled *)
+		(* op = 1:  ask for number in l1 *)
+		(* op = 2:  set page number to given value l1 *)
+	CtrlId* = 4;	(* information about controls *)
+		(* id: serves as result code: id = DoneId: message handled *)
+		(* op = 1:  ask for a control in ctrl: l1: kind of control [0=styles/1=format] *)
+		(* op = 2:  notify the change of control ctrl [id not regarded] *)
+		(* op = 3:  ask for overlay data: ctrl: format base; l1: aster field height *)
+	BoxId* = 5;	(* information about boxes *)
+		(* id: serves as result code: id = DoneId: message handled *)
+		(* op = 1:  insert new box: box1: new box(es); box2: reference box *)
+		(* op = 2:  delete box: box1: box to delete; box2: box that contains box1 *)
+		(* op = 3:  check if box box1 is empty [has no data]; id = DoneId: box1 is empty *)
+		(* op = 4:  remove notification [box is removed from document tree] *)
+		(* op = 5:  return level of selection in l0 [box has selection] *)
+		(* op = 6:  return background color in l0 *)
+		(* op = 7:  dispose notification *)
+	FocusId* = 6;	(* information about focus *)
+		(* op = 1:  pass focus *)
+		(* op = 2:  return location of focus in l1, l2; id = DoneId: message handled *)
+	LocateId* = 7;	(* handling of text *)
+		(* op = 1:  get text location [focus or first text]: text: text; l1: text position *)
+		(* op = 2:  get line bounds of block containing position l1 in text; l2, l3: upper and lower bound *)
+		(* op = 3:  mark text location: text: text; l1: begin position; l2: end position *)
+		(* op = 4:  get line data of block containing position l1 in text; *)
+		(*				l2, l3: begin and length of line; l4: separator kind of block *)
+		(* op = 5:  get text containing given control ctrl; text: text containing ctrl; l1: position in text *)
+		(* op = 6:  get external reference [coordinate] of position l0 in text; *)
+		(*				l1, l2: external reference of line [eX, eY]; l3, l4: distances in line [X, bH] *)
+		(*				set boolean b if position l0 is part of a selection *)
+	FormId* = 8;	(* handling of format base *)
+		(* op = 1:  get named, unstamped  format bases; link it to the ctrl field *)
+		(* op = 2:  notification about change of format base ctrl *)
+		
+	(*--- id's for PageMsg ---*)
+	PgArea* = 0;	(* to change type area *)
+		(* m.X, m.Y, m.W, m.H: new values of type area *)
+		(* m.dX, m.dY, m.dW, m.dH: size change of type area *)
+		(* m.*Chng - fields: change of overlay *)
+	PgTexts* = 1;	(* to process text flow *)
+		(* m.op = 0: invalidate text flows; m.op = 1: validate text flows *)
+	PgLettering* = 2;	(* to process lettering *)
+		(* m.op = 0: return lettering type of box m.box in m.typ [PgHeading/PgFooter] *)
+		(* m.op = 1: return lettering box of type m.typ in m.box [PgHeading/PgFooter] *)
+		(* m.op = 2: set lettering box of type m.typ to m.box [PgHeading/PgFooter] *)
+		(* m.op = 3: adjust lettering of type m.typ according reference m.box and m.all [all or successors] *)
+		(* m.op = 4: return lettering area of type m.typ in m.X, m.Y, m.W, m.H; m.avail: area valid *)
+		(* m.op = 5: invalidate lettering of type m.typ [PgHeading/PgFooter]; set invisible *)
+		PgHeading* = 1;	PgFooter* = 2;	(* predefined lettering types *)
+		
+	(*--- id's for PlaneMsg---*)
+	PlGet* = 0;	(* return plane for box m.box in m.plane; m.mask: set mask for plane *)
+	PlMask* = 1;	(* set mask for plane of box m.box and set m.avail if plane is available *)
+	PlDraw* = 2;	(* draw the box m.box and it's plane; m.planeBox: caused change for redraw *)
+	PlChange* = 3;	(* notification that the plane changed for box m.box [adjust structure] *)
+				(* m.planeBox: plane box that cause change *)
+	PlAttr* = 4;	(* notification that the plane attributes of box m.box changed *)
+				(* m.avail: controls drawing of plane  *)
+	PlSetValue* = 5;	(* store the given plane values m.c, m.l, m.h/m.wdt, m.v/m.hgt if the values are defined [>= 0] *)
+	PlGetValue* = 6;	(* return the plane values in m.wdt, m.hgt, m.c, m.l, m.h, m.v *)
+
+	(*--- page number control ---*)
+	PgNbrCh = 0EX;	(* CTRL - N *)
+	
+	(*--- predefined control kinds ---*)
+	FileId = 4;	(* id for LedaBase.CtrlMsg; defined in LedaBase *)
+	PgNbrId = 15;
+		(* predefined controls in LedaBase:  id's 1..3 [not used: 5]  *)
+		(* predefined controls in LedaCtrl: id's 7..8 [not used: 6] *)
+		(* predefined controls in LedaChar: id's 4, 9..14, 20..21 [not used: 22..31] *)
+		(* predefined controls in LedaBox: id's 15 [not used: 16..19] *)
+	
+	(*--- parameters and attributes ---*)
+	No* = 0;	Str* = 1;	Int* = 2;	Enum* = 3;	NewLn* = -1;
+	AddFlag* = 0;	StyleFlag* = 2;	(* flags for attribute log procedure *)
+	(*--- id's for attribute message ---*)
+	GetValue* = 1;	SetValue* = 2;	(* for single attribute values *)
+	GetStyle* = 4;	SetStyle* = 5;	NewStyle* = 6;	(* for attribute styles *)
+	SameAttr* = 7;	(* set same attributes [regard fields box and ctrl] *)
+	(*--- attribute names ---*)
+	P = 11;	(* linear hashing *)
+	
+	NotDef = -1;	
+	SpecErr = "specification error";
+	NameLess = "nameless";
+	
+	NumAttributes* = 128;
+	
+TYPE
+	(*--- message for box communication ---*)
+	Msg* = RECORD
+		(LedaBase.Msg)
+		id*, op*: INTEGER;
+		l0*, l1*, l2*, l3*, l4*: LONGINT;
+		caller*, box1*, box2*: LedaBase.Box;
+		ctrl*: LedaBase.Control;
+		text*: LedaCtrl.Text;
+		b*: BOOLEAN
+	END;
+	
+	(*--- page layout ---*)
+	PageMsg* = RECORD
+		(LedaBase.Msg)
+		id*, op*, typ*: INTEGER;
+		X*, Y*, W*, H*: LONGINT;
+		dX*, dY*, dW*, dH*: LONGINT;
+		box*: LedaBase.Box;
+		colsChng*, colDXChng*, lspChng*, rstrChng*: BOOLEAN;
+		avail*, all*: BOOLEAN
+	END;
+		(*---
+			- processes structural changes only;
+				redraw is done by sender [document]
+		---*)
+		
+	 Plane* = POINTER TO PlaneDsc;
+	 PlaneDsc* = RECORD
+	 	next*: Plane;
+	 	X*, Y*, W*, H*: LONGINT
+	 END;
+	 PlaneMsg* = RECORD
+	 	(LedaBase.Msg)
+		id*: INTEGER;
+		plane*: Plane;
+		box*, planeBox*: LedaBase.Box;
+		wdt*, hgt*: LONGINT;
+		c*, l*, h*, v*: INTEGER;
+		mask*, avail*: BOOLEAN
+	END;
+		(*---
+			- planes specify areas like image areas
+			- planes are local to a box
+			- the area specified by a plane should not be used by a box
+			- the plane message serves to exchange information about planes
+		---*)
+
+	(*--- focus and selection [marks ] ---*)
+	List* = POINTER TO ListDsc;
+	ListDsc* = RECORD
+		next*: List;
+		box*: LedaBase.Box
+	END;
+	
+	SelectionMsg* = RECORD
+		(LedaBase.Msg)
+		copy*: LedaBase.CopyProc
+	END;	(* message to get copy procedure of selection *)
+	
+	(*--- page number ---*)
+	PgNbr* = POINTER TO PgNbrDsc;
+	PgNbrDsc* = RECORD
+		(LedaBase.PieceCtrlDsc)
+		style*: LedaBase.Style;
+		s: LedaSys.Name	(* for page number; temporary used [printing, drawing, width] *)
+	END;
+	
+	(*--- parameters and attributes ---*)
+	ParaDsc* = RECORD
+		typ*: INTEGER;	(* No / Str / Int / Enum  / NewLn *)
+		s*: LedaSys.String;	(* for Enum: specification of enumeration; e.g. "-|-|-" or "--|--" *)
+		i*: LONGINT;	(* for Enum: active choice of enumeration *)
+		stat*: BOOLEAN	(* if not editable *)
+	END;
+	
+	Attributes* = ARRAY NumAttributes OF ParaDsc;
+	AttributeMsg* = RECORD
+		(LedaBase.Msg)
+		id*, nbr*: INTEGER;
+		name*: LedaSys.String;	(* name of attribute *)
+		a*: Attributes;
+		P*: LedaSys.Port;
+		box*: LedaBase.Box;	(* valid for id = SameAttr *)
+		ctrl*: LedaBase.PieceCtrl	(* valid for id = SameAttr *)
+	END;
+	(*--- remarks to attribute array:
+		- a ParaDsc specifies a single attribute according its typ field;
+			possible types are: strings, integers, enumerations    [Str/Int/Enum]
+		- all attributes are listed horizontal until an element with typ NewLn is found;
+			a NewLn element causes a new line to be started; it can specify an entry string in field s
+		- string and integer elements can be defined as static [not editable] with the stat field set true
+		- enumerations can not contain further enumerations;
+			the form of an enumeration is specified by its string field with characters "-" and "|";
+			the character "-" stands for a string or integer element and the "|" introduces the next
+			choice of the enumeration; the active/selected choice is specified by the field i;
+			examples:  s = "-|-|-" and i = 0  [3 elems];  s = "-|--|--" and i = 2  [5 elems]
+		- an enumeration element must be followed by as many attribute elements
+			as the form of the enumeration specifies
+	---*)
+	
+	Parameters* = RECORD
+		ind*, nbr*: INTEGER;	(* index in ParaArray and number of valid ParaDsc's *)
+		el: ARRAY 32 OF ParaDsc
+	END;
+	
+	(*- display the attributes specified in message M in a viewer: -*)
+	AttrProc* = PROCEDURE (flags: SET; VAR M: AttributeMsg);	(* valid flags: AddFlag, EditFlag *)
+	
+	(*- handle an attribute message M: -*)
+	AttrMsgProc* = PROCEDURE (VAR ctrl: LedaBase.PieceCtrl; VAR M: AttributeMsg);
+	
+	AttrNameDsc = RECORD
+		name: LedaSys.String;	(* name of attribute *)
+		mod, cmd: LedaSys.Name	(* command to call to get message handler *)
+	END;
+	
+
+VAR
+	attrUnit*: LONGINT;	(* unit of  attribute values *)
+	par*: Parameters;
+	bcFlags*: SET;	(* broadcast info *)
+	freePlane: Plane;	(* free list for plane [recycling] *)
+	(*--- page number ---*)
+	pgNbrDoOp: LedaBase.CtrlProc;		(* control handle *)
+	(*--- attributes ---*)
+	attrLog: AttrProc;	(* valid flags: AddFlag, EditFlag *)
+	an: ARRAY P OF AttrNameDsc;
+	attrHandler: AttrMsgProc;
+
+	
+(*--- document support ---*)
+
+	PROCEDURE DscBC(box: LedaBase.Box; VAR stop: BOOLEAN; VAR m: LedaBase.Msg);
+	BEGIN
+		WHILE ~ stop & (box # NIL) DO
+			INCL(box.flags, BcMsg); box.do.handle(box, m); EXCL(box.flags, BcMsg);
+			stop := BcMsg IN bcFlags;
+			IF ~ stop THEN DscBC(box.dsc, stop, m) END;
+			box := box.next
+		END
+	END DscBC;
+
+	PROCEDURE *BoxDscBC(box: LedaBase.Box; VAR m: LedaBase.Msg);
+	(* broadcasts message M in the given box box and it's descenders *)
+		VAR stop, once: BOOLEAN;
+	BEGIN
+		once := box.anc = NIL;	(* document *)
+		EXCL(bcFlags, BcMsg);
+		REPEAT
+			INCL(box.flags, BcMsg); box.do.handle(box, m); EXCL(box.flags, BcMsg);
+			stop := BcMsg IN bcFlags;
+			IF ~ stop THEN DscBC(box.dsc, stop, m) END;
+			box := box.next
+		UNTIL once OR stop OR (box = NIL)
+	END BoxDscBC;
+
+	PROCEDURE Broadcast*(box: LedaBase.Box; flags: SET; VAR M: LedaBase.Msg);
+	(** broadcasts the message M according parameter box *)
+	(** bcFlags set to flags; they specify additional information for broadcast *)
+	(** box = NIL -> broadcast to all documents in use *)
+	(** box # NIL -> broadcast in box box [box and descenders] and successors [box.next] *)
+	(** BcMsg flag is set in box.flags when receiving a broadcast message *)
+	(** to stop broadcast include BcMsg flag in global variable bcFlags *)
+		VAR set: SET;	access: LedaSys.Access;
+	BEGIN
+		set := bcFlags;	(* save flags *)
+		bcFlags := flags;	(* set flags *)
+		IF box = NIL THEN
+			LedaSys.GetDocuments(access);
+			WHILE access # NIL DO
+				BoxDscBC(access.trailer(LedaFrames.Frame).box, M);
+				access := access.next
+			END
+		ELSE BoxDscBC(box, M)
+		END;
+		bcFlags := set	(* restore flags *)
+	END Broadcast;
+	
+	PROCEDURE Root*(box: LedaBase.Box): LedaBase.Box;
+	BEGIN
+		WHILE box.anc # NIL DO box := box.anc END; RETURN box
+	END Root;
+	
+	PROCEDURE *UpdExHandle(ex: LedaSys.Excpt);
+	BEGIN
+		LedaFrames.UpdatePort(NIL, 0);	(* to display updates *)
+		ex.remove := TRUE
+	END UpdExHandle;
+	
+	PROCEDURE GetPort*(box: LedaBase.Box; VAR P: LedaSys.Port);
+		VAR p: LedaFrames.Port;	updEx: LedaSys.Excpt;	level: INTEGER;
+	BEGIN
+		box := Root(box);	(* get document box *)
+		IF Structure IN box.flags THEN p := NIL
+		ELSE
+			LedaFrames.GetPort(NIL, box, p, level);
+			IF level = 0 THEN	(* take care that updates will be displayed *)
+				NEW(updEx); 
+				updEx.remove := FALSE; updEx.handle := UpdExHandle;
+				LedaSys.InstallExcpt(updEx)
+			END
+		END;
+		P := p
+	END GetPort;
+	
+	PROCEDURE IsDsc*(box, anc: LedaBase.Box): BOOLEAN;
+	(** checks if box B is a descender of box anc [direkt or indirect] *)
+	BEGIN
+		WHILE box # NIL DO
+			box := box.anc;
+			IF box = anc THEN RETURN TRUE END
+		END;
+		RETURN FALSE
+	END IsDsc;
+	
+	PROCEDURE ExtRef*(box: LedaBase.Box; VAR eX, eY: LONGINT);
+	BEGIN
+		eX := box.X; eY := box.Y;
+		WHILE box.anc # NIL DO box := box.anc; INC(eX, box.X); INC(eY, box.Y) END
+	END ExtRef;
+	
+	PROCEDURE Init*(box: LedaBase.Box);
+	(** initializes the box box *)
+	BEGIN
+		IF box # NIL THEN
+			box.do := NIL;
+			box.dsc := NIL; box.next := NIL; box.anc := NIL; box.sel := NIL;
+			box.X := 0; box.Y := 0; box.W := 0; box.H := 0; box.bL := 0;
+			box.flags := {}
+		END
+	END Init;
+	
+	PROCEDURE EHandle*(self: LedaBase.Box; VAR m: LedaBase.Msg); END EHandle;
+	PROCEDURE ENew*(bT: LedaBase.BoxType; caller, ref: LedaBase.Box): LedaBase.Box;  BEGIN RETURN NIL END ENew;
+	PROCEDURE ELoad*(VAR r: LedaBase.Rider; bT: LedaBase.BoxType; flags: SET; caller: LedaBase.Box): LedaBase.Box;  BEGIN RETURN NIL END ELoad;
+	PROCEDURE EStore*(self: LedaBase.Box; VAR r: LedaBase.Rider); END EStore;
+	PROCEDURE EDraw*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port); END EDraw;
+	PROCEDURE EMark*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; kind, mode: SHORTINT); END EMark;
+	PROCEDURE EMouse*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; mX, mY: LONGINT; keys: SET; VAR res: INTEGER); END EMouse;
+	PROCEDURE EKey*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; nbr: SHORTINT; VAR keys: LedaSys.String); END EKey;
+	PROCEDURE EInsert*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; VAR B: LedaBase.Buffer); END EInsert;
+	PROCEDURE ESize*(self: LedaBase.Box; W, H: LONGINT; caller: LedaBase.Box; draw: BOOLEAN; VAR res: INTEGER); END ESize;
+	
+	PROCEDURE InitType*(type: LedaBase.BoxType);
+	BEGIN
+		type.handle := EHandle;
+		IF type IS LedaBase.BoxHandler THEN
+			WITH type: LedaBase.BoxHandler DO
+				type.new := ENew;
+				type.load := ELoad;
+				type.store := EStore;
+				type.draw := EDraw;
+				type.mark := EMark;
+				type.mouse := EMouse;
+				type.key := EKey;
+				type.insert := EInsert;
+				type.size := ESize
+			END
+		END
+	END InitType;
+	
+	PROCEDURE Insert*(new, ref : LedaBase.Box; kind: SHORTINT);
+	(** inserts the box new according ref and kind *)
+	(** kind = Last/Before/After:  in list containing ref according kind *)
+	(** kind = LastDsc:  as last descender of box ref *)
+		VAR b: LedaBase.Box;
+	BEGIN
+		CASE kind OF FirstDsc:  new.next := ref.dsc; ref.dsc := new; new.anc := ref
+		| LastDsc:
+				IF ref.dsc = NIL THEN ref.dsc := new; new.next := NIL; new.anc := ref
+				ELSE
+					b := ref.dsc; WHILE b.next # NIL DO b := b.next END;
+					b.next := new; new.next := NIL; new.anc := ref
+				END
+		| Last:
+				b := ref; WHILE b.next # NIL DO b := b.next END;
+				b.next := new; new.next := NIL; new.anc := ref.anc
+		| Before:  b := ref.anc.dsc;
+				IF b = ref THEN ref.anc.dsc := new
+				ELSE
+					WHILE b.next # ref DO b := b.next END; b.next := new
+				END;
+				new.next := ref; new.anc := ref.anc
+		| After:  new.next := ref.next; ref.next := new; new.anc := ref.anc
+		END
+	END Insert;
+	
+	PROCEDURE Remove*(box: LedaBase.Box);
+	(** removes box box from the document tree *)
+	(** leaving any descenders theroff danggling *)
+		VAR b: LedaBase.Box;	m: Msg;
+	BEGIN
+		b := box.anc.dsc;
+		IF b = box THEN box.anc.dsc := box.next
+		ELSE
+			WHILE b.next # box DO b := b.next END; b.next := box.next
+		END;
+		box.anc := NIL; box.next := NIL;
+		m.id := BoxId; m.op := 4; m.caller := NIL; m.box1 := NIL; m.box2 := NIL;
+		box.do.handle(box, m)	(* remove notification *) 
+	END Remove;
+	
+	PROCEDURE New*(modName, cmdName: LedaSys.String; caller: LedaBase.Box): LedaBase.Box;
+		VAR ctrl: LedaBase.Control;	box: LedaBase.Box;	m: LedaBase.BoxMsg;
+	BEGIN
+		box := NIL; IF cmdName = "" THEN cmdName := "DC" END;
+		IF caller # NIL THEN	(* search box type instance in document *)
+			m.id := LedaBase.TypeInstId; m.ctrl := NIL;
+			LedaSys.CopyStr(modName, m.name); LedaSys.CopyStr(cmdName, m.s);
+			Broadcast(Root(caller), {}, m);
+			ctrl := m.ctrl
+		ELSE ctrl := NIL
+		END;
+		IF ctrl = NIL THEN ctrl := LedaBase.CreateControl(modName, cmdName) END;
+		IF (ctrl # NIL) & (ctrl IS LedaBase.BoxType) THEN
+			box := ctrl(LedaBase.BoxHandler).new(ctrl(LedaBase.BoxHandler), caller, NIL)	(* get new default box *)
+		END;
+		RETURN box
+	END New;
+	
+(*--- focus and selection [marks ] ---*)
+
+	(*--- remarks: 
+		_ see also in  LedaFrames
+		_ access of selected boxes by root box [=document]:
+			-> root.sel: first selected box
+			-> root.bL: time stamp of selection
+		_ access of focus box by root box [=document]:
+			-> root.next: focus box
+		_ there are two kinds to operate on marks:
+			-> operate on the marks of a document [get, set, remove]
+			-> operate on visible marks  [get]
+	---*)
+
+	(*--- operation on the marks of a document ---*)
+	
+	PROCEDURE RemSel*(box: LedaBase.Box; P: LedaSys.Port);
+	(** removes any selection in the document containing box box; P # NIL -> unhighlite selection *)
+		VAR sel, h: LedaBase.Box;	eX, eY: LONGINT;
+	BEGIN
+		box := Root(box); sel := box.sel;
+		box.sel := NIL; box.bL := NotDef;	(* reset selection in document *)
+		WHILE sel # NIL DO
+			ExtRef(sel, eX, eY);
+			IF P # NIL THEN sel.do(LedaBase.BoxHandler).mark(sel, eX, eY, P, LedaBase.SelMark, LedaBase.Off) END;	(* unhighlite selection *)
+			sel.do(LedaBase.BoxHandler).mark(sel, eX, eY, NIL, LedaBase.SelMark, LedaBase.Off);	(* notify about deselect *)
+			IF sel = box THEN h := sel; sel := NIL
+			ELSE h := sel; sel := sel.sel; h.sel := NIL
+			END
+		END;
+	END RemSel;
+	
+	PROCEDURE SetSel*(box: LedaBase.Box; P: LedaSys.Port; kind: SHORTINT);
+	(** set the selection to the box box according kind in the document containing box box *)
+	(** kind: NewSel or AppendSel ; P # NIL -> highlite selection *)
+		VAR h, doc: LedaBase.Box;	eX, eY: LONGINT;
+	BEGIN
+		IF (kind # NewSel) & (kind # AppendSel) THEN LedaSys.Halt(SpecErr) END;
+		doc := Root(box); ExtRef(box, eX, eY);
+		IF kind = AppendSel THEN
+			IF doc.sel = NIL THEN kind := NewSel ELSIF doc.sel = doc THEN LedaSys.Halt(SpecErr) END
+		END;	(* adjustments *)
+		IF kind = AppendSel THEN
+			h := doc.sel; WHILE h.sel # NIL DO h := h.sel END
+		ELSE	(* kind = NewSel *)
+			RemSel(doc, P); h := doc	(* remove any old selection *)
+		END;
+		h.sel := box;
+		IF box # doc THEN box.sel := NIL END;
+		doc.bL := LedaSys.Time();	(* box added to selection *)
+		box.do(LedaBase.BoxHandler).mark(box, eX, eY, NIL, LedaBase.SelMark, LedaBase.On);	(* notify box *)
+		IF P # NIL THEN
+			box.do(LedaBase.BoxHandler).mark(box, eX, eY, P, LedaBase.SelMark, LedaBase.On)	(* highlite selection *)
+		END
+	END SetSel;
+	
+	PROCEDURE GetSel*(box: LedaBase.Box; kind: SHORTINT): LedaBase.Box;
+	(** returns a selected box of the document containing box box; the kind of the *)
+	(** returned box is specified by kind; nil is returned if no according box is found *)
+	(**	kind=First: first box of selection / kind=Self: box itself if selected *)
+	(**	kind=Dsc: a descender box of box / kind=InBox: a box in box [including box] *)
+		VAR h: LedaBase.Box;
+	BEGIN
+		h := Root(box);
+		IF h.sel = h THEN
+			h := h.sel; 
+			IF (kind = Dsc) OR ( (kind =Self) & (h # box) ) THEN h := NIL END
+		ELSE
+			h := h.sel;
+			IF kind = Self THEN
+				WHILE (h # NIL) & (h # box) DO h := h.sel END
+			ELSIF kind = Dsc THEN
+				WHILE (h # NIL) & (h.anc # box) DO h := h.sel END
+			ELSIF kind = InBox THEN
+				WHILE (h # NIL) & (h # box) & ~IsDsc(h, box) DO h := h.sel END
+			END
+		END;
+		RETURN h
+	END GetSel;
+	
+	PROCEDURE SelList*(sel: LedaBase.Box): List;
+	(** returns list with selected boxes beginning with box sel *)
+		VAR r, l: List;
+	BEGIN
+		r := NIL;
+		WHILE sel # NIL DO
+			IF r = NIL THEN NEW(l); r := l ELSE NEW(l.next); l := l.next END;
+			l.next := NIL; l.box := sel;
+			IF sel.sel = sel THEN sel := NIL ELSE sel := sel.sel END;
+		END
+	END SelList;
+	
+	PROCEDURE SelLevel*(box: LedaBase.Box; VAR level: INTEGER);
+	(** returns the selection level of box box; level < 0: no selection *)
+	(** level = 0: box selected itself; level > 0: structure in box selected *)
+		VAR m: Msg;
+	BEGIN
+		IF GetSel(box, Self) = box THEN
+			m.id := BoxId; m.op := 5; m.l0 := 0;	(* ask level of selection *)
+			box.do.handle(box, m); level := SHORT(m.l0)
+		ELSE level := -1
+		END
+	END SelLevel;
+
+	PROCEDURE RemFoc*(box: LedaBase.Box; P: LedaSys.Port);
+	(** removes the focus in the document containing box box; P # NIL -> unhighlite focus *)
+		VAR foc: LedaBase.Box;	eX, eY: LONGINT;
+	BEGIN
+		box := Root(box); foc := box.next;
+		IF foc # NIL THEN
+			ExtRef(foc, eX, eY);
+			IF P # NIL THEN foc.do(LedaBase.BoxHandler).mark(foc, eX, eY, P, LedaBase.FocMark, LedaBase.Off) END;	(* unhighlite focus *)
+			foc.do(LedaBase.BoxHandler).mark(foc, eX, eY, NIL, LedaBase.FocMark, LedaBase.Off);	(* notify about defocus *)
+			box.next := NIL;	(* reset focus in document *)
+			LedaFrames.ResetFocus(box)	(* reset focus frame *)
+		END
+	END RemFoc;
+	
+	PROCEDURE SetFoc*(box: LedaBase.Box; P: LedaSys.Port; kind: SHORTINT);
+	(** sets the focus to the box box according kind in the document containing box box  *) 
+	(** kind: NewFoc or PassFoc ; P # NIL -> highlite focus *)
+		VAR doc: LedaBase.Box;	eX, eY: LONGINT;
+	BEGIN
+		doc := Root(box); ExtRef(box, eX ,eY);
+		IF (kind # PassFoc) OR (doc.next = NIL) THEN LedaFrames.SetFocus(doc) END;	(* focus frame defined *)
+		doc.next := box;	(* focus defined in document *)
+		box.do(LedaBase.BoxHandler).mark(box, eX, eY, NIL, LedaBase.FocMark, LedaBase.On);	(* notify box *)
+		IF P # NIL THEN box.do(LedaBase.BoxHandler).mark(box, eX, eY, P, LedaBase.FocMark, LedaBase.On) END;	(* highlite focus *)
+	END SetFoc;
+	
+	PROCEDURE GetFoc*(box: LedaBase.Box): LedaBase.Box;
+	(** returns the focus box of document containing box box *)
+	BEGIN
+		box := Root(box); RETURN box.next
+	END GetFoc;
+	
+	(*--- operation on general marks ---*)
+	
+	PROCEDURE CopyProc*(VAR copy: LedaBase.CopyProc);
+	(** returns the procedure copy to insert the selection [copy=nil: no selection available] *)
+		VAR F: LedaFrames.Frame;	sel: LedaBase.Box;	sM: SelectionMsg;
+	BEGIN
+		F := LedaFrames.Selection();
+		IF F # NIL THEN
+			sel := F.box.sel; sM.copy := NIL;
+			sel.do.handle(sel, sM);	(* get copy procedure of selection *)
+			copy := sM.copy
+		ELSE
+			copy := LedaFrames.SelTextCopy()	(* get copy procedure of standard text selection *)
+		END
+	END CopyProc;
+	
+	PROCEDURE Selection*(VAR sel: LedaBase.Box);
+	(** sets sel to the latest selected box *) 
+		VAR F: LedaFrames.Frame;
+	BEGIN
+		F := LedaFrames.Selection();
+		IF F # NIL THEN sel := F.box.sel ELSE sel := NIL END
+	END Selection;
+	
+	PROCEDURE NewExtFoc(): LedaBase.Box;
+	(* returns an imaginary box to insert a text buffer outside Leda *)
+		VAR box: LedaBase.Box;	type: LedaBase.BoxHandler;
+	BEGIN
+		NEW(box); Init(box);
+		NEW(type); InitType(type);
+		type.insert := LedaFrames.InsTextExt;
+		box.do := type;
+		RETURN box
+	END NewExtFoc;
+			
+	PROCEDURE Focus*(VAR foc: LedaBase.Box; VAR focP: LedaSys.Port);
+	(** sets foc to the focus box and focP to the according port *)
+		VAR F: LedaFrames.Frame;
+	BEGIN
+		foc := NIL; focP := NIL; F := NIL;
+		F := LedaFrames.Focus();
+		IF (F # NIL) & (F.box.next # NIL) THEN
+			foc := F.box.next; GetPort(foc, focP)
+		ELSE foc := NewExtFoc()
+		END
+	END Focus;
+	
+(*--- parameters ---*)
+
+	PROCEDURE ParPutStr*(s: ARRAY OF CHAR);
+	BEGIN
+		IF par.nbr < LEN(par.el) THEN
+			par.el[par.nbr].typ := Str; COPY(s, par.el[par.nbr].s); INC(par.nbr)
+		END
+	END ParPutStr;
+	
+	PROCEDURE ParPutInt*(i: LONGINT);
+	BEGIN
+		IF par.nbr < LEN(par.el) THEN
+			par.el[par.nbr].typ := Int; par.el[par.nbr].i := i; INC(par.nbr)
+		END
+	END ParPutInt;
+	
+	PROCEDURE ParPopStr*(VAR s: ARRAY OF CHAR);
+	BEGIN
+		IF (par.ind < par.nbr) & (par.el[par.ind].typ = Str) THEN
+			COPY(par.el[par.ind].s, s); INC(par.ind)
+		ELSE s[0] := 0X
+		END
+	END ParPopStr;
+	
+	PROCEDURE ParPopInt*(VAR i: LONGINT);
+	BEGIN
+		IF (par.ind < par.nbr) & (par.el[par.ind].typ = Int) THEN
+			i := par.el[par.ind].i; INC(par.ind)
+		ELSE i := MIN(LONGINT)
+		END
+	END ParPopInt;
+	
+	PROCEDURE ParReset*(typ: INTEGER);
+	(** typ = Str or Int: reset last pop of string or int *)
+	(** typ < 0:  reset parameters *)
+		VAR ind, i, l: INTEGER;
+	BEGIN
+		IF (typ = Str) OR (typ = Int) THEN
+			ind := par.ind - 1;
+			IF (ind >= 0) & (ind < par.nbr) & (par.el[ind].typ = typ) THEN par.ind := ind END
+		ELSIF typ < 0 THEN
+			par.ind := 0; par.nbr := 0;
+			i := 0; l := LEN(par.el);
+			WHILE i < l DO par.el[i].typ := No; par.el[i].s := ""; par.el[i].i := 0; par.el[i].stat := FALSE; INC(i) END
+		END
+	END ParReset;
+	
+(*--- attributes ---*)
+
+	PROCEDURE GetAttrLog*(VAR showAttrs: AttrProc);
+	BEGIN
+		attrLog := NIL;
+		IF LedaSys.dialogMod # "" THEN
+			LedaSys.Execute(LedaSys.dialogMod, "DAL")	(* to deposit attribute log *)
+		END;
+		showAttrs := attrLog;
+		attrLog := NIL
+	END GetAttrLog;
+	
+	PROCEDURE SetAttrLog*(showAttrs: AttrProc);
+	BEGIN
+		attrLog := showAttrs
+	END SetAttrLog;
+	
+	PROCEDURE InitAttrNames;
+		VAR i: INTEGER;
+	BEGIN
+		i := 0; WHILE i < P DO an[i].name := ""; an[i].mod := ""; an[i].cmd := ""; INC(i) END
+	END InitAttrNames;
+	
+	PROCEDURE HashCode(name: LedaSys.String): INTEGER;
+		VAR i, c: INTEGER;
+	BEGIN
+		i := 0; c := 0;
+		WHILE name[i] # 0X DO INC(c, ORD(name[i])); INC(i) END;
+		RETURN c MOD P
+	END HashCode;
+	
+	PROCEDURE DefineAttrName*(name: LedaSys.String; mod, cmd: ARRAY OF CHAR);
+	(** defines the attribute name name; the command mod.cmd is called *)
+	(** for this name to get a procedure to handle an attribute message *)
+		VAR i: INTEGER;
+	BEGIN
+		IF (name = "") OR (mod = "") OR (cmd = "") THEN RETURN END;	(*###*)
+		i := HashCode(name);
+		WHILE (an[i].name # "") & (an[i].name # name) DO i := (i + 1) MOD P END;	(* linear hashing *)
+		IF an[i].name = "" THEN
+			an[i].name := name; COPY(mod, an[i].mod); COPY(cmd, an[i].cmd)
+		END
+	END DefineAttrName;
+	
+	PROCEDURE GetAttrHandle*(name: LedaSys.String; VAR setHandle: AttrMsgProc);
+	(** gets the procedure setHandle for attribute name name that handles *)
+	(** an attribute message with id's SetValue, SetStyle or NewStyle *)
+		VAR i: INTEGER;
+	BEGIN
+		attrHandler := NIL;
+		i := HashCode(name);
+		WHILE (an[i].name # "") & (an[i].name # name) DO i := (i + 1) MOD P END;	(* linear hashing *)
+		IF an[i].name = name THEN LedaSys.Execute(an[i].mod, an[i].cmd) END;
+		setHandle := attrHandler; attrHandler := NIL
+	END GetAttrHandle;
+	
+	PROCEDURE SetAttrHandle*(setHandle: AttrMsgProc);
+	(** to deposit a handler for attribute messages *)
+	BEGIN attrHandler := setHandle
+	END SetAttrHandle;
+	
+	PROCEDURE NewLnAt(VAR a: ParaDsc; s: ARRAY OF CHAR);
+	BEGIN
+		a.typ := NewLn; a.stat := TRUE; a.i := 0;
+		IF s # "" THEN COPY(s, a.s) ELSE a.s := "" END
+	END NewLnAt;
+	
+	PROCEDURE StrAt(VAR a: ParaDsc; s: ARRAY OF CHAR; stat: BOOLEAN);
+	BEGIN
+		a.typ := Str; COPY(s, a.s); a.stat := stat; a.i := 0;
+	END StrAt;
+	
+	PROCEDURE EnumAt(VAR a: ParaDsc; s: ARRAY OF CHAR; i: LONGINT);
+	BEGIN
+		a.typ := Enum; COPY(s, a.s); a.i := i
+	END EnumAt;
+
+	PROCEDURE EnumerateCtrls*(seq: LedaCtrl.Sequence; activ: LedaBase.Control; VAR M: AttributeMsg);
+	(** enumerates the controls of the sequence seq in the attribute message M *)
+	(** starting with entry M.nbr; M.name has to be set to the name of the enumeration list *)
+		VAR i, j, k: INTEGER;	str: LedaSys.String;	m: LedaBase.BoxMsg;
+	BEGIN
+		IF seq = NIL THEN
+			StrAt(M.a[M.nbr], "no choice", TRUE); INC(M.nbr)
+		ELSE
+			str[0] := "v"; i := -1; j := 1; k := 1;
+			WHILE seq # NIL DO
+				m.id := LedaBase.NameId; m.name := NameLess;
+				m.ctrl := activ; m.b := FALSE;
+				seq.ctrl.doOp(seq.ctrl, m);	(* ask name; m.b1 = equal to active *)
+				IF m.b THEN i := k - 1 END;	(* i -> active choice *)
+				IF j > 1 THEN str[j] := "|"; INC(j) END;	(* separator to previous choice *)
+				StrAt(M.a[M.nbr + k], m.name, TRUE);	(* static *)
+				str[j] := "-"; INC(j); INC(k);
+				seq := seq.next
+			END;
+			str[j] := 0X; EnumAt(M.a[M.nbr], str, i); INC(M.nbr, k)
+		END
+	END EnumerateCtrls;
+	
+	PROCEDURE GetNamedCtrl*(seq: LedaCtrl.Sequence; name: ARRAY OF CHAR; VAR ctrl: LedaBase.Control);
+	(** gets the control ctrl with the name name off the sequence seq *)
+		VAR m: LedaBase.BoxMsg;
+	BEGIN
+		ctrl := NIL;
+		LOOP
+			IF seq = NIL THEN EXIT END;	(*###*)
+			m.id := LedaBase.NameId; m.name := NameLess; m.ctrl := NIL; m.b := FALSE;
+			seq.ctrl.doOp(seq.ctrl, m);	(* ask name *)
+			IF name = m.name THEN ctrl := seq.ctrl; EXIT END;	(*###*)
+			seq := seq.next
+		END
+	END GetNamedCtrl;
+	
+(*--- plane support ---*)
+
+	PROCEDURE PlaneNew*(X, Y, W, H: LONGINT; next: Plane): Plane;
+		VAR p: Plane;
+	BEGIN
+		IF freePlane = NIL THEN NEW(p) ELSE p := freePlane; freePlane := freePlane.next END;
+		p.X := X; p.Y := Y; p.W := W; p.H := H; p.next := next;
+		RETURN p
+	END PlaneNew;
+	
+	PROCEDURE PlaneDispose*(VAR P: Plane);
+	(** disposes the given plane [whole list] *)
+		VAR p: Plane;
+	BEGIN
+		IF P # NIL THEN
+			p := P; WHILE p.next # NIL DO p := p.next END;
+			p.next := freePlane; freePlane := P;
+			P := NIL
+		END
+	END PlaneDispose;
+	
+	PROCEDURE PlaneCuts*(P: Plane; X, Y, W, H: LONGINT): BOOLEAN;
+	(** returns if the given area cuts the area specified by the plane P *)
+		VAR cut: BOOLEAN;
+	BEGIN
+		cut := FALSE;
+		WHILE (P # NIL) & ~cut DO
+			cut := (X < P.X + P.W) & (X + W > P.X) & (Y < P.Y + P.H) & (Y + H > P.Y);
+			(*  ~[ (X >= P.X + P.W) OR (X + W <= P.X) OR (Y >= P.Y + P.H) OR (Y + H <= P.Y) ] *)
+			P := P.next
+		END;
+		RETURN cut
+	END PlaneCuts;
+	
+	PROCEDURE PlaneGet*(VAR P: Plane; box: LedaBase.Box; mask: BOOLEAN);
+	(** returns the plane for box box and sets mask for plane if mask is true *)
+	(** set mask: exclude plane area from visible area *)
+		VAR m: PlaneMsg;
+	BEGIN
+		m.id := PlGet; m.box := box; m.mask := mask; m.plane := NIL;
+		IF box.anc # NIL THEN box.anc.do.handle(box.anc, m) END;
+		P := m.plane
+	END PlaneGet;
+	
+	PROCEDURE PlaneMask*(box: LedaBase.Box; VAR avail: BOOLEAN);
+	(** set mask for plane of box m.box and set boolean avail if plane is available *)
+	(** set mask: exclude plane area from visible area *)
+		VAR m: PlaneMsg;
+	BEGIN
+		m.id := PlMask; m.box := box; m.mask := TRUE; m.avail := FALSE;
+		IF box.anc # NIL THEN box.anc.do.handle(box.anc, m) END;
+		avail := m.avail
+	END PlaneMask;
+	
+(*--- services ---*)
+
+	PROCEDURE GetSize*(from: LedaBase.Box; defW, defH: LONGINT; VAR W, H: LONGINT);
+		VAR m: Msg;
+	BEGIN
+		m.id := SizeId; m.op := 1; m.l1 := defW; m.l2 := defH;	(* 1 = descender size *)
+		IF from # NIL THEN from.do.handle(from, m) END;
+		W := m.l1; H := m.l2
+	END GetSize;
+
+	PROCEDURE GetInfo*(from: LedaBase.Box; VAR m: Msg);
+	(** get info from ancor box as long message is not handled *)
+	(** all fields of message m set [also m.caller] *)
+	BEGIN
+		WHILE (from # NIL) & (m.id # DoneId) DO
+			from.do.handle(from, m);
+			IF m.id # DoneId THEN m.caller := from; from := from.anc END
+		END
+	END GetInfo;
+	
+
+(*--- page number ---*)
+	
+	(*---
+		- a page number control is a unique control
+		- the actual page number the control is contained in is get by width and draw calls
+		- a page number control has no attributes
+		- the page number is displayed in the same style as the following character
+			[therefore every control has to be unique]
+	---*)
+	
+	PROCEDURE SetPNumber(pgNbr: PgNbr; text: LedaCtrl.Text; pos: LONGINT);
+		VAR m: Msg;
+	BEGIN
+		m.id := PageNbrId; m.op := 1; m.caller := NIL; m.l1 := -1; 	(* 1 = ask number *)
+		GetInfo(text.owner, m);
+		IF (m.l1 >= 0) THEN LedaSys.ValToStr(m.l1, pgNbr.s) ELSE pgNbr.s := "##" END
+	END SetPNumber;
+	
+	PROCEDURE SetPNStyle(pgNbr: PgNbr; text: LedaCtrl.Text; pos: LONGINT);
+		VAR R: LedaCtrl.Reader;	cnt: LedaBase.Control;	ctrl: LedaBase.PieceCtrl;	ch: CHAR;
+	BEGIN
+		IF text # NIL THEN
+			LedaCtrl.InitReader(R, text); LedaCtrl.SetReader(R, pos + 1);
+			LedaCtrl.ReadChar(R, ch, ctrl);
+			IF (ctrl = NIL) OR ~ (ctrl IS LedaBase.Style) THEN
+				LedaCtrl.TextBasics(text, LedaCtrl.GetId, 0, cnt);	(* get default styles *)
+				IF (cnt # NIL) & (cnt IS LedaCtrl.List) THEN
+					ctrl := cnt(LedaCtrl.List).seq.ctrl(LedaBase.PieceCtrl)
+				ELSE ctrl := NIL
+				END
+			END
+		ELSE cnt := LedaBase.CreateControl("", "DefStyle");	(* get default style *)
+			IF (cnt # NIL) & (cnt IS LedaBase.Style) THEN ctrl := cnt(LedaBase.PieceCtrl) ELSE ctrl := NIL END
+		END;
+		IF (ctrl # NIL) & (ctrl IS LedaBase.Style) THEN pgNbr.style := ctrl(LedaBase.Style)
+		ELSE pgNbr.style := LedaBase.NewStyle("number", LedaBase.GetFont("Oberon", 10, " "), LedaSys.fg, 0)
+		END
+	END SetPNStyle;
+	
+	PROCEDURE *PNHeight(ctrl: LedaBase.PieceCtrl; VAR H, bH: LONGINT);
+	BEGIN
+		WITH ctrl: PgNbr DO ctrl.style.height(ctrl.style, H, bH) END
+	END PNHeight;
+	
+	PROCEDURE *PNWidth(ctrl: LedaBase.PieceCtrl; ch: CHAR; I: LedaBase.FormatInfo;
+												VAR W: LONGINT; VAR w: INTEGER; VAR sepKind: CHAR);
+		VAR pgNbr: PgNbr;	font: LedaBase.Font;	text: LedaCtrl.Text;
+			pos: LONGINT;	i, j: INTEGER;
+	BEGIN
+		pgNbr := ctrl(PgNbr);
+		LedaCtrl.TextGet(pgNbr, text, pos);
+		IF I # NIL THEN SetPNStyle(pgNbr, text, pos) END;
+		SetPNumber(pgNbr, text, pos);
+		i := 0; W := 0; w := 0; font := pgNbr.style.font;
+		WHILE pgNbr.s[i] # 0X DO
+			j := ORD(pgNbr.s[i]); INC(W, font.w[j]); INC(w, LONG(font.dx[j])); INC(i)
+		END
+	END PNWidth;
+	
+	PROCEDURE *PNDraw(ctrl: LedaBase.PieceCtrl; ch: CHAR; y, mode: INTEGER; last: BOOLEAN;
+											VAR x: INTEGER; VAR sepKind: CHAR);
+		VAR pgNbr: PgNbr;	text: LedaCtrl.Text;	pos: LONGINT;	i: INTEGER;
+	BEGIN
+		pgNbr := ctrl(PgNbr);
+		LedaCtrl.TextGet(pgNbr, text, pos);
+		SetPNumber(pgNbr, text, pos); i := 0; 
+		WHILE pgNbr.s[i] # 0X DO
+			pgNbr.style.draw(pgNbr.style, pgNbr.s[i], y, mode, FALSE, x, sepKind); INC(i)
+		END
+	END PNDraw;
+	
+	PROCEDURE PgNbrPrint(pgNbr: PgNbr; x, y, mode: INTEGER; P: LedaSys.PrtPort);
+		VAR fName: LedaSys.String;	i: INTEGER;
+	BEGIN
+		LedaBase.FntInfo(pgNbr.style.font, 1, fName, i);	(* get screen font name *)
+		P.out.string(P.out, x, y, pgNbr.s, fName, pgNbr.style.clr, mode)
+	END PgNbrPrint;
+	
+	PROCEDURE NewPageNbr*(style: LedaBase.Style): PgNbr;
+		VAR pgNbr: PgNbr;
+	BEGIN
+		NEW(pgNbr); LedaBase.InitControl(pgNbr, pgNbrDoOp);
+		pgNbr.width := PNWidth; pgNbr.height := PNHeight; pgNbr.draw := PNDraw;
+		IF style = NIL THEN SetPNStyle(pgNbr, NIL, 0) ELSE pgNbr.style := style END;
+		pgNbr.s := ""; RETURN pgNbr
+	END NewPageNbr;
+	
+	PROCEDURE PutPgNbr(pgNbr: PgNbr; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		cM.id := LedaBase.RegisterId; pgNbr.style.doOp(pgNbr.style, cM); LedaBase.PutToList(pgNbr, refId)
+	END PutPgNbr;
+	
+	PROCEDURE *PgNbrDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* handler for page number control; unique control *)
+		VAR w: INTEGER;
+	BEGIN
+		IF m IS LedaBase.PrintMsg THEN
+			WITH m: LedaBase.PrintMsg DO
+				IF m.id = 0 THEN	(* return print specification *)
+					m.id := 2; ctrl(LedaBase.PieceCtrl).width(ctrl(LedaBase.PieceCtrl), m.ch, NIL, m.W, w, m.sepKind)	(* get width *)
+				ELSIF m.id = 2 THEN	(* print page number *)
+					PgNbrPrint(ctrl(PgNbr), m.x, m.y, m.mode, m.p(LedaSys.PrtPort))
+				END
+			END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.CopyId:  m.ctrl := NewPageNbr(ctrl(PgNbr).style)
+				| LedaBase.RegisterId:  PutPgNbr(ctrl(PgNbr), m.ctrlId)
+				| LedaBase.StoreId:  LedaBase.StoreCtrl(m.r, ctrl(PgNbr).style)
+				| LedaBase.LoadId:  LedaBase.LoadCtrl(m.r, ctrl);
+						IF (ctrl # NIL) & (ctrl IS LedaBase.Style) THEN m.ctrl := NewPageNbr(ctrl(LedaBase.Style))
+						ELSE m.ctrl := NewPageNbr(NIL)
+						END
+				| LedaBase.StoreModCmd:  LedaSys.Halt("page number control error")
+				| FileId:  ctrl.kindId := PgNbrId
+				ELSE
+				END
+			END
+		END
+	END PgNbrDoOp;
+
+
+
+BEGIN
+	freePlane := NIL;
+	attrUnit := LedaBase.MM DIV 10;
+	attrLog := NIL;
+	attrHandler := NIL; InitAttrNames;
+	ParReset(-1);
+	bcFlags := {};
+	(*--- page number control ---*)
+	pgNbrDoOp := PgNbrDoOp;
+	LedaBase.RPC(NewPageNbr(NIL), PgNbrId);	(* register type *)
+	LedaCtrl.DefChCtrl(PgNbrCh, "pagenumber", FALSE, FALSE, NIL, NewPageNbr(NIL), "", "");	(* register for key input *)
+END LedaBox.

@@ -1,0 +1,252 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE Finder; (* ejz 3.1.95 / jm - adapted for ver 1.6  *)
+	IMPORT Objects, Fonts, Display, Display3, Texts, Oberon, Effects, Gadgets, Lists, Documents, Desktops;
+
+	CONST
+		quote = 022X;
+
+	TYPE
+		DocList* = POINTER TO DocListDesc;
+		DocListDesc* = RECORD (Gadgets.FrameDesc)
+			open: BOOLEAN
+		END;
+
+	VAR
+		W: Texts.Writer;
+
+	PROCEDURE BringToFront*;
+		VAR
+			list: Objects.Object;
+			item: Lists.Item;
+			desk, doc, frame: Display.Frame;
+			P: Gadgets.PriorityMsg;
+	BEGIN
+		desk := Gadgets.context(Display.Frame);
+		list := Gadgets.executorObj;
+		WITH list: Lists.List DO
+			frame := desk.dsc;
+			WHILE (frame # NIL) & ~(frame IS Desktops.DocGadget) DO
+				frame := frame.next
+			END;
+			item := list.items;
+			WHILE item # list.pointed DO
+				frame := frame.next;
+				WHILE (frame # NIL) & ~(frame IS Desktops.DocGadget) DO
+					frame := frame.next
+				END;
+				item := item.next
+			END;
+			doc := Desktops.Main(frame(Desktops.DocGadget))
+		END;
+		P.id := 0;
+		P.F := frame;
+		P.res := -1;
+		Display.Broadcast(P)
+	END BringToFront;
+
+	PROCEDURE Remove(F: Display.Frame);
+		VAR C: Display.ControlMsg;
+	BEGIN
+		C.F := F;
+		C.id := Display.remove;
+		Display.Broadcast(C)
+	END Remove;
+
+	PROCEDURE ListDocs(context, exec: Display.Frame): Display.Frame;
+		VAR
+			obj: Objects.Object;
+			A: Objects.AttrMsg;
+			doc: Gadgets.Frame;
+			frame: Display.Frame;
+			C: Oberon.ConsumeMsg;
+			D: Display.ConsumeMsg;
+	BEGIN
+		obj := Gadgets.CreateObject("Lists.NewList");
+		A.id := Objects.set;
+		A.class := Objects.Bool;
+		A.name := "Sorted";
+		A.b := FALSE;
+		obj.handle(obj, A);
+		A.name := "MultiSel";
+		obj.handle(obj, A);
+		A.name := "ScrollBar";
+		obj.handle(obj, A);
+		A.class := Objects.String;
+		A.name := "Cmd";
+		A.s := "Finder.BringToFront";
+		obj.handle(obj, A);
+		NEW(C.text);
+		Texts.Open(C.text, "");
+		frame := context.dsc;
+		WHILE frame # NIL DO
+			IF frame IS Desktops.DocGadget THEN
+				doc := Desktops.Main(frame(Desktops.DocGadget));
+				Texts.Write(W, quote);
+				IF doc(Documents.Document).name = "" THEN
+					Texts.WriteString(W, "Untitled document")
+				ELSE
+					Texts.WriteString(W, doc(Documents.Document).name)
+				END;
+				Texts.Write(W, quote);
+				Texts.WriteLn(W)
+			END;
+			frame := frame.next
+		END;
+		Texts.Append(C.text, W.buf);
+		frame := obj(Display.Frame);
+		(*
+		INCL(frame(Gadgets.Frame).state, Gadgets.nomove);
+		*)
+		frame.W := exec.W;
+		D.id := Display.drop;
+		D.F := exec.dlink(Display.Frame);
+		D.obj := obj;
+		D.u := exec.X;
+		IF (exec.Y+exec.H+frame.H) < 0 THEN
+			D.v := exec.Y+exec.H
+		ELSE
+			D.v := exec.Y-frame.H
+		END;
+		D.res := -1;
+		Display.Broadcast(D);
+		C.F := frame;
+		C.beg := 0;
+		C.end := C.text.len;
+		C.res := -1;
+		frame.handle(frame, C);
+		RETURN frame
+	END ListDocs;
+
+	PROCEDURE Restore(F: DocList; Q: Display3.Mask; x, y, w, h: INTEGER);
+	BEGIN
+		IF F.open THEN
+			Display3.FilledRect3D(Q, Display3.bottomC, Display3.topC, Display3.groupC, x+1, y+1, w-2, h-2, 2, Display.replace)
+		ELSE
+			Display3.FilledRect3D(Q, Display3.topC, Display3.bottomC, Display3.groupC, x+1, y+1, w-2, h-2, 2, Display.replace)
+		END;
+		Display3.CenterString(Q, Display3.textC, x, y, w, h, Fonts.Default, "Document List", Display.paint);
+		Display3.Rect(Q, Display3.black, Display.solid, x, y, w, h, 1, Display.replace);
+		IF Gadgets.selected IN F.state THEN
+			Display3.FillPattern(Q, Display3.white, Display3.selectpat, x, y, x, y, w, h, Display.paint)
+		END
+	END Restore;
+
+	PROCEDURE DocListHandler*(F: Objects.Object; VAR M: Objects.ObjMsg);
+		VAR
+			x, y, w, h: INTEGER;
+			Q: Display3.Mask;
+			list: Display.Frame;
+			F1: DocList; undo: BOOLEAN;
+	BEGIN
+		WITH F: DocList DO
+			IF M IS Display.FrameMsg THEN
+				WITH M: Display.FrameMsg DO
+					IF (M.F = NIL) OR (M.F = F) THEN
+						x := M.x + F.X;
+						y := M.y + F.Y;
+						w := F.W;
+						h := F.H;
+						IF M IS Display.DisplayMsg THEN
+							WITH M: Display.DisplayMsg DO
+								IF (M.id = Display.frame) OR (M.F = NIL) THEN
+									Gadgets.MakeMask(F, x, y, M.dlink, Q);
+									Restore(F, Q, x, y, w, h)
+								ELSIF M.id = Display.area THEN
+									Gadgets.MakeMask(F, x, y, M.dlink, Q);
+									Display3.AdjustMask(Q, x + M.u, y + h - 1 + M.v, M.w, M.h);
+									Restore(F, Q, x, y, w, h)
+								END
+							END
+						ELSIF M IS Oberon.InputMsg THEN
+							WITH M: Oberon.InputMsg DO
+								IF (M.id = Oberon.track) & (M.keys = {1}) & Gadgets.InActiveArea(F, M) & ~(Gadgets.selected IN F.state) THEN
+									Gadgets.MakeMask(F, x, y, M.dlink, Q);
+									F.open := TRUE;
+									Oberon.RemoveMarks(x, y, w, h);
+									Restore(F, Q, x, y, w, h);
+									F.dlink := M.dlink;
+									list := ListDocs(M.dlink(Display.Frame), F);
+									M.F := list;
+									IF ~(Gadgets.lockedcontents IN M.dlink(Gadgets.Frame).state) THEN
+										INCL(M.dlink(Gadgets.Frame).state, Gadgets.lockedcontents);
+										undo := TRUE;
+									ELSE undo := FALSE
+									END;
+									REPEAT
+										Effects.TrackMouse(M.keys, M.X, M.Y, Effects.Arrow);
+										list.handle(list, M)
+									UNTIL M.keys = {};
+									IF undo THEN
+										EXCL(M.dlink(Gadgets.Frame).state, Gadgets.lockedcontents)
+									END;
+									Remove(list);
+									F.open := FALSE;
+									Oberon.RemoveMarks(x, y, w, h);
+									Restore(F, Q, x, y, w, h)
+								ELSE
+									Gadgets.framehandle(F, M)
+								END
+							END
+						ELSE
+							Gadgets.framehandle(F, M)
+						END
+					END
+				END
+			ELSIF M IS Objects.AttrMsg THEN
+				WITH M: Objects.AttrMsg DO
+					IF (M.id = Objects.get) & (M.name = "Gen") THEN
+						M.class := Objects.String;
+						M.s := "Finder.NewDocList";
+						M.res := 0
+					ELSE
+						Gadgets.framehandle(F, M)
+					END
+				END
+			ELSIF M IS Objects.CopyMsg THEN
+				WITH M: Objects.CopyMsg DO
+					IF M.stamp = F.stamp THEN
+						M.obj := F.dlink
+        			ELSE
+          			NEW(F1);
+          			F.stamp := M.stamp;
+          			F.dlink := F1;
+          			Gadgets.CopyFrame(M, F, F1);
+          			M.obj := F1
+					END
+				END
+			ELSE
+				Gadgets.framehandle(F, M)
+			END
+		END
+	END DocListHandler;
+
+	PROCEDURE NewDocList*;
+		VAR F: DocList;
+	BEGIN
+		NEW(F);
+		F.W := 96;
+		F.H := 24;
+		F.open := FALSE;
+		F.handle := DocListHandler;
+		Objects.NewObj := F
+	END NewDocList;
+
+BEGIN
+	Texts.OpenWriter(W)
+END Finder.
+
+Gadgets.Insert Finder.NewDocList
+
+

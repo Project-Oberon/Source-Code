@@ -1,0 +1,291 @@
+MODULE EtherNet;  (*NW 13.11.87 / 15.2.90  Ceres-3  --> SCC *)
+(* ARD 09.11.93/ DOS with Packet driver *)
+(* mg TCP/IP for Ceres *)
+(* ARD 12.09.94/ revised *)
+(* ARD 05.04.95/ revised *)
+
+	IMPORT SYSTEM, Kernel, DOS;
+
+	CONST AdrLen* = 6;
+				BufLen = 8192;
+				IP = 800H;				(* IP protocol *)
+				ARP = 806H;			(* Address resolution protocol *)
+								
+				ip = 8H; arp = 608H;  (* Network order *)
+
+				EAX = 0; ECX = 1; EDX = 2; EBX = 3; ESI = 6; EDI = 7; CC = -1; 
+				carry = 0; zero = 6;
+				
+				MemPara = 380H;	(* conventional memory block in paragraphs --> 14336 bytes  (old = 4B0H) *)
+				ScratchSize = 1600;	(* Size of first-receive buffer *)
+				ProcSize = 101;			(* Size of receiver procedure *)
+	
+	TYPE 
+		Adr* =  ARRAY 6 OF CHAR;	
+		
+		Header* = POINTER TO HeaderDesc;
+		HeaderDesc* = RECORD
+							dst*, src*: Adr;		(* 0, 6 *)
+							type*: INTEGER; 		(* 12 *)
+						END;
+		
+		Data* = POINTER TO DataDesc;
+		DataDesc* = RECORD
+			data*: ARRAY 1500 OF SYSTEM.BYTE;
+		END;
+		
+		IODesc = RECORD
+			in, out, high, oldin, oldhigh: INTEGER;
+			buf: ARRAY BufLen OF SYSTEM.BYTE
+		END;
+
+	VAR bethadr*, ethadr*, anyadr*: Adr;
+			ARPHandle, IPHandle, res: INTEGER;
+			function, version, class, number, type: INTEGER;
+			proc: PROCEDURE;
+			
+			Scratch: ARRAY ScratchSize OF CHAR;
+			Buf: IODesc;
+			dmy: LONGINT;
+			IntNo: INTEGER;
+			
+	PROCEDURE GetInfo;
+	VAR addr: LONGINT;
+	BEGIN
+		Kernel.Reg.AX := 1FFH;
+		Kernel.INT(Kernel.Reg, IntNo);
+		function := Kernel.Reg.AX MOD 100H;
+		version := Kernel.Reg.BX;
+		class := Kernel.Reg.CX DIV 100H;
+		number := Kernel.Reg.CX MOD 100H;
+		type := Kernel.Reg.DX;
+	END GetInfo;
+	
+	PROCEDURE GetAddress;
+	BEGIN
+		Kernel.Reg.AX := 600H;
+		Kernel.Reg.BX := ARPHandle;
+		Kernel.Reg.CX := 6H;
+		Kernel.Reg.DI := Kernel.DX;
+		Kernel.Reg.ES := Kernel.DS;
+		Kernel.INT(Kernel.Reg, IntNo);
+		SYSTEM.MOVE(SYSTEM.ADR(Kernel.Transfer[0]), SYSTEM.ADR(ethadr[0]), 6)
+	END GetAddress;
+
+	(* REAL MODE PROCEDURE *)
+	PROCEDURE -receiver
+		01EH,								(* PUSH DS *)
+		09CH, 								(* PUSHF *)
+		083H, 0F9H, 0H, 				(* CMP CX, 0 *)
+		074H, 02AH, 					(* JE label 2 *)
+		03DH, 0H, 0H, 				(* CMP AX, 0 *)
+		075H, 028H, 					(* JNE label 1 *)
+		0BBH, 0H, 0H, 				(* MOV BX, 0 <-- PATCH Segment *)
+		08EH, 0DBH, 					(* MOV DS, BX *)
+		0BBH, 0H, 0H, 				(* MOV BX, 0 <-- PATCH Segment *)
+		08EH, 0C3H, 					(* MOV ES, BX *)
+		0BBH, 0H, 0H,				 (* MOV BX, 0 <-- PATCH Offset *)
+		0BFH, 0H, 0H, 				(* MOV DI, 0 <-- PATCH Offset *)	
+		8BH, 47H, 02H, 				(* MOV AX, DS:[BX+2] ; out *)	
+		2BH, 07H, 						(* SUB, AX, [BX] ; in *)
+		48H, 								(* DEC AX *)
+		25H, 0FFH, 1FH, 				(* AND AX, $1FFF *)
+		83H, 0C1H, 02H, 				(* ADD CX, 2 *)
+		39H, 0C8H, 						(* CMP AX, CX *)
+		07DH, 05H, 					(* JGE label 2 *)
+		0BFH, 0H, 0H, 				(* MOV DI, 0 *)
+		8EH, 0C7H, 					(* MOV ES, DI *)
+		09DH, 							(* POPF label 2*)
+		01FH, 							(* POP DS *)
+		0CBH, 							(* RETF *)
+		0BBH, 0H, 0H, 				(* MOV BX, 0 <-- PATCH Segment label 1*)
+		08EH, 0C3H, 					(* MOV ES, BX *)
+		0BBH, 0H, 0H,				 (* MOV BX, 0 <-- PATCH Offset *)
+		26H, 8BH, 3FH, 				(* MOV DI, ES:[BX] ; in *)
+		26H, 88H, 49H, 0AH, 		(* MOV ES:[DI+BX+10], CL *)
+		47H, 								(* INC DI *)
+		81H, 0E7H, 0FFH, 1FH, 	(* AND DI, $1FFF *)
+		26H, 88H, 69H, 0AH,		(* MOV ES:[DI+BX+10], CH *)
+		47H, 								(* INC DI *)
+		81H, 0E7H, 0FFH, 1FH, 	(* AND DI, $1FFF *)
+		8BH, 04H, 						(* MOV AX, [SI] ; LOOP *)
+		26H, 89H, 41H, 0AH,		(* MOV ES:[DI+BX+10], AX *)
+		46H, 								(* INC SI *)
+		47H, 								(* INC DI *)
+		81H, 0E7H, 0FFH, 1FH, 	(* AND DI, $1FFF *)
+		0E2H, 0F2H, 					(* LOOP -14*)
+		26H, 89H, 3FH, 				(* MOV ES:[BX], DI *)
+		09DH, 							(* POPF *)
+		01FH, 							(* POP DS *)
+		0CBH; 							(* RETF *)
+	
+	PROCEDURE Receiver;
+	BEGIN receiver END Receiver;
+	
+	PROCEDURE AccessType(typ: LONGINT; VAR handle: INTEGER);
+	BEGIN
+		Kernel.Reg.AX := 200H+class;
+		Kernel.Reg.BX := type;
+		Kernel.Reg.CX := 2;
+		Kernel.Reg.DX := number;
+		Kernel.Reg.DS := SYSTEM.ADR(typ) DIV 16;
+		Kernel.Reg.SI := SHORT(SYSTEM.ADR(typ) MOD 16);
+		Kernel.Reg.ES := (SYSTEM.VAL(LONGINT, proc)-ProcSize) DIV 16;
+		Kernel.Reg.DI := SHORT((SYSTEM.VAL(LONGINT, proc)-ProcSize) MOD 16);
+		Kernel.INT(Kernel.Reg, IntNo);
+		IF ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN handle := Kernel.Reg.AX; res := 0 
+		ELSE res := Kernel.Reg.DX DIV 256 END;
+	END AccessType;
+	
+	PROCEDURE ReleaseType(handle: INTEGER);
+	BEGIN
+		Kernel.Reg.AX := 300H;
+		Kernel.Reg.BX := handle;
+		Kernel.INT(Kernel.Reg, IntNo);
+		IF ~SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN res := 0 ELSE res := Kernel.Reg.DX DIV 256 END;
+	END ReleaseType;
+			
+	PROCEDURE Error*(VAR s: ARRAY OF CHAR);
+	BEGIN
+		IF LEN(s) < 64 THEN COPY("string to short", s); HALT(99) END;
+		IF res = 0 THEN COPY("No Error", s)
+		ELSIF res = 1 THEN COPY("Invalid handle number", s)
+		ELSIF res = 2 THEN COPY("No interfaces of specified class found", s)
+		ELSIF res = 3 THEN COPY("No interfaces of specified type found", s)
+		ELSIF res = 4 THEN COPY("No interfaces of specified number found", s)
+		ELSIF res = 5 THEN COPY("Bad packet type specified", s)
+		ELSIF res = 6 THEN COPY("This interface does not support multicast", s)
+		ELSIF res = 7 THEN COPY("This packet driver cannot terminate", s)
+		ELSIF res = 8 THEN COPY("An invalid receiver mode was specified", s)
+		ELSIF res = 9 THEN COPY("Operation failed because of insufficient space", s)
+		ELSIF res = 10 THEN COPY("The type had previously been accessed, and not released", s)
+		ELSIF res = 11 THEN COPY("The command was out of range, or not implemented", s)
+		ELSIF res = 12 THEN COPY("The packet couldn't be sent (usually hardware error)", s)
+		ELSIF res = 13 THEN COPY("Hardware address couldn't be changed (more than 1 handle open)", s)
+		ELSIF res = 14 THEN COPY("Hardware address has bad length or format", s)
+		ELSIF res = 15 THEN COPY("Couldn't reset interface (more than 1 handle open)", s)
+		ELSE COPY("Non specified Error", s)
+		END;
+	END Error;
+
+	PROCEDURE Start(recmode: SYSTEM.BYTE; handle: LONGINT; type: LONGINT);
+	(* 1: turn off receiver
+		2: receive only packets sent to this interface
+		3: receive packets sent to this interface plus broadcast packets
+		4: receive packets sent to this interface plus broadcast plus limited multicast
+		5: receive packets sent to this interface plus broadcast plus all multicast
+		6: receive all packets *)
+	BEGIN 
+		Kernel.Reg.AX := 1400H; 
+		Kernel.Reg.BX := SHORT(handle);
+		Kernel.Reg.CX := SYSTEM.VAL(SHORTINT, recmode);
+		Kernel.INT(Kernel.Reg, IntNo);
+		IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN res := Kernel.Reg.DX DIV 256 END;
+		Buf.in := 0; Buf.out := 0; Buf.high := BufLen
+	END Start;
+
+	PROCEDURE SendPacket*(VAR h: Header; d: Data; len: INTEGER);
+	BEGIN 
+		SYSTEM.MOVE(SYSTEM.VAL(LONGINT, h), SYSTEM.ADR(Kernel.Transfer[0]), 14);	(* destination *)
+		SYSTEM.MOVE(SYSTEM.ADR(ethadr[0]), SYSTEM.ADR(Kernel.Transfer[0])+6, 6);	(* source *)
+		SYSTEM.MOVE(SYSTEM.VAL(LONGINT, d), SYSTEM.ADR(Kernel.Transfer[0])+14, len);	(* source *)
+		Kernel.Reg.CX := len + 14;
+		Kernel.Reg.AX := 400H; 
+		Kernel.Reg.SI := Kernel.DX;
+		Kernel.Reg.DS := Kernel.DS;
+		Kernel.INT(Kernel.Reg, IntNo);
+		IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN res := Kernel.Reg.DX DIV 256 END;
+	END SendPacket;
+
+	PROCEDURE available(): INTEGER;
+	BEGIN 
+		RETURN (Buf.in - Buf.out) MOD BufLen
+	END available;
+
+	PROCEDURE Available*(): BOOLEAN;
+	BEGIN 
+		RETURN (available() > 0)
+	END Available;
+
+	PROCEDURE Receive(h: Header; d: Data; VAR l: INTEGER);
+	VAR out, diff, len: INTEGER;
+	BEGIN
+	SYSTEM.CLI();
+		out := Buf.out;
+		len := ORD(Buf.buf[out])+ORD(Buf.buf[(out+1) MOD BufLen])*100H; out := (out+2) MOD BufLen;
+		IF out + 14 <= BufLen THEN 
+			SYSTEM.MOVE(SYSTEM.ADR(Buf.buf[out]), SYSTEM.VAL(LONGINT, h), 14); 
+			Buf.out := (out+14) MOD BufLen; out := Buf.out
+		ELSE
+			diff := BufLen - out;
+			SYSTEM.MOVE(SYSTEM.ADR(Buf.buf[out]), SYSTEM.VAL(LONGINT, h), diff);
+			SYSTEM.MOVE(SYSTEM.ADR(Buf.buf[0]), SYSTEM.VAL(LONGINT, h)+diff, 14-diff);
+			Buf.out := 14-diff; out := Buf.out
+		END;
+		l := len - 14;
+		IF out + l <= BufLen THEN 
+			SYSTEM.MOVE(SYSTEM.ADR(Buf.buf[out]), SYSTEM.VAL(LONGINT, d), l); 
+			Buf.out := (out+l) MOD BufLen
+		ELSE
+			diff := BufLen - out;
+			SYSTEM.MOVE(SYSTEM.ADR(Buf.buf[out]), SYSTEM.VAL(LONGINT, d), diff);
+			SYSTEM.MOVE(SYSTEM.ADR(Buf.buf[0]), SYSTEM.VAL(LONGINT, d)+diff, l-diff);
+			Buf.out := l-diff
+		END;
+		SYSTEM.STI()
+	END Receive;
+
+	PROCEDURE ReceivePacket*(h: Header; d: Data; VAR l: INTEGER);
+	BEGIN
+		IF available() > 0 THEN Receive(h, d, l) END;
+	END ReceivePacket;
+	
+	PROCEDURE Reset*(handle: LONGINT; type: INTEGER);	(* Reset *)
+	BEGIN
+		Kernel.Reg.AX := 700H; 
+		Kernel.Reg.BX := SHORT(handle);
+		Kernel.INT(Kernel.Reg, IntNo);
+		IF SYSTEM.BIT(SYSTEM.ADR(Kernel.Reg.Flags), 0) THEN res := Kernel.Reg.DX DIV 256 END;
+		Buf.in := 0; Buf.out := 0; Buf.high := BufLen
+	END Reset;
+	
+	PROCEDURE Terminate;
+	BEGIN
+		ReleaseType(ARPHandle);
+		ReleaseType(IPHandle);
+	END Terminate;
+	
+	PROCEDURE SearchInt;
+	VAR i, j, adr: LONGINT; temp, str: ARRAY 15 OF CHAR;
+	BEGIN
+		FOR i := 60H TO 80H DO
+			Kernel.Reg.AX := 3500H + i;
+			Kernel.INT(Kernel.Reg, 21H);
+			adr := Kernel.Reg.ES*16 + Kernel.Reg.BX;
+			SYSTEM.MOVE(adr, SYSTEM.ADR(temp), 15);
+			FOR j := 3 TO 12 DO str[j-3] := temp[j] END;
+			IF str = "PKT DRVR" THEN IntNo := SHORT(i) END
+		END;
+	END SearchInt;
+	
+BEGIN
+	res := 0; 	
+	SearchInt; 
+	GetInfo;
+	GetAddress;
+	
+	Buf.in := 0; Buf.out := 0; Buf.high := BufLen;
+	
+	proc := Receiver; AccessType(arp, ARPHandle); AccessType(ip, IPHandle); 
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-67-18-3, SHORT(SYSTEM.ADR(Buf) DIV 16));	(* Segment *)
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-30-18, SHORT(SYSTEM.ADR(Buf) DIV 16));	(* Segment *)
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-57-18-3, SHORT(SYSTEM.ADR(Buf) MOD 16));	(* Offset *)
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-25-18, SHORT(SYSTEM.ADR(Buf) MOD 16));	(* Offset *)
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-62-18-3, SHORT(SYSTEM.ADR(Scratch) DIV 16));	(* Segment *)
+	SYSTEM.PUT(SYSTEM.VAL(LONGINT, proc)-54-18-3, SHORT(SYSTEM.ADR(Scratch) MOD 16));	(* Offset *)
+	
+	Start(3, ARPHandle, ARP); Start(3, IPHandle, IP); 
+	DOS.AllocTermProc(Terminate);
+	bethadr[0] := 0FFX; bethadr[1] := 0FFX; bethadr[2] := 0FFX; bethadr[3] := 0FFX; bethadr[4] := 0FFX; bethadr[5] := 0FFX;
+	anyadr[0] := 0X; anyadr[1] := 0X; anyadr[2] := 0X; anyadr[3] := 0X; anyadr[4] := 0X; anyadr[5] := 0X;
+END EtherNet.

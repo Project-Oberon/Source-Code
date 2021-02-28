@@ -1,0 +1,1322 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaText;	(* uh, Fri, 12-Nov-1993 *)
+
+	(*--- remarks:
+		- implements text boxes
+		- the type definition of text boxes is in LedaLines
+		- the basic line formatting [format and update] is in LedaLines
+	---*)
+	
+	IMPORT LedaSys, LedaBase, LedaCtrl, LedaBox, LedaIO, LedaAdjust, LedaRules, LedaLines;
+	
+CONST
+	ModName = "LedaText";
+	ProgErr = "program error";
+	TextAttr = "text.attribute";
+	Anon = "anonymous";
+	
+	Dash = 09BX;	DashKey = 04X;	(* Gedankenstrich *)
+	HyphenKey = 0A3X;	(* second key for hyphen; first key is CTRL "-" *)
+	GlueKey = 07X;	(* CTRL "g" *)
+	LtArrow = 0C4X;	RtArrow = 0C3X;	Del = 7FX;
+	
+	StyleInd = 0;	FormatInd = 1;	(* used for LedaCtrl.TextBasics *)
+	
+	TopBot = 1;
+	ColMarkW = LedaBase.MM DIV 3;	(* width of column mark *)
+	DefW = 5 * LedaBase.CM;	DefH = 2 * LedaBase.CM;
+	
+	ColumnPat = LedaSys.Mark0;
+	
+	Black = -1;
+	ModeTxt = LedaIO.Paint;
+	ML = LedaSys.ML;	MM = LedaSys.MM;	MR = LedaSys.MR;	MX = LedaSys.MX;
+	NotDef = -1;
+	
+TYPE
+	TextDsc = RECORD
+		text: LedaCtrl.Text;
+		beg, len: LONGINT
+	END;
+	
+	DelBufBox = POINTER TO DelBufBoxDsc;
+	DelBufBoxDsc = RECORD
+		(LedaBase.BoxDsc)
+		text: LedaCtrl.Text
+	END;
+
+	
+VAR
+	(*--- box type control ---*)
+	typeDoOp: LedaBase.CtrlProc;
+	(*--- own ---*)
+	W: LedaCtrl.Writer;
+	notedSel: TextDsc;	(* used in Handle and CopyNotedText *)
+	note: TextDsc;	(* used for long copy and long delete *)
+	eqCtrl: LedaBase.PieceCtrl;	(* used in EqualCtrl *)
+	keyCode: ARRAY 256 OF SHORTINT;
+	
+
+	PROCEDURE InitKeys;
+		CONST Null = 0;	Char = 1;	Translate = 2;	Special = 3;
+		VAR i: INTEGER;
+	BEGIN
+		i := 0; WHILE i < 32 DO keyCode[i] := Null; INC(i) END;
+		WHILE i < 150 DO keyCode[i] := Char; INC(i) END;
+		WHILE i < 256 DO keyCode[i] := Null; INC(i) END;
+		keyCode[ORD(Del)] := Special;
+		keyCode[ORD(LtArrow)] := Special;
+		keyCode[ORD(RtArrow)] := Special;
+		keyCode[ORD(LedaBase.LEnd)] := Char;
+		keyCode[ORD(LedaBase.Glue)] := Char;
+		keyCode[ORD(LedaBase.Hyphen)] := Char;
+		keyCode[ORD(Dash)] := Char;	(* Gedankenstrich *)
+		keyCode[ORD(DashKey)] := Translate;
+		keyCode[ORD(GlueKey)] := Translate;
+		keyCode[ORD(HyphenKey)] := Translate;
+		LedaCtrl.DefChCtrl(LedaBase.Glue, "glue", FALSE, FALSE, NIL, NIL, "", "");	(* define name only *)
+		LedaCtrl.DefChCtrl(LedaBase.Hyphen, "hyphen", FALSE, FALSE, NIL, NIL, "", "");	(* define name only *)
+		LedaCtrl.DefChCtrl(DashKey, "dash", FALSE, FALSE, NIL, NIL, "", "");	(* define name only *)
+	END InitKeys;
+	
+(*--- handling of block structure ---*)
+
+	PROCEDURE LineBounds(tB: LedaLines.Box; relY: LONGINT; VAR upper, lower: LONGINT);
+	(* finds the upper and lower y coordinate for the line nearest at relY *)
+	(* all coordinates [relY, upper, lower] are relative to the box tB *)
+		VAR blk: LedaCtrl.Block;	dy: LONGINT;
+	BEGIN
+		blk := tB.lines;
+		WHILE (blk # NIL) & (blk.Y < relY) DO blk := blk.next END;
+		IF (blk # NIL) & (blk IS LedaLines.Block) THEN blk := blk.next END;
+		IF blk # NIL THEN dy := 3*LedaSys.scnUnit;
+			IF blk.mode <= "Z" THEN 	(* big line *)
+			ELSIF LedaSys.InRange(relY, blk.Y - blk.H - dy, blk.H + 2*dy) THEN
+				upper := blk.Y - blk.H; lower := blk.Y
+			END
+		END
+	END LineBounds;
+
+	PROCEDURE LocateXY(P: LedaSys.Port; lX, lY: LONGINT; tB: LedaLines.Box; loc: LedaLines.Location);
+	(* locates the nearest text block for the local coordinates lX, lY *)
+	(* in the text box tB; sets the location loc to the found block *)
+		VAR blk: LedaCtrl.Block;	R: LedaCtrl.Reader;	X, Y, W, org, colX: LONGINT;
+		
+		PROCEDURE NextBlock(VAR blk: LedaCtrl.Block; VAR org, Y: LONGINT);
+		BEGIN INC(org, LONG(blk.len)); blk := blk.next; Y := blk.Y
+		END NextBlock;
+		
+		PROCEDURE NoteBlock(loc: LedaLines.Location; blk: LedaCtrl.Block; org, X, W: LONGINT);
+		BEGIN loc.blk := blk; loc.org := org; loc.X := X; loc.W := W
+		END NoteBlock;
+		
+		PROCEDURE NewColumn(loc: LedaLines.Location; blk: LedaLines.Block; VAR X, Y, W: LONGINT);
+		BEGIN X := blk.X; W := blk.W; Y := MIN(LONGINT); loc.blk := NIL
+		END NewColumn;
+		
+	BEGIN
+		IF lX < 0 THEN lX := 0 ELSIF lX > tB.W THEN lX := tB.W END;
+		IF lY < 0 THEN lY := 0 ELSIF lY > tB.H THEN lY := tB.H END;
+		blk := tB.lines; org := tB.text.beg;
+		NewColumn(loc, blk(LedaLines.Block), X, Y, W); colX := 0;
+		LOOP	(* current block: blk, org, X, Y *)
+			IF blk.next = NIL THEN EXIT	(*###*)
+			ELSIF blk.next IS LedaLines.Block THEN
+				IF blk.next.Y < Y THEN	(* new column *)
+					INC(colX, tB.colW + tB.colDX); 
+					IF lX <= colX - (tB.colDX DIV 2) THEN EXIT	(*###*)
+					ELSE NextBlock(blk, org, Y); NewColumn(loc, blk(LedaLines.Block), X, Y, W)
+					END
+				ELSE NextBlock(blk, org, Y); X := blk(LedaLines.Block).X; W := blk(LedaLines.Block).W
+				END
+			ELSIF (Y < lY) & (lY <= blk.next.Y) THEN	(* lY vertical contained in blk.next *)
+				NextBlock(blk, org, Y); NoteBlock(loc, blk, org, X, W)
+			ELSE
+				NextBlock(blk, org, Y)
+			END
+		END;	
+		IF loc.blk = NIL THEN NoteBlock(loc, blk, org, X, W) END;		
+		LedaCtrl.InitReader(R, tB.text); LedaCtrl.SetReader(R, loc.org);
+		loc.pos := LedaIO.out.pos(P, lX - loc.X, R, loc.blk)
+	END LocateXY;
+	
+	PROCEDURE LocatePos(pos: LONGINT; blk: LedaCtrl.Block; org: LONGINT; loc: LedaLines.Location);
+	(* locates the nearest text block for the given text position pos *)
+	(* beginning with block blk, org; sets the location loc to the found block *)
+		VAR X, W: LONGINT;
+	BEGIN
+		LOOP
+			IF blk IS LedaLines.Block THEN X := blk(LedaLines.Block).X; W := blk(LedaLines.Block).W
+			ELSIF pos <= org THEN pos := org; EXIT	(*###*)
+			ELSIF pos < org + blk.len THEN EXIT	(*###*)
+			END;
+			IF blk.next = NIL THEN pos := org + blk.len; EXIT END;	(*###*)
+			INC(org, LONG(blk.len)); blk := blk.next
+		END;
+		loc.blk := blk; loc.pos := pos; loc.X := X; loc.W := W; loc.org := org
+	END LocatePos;
+	
+	PROCEDURE LocateLine(pos: LONGINT; blk: LedaCtrl.Block; org: LONGINT; VAR upper, lower: LONGINT);
+	(* locates the line with given text position pos and returns its relative y coordinates *)
+	BEGIN
+		LOOP
+			IF blk IS LedaLines.Block THEN (* skip *)
+			ELSIF (pos <= org) OR (pos < org + blk.len) OR (blk.next = NIL) THEN EXIT	(*###*)
+			END;
+			INC(org, LONG(blk.len)); blk := blk.next
+		END;
+		upper := blk.Y - blk.H; lower := blk.Y
+	END LocateLine;
+	
+	PROCEDURE LocateBlock(pos: LONGINT; blk: LedaCtrl.Block; org: LONGINT; VAR blkW, beg, len, sep: LONGINT);
+	(* locates the line with given text position pos and returns the block data beg, len, sep *)
+	BEGIN
+		LOOP
+			IF blk IS LedaLines.Block THEN (* skip *)
+			ELSIF pos < org THEN blkW := 0; beg := 0; len := 0; sep := 0; EXIT	(*###*)
+			ELSIF pos < org + blk.len THEN blkW := blk.W; beg := org; len := blk.len; sep := ORD(blk.sepKind); EXIT	(*###*)
+			ELSIF blk.next = NIL THEN blkW := 0; beg := 0; len := 0; sep := 0; EXIT	(*###*)
+			END;
+			INC(org, LONG(blk.len)); blk := blk.next
+		END
+	END LocateBlock;
+	
+	PROCEDURE *EqualCtrl(ctrl: LedaBase.PieceCtrl; VAR stop: BOOLEAN): BOOLEAN;
+	BEGIN RETURN ctrl = eqCtrl
+	END EqualCtrl;
+
+	PROCEDURE LocateCtrl(tB: LedaLines.Box; ctrl: LedaBase.Control; VAR text: LedaCtrl.Text; VAR pos: LONGINT);
+	(* locates the given control ctrl in text of box tB and sets text to text containing it *)
+		VAR p, len: LONGINT;	pCtrl: LedaBase.PieceCtrl;
+	BEGIN
+		IF (tB.text.beg = 0) & (ctrl IS LedaBase.PieceCtrl) THEN
+			p := 0; eqCtrl := ctrl(LedaBase.PieceCtrl);
+			LedaCtrl.TextSearch(EqualCtrl, tB.text, p, len, pCtrl);
+			IF pCtrl = eqCtrl THEN text := LedaCtrl.TextLocate(tB.text, p); pos := p END
+		END
+	END LocateCtrl;
+	
+	PROCEDURE LocateExtRef(tB: LedaLines.Box; pos: LONGINT; VAR eX, eY, X, bH: LONGINT);
+	(* locates the [absolute] external reference of position pos in the text of tB *)
+	(* eX, eY: external reference of line; X, bH: relative distances in line *)
+		VAR loc: LedaLines.Location;	R: LedaCtrl.Reader;
+	BEGIN
+		NEW(loc); LocatePos(pos, tB.lines, tB.text.beg, loc);
+		IF loc.pos # pos THEN eX := -1; eY := -1
+		ELSE
+			LedaBox.ExtRef(tB, eX, eY);
+			LedaCtrl.InitReader(R, tB.text); LedaCtrl.SetReader(R, loc.org); 
+			X := LedaIO.out.width(NIL, loc.pos, R, loc.blk); bH := loc.blk.bH;
+			INC(eX, loc.X); INC(eY, loc.blk.Y)
+		END
+	END LocateExtRef;
+
+	PROCEDURE InvertBlocks(P: LedaSys.Port;  eX, eY: LONGINT; loc: LedaLines.Location; len: LONGINT; VAR R: LedaCtrl.Reader);
+	(* inverts len characters beginning at location loc; reader R set to according text *)
+		VAR l, org, pos, X: LONGINT;	blk: LedaCtrl.Block;
+	BEGIN
+		blk := loc.blk; org := loc.org; X := loc.X; pos := loc.pos;
+		l := blk.len - (loc.pos - loc.org);
+		WHILE len > 0 DO
+			LedaCtrl.SetReader(R, org);
+			LedaIO.out.select(P, eX + X, eY + blk.Y, pos, LedaSys.Min(l, len), R, blk);
+			DEC(len, l);
+			IF len > 0 THEN
+				INC(org, LONG(blk.len)); pos := org; blk := blk.next;
+				IF (blk # NIL) & (blk IS LedaLines.Block) THEN X := blk(LedaLines.Block).X; blk := blk.next END;
+				IF blk = NIL THEN len := 0 ELSE l := blk.len END
+			END
+		END 
+	END InvertBlocks;
+	
+	PROCEDURE SetFocus(pos: LONGINT; tB: LedaLines.Box; loc: LedaLines.Location);
+	(* sets the focus at position pos in box tB; loc: recycling of location *)
+	BEGIN
+		IF loc = NIL THEN NEW(tB.carLoc) ELSE tB.carLoc := loc END;
+		LocatePos(pos, tB.lines, tB.text.beg, tB.carLoc);
+		IF LedaBox.GetFoc(tB) # tB THEN LedaBox.SetFoc(tB, NIL, LedaBox.PassFoc) END
+	END SetFocus;
+	
+	PROCEDURE ValidateFocus(pos: LONGINT; tB: LedaLines.Box; loc: LedaLines.Location);
+	(* validates the focus position pos in box tB [data structure] *)
+	(* the focus may pass to previous or next box in text stream *)
+	(* loc: recycled and used as location [if not nil] *)
+		VAR text: LedaCtrl.Text;	m: LedaBox.Msg;
+	BEGIN	(* tB has focus *)
+		IF pos < 0 THEN pos := 0 END;
+		text := LedaCtrl.TextLocate(tB.text, pos);
+		IF text.owner = tB THEN SetFocus(pos, tB, loc)	(* focus remains in box tB *)
+		ELSIF text.owner # NIL THEN	(* pass focus *)
+			m.id := LedaBox.FocusId; m.op := 1; m.l1 := pos;
+			text.owner.do.handle(text.owner, m)
+		END
+	END ValidateFocus;
+
+	PROCEDURE MarkTextLocation(tB: LedaLines.Box; beg, end: LONGINT);
+		VAR P: LedaSys.Port;
+	BEGIN
+		LedaBox.GetPort(tB, P);
+		LedaBox.RemFoc(tB, P); LedaBox.RemSel(tB, P);
+		NEW(tB.carLoc); LocatePos(end, tB.lines, tB.text.beg, tB.carLoc);
+		IF tB.carLoc.pos = end THEN
+			LedaBox.SetFoc(tB, P, LedaBox.NewFoc);
+			NEW(tB.selLoc); LocatePos(beg, tB.lines, tB.text.beg, tB.selLoc);
+			tB.selLen := end - tB.selLoc.pos;
+			IF tB.selLen > 0 THEN LedaBox.SetSel(tB, P, LedaBox.NewSel)
+			ELSE tB.selLoc := NIL; tB.selLen := NotDef
+			END
+		ELSE tB.carLoc := NIL
+		END
+	END MarkTextLocation;
+	
+	PROCEDURE ValidateFormat*(tB: LedaLines.Box);
+		VAR fB, styles: LedaBase.Control;
+	BEGIN
+		LedaCtrl.TextBasics(tB.text, LedaCtrl.GetId, FormatInd, fB);
+		LedaCtrl.TextBasics(tB.text, LedaCtrl.GetId, StyleInd, styles);
+		LedaBase.CheckControl(fB);
+		IF styles = NIL THEN LedaRules.FirstBaseLine(fB(LedaBase.FormBase), NIL, tB.asr)
+		ELSE LedaRules.FirstBaseLine(fB(LedaBase.FormBase), styles(LedaCtrl.List), tB.asr)
+		END
+	END ValidateFormat;
+	
+	PROCEDURE ValidateFlow(tB: LedaLines.Box);
+		VAR len: LONGINT;	newFrm, mask: BOOLEAN;
+	BEGIN
+		ValidateFormat(tB);
+		IF tB.lines = NIL THEN	(* build block structure for the box tB *)
+			mask := FALSE; LedaLines.FormatText(tB, len, newFrm, mask);
+			IF newFrm OR (len # tB.text.len) THEN LedaCtrl.TextChangeFlow(tB.text, len) END;	(* adjust length of text *)
+		ELSIF tB.lines = tB.lines.next THEN	(* text flow invalid *)
+			LedaLines.ValidateTexts(tB)	(* causes forced trap *)
+		END
+	END ValidateFlow;
+	
+	PROCEDURE DrawBoxAndPlane(box, plane: LedaBase.Box);
+	(* calls ancor to display box and the overlapping planes *)
+		VAR m: LedaBox.PlaneMsg;
+	BEGIN
+		m.id := LedaBox.PlDraw; m.plane := NIL; 
+		m.box := box; m.planeBox := plane;
+		box.anc.do.handle(box.anc, m)
+	END DrawBoxAndPlane;
+	
+	PROCEDURE PlaneChange(tB: LedaLines.Box; plane: LedaBase.Box);
+	(* repour text flow because of change in overlapping planes *)
+	(* change caused by plane box plane *)
+		VAR len: LONGINT;	newFrm, mask: BOOLEAN;
+	BEGIN
+		mask := FALSE; LedaLines.FormatText(tB, len, newFrm, mask);
+		DrawBoxAndPlane(tB, plane);
+		IF newFrm OR (len # tB.text.len) THEN	(* propagate change in text flow *)
+			LedaCtrl.TextChangeFlow(tB.text, len)	(* adjust length of text *)
+		END
+	END PlaneChange;
+			
+(*--- own utilities ---*)
+
+	PROCEDURE FormBaseValidate*(tB: LedaLines.Box);
+	(* validate formatting of box tB [format base changed] *)
+		VAR P: LedaSys.Port;	eX, eY, len: LONGINT;	newFrm, mask: BOOLEAN;
+	BEGIN
+		LedaBox.GetPort(tB, P);
+		IF tB.carLoc # NIL THEN LedaBox.RemFoc(tB, P) END;
+		IF (tB.selLoc # NIL) & (tB.selLen > 0) THEN LedaBox.RemSel(tB, P) END;
+		ValidateFormat(tB);
+		mask := FALSE; LedaLines.FormatText(tB, len, newFrm, mask);
+		IF (P # NIL) & ~(LedaSys.DrawFlag IN P.state) THEN
+			LedaBox.ExtRef(tB, eX, eY);
+			IF tB.selLoc # NIL THEN INCL(P.state, LedaSys.SelFlag) END;	(* to restore box selection *)
+			P.eraseCol := LedaLines.BGColor(tB);
+			LedaIO.out.update(P, eX, eY, tB.W, tB.H, tB.do(LedaBase.BoxHandler).draw, tB)
+		END;
+		IF newFrm OR (len # tB.text.len) THEN LedaCtrl.TextChangeFlow(tB.text, len) END	(* adjust length of text *)
+	END FormBaseValidate;
+	
+	PROCEDURE FormatBase(tB: LedaLines.Box; VAR m: LedaBox.Msg);
+	(* handles the message concerning the format base [m.op = LedaBase.FormId] *)
+		VAR fB: LedaBase.FormBase;	ctrl: LedaBase.Control;
+	BEGIN
+		LedaCtrl.TextBasics(tB.text, LedaCtrl.GetId, FormatInd, ctrl); fB := ctrl(LedaBase.FormBase);
+		IF m.op = 1 THEN	(* return named, unstamped format base *)
+			IF LedaBase.Unstamped(fB.stamp) & (fB.name # Anon) THEN
+				fB.stamp := LedaBase.CurStamp();	(* stamp control *)
+				fB.link := m.ctrl; m.ctrl := fB	(* link to fB to message *)
+			END
+		ELSIF m.op = 2 THEN	(* notification about change of format base *)
+			IF fB = m.ctrl THEN FormBaseValidate(tB) END
+		END
+	END FormatBase;
+
+	PROCEDURE ProcessFlow(tB: LedaLines.Box; op: INTEGER);
+	(* processes the text flow of box tB According op *)
+		VAR blk: LedaLines.Block;	len: LONGINT;	newFrm, mask: BOOLEAN;
+	BEGIN
+		IF op = 0 THEN	(* invalidate text flow *)
+			IF tB.lines = NIL THEN
+				NEW(blk); blk.next := blk; blk.len := 0;
+				blk.X := 0; blk.Y := 0; blk.W := tB.W; blk.H := 0;
+				tB.lines := blk
+			ELSE tB.lines.next := tB.lines
+			END
+		ELSIF op = 1 THEN	(* validate text flow *)
+			ValidateFormat(tB);
+			IF tB.lines = NIL THEN	(* delayed loading *)
+				mask := FALSE; LedaLines.FormatText(tB, len, newFrm, mask);
+				IF newFrm OR (len # tB.text.len) THEN
+					LedaCtrl.TextUpdateFlow(LedaCtrl.PourThis, tB.text)
+				END
+			ELSIF tB.lines = tB.lines.next THEN
+				IF tB.text.beg = 0 THEN LedaCtrl.TextUpdateFlow(LedaCtrl.PourAll, tB.text) END
+			END
+		END
+	END ProcessFlow;
+
+	PROCEDURE CtrlChange(ctrl: LedaBase.PieceCtrl);
+	(* handles the change of the control ctrl *)
+		VAR M: LedaBox.Msg;
+	BEGIN
+		IF ctrl = NIL THEN RETURN END;	(*###*)
+		M.id := LedaBox.CtrlId; M.op := 2; M.ctrl := ctrl;	(* 2 = notify the change of control ctrl *)
+		LedaBox.Broadcast(NIL, {LedaBox.BcTxt}, M)	(* {LedaBox.BcTxt} -> broadcast to texts *)
+	END CtrlChange;
+	
+	PROCEDURE GetAttributes(tB: LedaLines.Box; VAR M: LedaBox.AttributeMsg);
+		VAR ctrl: LedaBase.PieceCtrl;	R: LedaCtrl.Reader;	ch: CHAR;
+	BEGIN	(* M.id:  LedaBox.GetValue or LedaBox.GetStyle *)
+		IF (tB.selLoc # NIL) & (tB.selLen > 0) THEN
+			LedaCtrl.InitReader(R, tB.text);
+			LedaCtrl.SetReader(R, tB.selLoc.pos); LedaCtrl.ReadChar(R, ch, ctrl);
+			IF M.id = LedaBox.GetStyle THEN
+				LedaAdjust.GetStyle(ctrl, M)		(* get attributes of control itself *)
+			ELSIF M.id = LedaBox.GetValue THEN 
+				LedaAdjust.GetValue(tB.text, ctrl, M)		(* get attribute names of controls *)
+			END;
+		END
+	END GetAttributes;
+	
+	PROCEDURE SetAttributes(tB: LedaLines.Box; VAR M: LedaBox.AttributeMsg);
+		VAR ctrl: LedaBase.PieceCtrl;	R: LedaCtrl.Reader;	ch: CHAR;
+			beg, len: LONGINT;	loc: LedaLines.Location;	
+	BEGIN	(* M.id:  LedaBox.SetValue or LedaBox.SetStyle or LedaBox.NewStyle *)
+		IF (tB.selLoc # NIL) & (tB.selLen > 0) THEN
+			beg := tB.selLoc.pos; len := tB.selLen; loc := tB.selLoc;	(* save selection *)
+			LedaCtrl.InitReader(R, tB.text);
+			LedaCtrl.SetReader(R, beg); LedaCtrl.ReadChar(R, ch, ctrl);
+			LedaBox.RemFoc(tB, M.P); LedaBox.RemSel(tB, M.P);	(* remove focus and selection *)
+			IF M.id = LedaBox.SetValue THEN LedaAdjust.SetValue(tB.text, ctrl, M)	(* get control specified by M *)
+			ELSE LedaAdjust.SetStyle(ctrl, M)	(* adjust control attributes or create new control according M *)
+			END;	(* M.id could have changed *)
+			IF M.id = LedaBox.SetStyle THEN CtrlChange(ctrl)
+			ELSIF ctrl # NIL THEN LedaCtrl.TextChange(tB.text, beg, len, ctrl)
+			END;
+(*
+			IF M.id = LedaBox.SetValue THEN
+				LedaAdjust.SetValue(tB.text, ctrl, M);	(* get control specified by M *) 
+				IF ctrl # NIL THEN LedaCtrl.TextChange(tB.text, beg, len, ctrl) END
+			ELSIF M.id = LedaBox.SetStyle THEN
+				LedaAdjust.SetStyle(ctrl, M);	(* adjust control attributes according M *)
+				CtrlChange(ctrl)
+			ELSIF M.id = LedaBox.NewStyle THEN
+				LedaAdjust.SetStyle(ctrl, M);	(* create new control with specified attributes *)
+				IF ctrl # NIL THEN LedaCtrl.TextChange(tB.text, beg, len, ctrl) END
+			END;
+*)
+			IF (tB.text.beg <= beg) & (beg + len <= tB.text.beg + tB.text.len) THEN	(* restore selection *)
+				LocatePos(beg, tB.lines, tB.text.beg, loc);
+				tB.selLoc := loc; tB.selLen := len; LedaBox.SetSel(tB, M.P, LedaBox.NewSel)	(* restore selection *)
+			END	
+		END
+	END SetAttributes;
+	
+	PROCEDURE SendTextAttr(tB: LedaLines.Box; pos: LONGINT);
+	(* sends the text attributes of text tB.text at position pos to the selection *)
+		VAR sel: LedaBase.Box;	M: LedaBox.AttributeMsg;
+			R: LedaCtrl.Reader;	ctrl: LedaBase.PieceCtrl;	ch: CHAR;
+	BEGIN
+		LedaCtrl.InitReader(R, tB.text); LedaCtrl.SetReader(R, pos);
+		LedaCtrl.ReadChar(R, ch, ctrl);
+		IF ~ R.eot THEN
+			LedaBox.Selection(sel);
+			IF sel # NIL THEN
+				M.id := LedaBox.SameAttr; M.name := TextAttr; M.box := tB; M.ctrl := ctrl;
+				sel.do.handle(sel, M)
+			END
+		END
+	END SendTextAttr;
+	
+	PROCEDURE CopyCtrl(ctrl: LedaBase.PieceCtrl): LedaBase.PieceCtrl;
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		cM.id := LedaBase.CopyId; cM.ctrl := NIL; ctrl.doOp(ctrl, cM);
+		IF cM.ctrl = NIL THEN LedaSys.Halt("copy error") END;	(*###*)
+		RETURN cM.ctrl(LedaBase.PieceCtrl)
+	END CopyCtrl;
+	
+	PROCEDURE ChangeTextAttr(tB: LedaLines.Box; ctrl: LedaBase.PieceCtrl);
+	(* chnages the text attributes of the selection to control ctrl *)
+		VAR P: LedaSys.Port;	crsp: LedaBase.PieceCtrl;	beg, len: LONGINT;	loc: LedaLines.Location;
+	BEGIN
+		LedaBox.GetPort(tB, P);
+		LedaCtrl.GetCorresp(ctrl, tB.text, crsp);
+		IF crsp = NIL THEN crsp := CopyCtrl(ctrl) END;
+		IF (crsp # NIL) & (tB.selLoc # NIL) & (tB.selLen > 0) THEN
+			beg := tB.selLoc.pos; len := tB.selLen; loc := tB.selLoc;	(* save selection *)
+			LedaBox.RemFoc(tB, P); LedaBox.RemSel(tB, P);	(* remove focus and selection *)
+			LedaCtrl.TextChange(tB.text, beg, len, crsp);
+			IF (tB.text.beg <= beg) & (beg + len <= tB.text.beg + tB.text.len) THEN	(* restore selection *)
+				LocatePos(beg, tB.lines, tB.text.beg, loc);
+				tB.selLoc := loc; tB.selLen := len; LedaBox.SetSel(tB, P, LedaBox.NewSel)	(* restore selection *)
+			END
+		END
+	END ChangeTextAttr;
+	
+	PROCEDURE SetInCtrl(text: LedaCtrl.Text; pos: LONGINT);
+	(* sets the basic input control LedaBase.inCtrl to character style given by text and pos *)
+		VAR cnt: LedaBase.Control;	ctrl: LedaBase.PieceCtrl;
+			R: LedaCtrl.Reader;	i: INTEGER;	ch: CHAR;
+	BEGIN
+		i := 2; LedaCtrl.InitReader(R, text);
+		IF pos >= text.beg + text.len THEN pos := text.beg + text.len - 1 END;
+		LOOP
+			IF pos < 0 THEN ctrl := NIL; EXIT END;	(*###*)
+			LedaCtrl.SetReader(R, pos);
+			LedaCtrl.ReadChar(R, ch, ctrl);
+			IF (ctrl IS LedaBase.Font) OR (ctrl IS LedaBase.Style) THEN EXIT END;	(*###*)
+			DEC(i); IF i = 0 THEN ctrl := NIL; EXIT END;	(*###*)
+			DEC(pos)
+		END;
+		IF ctrl = NIL THEN
+			LedaCtrl.TextBasics(text, LedaCtrl.GetId, StyleInd, cnt);
+			IF (cnt # NIL) & (cnt IS LedaCtrl.List) THEN ctrl := cnt(LedaCtrl.List).seq.ctrl(LedaBase.PieceCtrl) END
+		END;
+		IF ctrl # NIL THEN LedaBase.inCtrl := ctrl END
+	END SetInCtrl;
+	
+	PROCEDURE TrackFocus(P: LedaSys.Port; eX, eY: LONGINT; tB: LedaLines.Box; mX, mY: LONGINT);
+		VAR loc: LedaLines.Location;	copySel: LedaBase.CopyProc;	btns, keySum: SET;
+	BEGIN
+		IF (tB.text.len = 0) & (tB.text.beg > 0) THEN
+			IF (tB.text.prev # NIL) & (tB.text.prev.len = 0) THEN RETURN END	(*###*)
+		END;	
+		LedaBox.RemFoc(tB, P);
+		NEW(tB.carLoc); LocateXY(P, mX - eX, mY - eY, tB, tB.carLoc);
+		IF (tB.carLoc.pos = tB.text.beg + tB.text.len) & (tB.text.next # NIL)
+			& (tB.carLoc.blk.sepKind = LedaCtrl.EndSep) THEN DEC(tB.carLoc.pos) END;
+		LedaBox.SetFoc(tB, P, LedaBox.NewFoc);
+		NEW(loc); btns := {ML}; keySum := {};
+		WHILE btns # {} DO
+			keySum := keySum + btns;
+			LocateXY(P, mX - eX, mY - eY, tB, loc);
+			IF (loc.pos = tB.text.beg + tB.text.len) & (tB.text.next # NIL)
+				& (tB.carLoc.blk.sepKind = LedaCtrl.EndSep) THEN DEC(loc.pos) END;
+			IF tB.carLoc.pos # loc.pos THEN
+				tB.do(LedaBase.BoxHandler).mark(tB, eX, eY, P, LedaBase.FocMark, LedaBase.Off);	(* unhighlight *)
+				tB.carLoc^ := loc^;
+				tB.do(LedaBase.BoxHandler).mark(tB, eX, eY, P, LedaBase.FocMark, LedaBase.On)	(* highlight *)
+			END;
+			LedaIO.in.mouse(P, btns, mX, mY)
+		END;
+		IF keySum = {ML, MM} THEN	(* copy text selection to focus *)
+			LedaBox.CopyProc(copySel);
+			IF copySel # NIL THEN copySel(tB, P) END	(* insert selection at caret *)
+		ELSIF keySum = {ML, MR} THEN	(* copy attributes from focus to selection *)
+			SendTextAttr(tB, tB.carLoc.pos)
+		END
+	END TrackFocus;
+	
+	PROCEDURE InsTextIn(foc: LedaBase.Box; text: LedaCtrl.Text; beg, len: LONGINT; P: LedaSys.Port);
+		VAR B: LedaCtrl.Buffer;	eX, eY: LONGINT;	focH: LedaBase.BoxHandler;
+	BEGIN	
+		LedaCtrl.InitBuffer(B);
+		LedaCtrl.SaveText(text, beg, len, B);
+		focH := foc.do(LedaBase.BoxHandler); LedaBox.ExtRef(foc, eX, eY);
+		LedaBox.RemSel(foc, P);	(* remove any selection *)
+		IF P # NIL THEN
+			focH.mark(foc, eX, eY, P, LedaBase.FocMark, LedaBase.Off);	(* unhighlite focus *)
+			INCL(P.state, LedaSys.FocFlag)
+		END;
+		focH.insert(foc, eX, eY, P, B)
+	END InsTextIn;
+	
+	PROCEDURE SelectText(P: LedaSys.Port; eX, eY: LONGINT; VAR R: LedaCtrl.Reader;
+											tB: LedaLines.Box; mX, mY: LONGINT; VAR keySum: SET);
+		VAR loc: LedaLines.Location;	btns: SET;	selEnd, newEnd: LONGINT;
+	BEGIN	(* tB.selLoc # NIL; tB.selLen >= 0 [empty selection in box tB] *)
+		NEW(loc); selEnd := tB.selLoc.pos + tB.selLen;
+		btns := {MR}; keySum := {};
+		WHILE btns # {} DO
+			keySum := keySum + btns;
+			LocateXY(P, mX - eX, mY - eY, tB, loc);
+			newEnd := loc.pos; IF loc.pos < loc.org + loc.blk.len THEN INC(newEnd) END;
+			IF selEnd < newEnd THEN
+				LocatePos(selEnd, tB.lines, tB.text.beg, loc);
+				InvertBlocks(P, eX, eY, loc, newEnd - selEnd, R);	(* highlite new part *)
+				INC(tB.selLen, newEnd - selEnd);	(* expand selection *)
+				selEnd := newEnd
+			ELSIF (newEnd < selEnd) & (tB.selLoc.pos < newEnd) THEN
+				LocatePos(newEnd, tB.lines, tB.text.beg, loc);
+				InvertBlocks(P, eX, eY, loc, selEnd - newEnd, R);	(* unhighlite part *)
+				DEC(tB.selLen, selEnd - newEnd);	(* reduce selection *)
+				selEnd := newEnd
+			END;
+			LedaIO.in.mouse(P, btns, mX, mY)
+		END;
+	END SelectText;
+	
+	PROCEDURE TrackSel(P: LedaSys.Port; eX, eY: LONGINT; tB: LedaLines.Box; mX, mY: LONGINT; VAR res: INTEGER);
+		VAR loc: LedaLines.Location;	foc: LedaBase.Box;	R: LedaCtrl.Reader;
+			keySum: SET;	beg, len: LONGINT;
+	BEGIN
+		NEW(loc); LedaCtrl.InitReader(R, tB.text);
+		LocateXY(P, mX - eX, mY - eY, tB, loc);
+		IF loc.blk.len > 0 THEN
+			IF loc.pos = loc.org + loc.blk.len THEN DEC(loc.pos) END
+		ELSIF loc.blk.len = 0 THEN LocatePos(loc.org - 1, tB.lines, tB.text.beg, loc)
+		END;	(* get previous line block *)
+		IF (tB.selLoc # NIL) & (tB.selLen = 0) & (tB.selLoc.org = loc.org) THEN	(* tB is selected *)
+			LedaBox.RemSel(tB, P); res := LedaBase.DoHandle	(* pass selection to tB.anc *)
+		ELSIF ((tB.selLoc # NIL) & (tB.selLoc.pos = tB.selLoc.org)  & (tB.selLoc.pos + tB.selLen = loc.pos + 1))
+				OR ((tB.selLoc = NIL) & (tB.text.len = 0)) THEN	(* select tB *)
+			LedaBox.RemSel(tB, P);
+			tB.selLoc := loc; tB.selLen := 0;	(* empty selection *)
+			LedaBox.SetSel(tB, P, LedaBox.NewSel);
+			res := LedaBase.DoTrack	(* tracking [copy, delete] handled by tB.anc *)
+		ELSE
+			res := LedaBase.Done;
+			IF (tB.selLoc # NIL) & (tB.selLen = 1) & (tB.selLoc.pos = loc.pos) THEN	(* extend selection to begin of line *)
+				LedaBox.RemSel(tB, P);	(* remove any selection *)
+				tB.selLen := loc.pos - loc.org + 1; loc.pos := loc.org; tB.selLoc := loc;	(* set selection in box tB *)
+				InvertBlocks(P, eX, eY, tB.selLoc, tB.selLen, R)
+			ELSE
+				LedaBox.RemSel(tB, P);	(* remove any selection *)
+				tB.selLoc := loc; tB.selLen := 0	(* set empty selection in box tB *)
+			END;
+			SelectText(P, eX, eY, R, tB, mX, mY, keySum);
+			(* selection inverted but not registered *)
+			IF keySum = {MR, ML} THEN		(* delete inverted selection *)
+				beg := tB.selLoc.pos; len := tB.selLen;	(* beg, len: selected text part *)
+				InvertBlocks(P, eX, eY, tB.selLoc, tB.selLen, R); 	(* unhighlite selection *)
+				tB.selLoc := NIL; tB.selLen := NotDef;	(* clear selection *)
+				IF len > 0 THEN
+					LedaBox.RemFoc(tB, P);	(* no marks in tB [and document] *)
+					LedaCtrl.TextDelete(tB.text, beg, len);
+					ValidateFocus(beg, tB, NIL);
+					INCL(P.state, LedaSys.FocFlag)	(* to show focus *)
+				END
+			ELSIF tB.selLen > 0 THEN		(* register inverted selection *)
+				beg := tB.selLoc.pos; len := tB.selLen;	(* beg, len: selected text part *)
+				LedaBox.SetSel(tB, NIL, LedaBox.NewSel); 
+				IF keySum = {MR, MM} THEN
+					LedaBox.Focus(foc, P);	(* P -> port of focus box *)
+					InsTextIn(foc, tB.text, beg, len, P)
+				END
+			ELSIF tB.text.len = 0 THEN	(* tB.selLen = 0 *)
+				LedaBox.SetSel(tB, P, LedaBox.NewSel)
+			ELSE tB.selLoc := NIL; tB.selLen := NotDef	(* no selection *)
+			END
+		END
+	END TrackSel;
+	
+	PROCEDURE GetColumn(X: LONGINT; tB: LedaLines.Box; VAR colX, colW: LONGINT);
+	(* gets the column data [colX, colW] of position X in box tB *)
+	(* the coordinates are relative to box tB *)
+	BEGIN
+		IF tB.colW > 0 THEN
+			colX := 0; colW := tB.colW;
+			WHILE colX + colW < X DO INC(colX, colW + tB.colDX) END
+		ELSE colX := 0; colW := tB.W
+		END;
+		INC(colX, LedaLines.ColInset); DEC(colW, LedaLines.ColWInset)
+	END GetColumn;
+	
+	PROCEDURE TrackMM(P: LedaSys.Port; eX, eY: LONGINT; tB: LedaLines.Box; mX, mY: LONGINT; VAR res: INTEGER);
+		VAR R: LedaCtrl.Reader;	ctrl: LedaBase.PieceCtrl;
+			beg, len, colX, colW, cX: LONGINT;	loc: LedaLines.Location;	ch: CHAR;
+	BEGIN
+		IF (tB.selLoc # NIL) & (tB.selLen > 0) THEN
+			NEW(loc); LedaCtrl.InitReader(R, tB.text);
+			LocateXY(P, mX - eX, mY - eY, tB, loc);
+			IF (tB.selLoc.pos <= loc.pos) & (loc.pos < tB.selLoc.pos + tB.selLen) THEN	(* contained in selection *)
+				beg := tB.selLoc.pos; len := tB.selLen;	(* save selection *)
+				LedaCtrl.SetReader(R, loc.pos); LedaCtrl.ReadChar(R, ch, ctrl);
+				GetColumn(loc.X, tB, colX, colW);
+				LedaCtrl.SetReader(R, loc.org); cX := LedaIO.out.width(P, loc.pos, R, loc.blk);
+				LedaBox.RemFoc(tB, P); LedaBox.RemSel(tB, P);	(* remove focus and selection *)
+				LedaAdjust.ShowRuler(eX + loc.X, eY + loc.blk.Y - loc.blk.H, loc.W, eX + colX, colW, cX, tB.text, ctrl, ch, res);
+				IF (res = LedaBox.SetStyle) & (ctrl # NIL) THEN CtrlChange(ctrl)
+				ELSIF (res = LedaBox.NewStyle) & (ctrl # NIL) THEN LedaCtrl.TextChange(tB.text, beg, len, ctrl)
+				ELSE LedaIO.in .waitNoKeys(P)
+				END;
+				IF (tB.text.beg <= beg) & (beg + len <= tB.text.beg + tB.text.len) THEN	(* restore selection *)
+					LocatePos(beg, tB.lines, tB.text.beg, loc);
+					tB.selLoc := loc; tB.selLen := len; LedaBox.SetSel(tB, P, LedaBox.NewSel)	(* restore selection *)
+				END;
+				res := LedaBase.Done
+			END
+		END
+	END TrackMM;
+	
+	PROCEDURE *DelBufSave(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; VAR B: LedaBase.Buffer);
+	BEGIN
+		LedaCtrl.TextInsert(self(DelBufBox).text, 0, B(LedaCtrl.Buffer))
+	END DelBufSave;
+	
+	PROCEDURE CreateDelBuf(VAR bufB: DelBufBox);
+		VAR bH: LedaBase.BoxHandler;
+	BEGIN
+		NEW(bufB); LedaBox.Init(bufB);
+		NEW(bH); LedaBox.InitType(bH); bH.insert := DelBufSave;
+		bufB.do := bH;
+		bufB.text := LedaCtrl.NewText(bufB, NIL)
+	END CreateDelBuf;
+
+	PROCEDURE ValidateNote(tB: LedaLines.Box);
+		VAR h: LedaCtrl.Text;
+	BEGIN
+		IF (tB.selLoc # NIL) & (tB.selLen > 0) THEN
+			h := note.text; WHILE (h # NIL) & (h # tB.text) DO h := h.next END;
+			IF (h = tB.text) & (tB.selLoc.pos + tB.selLen > note.beg) THEN
+				IF (note.beg >= note.text.beg) & (note.beg < note.text.beg + note.text.len) THEN
+					note.len := tB.selLoc.pos + tB.selLen - note.beg
+				ELSE note.len := 0
+				END
+			END
+		ELSE note.len := 0
+		END
+	END ValidateNote;
+	
+	PROCEDURE TrackExec(P: LedaSys.Port; eX, eY: LONGINT; tB: LedaLines.Box; mX, mY: LONGINT; VAR res: INTEGER);
+		VAR loc: LedaLines.Location;	R: LedaCtrl.Reader;	ctrl: LedaBase.PieceCtrl;	ch: CHAR; 
+			m: LedaCtrl.TextMsg;	t0, t1: LedaCtrl.Text; 	buf: DelBufBox;
+			foc: LedaBase.Box;	fP: LedaSys.Port;	beg, len: LONGINT;	s: LedaSys.String;
+	BEGIN
+		NEW(loc); LocateXY(P, mX - eX, mY - eY, tB, loc);
+		IF LedaSys.InRect(mX - eX, mY - eY, loc.X, loc.blk.Y - loc.blk.H, loc.blk.W, loc.blk.H) THEN
+			LedaCtrl.InitReader(R, tB.text);
+			LedaCtrl.SetReader(R, loc.pos); LedaCtrl.ReadChar(R, ch, ctrl);
+			IF (ctrl # NIL) & ~ (ctrl IS LedaBase.Font) & ~ (ctrl IS LedaBase.Style) THEN
+				m.id := LedaCtrl.ExecuteId; m.text := tB.text; m.beg := loc.pos; m.len := 1;
+				ctrl.doOp(ctrl, m);
+				IF m.id = -1 THEN res := LedaBase.Done END;
+			END
+		END;
+		IF res # LedaBase.Done THEN
+			LedaBox.ParPopStr(s);
+			IF s = "text" THEN res := LedaBase.Done;
+				LedaBox.ParPopStr(s);
+				IF s = "format" THEN
+					INCL(P.state, LedaSys.DrawFlag);	(* global redraw *)
+					LedaCtrl.TextUpdateFlow(LedaCtrl.PourAll, tB.text)
+				ELSIF s = "note" THEN
+					IF (tB.selLoc # NIL) & (tB.selLen > 0) THEN
+						note.text := tB.text; note.beg := tB.selLoc.pos; note.len := 0
+					END
+				ELSIF s = "delete" THEN
+					ValidateNote(tB);
+					IF note.len > 0 THEN
+						t0 := LedaCtrl.TextLocate(note.text, note.beg + note.len);
+						CreateDelBuf(buf);
+						WHILE note.len > 0 DO
+							IF t0.beg > note.beg THEN beg := t0.beg ELSE beg := note.beg END;
+							len := note.beg + note.len - beg;
+							IF len > 0 THEN
+								DEC(note.len, len); t1 := t0; t0 := t0.prev;
+								LedaCtrl.TextDelete(t1, beg, len);	(* text may be detached from textbase*)
+								LedaCtrl.InsDelBuf(buf, NIL);
+							ELSE t0 := t0.prev
+							END
+						END;
+						LedaCtrl.TextDelete(buf.text, buf.text.beg, buf.text.len);	(* restore delete buffer *)
+						note.text := NIL; note.beg := NotDef; note.len := NotDef
+					ELSE LedaSys.OutT(" - invalid text specification", 1)
+					END
+				ELSIF s = "copy" THEN
+					ValidateNote(tB);
+					IF note.len > 0 THEN
+						LedaBox.Focus(foc, fP);	(* P -> port of focus box *)
+						InsTextIn(foc, note.text, note.beg, note.len, fP);
+						note.text := NIL; note.beg := NotDef; note.len := NotDef
+					ELSE LedaSys.OutT(" - invalid text specification", 1)
+					END
+				ELSIF s = "check" THEN
+					t0 := tB.text.next; LedaSys.OutT("text check", 1);
+					WHILE t0 # NIL DO
+						LedaSys.OutT("text.len = ", 0); LedaSys.OutI(t0.len, 0);
+						IF t0.owner # NIL THEN LedaSys.OutT(" text.owner # NIL", 1)
+						ELSE LedaSys.OutT(" text.owner = NIL", 1)
+						END;
+						t0 := t0.next
+					END
+				END
+			ELSE LedaBox.ParReset(LedaBox.Str)
+			END
+		END
+	END TrackExec;
+
+	PROCEDURE CopyNotedText*(foc: LedaBase.Box; P: LedaSys.Port);
+	BEGIN
+		IF notedSel.len > 0 THEN InsTextIn(foc, notedSel.text, notedSel.beg, notedSel.len, P) END
+	END CopyNotedText;
+	
+	PROCEDURE PrepTextChange(tB: LedaLines.Box; VAR P: LedaSys.Port; VAR eX, eY: LONGINT);
+	(* prepares a change [update/format] in the text of text box tB *)
+	(* returns the port and external referenceof of tB *)
+	BEGIN
+		LedaBox.GetPort(tB, P);
+		IF (P = NIL) OR (LedaSys.DrawFlag IN P.state) THEN P := NIL; eX := 0; eY := 0	(* no drawing needed *)
+		ELSE LedaBox.ExtRef(tB, eX, eY)
+		END;
+		IF tB.carLoc # NIL THEN LedaBox.RemFoc(tB, P) END;
+		IF tB.selLoc # NIL THEN
+			LedaBox.RemSel(tB, NIL);
+			IF P # NIL THEN INCL(P.state, LedaSys.DrawFlag); P := NIL; eX := 0; eY := 0 END	(* to avoid further drawing *)
+		END
+	END PrepTextChange;
+	
+	PROCEDURE InitBox*(tB: LedaLines.Box; bT: LedaBase.BoxType; flags: SET);
+	BEGIN
+		LedaBox.Init(tB); 
+		tB.do := bT; tB.flags := flags;
+		tB.text := NIL; tB.lines := NIL; tB.asr := NotDef; 
+		tB.colW := NotDef; tB.colDX := NotDef;
+		tB.bgClr := NotDef;
+		tB.carLoc := NIL; tB.selLoc := NIL; tB.selLen := NotDef
+	END InitBox;
+	
+	PROCEDURE AddBox(tB: LedaLines.Box; text: LedaCtrl.Text; beg, len: LONGINT);
+		VAR m: LedaBox.Msg;
+	BEGIN
+		IF tB.anc # NIL THEN
+			m.id := LedaBox.TextId; m.op := 3;	(* 3 = unpoured text available *)
+			m.box1 := tB; m.text := text; m.l1 := beg; m.l2 := len;
+			tB.anc.do.handle(tB.anc, m)	(* to enlarge text flow *)
+		END
+	END AddBox;
+	
+	PROCEDURE RemoveBox(tB: LedaLines.Box);
+		VAR m: LedaBox.Msg;	len: LONGINT;	newFrm, mask: BOOLEAN;
+	BEGIN
+		IF LedaBox.GetFoc(tB) = tB THEN LedaBox.RemFoc(tB, NIL) END;
+		IF LedaBox.GetSel(tB, LedaBox.Self) = tB THEN LedaBox.RemSel(tB, NIL) END;
+		m.id := LedaBox.TextId; m.op := 4; m.box1 := tB; m.text := tB.text;	(* 4 = text became empty *)
+		IF tB.anc # NIL THEN tB.anc.do.handle(tB.anc, m) END;
+		IF m.id # LedaBox.DoneId THEN	(* box is not removed [deleted] *)
+			mask := FALSE; LedaLines.FormatText(tB, len, newFrm, mask);	(* validate structure *)
+			DrawBoxAndPlane(tB, NIL)	
+		END
+	END RemoveBox;
+	
+	PROCEDURE NewText*(caller: LedaBase.Box; tB: LedaLines.Box): LedaCtrl.Text;
+		VAR text: LedaCtrl.Text;	ctrl: LedaBase.Control;	fB: LedaBase.FormBase;
+			list: LedaCtrl.List;	m: LedaBox.Msg;
+	BEGIN
+		m.id := LedaBox.TextId; m.op := 1; m.text := NIL; m.ctrl := NIL;	(* ask reference data of text *)
+		LedaBox.GetInfo(caller, m);	(* returns reference text or linked controls [format, style list] *)
+		IF m.text # NIL THEN	(* continue flow of reference text *)
+			text := LedaCtrl.NewText(tB, m.text)
+		ELSE		(* create new text based on linked controls *)
+			fB := NIL; list := NIL;
+			text := LedaCtrl.NewText(tB, NIL);
+			IF m.ctrl # NIL THEN
+				ctrl := m.ctrl; m.ctrl := m.ctrl.link; ctrl.link := NIL;
+				IF ctrl IS LedaBase.FormBase THEN fB := ctrl(LedaBase.FormBase) END
+			END;		(* fB: format base to refer to *)
+			fB := LedaBase.NewFormBase(fB);
+			ctrl := fB; LedaCtrl.TextBasics(text, LedaCtrl.SetId, FormatInd, ctrl);	(* set basic formatting *)
+			IF m.ctrl # NIL THEN
+				ctrl := m.ctrl; m.ctrl := m.ctrl.link; ctrl.link := NIL;
+				IF ctrl IS LedaCtrl.List THEN list := ctrl(LedaCtrl.List) END
+			END;	(* list: list of styles [character, format, tabs] *)
+			IF list = NIL THEN list := LedaRules.DefStyleList("", fB, tB.W) END;
+			ctrl := list; LedaCtrl.TextBasics(text, LedaCtrl.SetId, StyleInd, ctrl);	(* set basic styles *)
+		END;
+		RETURN text
+	END NewText;
+	
+	PROCEDURE CopyText*(tB, ref: LedaLines.Box): LedaCtrl.Text;
+		VAR B: LedaCtrl.Buffer;	text: LedaCtrl.Text;
+			handle: LedaBase.HandlerProc;	ctrl: LedaBase.Control;
+	BEGIN
+		text := LedaCtrl.NewText(tB, NIL);
+		LedaCtrl.TextBasics(ref.text, LedaCtrl.GetId, StyleInd, ctrl);	(* get default styles *)
+		LedaCtrl.TextBasics(text, LedaCtrl.SetId, StyleInd, ctrl);	(* set default styles *)
+		LedaCtrl.TextBasics(ref.text, LedaCtrl.GetId, FormatInd, ctrl);	(* get basic formatting *)
+		LedaCtrl.TextBasics(text, LedaCtrl.SetId, FormatInd, ctrl);	(* set basic formatting *)
+		IF ref.text.len > 0 THEN
+			LedaCtrl.InitBuffer(B);
+			LedaCtrl.SaveText(ref.text, ref.text.beg, ref.text.len, B);
+			handle := tB.do.handle; tB.do.handle := LedaBox.EHandle;	(* to avoid update call *)
+			LedaCtrl.TextAppend(text, B);
+			tB.do.handle := handle
+		END;
+		RETURN text
+	END CopyText;
+	
+	PROCEDURE ExtendBG(tB: LedaLines.Box; VAR dH: LONGINT);
+	(* if the successor of tB has the same background color and is adjacent with the *)
+	(* same width the area of tB can be extended about the returned value dH *)
+		VAR m: LedaBox.Msg;
+	BEGIN
+		dH := 0;
+		m.id := LedaBox.BoxId; m.op := 6; m.l0 := LedaSys.bg;
+		IF tB.next # NIL THEN tB.next.do.handle(tB.next, m) END;
+		IF (m.l0 # LedaSys.bg) & (m.l0 = LedaLines.BGColor(tB)) THEN	(* try to extend *)
+			IF tB.next.W = tB.W THEN
+				dH := tB.next.Y - tB.Y - tB.H;
+				IF (dH < 0) OR (dH > 3*LedaSys.scnUnit) THEN dH := 0 END
+			END
+		END
+	END ExtendBG;
+	
+	PROCEDURE RemoveText(tB: LedaLines.Box);
+		VAR handle: LedaBase.HandlerProc;	pf, tf: LedaBase.FormatDsc;
+	BEGIN
+		tB.lines := NIL;
+		IF tB.text.len > 0 THEN
+			handle := tB.do.handle; tB.do.handle := LedaBox.EHandle;	(* ignore notifications *)
+			LedaCtrl.TextDelete(tB.text, tB.text.beg, tB.text.len);	(* remove text part form text flow *)
+			tB.do.handle := handle;	(* restore handler *)
+			IF tB.text.next # NIL THEN	(* check for format change *)
+				tf := tB.text.frm;
+				IF tB.text.prev = NIL THEN LedaBase.InitFormat(pf) ELSE pf := tB.text.prev.frm END;
+				IF (tf.lt # pf.lt) OR (tf.rt # pf.rt) OR (tf.lsp # pf.lsp) OR (tf.adj # pf.adj) THEN
+					tB.text.frm := pf; LedaCtrl.TextChangeFlow(tB.text, tB.text.len)	(* to propagate format change *)
+				END
+			END
+		END;
+		LedaCtrl.TextUpdateFlow(LedaCtrl.DetachThis, tB.text)
+	END RemoveText;
+	
+(*--- procedures attached to boxType ---*)
+	
+	PROCEDURE New*(bT: LedaBase.BoxType; caller, ref: LedaBase.Box): LedaBase.Box;
+	(** ref = NIL: create default box;  ref # NIL: copy box ref *)
+		VAR tB, rB: LedaLines.Box;	len: LONGINT;	newFrm, mask: BOOLEAN;
+	BEGIN
+		NEW(tB); InitBox(tB, bT, {});
+		IF ref # NIL THEN
+			tB.W := ref.W; tB.H := ref.H; tB.flags := ref.flags; 
+			rB := ref(LedaLines.Box); tB.asr := rB.asr;
+			(* tB.lines, tB.colW, tB.colDX set in LedaLines.FormatText *)
+			tB.text := CopyText(tB, rB)
+		ELSE
+			LedaBox.GetSize(caller, DefW, DefH, tB.W, tB.H);
+			tB.text := NewText(caller, tB);
+			ValidateFormat(tB)
+		END;
+		tB.anc := caller;	(* to allow access to caller during formatting [example: to get page number] *)
+		mask := FALSE; LedaLines.FormatText(tB, len, newFrm, mask);	(* builds the block structure for the box tB *)
+		tB.anc := NIL;	(* to prevent call to tB because of unpoured text *)
+		LedaCtrl.TextChangeFlow(tB.text, len);
+			(* LedaCtrl.TextChangeFlow(...) can cause call to tB if there is unpoured text *)
+			(* however call is not processed because tB.anc = NIL *)
+			(* caller has to take care that all unpoured text will be poured *)
+		RETURN tB
+	END New;
+	
+	PROCEDURE Load*(VAR r: LedaBase.Rider; bT: LedaBase.BoxType; flags: SET; caller: LedaBase.Box): LedaBase.Box;
+		VAR tB: LedaLines.Box;	ch: CHAR;
+	BEGIN
+		NEW(tB); InitBox(tB, bT, flags);
+		LedaBase.Load(r, ch);	(* skip byte [previously pattern number] *)
+		LedaBase.LoadVal(r, tB.asr); 
+		LedaCtrl.TextLoad(r, tB, tB.text);
+		(* formatting delayed [tB.lines = NIL] *)
+		(* overlapping planes not available yet *)
+		RETURN tB
+	END Load;
+	
+	PROCEDURE Store*(self: LedaBase.Box; VAR r: LedaBase.Rider);
+		VAR tB: LedaLines.Box;
+	BEGIN
+		tB := self(LedaLines.Box);
+		LedaBase.Store(r, 0FFX);	(* filler byte [previously pattern number] *)
+		LedaBase.StoreVal(r, tB.asr);
+		LedaCtrl.TextStore(r, tB.text);
+	END Store;
+	
+	PROCEDURE DrawColumnMarks(P: LedaSys.Port; eX, eY: LONGINT; tB: LedaLines.Box);
+		VAR colX, H: LONGINT;	m: LedaLines.ColMarkMsg;
+	BEGIN
+		IF tB.colW > 0 THEN colX := 0;
+			m.pNr := LedaSys.Mark0; m.clr := LedaSys.fg; tB.do.doOp(tB.do, m);	(* get column mark specification *)
+			INC(eY, 2 * LedaSys.scnUnit); H := tB.H - 4 * LedaSys.scnUnit;
+			REPEAT
+				LedaIO.out.line(P, eX + colX, eY, 0, H, ColMarkW, TopBot, m.pNr, m.clr, LedaIO.Paint);
+				LedaIO.out.line(P, eX + colX + tB.colW - ColMarkW, eY, 0, H, ColMarkW, TopBot, m.pNr, m.clr, LedaIO.Paint);
+				INC(colX, tB.colW + tB.colDX)
+			UNTIL colX >= tB.W
+		END
+	END DrawColumnMarks;
+	
+	PROCEDURE Draw*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port);
+		VAR tB: LedaLines.Box;	blk: LedaCtrl.Block;	R: LedaCtrl.Reader;	X, W, dH, pY, pos: LONGINT;
+	BEGIN	(* box is visible *)
+		tB := self(LedaLines.Box);
+		IF LedaLines.BGColor(tB) # LedaSys.bg THEN
+			ExtendBG(tB, dH);
+			LedaIO.out.area(P, eX, eY, tB.W, tB.H+dH, -1, -tB.bgClr, LedaIO.Replace)
+				(* -tB.bgClr --> draw background only on color screen *)
+		END;
+		IF tB.lines = NIL THEN ValidateFlow(tB) END;
+		blk := tB.lines; pY := P.Y - eY;
+		LedaCtrl.InitReader(R, tB.text); pos := tB.text.beg;
+		IF (P.X <= eX) & (P.Y <= eY) & (eX + tB.W - P.X <= P.W) & (eY + tB.H - P.Y <= P.H) THEN	(* visible *)
+			(*-- remark:  P.X + P.W could cause overflow --> guard formulated as eX + tB.W - P.X <= P.W --*)
+			LedaCtrl.SetReader(R, pos);
+			REPEAT
+				IF blk IS LedaLines.Block THEN X := eX + blk(LedaLines.Block).X
+				ELSE LedaIO.out.text(P, X, eY+blk.Y, R, blk, ModeTxt)
+				END;
+				blk := blk.next
+			UNTIL blk = NIL
+		ELSE	(* draw visible part *)
+			REPEAT
+				IF blk IS LedaLines.Block THEN X := eX + blk(LedaLines.Block).X; W := blk.W; blk := blk.next
+				ELSIF blk.Y < pY THEN INC(pos, LONG(blk.len)); blk := blk.next
+				ELSIF (X+W < P.X) OR (X > P.X + P.W) THEN
+					WHILE (blk # NIL) & ~(blk IS LedaLines.Block) DO INC(pos, LONG(blk.len)); blk := blk.next END
+				ELSE	(* horizontal inside & (blk.Y >= pY) *)
+					LedaCtrl.SetReader(R, pos);
+					WHILE (blk # NIL) & ~(blk IS LedaLines.Block) & (blk.Y - blk.H < pY + P.H) DO
+						LedaIO.out.text(P, X, eY+blk.Y, R, blk, ModeTxt);
+						INC(pos, LONG(blk.len)); blk := blk.next
+					END;
+					WHILE (blk # NIL) & ~(blk IS LedaLines.Block) DO INC(pos, LONG(blk.len)); blk := blk.next END
+				END
+			UNTIL blk = NIL
+		END;
+		IF ~ (LedaSys.PrintFlag IN P.state) THEN DrawColumnMarks(P, eX, eY, tB) END
+	END Draw;
+	
+	PROCEDURE Mark*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; kind, mode: SHORTINT);
+	(** kind = LedaBase.FocMark or LedaBase.SelMark ; mode = LedaBase.On or LedaBase.Off  *)
+	(** P # NIL: show mark / P = NIL: change of mark state [get/loose] *)
+		VAR tB: LedaLines.Box;	blk: LedaCtrl.Block;	R: LedaCtrl.Reader;
+	BEGIN
+		tB := self(LedaLines.Box);
+		IF kind = LedaBase.FocMark THEN	(* focus *)
+			IF P = NIL THEN		(* change of state *)
+				IF mode = LedaBase.On THEN SetInCtrl(tB.text, tB.carLoc.pos)	(* set input style *)
+				ELSIF mode = LedaBase.Off THEN tB.carLoc := NIL
+				END
+			ELSE		(* show focus *)
+				IF tB.carLoc # NIL THEN
+					IF mode = LedaBase.On THEN blk := tB.carLoc.blk;
+						LedaCtrl.InitReader(R, tB.text); LedaCtrl.SetReader(R, tB.carLoc.org);
+						LedaIO.out.caret(P, eX + tB.carLoc.X, eY + blk.Y + blk.bH, tB.carLoc.pos, R, blk)
+					ELSE LedaIO.out.caret(P, -1, -1, -1, R, blk)
+					END
+				END
+			END
+		ELSIF kind = LedaBase.SelMark THEN 	(* selection *)
+			IF P = NIL THEN		(* change of state *)
+				IF mode = LedaBase.On THEN
+					IF tB.selLoc = NIL THEN LedaSys.Halt(ProgErr) END
+				ELSIF mode = LedaBase.Off THEN tB.selLoc := NIL; tB.selLen := NotDef
+				END
+			ELSE		(* show selection *)
+				IF tB.selLoc # NIL THEN
+					IF tB.selLen > 0 THEN	(* character selection *)
+						LedaCtrl.InitReader(R, tB.text); InvertBlocks(P, eX, eY, tB.selLoc, tB.selLen, R)
+					ELSE	(* box selection *)
+						LedaIO.out.area(P, eX, eY, tB.W, tB.H, LedaSys.Grey2, LedaSys.inv, LedaIO.Invert)
+					END
+				END
+			END
+		END
+	END Mark;
+			
+	PROCEDURE Mouse*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port;
+											mX, mY: LONGINT; keys: SET; VAR res: INTEGER);
+		VAR tB: LedaLines.Box;
+	BEGIN	(* mX, mY within box *)
+		tB := self(LedaLines.Box);
+		IF keys = {ML} THEN TrackFocus(P, eX, eY, tB, mX, mY); res := LedaBase.Done
+		ELSIF keys = {MM} THEN TrackMM(P, eX, eY, tB, mX, mY, res);
+		ELSIF keys = {MR} THEN TrackSel(P, eX, eY, tB, mX, mY, res)
+		ELSIF keys = {MX} THEN TrackExec(P, eX, eY, tB, mX, mY, res)
+		END
+	END Mouse;
+	
+	PROCEDURE Key*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; nbr: SHORTINT; VAR keys: LedaSys.String);
+		VAR tB: LedaLines.Box;	loc: LedaLines.Location;	ctrl: LedaBase.PieceCtrl;
+			pos, len: LONGINT;	i: INTEGER;	ch: CHAR;
+	BEGIN	(* no selection in document, focus unhighlited *)
+		tB := self(LedaLines.Box); IF tB.carLoc = NIL THEN RETURN END;	(*###*)
+		loc := tB.carLoc; tB.carLoc := NIL; pos := loc.pos;  i := 0; 
+		WHILE i < nbr DO
+			ch := keys[i];
+			CASE keyCode[ORD(ch)] OF
+			   0:  LedaCtrl.GetChCtrl(tB.text, pos, ch, ctrl);
+					IF ctrl # NIL THEN LedaCtrl.WriteChar(W, ch, ctrl) END
+			| 1:  LedaCtrl.WriteChar(W, ch, LedaBase.inCtrl)
+			| 2:  IF ch = GlueKey THEN ch := LedaBase.Glue
+					ELSIF ch = HyphenKey THEN ch := LedaBase.Hyphen
+					ELSIF ch = DashKey THEN ch := Dash
+					END;
+					LedaCtrl.WriteChar(W, ch, LedaBase.inCtrl)
+			| 3:  IF nbr = 1 THEN
+						IF ch = Del THEN
+							IF pos > tB.text.beg THEN DEC(pos); LedaCtrl.TextDelete(tB.text, pos, 1)
+							ELSIF (pos = tB.text.beg) & (tB.text.prev # NIL) THEN
+								 DEC(pos); LedaCtrl.TextDelete(tB.text.prev, pos, 1)
+							END
+						ELSIF ch = LtArrow THEN DEC(pos)
+						ELSIF ch = RtArrow THEN INC(pos)
+						END
+					END
+			END;
+			INC(i)
+		END;
+		IF W.len > 0 THEN
+			len := W.len; LedaCtrl.TextInsert(tB.text, pos, W); INC(pos, len)
+		END;
+		ValidateFocus(pos, tB, loc)
+	END Key;
+	
+	PROCEDURE Insert*(self: LedaBase.Box; eX, eY: LONGINT; P: LedaSys.Port; VAR B: LedaBase.Buffer);
+		VAR tB: LedaLines.Box;	loc: LedaLines.Location;	pos, len: LONGINT;
+	BEGIN	(* no selection in document, focus unhighlited *)
+		tB := self(LedaLines.Box);
+		IF B IS LedaCtrl.Buffer THEN
+			WITH B: LedaCtrl.Buffer DO
+				LedaCtrl.ReplaceCorresp(B, tB.text);	(* replace controls in buffer with corresponding controls of text *)
+				IF tB.carLoc = NIL THEN loc := NIL; pos := tB.text.beg
+				ELSE loc := tB.carLoc; tB.carLoc := NIL; pos := loc.pos	(* loc.pos valid; other fields of loc invalid *)
+				END;
+				len := B.len; LedaCtrl.TextInsert(tB.text, pos, B); INC(pos, len);
+				IF loc # NIL THEN ValidateFocus(pos, tB, loc) END
+			END
+		END
+	END Insert;
+	
+	PROCEDURE Size*(self: LedaBase.Box; W, H: LONGINT; caller: LedaBase.Box; draw: BOOLEAN; VAR res: INTEGER);
+	(** W/H > 0: accept value; caller: box notifying size change; res = 0: call successful *)
+		VAR tB: LedaLines.Box;	eX, eY, len: LONGINT;	P: LedaSys.Port;	newFrm, mask: BOOLEAN;
+	BEGIN
+		tB := self(LedaLines.Box);
+		IF tB.carLoc # NIL THEN LedaBox.RemFoc(tB, NIL) END;
+		IF (tB.selLoc # NIL) & (tB.selLen > 0) THEN LedaBox.RemSel(tB, NIL) END;
+		IF W > 0 THEN tB.W := W END;
+		IF H > 0 THEN tB.H := H END;
+		IF (tB.lines = NIL) OR (tB.lines # tB.lines.next) THEN	(* text flow is valid *)
+			ValidateFormat(tB);
+			mask := draw; LedaLines.FormatText(tB, len, newFrm, mask);
+			IF draw THEN
+				LedaBox.GetPort(tB, P); LedaBox.ExtRef(tB, eX, eY);
+				P.eraseCol := LedaLines.BGColor(tB); LedaIO.out.update(P, eX, eY, tB.W, tB.H, tB.do(LedaBase.BoxHandler).draw, tB);
+				IF mask THEN LedaIO.out.mask(P, "R", 0, 0, 0, 0) END	(* reset masks *)
+			END;
+			IF newFrm OR (len # tB.text.len) THEN LedaCtrl.TextChangeFlow(tB.text, len) END;	(* adjust length of text *)
+		END
+	END Size;
+
+	PROCEDURE Handle*(self: LedaBase.Box; VAR m: LedaBase.Msg);
+		VAR tB: LedaLines.Box;	P: LedaSys.Port;	len, eX, eY: LONGINT;	newFrm, mask, handled: BOOLEAN;
+	BEGIN
+		tB := self(LedaLines.Box); handled := TRUE;
+		IF m IS LedaCtrl.TextMsg THEN	(* notification about text change *)
+			WITH m: LedaCtrl.TextMsg DO
+				CASE m.id OF LedaCtrl.TextUpdId, LedaCtrl.TextInsId, LedaCtrl.TextDelId:	(* change in text *)
+						PrepTextChange(tB, P, eX, eY); LedaLines.UpdateText(tB, P, eX, eY, m, len, newFrm);
+						IF newFrm OR (len # tB.text.len) THEN LedaCtrl.TextChangeFlow(tB.text, len) END
+				| LedaCtrl.FlowChkId:	(* check for change in last line *)
+						(* m.beg: end of text / m.len: 0; return in m.len length of this text *)
+						PrepTextChange(tB, P, eX, eY); LedaLines.UpdateText(tB, P, eX, eY, m, len, newFrm); m.len := len;
+						IF newFrm OR (len # tB.text.len) THEN m.id := LedaCtrl.FlowPourId END
+				| LedaCtrl.FlowInsId, LedaCtrl.FlowDelId:	(* change in text flow *)
+						(* m.beg: new begin of text [m.beg=text.beg] / m.len: length of change [inserted or deleted characters] *)
+						(* return in m.len length of this text; set m.id to LedaCtrl.FlowPourId to propagate change *) 
+						PrepTextChange(tB, P, eX, eY); LedaLines.UpdateText(tB, P, eX, eY, m, len, newFrm); m.len := len;
+						IF newFrm OR (len # tB.text.len) THEN m.id := LedaCtrl.FlowPourId END	(* to propagate change *)
+				| LedaCtrl.FlowPourId:	(* change in text flow *)
+						(* m.beg: new begin of text [m.beg=text.beg] / m.len: 0; return in m.len length of this text *)
+						PrepTextChange(tB, P, eX, eY); mask := P # NIL; LedaLines.FormatText(tB, m.len, newFrm, mask);
+						IF P # NIL THEN
+							P.eraseCol := LedaLines.BGColor(tB); LedaIO.out.update(P, eX, eY, tB.W, tB.H, Draw, tB);
+							IF mask THEN LedaIO.out.mask(P, "R", 0, 0, 0, 0) END	(* reset masks *)
+						END
+				| LedaCtrl.FlowAvailId: 	(* there is unpoured text *)
+						(* m.beg: begin of unpoured text / m.len: length of unpoured text *)
+						(* handler of message has to take care that all unpoured text will be poured *)
+						IF ~(LedaBox.NoFlow IN tB.flags) THEN AddBox(tB, tB.text, m.beg, m.len) END
+				| LedaCtrl.FlowEndId:	(* text became empty *)
+						RemoveBox(tB)
+				| LedaCtrl.DrawTextId:
+						LedaBox.GetPort(tB, P); LedaBox.ExtRef(tB, eX, eY);
+						IF tB.carLoc # NIL THEN LedaBox.RemFoc(tB, P) END;
+						IF tB.selLoc # NIL THEN LedaBox.RemSel(tB, P) END;
+						LedaLines.DisplayPart(tB, P, eX, eY, m.beg, m.len)
+				| LedaCtrl.SelectedTextId:	(* get selected text *)
+						IF tB.selLen > 0 THEN m.text := tB.text; m.beg := tB.selLoc.pos; m.len := tB.selLen END
+				END;
+			END
+		ELSIF m IS LedaBase.BoxMsg THEN
+			WITH m: LedaBase.BoxMsg DO
+				IF m.id = LedaBase.AdjustYId THEN LineBounds(tB, m.l1, m.l1, m.l2)
+				ELSIF m.id = LedaBase.SizeId THEN	(* size change [font, marginal] *)
+					IF tB.text.beg = 0 THEN LedaCtrl.TextBroadcast(tB.text, FALSE, m) END
+				ELSIF m.id = LedaBase.TypeInstId THEN
+					IF (m.name = ModName) & (m.s = "DC") THEN	(* return box type instance *) 
+						m.ctrl := tB.do; INCL(LedaBox.bcFlags, LedaBox.BcMsg)	(* stop broadcast *)
+					END
+				END
+			END
+		ELSIF m IS LedaBase.CtrlMsg THEN
+			IF (m(LedaBase.CtrlMsg).id = LedaBase.ChangeId) & (tB.text.beg = 0) THEN
+				LedaCtrl.TextBroadcast(tB.text, FALSE, m)
+			END
+		ELSIF m IS LedaBox.Msg THEN
+			WITH m: LedaBox.Msg DO
+				IF m.id = LedaBox.FocusId THEN
+					IF m.op = 1 THEN
+						IF tB.lines = NIL THEN ValidateFlow(tB) END;
+						SetFocus(m.l1, tB, NIL)
+					ELSIF (m.op = 2) & (tB.carLoc # NIL) THEN
+						LocateExtRef(tB, tB.carLoc.pos, m.l1, m.l2, m.l3, m.l4);
+						INC(m.l1, m.l3); INC(m.l2, m.l4); m.id := LedaBox.DoneId
+					END
+				ELSIF m.id = LedaBox.LocateId THEN
+					IF tB.anc # NIL THEN	(* in document tree *)
+						IF tB.lines = NIL THEN ValidateFlow(tB) END;
+						IF tB.lines # tB.lines.next THEN	(* text flow is valid *)
+							CASE m.op OF 1:  m.text := tB.text;	(* get text location [focus or begin] *)
+									IF tB.carLoc # NIL THEN m.l1 := tB.carLoc.pos ELSE m.l1 := tB.text.beg END
+							| 2:  LocateLine(m.l1, tB.lines, tB.text.beg, m.l2, m.l3)	(* get line bounds *)
+							| 3:  MarkTextLocation(tB, m.l1, m.l2)
+							| 4:  LocateBlock(m.l1, tB.lines, tB.text.beg, m.l1, m.l2, m.l3, m.l4)
+							| 5:  LocateCtrl(tB, m.ctrl, m.text, m.l1)
+							| 6:  LocateExtRef(tB, m.l0, m.l1, m.l2, m.l3, m.l4);
+									m.b := (tB.selLoc # NIL) & LedaSys.InRange(m.l0, tB.selLoc.pos, tB.selLen)	(* part of selection *)
+							ELSE
+							END
+						END
+					END
+				ELSIF m.id = LedaBox.BoxId THEN
+					IF m.op = 3 THEN	(* check if box is empty *)
+						IF (m.box1 = tB) & (tB.text.len = 0) & (tB.text.next = NIL) & (tB.text.prev # NIL) THEN m.id := LedaBox.DoneId END	(* box is empty *)
+					ELSIF m.op = 4 THEN	(* remove notification *)
+						IF tB.lines # NIL THEN tB.lines := NIL END;
+						m.caller := tB; m.text := tB.text;
+						LedaCtrl.TextBroadcast(tB.text, TRUE, m)	(* notify controls to remove from trailer list *)
+					ELSIF m.op = 5 THEN	(* return selection level *)
+						IF tB.selLoc = NIL THEN m.l0 := -1 ELSE m.l0 := 0; IF tB.selLen > 0 THEN INC(m.l0) END END
+					ELSIF m.op = 6 THEN m.l0 := LedaLines.BGColor(tB); m.id := LedaBox.DoneId	(* return background color *)
+					ELSIF m.op = 7 THEN RemoveText(tB)	(* dispose notification *)
+					END 
+				ELSIF (m.id = LedaBox.CtrlId) & (m.op = 2) THEN	(* changed control; broadcast *)
+					IF (m.ctrl # NIL) & (tB.text.beg = 0) THEN LedaCtrl.TextUpdate(tB.text, m.ctrl) END
+				ELSIF m.id = LedaBox.FormId THEN FormatBase(tB, m)
+				END
+			END
+		ELSIF m IS LedaBox.PageMsg THEN
+			WITH m: LedaBox.PageMsg DO
+				IF m.id = LedaBox.PgTexts THEN ProcessFlow(tB, m.op) END
+			END
+		ELSIF m IS LedaBox.PlaneMsg THEN
+			WITH m: LedaBox.PlaneMsg DO
+				IF m.id = LedaBox.PlChange THEN PlaneChange(tB, m.planeBox) END
+			END
+		ELSIF m IS LedaBox.SelectionMsg THEN	(* tB has selection *)
+			notedSel.text := tB.text; notedSel.beg := tB.selLoc.pos; notedSel.len := tB.selLen;
+			m(LedaBox.SelectionMsg).copy := CopyNotedText
+		ELSIF m IS LedaBox.AttributeMsg THEN	(* tB has selection *)
+			WITH m: LedaBox.AttributeMsg DO
+				IF m.id IN {LedaBox.GetValue, LedaBox.GetStyle} THEN GetAttributes(tB, m)
+				ELSIF m.id IN {LedaBox.SetValue, LedaBox.SetStyle, LedaBox.NewStyle} THEN SetAttributes(tB, m)
+				ELSIF m.id = LedaBox.SameAttr THEN
+					IF m.name = TextAttr THEN ChangeTextAttr(tB, m.ctrl(LedaBase.PieceCtrl)) END
+				END
+			END
+		ELSE handled := FALSE
+		END;
+		IF ~ handled & (LedaBox.BcMsg IN tB.flags) & (tB.text.beg = 0) & (LedaBox.BcTxt IN LedaBox.bcFlags) THEN
+			EXCL(tB.flags, LedaBox.BcMsg);	(* to prevent broadcast in case of a desender call *)
+			LedaCtrl.TextBroadcast(tB.text, FALSE, m)	(* broadcast to end of stream *)
+		END
+	END Handle;
+	
+(*--- box type control ---*)
+
+	PROCEDURE NewType(ctrl: LedaBase.Control): LedaBase.BoxHandler;
+	(* return new instance of box type *)
+	(* ctrl: macro definitions *)
+		VAR nT: LedaBase.BoxHandler;
+	BEGIN
+		NEW(nT);
+		LedaBase.InitControl(nT, typeDoOp);
+		LedaBox.InitType(nT);
+		nT.handle := Handle;
+		nT.new := New; 
+		nT.load := Load;
+		nT.store := Store;
+		nT.draw := Draw;
+		nT.mark := Mark;
+		nT.mouse := Mouse;
+		nT.key := Key;
+		nT.insert := Insert;
+		nT.size := Size;
+		nT.data := ctrl;	(* data of box type control *)
+		RETURN nT
+	END NewType;
+	
+	PROCEDURE PutType(bT: LedaBase.BoxType; VAR refId: INTEGER);
+		VAR cM: LedaBase.CtrlMsg;
+	BEGIN
+		IF bT.data # NIL THEN cM.id := LedaBase.RegisterId; bT.data.doOp(bT.data, cM) END;
+		LedaBase.PutToList(bT, refId)
+	END PutType;
+	
+	PROCEDURE *TypeDoOp(ctrl: LedaBase.Control; VAR m: LedaBase.Msg);
+	(* implements the basic behaviour of the box type control *)
+	(* control can have instance data [macro definitions] *)
+	BEGIN
+		IF m IS LedaBase.CtrlMsg THEN
+			WITH m: LedaBase.CtrlMsg DO
+				CASE m.id OF LedaBase.RegisterId:  PutType(ctrl(LedaBase.BoxType), m.ctrlId)
+				| LedaBase.StoreId:  LedaBase.StoreCtrl(m.r, ctrl(LedaBase.BoxType).data)
+				| LedaBase.LoadId: 
+					IF LedaBase.version > 0X THEN LedaBase.LoadCtrl(m.r, ctrl) ELSE ctrl := NIL END;
+					m.ctrl := NewType(ctrl)
+				| LedaBase.StoreModCmd:  LedaBase.StoreStr(m.r, ModName); LedaBase.StoreStr(m.r, "DC")
+				ELSE
+				END
+			END
+		ELSIF m IS LedaLines.ColMarkMsg THEN
+			WITH m: LedaLines.ColMarkMsg DO m.pNr := ColumnPat; m.clr := LedaSys.fg END	(* specifies column mark *)
+		END
+	END TypeDoOp;
+	
+	PROCEDURE DC*;
+	(** deposits own box type in the module LedaCtrl *)
+	BEGIN
+		LedaBase.depositedCtrl := NewType(NIL)
+	END DC;
+	
+	
+BEGIN
+	(*--- box type control ---*)
+	typeDoOp := TypeDoOp;
+	
+	LedaCtrl.InitWriter(W);
+	notedSel.text := NIL; notedSel.beg := NotDef; notedSel.len := NotDef;
+	note.text := NIL; note.beg := NotDef; note.len := NotDef;
+	eqCtrl := NIL;
+	InitKeys
+	
+END LedaText.
+

@@ -1,0 +1,476 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE iOPM;	(* RC, NM 6.3.89 / 16.12.92 / 12.12.93 / 14.12.94 / prk 27.4.96 *)
+
+(*
+	code generator for Intel i386, i387/ i486 - Diplomarbeit ETH-Z…rich WS 92/93
+	by Niklaus Mannhart, 87-913-117I
+	author's address: 	Himmelrich 22
+		6340 Baar, Switzerland
+		e-mail: mannhart@inf.ethz.ch	phone: +41 (0)42 31 40 33
+
+This program is distributed in the hope that it will be useful, 
+but WITHOUT ANY WARRANTY; without even the implied warranty of 
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+	March the 2nd 1993
+	Release 12.12.93 / Release 1.0
+	Release 12.1.94 / Release 1.1 (fixed bugs in iOPL.LoadProc and floating point compare (iOPL.FloadCmp))
+	jm 28.8.95 - compiler error positions are now emitted in a larger field.
+	prk 27.4.96 / Intel Native common release (Native PC + Linux + Windows)
+	prk 3.6.96 (reali@inf.ethz.ch)
+		Merging Active Compiler
+*)
+
+(* Machine dependent constants needed before code generation *)
+(* Host interface *)
+
+
+	IMPORT Texts, Oberon, Fonts, Files, Files1:= Files, SYSTEM;
+
+
+	CONST (* i386 *)
+
+		(* basic type sizes *)
+		ByteSize* = 1;	(* SYSTEM.BYTE *)
+		CharSize* = 1;	(* CHAR *)
+		BoolSize* = 1;	(* BOOLEAN *)
+		SetSize* = 4;	(* SET *)
+		SIntSize* = 1;	(* SHORTINT *)
+		IntSize* = 2;	(* INTEGER *)
+		LIntSize* = 4;	(* LONGINT *)
+		RealSize* = 4;	(* REAL *)
+		LRealSize* = 8;	(* LONGREAL *)
+		ProcSize* = 4;	(* PROCEDURE type *)
+		PointerSize* = 4;	(* POINTER type *)
+
+		(* value of constant NIL *)
+		nilval* = 0;
+		
+		(* target machine minimum values of basic types expressed in host machine format: *)
+		MinSInt* = -80H;
+		MinInt* = -8000H;
+		MinLInt* =  80000000H;	(* i386: -2147483648*)
+		MinRealPat = 0FF7FFFFFH;	(* most  negative, 32-bit pattern *)
+		MinLRealPatL = 0FFFFFFFFH;	(* most  negative, lower 32-bit pattern *)
+		MinLRealPatH = 0FFEFFFFFH;	(* most  negative, higher 32-bit pattern *)
+		
+		(* target machine maximum values of basic types expressed in host machine format: *)
+		MaxSInt* = 7FH;
+		MaxInt* = 7FFFH;
+		MaxLInt* = 7FFFFFFFH;	(* i386: 2147483647*)
+		MaxSet* = 31;	(* must be >= 15, else the bootstraped compiler cannot run (IN-tests) *)
+		MaxRealPat = 7F7FFFFFH;	(* most positive, 32-bit pattern *)
+		MaxLRealPatL = 0FFFFFFFFH;	(* most positive, lower 32-bit pattern *)
+		MaxLRealPatH = 7FEFFFFFH;		(* most positive, higher 32-bit pattern *)
+		
+		(* maximal index value for array declaration: *)
+		MaxIndex* = MaxLInt;
+		
+		(* parametrization of numeric scanner: *)
+		MaxHDig* = 8;	(* maximal hexadecimal longint length *)
+		MaxRExp* = 38;	(* maximal real exponent *)
+		MaxLExp* = 308;	(* maximal longreal exponent *)
+		
+		(* inclusive range of parameter of standard procedure HALT: *)
+		MinHaltNr* = 20;
+		 MaxHaltNr* = MAX(LONGINT); 
+		
+		(* inclusive range of register number of procedures SYSTEM.GETREG and SYSTEM.PUTREG: *)
+		MinRegNr* = 0;	(* interpretation is left to the back-end, e.g. for i386: *)
+		MaxRegNr* = 7;	(* F0-F7 if second parameter is REAL or LONGREAL, R0-R7 else *)
+		
+		(* maximal value of flag used to mark interface structures: *)
+		MaxSysFlag* = 0;	(* i386: only 0 is valid, not used *)
+		
+		(* maximal condition value of parameter of SYSTEM.CC: *)
+		MaxCC* = -1;	(* not implemented interpretation is left to the back-end *)
+		
+		(* initialization of linkadr field in ObjDesc, must be different from any valid link address: *)
+		LANotAlloc* = -1;
+		
+		(* initialization of constant address, must be different from any valid constant address: *)
+		ConstNotAlloc* = -1;	(* i386: only strings are allocated *)
+		
+		(* initialization of tdadr field in StrDesc, must be different from any valid address: *)
+		TDAdrUndef* = -1;
+		
+		(* maximal number of cases in a case statement: *)
+		MaxCases* = 128;
+		
+		(* maximal range of a case statement (higher label - lower label ~ jump table size): *)
+		MaxCaseRange* = 512;
+		
+		(* whether hidden pointer fields have to be nevertheless exported: *)
+		ExpHdPtrFld* = TRUE;
+
+		(* whether hidden procedure fields have to be nevertheless exported (may be used for System.Free): *)
+		ExpHdProcFld* = FALSE;
+		
+		(* whether hidden bound procedures have to be nevertheless exported: *)
+		ExpHdTProc* = FALSE;
+
+		(* whether addresses of formal parameters are exported: *)
+		ExpParAdr* = FALSE;
+
+		(* whether addresses or entry numbers are exported for global variables: *)
+		ExpVarAdr* = FALSE;
+
+		(* whether field leaf of pointer variable p has to be set to FALSE, when NEW(p) or SYSTEM.NEW(p, n) is used: *)
+		NEWusingAdr* = TRUE;
+		
+		(* special character (< " ") returned by procedure Get, if end of text reached *)
+		Eot* = 0X;
+		
+		
+		SetLen = MAX(SET)+1;
+		NumErrors = (912+SetLen) DIV SetLen * SetLen;
+		
+
+	VAR
+		MinReal*, MaxReal*: REAL;
+		MinLReal*, MaxLReal*: LONGREAL;
+		noerr*: BOOLEAN;	(* no error found until now *)
+		curpos*, errpos*: LONGINT;	(* character and error position in source file *)
+		breakpc*: LONGINT;	(* set by OPV.Init *)
+		breakpos*: LONGINT;	(* set by Mark *)
+		
+		errors: ARRAY NumErrors DIV SetLen OF SET;
+		
+		outputPath*: ARRAY 64 OF CHAR;		
+		pathChar*: CHAR;
+
+	CONST
+		
+		OFext = ".Obj";	SFext = ".Sym";
+		
+		SFtag = 0F7X;	(* symbol file tag *)
+		OFtag = 0F8X;	(* object file tag *)
+
+	TYPE
+		FileName = ARRAY 32 OF CHAR;
+		
+	VAR
+		LRealPat: RECORD L, H: LONGINT END ;
+		lastpos, pat: LONGINT;	(* last position error in source file *)
+		inR: Texts.Reader;
+		Log: Texts.Text;
+		W: Texts.Writer;
+		oldSF, newSF, ObjF, RefF: Files.Rider;
+		oldSFile, newSFile, ObjFile, RefFile: Files.File;
+		
+	PROCEDURE Init*(source: Texts.Reader; log: Texts.Text);
+	 VAR i: SHORTINT; 
+	BEGIN inR := source; Log := log;
+		noerr := TRUE; curpos := Texts.Pos(inR); errpos := curpos; lastpos := curpos-10;
+		
+		FOR i := 0 TO NumErrors DIV SetLen - 1 DO errors[i] := {} END
+		
+	END Init;
+	
+		PROCEDURE Close*; (* jm *)
+		BEGIN
+			Files.Set(oldSF, NIL, 0); Files.Set(newSF, NIL, 0); Files.Set(ObjF, NIL, 0); Files.Set(RefF, NIL, 0);
+			oldSFile := NIL; newSFile := NIL; ObjFile := NIL;  RefFile := NIL;
+		END Close;
+		
+	PROCEDURE Get*(VAR ch: CHAR);	(* read next character from source text, Eot if no more *)
+	BEGIN
+
+		REPEAT
+
+			Texts.Read(inR, ch); INC(curpos)
+
+		UNTIL inR.eot OR ((inR.lib # NIL) & (inR.lib IS Fonts.Font))
+
+	END Get;
+	
+	PROCEDURE NewKey*(): LONGINT;
+		VAR time, date: LONGINT;
+	BEGIN Oberon.GetClock(time, date); RETURN (time MOD 20000H) * (date MOD 4000H)
+	END NewKey;
+	
+	PROCEDURE MakeFileName(path: ARRAY OF CHAR; VAR name, FName: ARRAY OF CHAR; ext: ARRAY OF CHAR);
+		VAR i, j: INTEGER; ch: CHAR;
+	BEGIN
+		i := 0;
+		IF path # "" THEN
+			WHILE outputPath[i] # 0X DO FName[i] := outputPath[i]; INC(i) END;
+			IF outputPath[i] # pathChar THEN FName[i] := pathChar; INC(i) END
+		END;
+		j := 0;
+		WHILE name[j] # 0X DO FName[i] := name[j]; INC(i); INC(j) END;
+		j := -1;
+		REPEAT INC(j); FName[i] := ext[j]; INC(i); UNTIL ext[j] = 0X
+	END MakeFileName;
+
+	(* ------------------------- Log Output ------------------------- *)
+	
+	PROCEDURE LogW*(ch: CHAR);
+	BEGIN
+		Texts.Write(W, ch); Texts.Append(Log, W.buf)
+	END LogW;
+	
+	PROCEDURE LogWStr*(s: ARRAY OF CHAR);
+	BEGIN
+		Texts.WriteString(W, s); Texts.Append(Log, W.buf)
+	END LogWStr;
+	
+	PROCEDURE LogWNum*(i, len: LONGINT);
+	BEGIN
+		Texts.WriteInt(W, i, len); Texts.Append(Log, W.buf)
+	END LogWNum;
+
+	PROCEDURE LogWLn*;
+	BEGIN
+		Texts.WriteLn(W); Texts.Append(Log, W.buf)
+	END LogWLn;
+
+	
+	PROCEDURE ErrorMsg(n: INTEGER);
+	VAR s: Texts.Scanner; ch: CHAR;  e: ARRAY 127 OF CHAR;  i: SHORTINT;
+	BEGIN
+		IF (n >= NumErrors) OR ~((n MOD SetLen) IN errors[n DIV SetLen]) THEN
+			IF n < NumErrors THEN INCL(errors[n DIV SetLen], n MOD SetLen) END;
+			Oberon.OpenScanner(s, "OP2.Errors");
+			IF s.class # Texts.Inval THEN
+				REPEAT Texts.Scan(s) UNTIL s.eot OR (s.class = Texts.Int) & (s.i = 0);
+				WHILE ~s.eot & ((s.class # Texts.Int) OR (s.i # n)) DO Texts.Scan(s) END;
+				IF ~s.eot THEN Texts.Read(s, ch);  Texts.Write(W, 9X);  i := 0;
+					WHILE ~s.eot & (ch # 0DX) DO e[i] := ch; INC(i); Texts.Read(s, ch) END;
+					e[i] := 0X;  LogWStr(e)
+				END
+			END
+		END
+	END ErrorMsg;
+	
+	
+	PROCEDURE Mark*(n: INTEGER; pos: LONGINT);
+	BEGIN
+		IF n >= 0 THEN
+			noerr := FALSE;
+			IF (pos < lastpos) OR (lastpos + 9 < pos) THEN lastpos := pos;
+				LogWLn; LogWStr("  pos "); LogWNum(pos, 6);
+				IF n = 255 THEN LogWStr("  pc "); LogWNum(breakpc, 6);
+					 breakpos := pos 
+				ELSIF n = 254 THEN LogWStr("  pc not found")
+				ELSE LogWStr("  err"); LogWNum(n, 4);
+					 ErrorMsg(n) 
+				END
+			END
+		ELSE
+			LogWLn; LogWStr("  pos "); LogWNum(pos, 6); LogWStr("  warning"); LogWNum(-n, 4);
+			 ErrorMsg(-n) 
+		END
+	END Mark;
+	
+	PROCEDURE err*(n: INTEGER);
+	BEGIN Mark(n, errpos)
+	END err;
+
+	(* ------------------------- Read Symbol File ------------------------- *)
+	
+	PROCEDURE SymRCh*(VAR ch: CHAR);
+	BEGIN Files.Read(oldSF, ch)
+	END SymRCh;
+
+	PROCEDURE SymRTag*(VAR k: INTEGER);
+		VAR ch: CHAR;
+	BEGIN Files.Read(oldSF, ch); k := ORD(ch)
+	END SymRTag;
+	
+	PROCEDURE SymRInt*(VAR k: LONGINT);
+		VAR i: INTEGER;
+	BEGIN Files1.ReadInt(oldSF, i); k := i
+	END SymRInt;
+
+	PROCEDURE SymRLInt*(VAR k: LONGINT);
+	BEGIN Files1.ReadLInt(oldSF, k)
+	END SymRLInt;
+	
+	PROCEDURE SymRSet*(VAR s: SET);
+	BEGIN Files1.ReadSet(oldSF, s)
+	END SymRSet;
+
+	PROCEDURE SymRReal*(VAR r: REAL);
+	BEGIN Files1.ReadReal(oldSF, r)
+	END SymRReal;
+	
+	PROCEDURE SymRLReal*(VAR lr: LONGREAL);
+	BEGIN Files1.ReadLReal(oldSF, lr)
+	END SymRLReal;
+	
+	PROCEDURE CloseOldSym*;
+	(* called only if OldSym previously returned done = TRUE *)
+	END CloseOldSym;
+
+	PROCEDURE OldSym*(VAR modName: ARRAY OF CHAR; self: BOOLEAN; VAR done: BOOLEAN);
+	(* open file in read mode *)
+		VAR ch: CHAR; fileName: FileName;
+	BEGIN 
+		MakeFileName("", modName, fileName, SFext);
+		oldSFile := Files.Old(fileName); done := oldSFile # NIL;
+		IF done THEN
+			Files.Set(oldSF, oldSFile, 0); SymRCh(ch);
+			IF ch # SFtag THEN err(151);  (*not a symbol file*)
+				CloseOldSym; done := FALSE
+			END
+		ELSIF ~self THEN err(152)   (*sym file not found*)
+		END
+	END OldSym;
+	
+	PROCEDURE eofSF*(): BOOLEAN;
+	(* = TRUE if end of old file reached *)
+	BEGIN RETURN oldSF.eof
+	END eofSF;
+	
+	(* ------------------------- Write Symbol File ------------------------- *)
+	
+	PROCEDURE SymWCh*(ch: CHAR);
+	BEGIN Files.Write(newSF, ch)
+	END SymWCh;
+
+	PROCEDURE SymWTag*(k: INTEGER);
+	BEGIN Files.Write(newSF, CHR(k))
+	END SymWTag;
+
+	PROCEDURE SymWInt*(k: LONGINT);
+	BEGIN Files1.WriteInt(newSF, SHORT(k))
+	END SymWInt;
+
+	PROCEDURE SymWLInt*(k: LONGINT);
+	BEGIN Files1.WriteLInt(newSF, k)
+	END SymWLInt;
+
+	PROCEDURE SymWSet*(s: SET);
+	BEGIN Files1.WriteSet(newSF, s)
+	END SymWSet;
+
+	PROCEDURE SymWReal*(r: REAL);
+	BEGIN Files1.WriteReal(newSF, r)
+	END SymWReal;
+	
+	PROCEDURE SymWLReal*(lr: LONGREAL);
+	BEGIN Files1.WriteLReal(newSF, lr)
+	END SymWLReal;
+	
+	PROCEDURE RegisterNewSym*(VAR modName: ARRAY OF CHAR);
+	(* delete possibly already existing file with same name, register new created file *)
+	BEGIN Files.Register(newSFile)
+	END RegisterNewSym;
+	
+	PROCEDURE DeleteNewSym*;
+	(* delete new created file, don't touch possibly already existing file with same name *)
+	END DeleteNewSym;
+
+	PROCEDURE NewSym*(VAR modName: ARRAY OF CHAR; VAR done: BOOLEAN);
+	(* open new file in write mode, don't touch possibly already existing file with same name *)
+		VAR fileName: FileName;
+	BEGIN 
+		MakeFileName(outputPath, modName, fileName, SFext);
+		newSFile := Files.New(fileName); done := newSFile # NIL;
+		IF done THEN Files.Set(newSF, newSFile, 0);
+			SymWCh(SFtag)
+		ELSE err(153)
+		END
+	END NewSym;
+
+	PROCEDURE EqualSym*(VAR oldkey: LONGINT): BOOLEAN;
+	(* compare old and new Symbol File, close old file, return TRUE if equal *)
+		VAR ch0, ch1: CHAR; equal: BOOLEAN;
+	BEGIN
+		Files.Set(oldSF, oldSFile, 2); Files1.ReadLInt(oldSF, oldkey); Files.Set(newSF, newSFile, 6);
+		REPEAT Files.Read(oldSF, ch0); Files.Read(newSF, ch1)
+		UNTIL (ch0 # ch1) OR newSF.eof;
+		equal := oldSF.eof & newSF.eof; CloseOldSym;
+		RETURN equal
+	END EqualSym;
+
+	(* ------------------------- Write Reference & Object Files ------------------------- *)
+
+	PROCEDURE RefW*(ch: CHAR);
+	BEGIN Files.Write(RefF, ch)
+	END RefW;
+
+	PROCEDURE RefWNum* (i: LONGINT);
+	BEGIN
+		Files.WriteNum (RefF, i)
+	END RefWNum;
+
+(* no longer used
+	PROCEDURE RefWInt*(i: INTEGER);
+	BEGIN Files1.WriteInt(RefF, i)
+	END RefWInt;
+
+	PROCEDURE RefWLInt*(i: LONGINT);
+	BEGIN Files1.WriteLInt(RefF, i)
+	END RefWLInt;
+*)
+
+	PROCEDURE ObjW*(ch: CHAR);
+	BEGIN Files.Write(ObjF, ch)
+	END ObjW;
+
+	PROCEDURE ObjWInt*(i: INTEGER);
+	BEGIN Files1.WriteInt(ObjF, i)
+	END ObjWInt;
+
+	PROCEDURE ObjWLInt*(i: LONGINT);
+	BEGIN Files1.WriteLInt(ObjF, i)
+	END ObjWLInt;
+
+	PROCEDURE ObjWBytes*(VAR bytes: ARRAY OF SYSTEM.BYTE; n: LONGINT);
+	BEGIN Files.WriteBytes(ObjF, bytes, n)
+	END ObjWBytes;
+
+	PROCEDURE OpenRefObj*(VAR modName: ARRAY OF CHAR);
+		VAR FName: ARRAY 32 OF CHAR;
+	BEGIN
+		RefFile := Files.New(""); Files.Set(RefF, RefFile, 0);
+		MakeFileName(outputPath, modName, FName, OFext);
+		ObjFile := Files.New(FName);
+		IF ObjFile # NIL THEN
+			Files.Set(ObjF, ObjFile, 0);
+
+			ObjW(OFtag); ObjW("6"); ObjWInt(0); ObjWInt(0)
+
+		ELSE err(153)
+		END
+	END OpenRefObj;
+
+	PROCEDURE CloseRefObj*;
+		VAR refpos: LONGINT; ch: CHAR; ref: Files.Rider;
+	BEGIN (*ref block*)
+		refpos := Files.Pos(ObjF); 
+		Files.Set(ref, RefFile, 0); Files.Read(ref, ch);
+		WHILE ~ref.eof DO ObjW(ch); Files.Read(ref, ch) END ;
+		Files.Set(ObjF, ObjFile, 2); ObjWLInt(Files.Length(RefFile));
+		Files.Register(ObjFile)
+	END CloseRefObj;
+
+BEGIN
+	pat := MinRealPat; SYSTEM.MOVE(SYSTEM.ADR(pat), SYSTEM.ADR(MinReal), 4);	(*i386: -3.40282346E38*)
+	pat := MaxRealPat; SYSTEM.MOVE(SYSTEM.ADR(pat), SYSTEM.ADR(MaxReal), 4);	(*i386: 3.40282346E38*)
+	LRealPat.L := MinLRealPatL; LRealPat.H := MinLRealPatH;
+	SYSTEM.MOVE(SYSTEM.ADR(LRealPat), SYSTEM.ADR(MinLReal), 8);	(*i386: -1.7976931348623157D308*)
+	LRealPat.L := MaxLRealPatL; LRealPat.H := MaxLRealPatH;
+	SYSTEM.MOVE(SYSTEM.ADR(LRealPat), SYSTEM.ADR(MaxLReal), 8);	(*i386: 1.7976931348623157D308*)
+	Texts.OpenWriter(W); Log := Oberon.Log;
+	outputPath := "";
+
+	pathChar := 0X;
+
+
+END iOPM.
+

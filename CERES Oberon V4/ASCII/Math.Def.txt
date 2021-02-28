@@ -1,0 +1,22 @@
+MODULE Math;  (*NW 21.6.86*)
+	CONST pi* = 3.14159265; e* = 2.71828182;
+
+	PROCEDURE sqrt*(x: REAL): REAL;
+	END sqrt;
+
+	PROCEDURE exp*(x: REAL): REAL;
+	END exp;
+
+	PROCEDURE ln*(x: REAL): REAL;
+	END ln;
+
+	PROCEDURE sin*(x: REAL): REAL;
+	END sin;
+
+	PROCEDURE cos*(x: REAL): REAL;
+	END cos;
+
+	PROCEDURE arctan*(x: REAL): REAL;
+	END arctan;
+
+END Math.

@@ -1,0 +1,119 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE ShowTree;
+
+(* Visualise disk space usage *)
+
+IMPORT FileDir, Disk, Display, Out, In, Input;
+
+CONST
+	Dir = 1;  Head = 10;  Tail = 6;
+
+VAR
+	files, dirs: LONGINT;
+	width: LONGINT;
+	file: ARRAY 32 OF CHAR;
+
+PROCEDURE Mark(sec: LONGINT;  type: INTEGER);
+BEGIN
+	sec := sec DIV 29;
+	Display.ReplConst(type, SHORT(sec MOD width)*4, SHORT(sec DIV width)*4, 4, 4, Display.set)
+END Mark;
+
+	PROCEDURE Init;
+		VAR k: INTEGER;
+				A: ARRAY 2000 OF LONGINT;
+
+		PROCEDURE MarkSectors;
+			VAR L, R, i, j, n: INTEGER; x: LONGINT;
+				hd: FileDir.FileHeader;
+				B: FileDir.IndexSector;
+				m: SHORTINT;
+
+			PROCEDURE sift(L, R: INTEGER);
+				VAR i, j: INTEGER; x: LONGINT;
+			BEGIN j := L; x := A[j];
+				LOOP i := j; j := 2*j + 1;
+					IF (j+1 < R) & (A[j] < A[j+1]) THEN INC(j) END ;
+					IF (j >= R) OR (x > A[j]) THEN EXIT END ;
+					A[i] := A[j]
+				END ;
+				A[i] := x
+			END sift;
+
+		BEGIN L := k DIV 2; R := k; (*heapsort*)
+			WHILE L > 0 DO DEC(L); sift(L, R) END ;
+			WHILE R > 0 DO
+				DEC(R); x := A[0]; A[0] := A[R]; A[R] := x; sift(L, R)
+			END ; 
+			L := 0;  R := 0;
+			WHILE (L < k) & (Input.Available() = 0) DO
+				Disk.GetSector(A[L], hd);
+				IF (file = "") OR (file = hd.name) THEN m := 1 ELSE m := 0 END;
+				IF hd.aleng < FileDir.SecTabSize THEN j := hd.aleng + 1;
+					REPEAT DEC(j); Mark(hd.sec[j], Tail+m) UNTIL j = 0;
+					Mark(hd.sec[j], Head+m)
+				ELSE j := FileDir.SecTabSize;
+					REPEAT DEC(j); Mark(hd.sec[j], Tail+m) UNTIL j = 0;
+					Mark(hd.sec[j], Head+m);
+					n := (hd.aleng - FileDir.SecTabSize) DIV 256; i := 0;
+					WHILE i <= n DO
+						Mark(hd.ext[i], Tail+m);
+						Disk.GetSector(hd.ext[i], B); (*index sector*)
+						IF i < n THEN j := 256 ELSE j := (hd.aleng - FileDir.SecTabSize) MOD 256 + 1 END ;
+						REPEAT DEC(j); Mark(B.x[j], Tail+m) UNTIL j = 0;
+						INC(i)
+					END
+				END ;
+				INC(L)
+			END
+		END MarkSectors;
+
+		PROCEDURE TraverseDir(dpg: LONGINT);
+			VAR i: INTEGER; a: FileDir.DirPage;
+		BEGIN Disk.GetSector(dpg, a); Mark(dpg, Dir); i := 0;
+			(*Out.Int(dpg DIV 29, 1);  Out.Ln;*) INC(dirs);
+			WHILE i < a.m DO
+				A[k] := a.e[i].adr; INC(k); INC(i); INC(files);
+				IF k = 2000 THEN MarkSectors; k := 0 END
+			END ;
+			IF a.p0 # 0 THEN
+				TraverseDir(a.p0); i := 0;
+				WHILE i < a.m DO
+					TraverseDir(a.e[i].p); INC(i)
+				END
+			END
+		END TraverseDir;
+
+	BEGIN k := 0; files := 0;  dirs := 0;
+		Display.ReplConst(Display.BG, 0, 0, SHORT(width*4), Display.Height, Display.set);
+		Out.String("Scanning... ");
+		TraverseDir(FileDir.DirRootAdr); MarkSectors;
+		Out.Int(files, 1); Out.String(" files, ");  Out.Int(dirs, 1); Out.String(" dir pages");  Out.Ln
+	END Init;
+
+PROCEDURE Show*;
+BEGIN
+	In.Open;  In.Name(file);
+	IF ~In.Done THEN file := "" END;
+	Init
+END Show;
+
+BEGIN
+	width := Display.Width DIV 8 * 5 DIV 4
+END ShowTree.
+
+ShowTree.Show ~
+ShowTree.Show ^
+

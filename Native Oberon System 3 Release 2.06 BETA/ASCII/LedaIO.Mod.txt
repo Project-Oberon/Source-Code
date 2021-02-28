@@ -1,0 +1,762 @@
+(*$C OBERON System 3, version 2.0.
+
+Copyright 1996 Team of the Institute of Computer Systems of ETH Zurich, ETH Center, CH-8092 Zurich,
+e-mail: oberon@inf.ethz.ch.
+
+This module may be used under the conditions of the general Oberon System 3 license contract.
+The full text can be downloaded from ftp://ftp.inf.ethz.ch/pub/software/Oberon/System3/License.Text
+or requested from the above mentioned address.
+
+Under the license terms dated it is in particular (a) prohibited to modify the interface of this module
+in any way that disagrees with style or content of the system and (b) requested to provide all conversions
+of the source code to another platform with the name OBERON. *)
+
+MODULE LedaIO;	(* uh, Mon, 8-Nov-1993 *)
+
+	(*--- remarks:
+		- provides basic in- and output operations for boxes
+		_ definition of rectangles in leda:	X, Y, W, H	[document space]
+			-> X, Y:  upper left / W:  width /  H:  height
+			-> horizontal inside regtangle:  X..X+(W-1)
+			-> vertical inside rectangle:  Y..Y+(H-1)
+		_ rectangles on screen:
+			-> X, Y:  lower left / W:  width /  H:  height
+		_ Display.hook:  x = 0, y = -10, w = 12, h = 12 [caret]
+	---*)
+
+	IMPORT LedaSys, LedaBase, LedaCtrl, Display, Oberon, LedaFrames;
+	
+CONST
+	(*--- output ---*)
+	Replace* = 0;	Paint* = 1;	Invert* = 2;	(* modes for output operations *)
+	
+	ProgErr = "program error";
+	
+TYPE
+	(*--- output and input ---*)
+	Out* = RECORD
+		define*: PROCEDURE (P: LedaSys.Port; n: INTEGER; X, Y, dX, dY: LONGINT; px, py: INTEGER);
+		mask*: PROCEDURE (P: LedaSys.Port; op: CHAR; X, Y, W, H: LONGINT);
+		erase*: PROCEDURE (P: LedaSys.Port; X, Y, W, H: LONGINT);
+		pattern*: PROCEDURE (P: LedaSys.Port; X, Y: LONGINT; pNr, col, mode: INTEGER);
+		rectangle*: PROCEDURE (P: LedaSys.Port; X, Y, W, H, lineW: LONGINT; pNr, col, mode: INTEGER);
+		area*: PROCEDURE (P: LedaSys.Port; X, Y, W, H: LONGINT; pNr, col, mode: INTEGER);
+		line*: PROCEDURE (P: LedaSys.Port; X, Y, W, H, Width: LONGINT; dir, pNr, col, mode: INTEGER);
+		text*: PROCEDURE (P: LedaSys.Port; X, Y: LONGINT; VAR R: LedaCtrl.Reader;
+										blk: LedaCtrl.Block; mode: INTEGER);
+		pos*, width*: PROCEDURE (P: LedaSys.Port; in: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block): LONGINT;
+		caret*: PROCEDURE (P: LedaSys.Port; X, Y, pos: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block);
+		select*: PROCEDURE (P: LedaSys.Port; X, Y, pos, len: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block);
+		update*: PROCEDURE (P: LedaSys.Port; X, Y, W, H: LONGINT; draw: LedaBase.DrawProc; box: LedaBase.Box)
+	END;
+		(*--- remarks:
+			_ the reader R in the procedures pos, caret and select has
+				to be set to the beginning of the block blk; the reader
+				remains unchanged in the procedures
+		---*)
+	
+	In * = RECORD
+		mouse*: PROCEDURE (P: LedaSys.Port; VAR keys: SET; VAR X, Y: LONGINT);
+		marker*: PROCEDURE (P: LedaSys.Port; VAR doc: LedaBase.Box; VAR X, Y: LONGINT);
+		waitNoKeys*: PROCEDURE (P: LedaSys.Port)
+	END;
+	
+	OutPageMsg* = RECORD
+		(LedaBase.Msg)
+		pageNbr*: INTEGER;
+		pX*, pY*: LONGINT;	(* upper left coordinate of page *)
+		P*: LedaSys.Port;
+		stop*: BOOLEAN	(* to stop further printing *)
+	END;	(* message handled by documents *)
+	
+	Modules = POINTER TO ModDsc;
+	ModDsc = RECORD
+		next: Modules;
+		name: LedaSys.Name
+	END;
+	
+
+VAR
+	(*--- output and input ---*)
+	out*: Out;	(* basic output functionality *)
+	in*: In;	(* basic input functionality *)
+	modHead: Modules;	(* list of modules providing output records *)
+	resetOutput: LedaSys.Excpt;	(* exception to redirect output to screen *)
+	(*--- output and input procedures ---*)
+	scnUnit: LONGINT;	(* initalized to LedaSys.scnUnit *)
+	clip: RECORD x, y, w, h: INTEGER END;	(* saved clipping rectangle *)
+	
+	PROCEDURE Min(i0, i1: INTEGER): INTEGER;
+	BEGIN
+		IF i0 < i1 THEN RETURN i0 ELSE RETURN i1 END
+	END Min;
+	
+	PROCEDURE Max(i0, i1: INTEGER): INTEGER;
+	BEGIN
+		IF i0 > i1 THEN RETURN i0 ELSE RETURN i1 END
+	END Max;
+	
+(*--- basic output and input procedures ---*)
+
+	(*---
+		_ all input and output procedures expect a port
+		_ the output procedures perform no action if (P = NIL) OR (P.state # 0) OR ~ (P IS LedaFrames.Port)
+		_ the input procedures perform no action if (P = NIL) OR ~ (P IS LedaFrames.Port) OR (LedaFrames.editF = NIL)
+		_ MarkArea belongs also to the output procedures
+	---*)
+	
+	PROCEDURE PortNotOk(P: LedaSys.Port): BOOLEAN;
+	BEGIN
+		RETURN (P = NIL) OR (LedaSys.DrawFlag IN P.state) OR ~ (P IS LedaFrames.Port)
+	END PortNotOk;
+	
+	PROCEDURE *OutDefine(P: LedaSys.Port; n: INTEGER; X, Y, dX, dY: LONGINT; px, py: INTEGER);
+	(* defines the point number n given by X, Y adjusted by dX, dY and px, py *)
+	(* specification of point parameters see definition Point *)
+	BEGIN	(* port P not used here *)
+		LedaFrames.DefinePoint(n, X, Y, dX, dY, px, py)
+	END OutDefine;
+	
+	PROCEDURE *OutMask(P: LedaSys.Port; op: CHAR; X, Y, W, H: LONGINT);
+	(* adjusts the masks in port P according character op *)
+	(* op = "-":  excludes area X, Y, W, H of the visible area *)
+	(* op = "R":  reset the masks *)
+		VAR p: LedaFrames.Port;	F, endF: LedaFrames.Frame;
+			M, N: LedaFrames.Mask;	x, y, w, h: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		p := P(LedaFrames.Port); F := p.begF; endF := p.endF;
+		WHILE F # endF DO
+			IF op = "-" THEN
+				IF W < 0 THEN LedaFrames.DocToFrmPointArea(F, x, y, w, h)
+				ELSE LedaFrames.DocToFrmArea(F, X, Y, W, H, x, y, w, h)
+				END;
+				IF w > 0 THEN
+					IF F.mask = NIL THEN F.mask := LedaFrames.MaskNew(F.X + F.margW, F.Y, F.W - F.margW, F.H, NIL) END;
+					M := F.mask;
+					REPEAT
+						N := M; M := M.next;
+						LedaFrames.MaskExcl(N, x, y, w, h)	(* may add new areas [masks] *)
+					UNTIL M = NIL
+				END
+			ELSIF op = "R" THEN LedaFrames.MaskDispose(F.mask)
+			END;
+			F := F.visNext
+		END
+	END OutMask;
+		
+	PROCEDURE *OutPattern(P: LedaSys.Port; X, Y: LONGINT; pNr, col, mode: INTEGER);
+		VAR p: LedaFrames.Port;	F: LedaFrames.Frame;	x, y: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		p := P(LedaFrames.Port); F := p.begF;
+		WHILE F # p.endF DO
+			IF p.fadeMarks THEN Oberon.RemoveMarks(F.X, F.Y, F.W, F.H) END;
+			LedaFrames.DocToFrm(F, X, Y, x, y);
+			IF p.setClip THEN
+				Display.GetClip(clip.x, clip.y, clip.w, clip.h); Display.SetClip(F.X + F.margW, F.Y, F.W - F.margW, F.H)
+			END;
+			Display.CopyPattern(col, LedaSys.scrPat[pNr], x, y, mode);
+			IF p.setClip THEN Display.SetClip(clip.x, clip.y, clip.w, clip.h) END;	(* reset clip *)
+			F := F.visNext
+		END;
+		p.fadeMarks := FALSE
+	END OutPattern;
+	
+	PROCEDURE *OutRect(P: LedaSys.Port; X, Y, W, H, lineW: LONGINT; pNr, col, mode: INTEGER);
+	(* negative pattern number pNr -> uses a black pattern *)
+		VAR p: LedaFrames.Port;	F: LedaFrames.Frame;	pat: LONGINT;	x1, y1, x2, y2, w, h, l, d: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		LedaFrames.DocToFrmLen(NIL, lineW + scnUnit DIV 2, l);	(* l -> screen line width *)
+		IF l = 0 THEN d := 0; pNr := LedaSys.TxtrUp ELSE d := (l-1) DIV 2 END;	(* d -> half screen line width *)
+		p := P(LedaFrames.Port); F := p.begF;
+		WHILE F # p.endF DO
+			IF p.fadeMarks THEN Oberon.RemoveMarks(F.X, F.Y, F.W, F.H) END;
+			LedaFrames.DocToFrm(F, X, Y + H, x1, y1); INC(y1); 	(* lower left; inside rectangle *)
+			LedaFrames.DocToFrm(F, X + W, Y, x2, y2); DEC(x2);	(* upper right; inside rectangle *)
+			DEC(x1, d); DEC(y1, d); INC(x2, d); INC(y2, d);	(* x1/y1 and x2/y2 -> outermost points of rectangle *)
+			IF LedaFrames.Inside(F, x1, y1, x2, y2) THEN
+				IF p.setClip THEN
+					Display.GetClip(clip.x, clip.y, clip.w, clip.h); Display.SetClip(F.X + F.margW, F.Y, F.W - F.margW, F.H)
+				END;
+				w := x2 - x1 + 1; h := y2 - y1 + 1;		(* adjust w/h *)
+				IF pNr < 0 THEN
+					Display.ReplConst(col, x1, y1, w, l, mode); Display.ReplConst(col, x1 + w - l, y1 + l, l, h - 2*l, mode);
+					Display.ReplConst(col, x1, y1 + h - l, w, l, mode); Display.ReplConst(col, x1 , y1 + l, l, h - 2*l, mode)
+				ELSE
+					pat := LedaSys.scrPat[pNr];
+					Display.ReplPattern(col, pat, x1, y1, w, l, mode);
+					Display.ReplPattern(col, pat, x1 + w - l, y1, l, h - 2*l, mode);
+					Display.ReplPattern(col, pat, x1, y1 + h - l, w, l, mode);
+					Display.ReplPattern(col, pat, x1 , y1 + l, l, h - 2*l, mode)
+				END;
+				IF p.setClip THEN Display.SetClip(clip.x, clip.y, clip.w, clip.h) END	(* reset clip *)
+			END;
+			F := F.visNext
+		END;
+		p.fadeMarks := FALSE
+	END OutRect;
+	
+	(*--- remark to rectangle drawing:
+		_ if the bottom line of a rectangle is clipped the left and right lines 
+			may not be shortened at the bottom about the line width l
+	---*)
+	
+	PROCEDURE *OutArea(P: LedaSys.Port; X, Y, W, H: LONGINT; pNr, col, mode: INTEGER);
+	(* negative pattern number pNr -> use a black pattern *)
+	(* negative color number col -> draw only on color display *)
+		VAR p: LedaFrames.Port;	F: LedaFrames.Frame;	x, y, w, h, clr: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		(* DEC(W, scnUnit); DEC(H, scnUnit);	adjust W/H -> X+W/Y+H outside rectangle *)
+		p := P(LedaFrames.Port); F := p.begF;
+		WHILE F # p.endF DO
+			IF p.fadeMarks THEN Oberon.RemoveMarks(F.X, F.Y, F.W, F.H) END;
+			IF (col < 0) & (F.X >= Display.ColLeft) THEN clr := -col ELSE clr := col END;
+			IF clr >= 0 THEN
+				LedaFrames.DocToFrmArea(F, X, Y, W, H, x, y, w, h);
+				IF w > 0 THEN
+					IF pNr < 0 THEN Display.ReplConst(clr, x, y, w, h, mode)
+					ELSE Display.ReplPattern(clr, LedaSys.scrPat[pNr], x, y, w, h, mode)
+					END
+				END
+			END;
+			F := F.visNext
+		END;
+		p.fadeMarks := FALSE
+	END OutArea;
+	
+	PROCEDURE *ScnStretch(x, y, w, pNr, col, mode: INTEGER);
+	BEGIN	(* clipping set *)
+		IF pNr < 0 THEN Display.ReplConst(col, x, y, w, 1, mode)
+		ELSE Display.ReplPattern(col, LedaSys.scrPat[pNr], x, y, w, 1, mode)
+		END
+	END ScnStretch;
+	
+	PROCEDURE ReplArea(M: LedaFrames.Mask; X, Y, W, H, col, pNr, mode: INTEGER);
+	(* replicates the area resulting by cutting the area X, Y, W, H with the mask area M.X, M.Y, M.W, M.H *)
+		VAR lt, rt, lo, hi: INTEGER;
+	BEGIN
+		lt := Max(X, M.X); rt := Min(X + W, M.X + M.W);	(* range: [lt..rt[ *)
+		lo := Max(Y, M.Y); hi := Min(Y + H, M.Y + M.H);	(* range: [lo..hi[ *)
+		IF (lt < rt) & (lo < hi) THEN
+			IF pNr < 0 THEN Display.ReplConst(col, lt, lo, rt - lt, hi - lo, mode)
+			ELSE Display.ReplPattern(col, LedaSys.scrPat[pNr], lt, lo, rt - lt, hi - lo, mode)
+			END
+		END
+	END ReplArea;
+
+	PROCEDURE *OutLine(P: LedaSys.Port; X, Y, W, H, Width: LONGINT; dir, pNr, col, mode: INTEGER);
+	(* direction of drawing:  left to right; dir>=0: top_bottom / dir<0: bottom_top *)
+	(* negative pattern number pNr -> uses a black pattern *)
+		VAR p: LedaFrames.Port;	F: LedaFrames.Frame;
+			M: LedaFrames.Mask;	x1, y1, x2, y2, w, h, d, dt: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		IF Width >= scnUnit THEN LedaFrames.DocToFrmLen(NIL, Width, d) ELSE d := 1; pNr := LedaSys.TxtrUp END;
+		IF (W < scnUnit) & (H < scnUnit) THEN RETURN END;	(*###*)
+		p := P(LedaFrames.Port); F := p.begF;
+		WHILE F # p.endF DO
+			IF p.fadeMarks THEN Oberon.RemoveMarks(F.X, F.Y, F.W, F.H) END;
+			IF (W = 0) OR (H = 0) THEN	(* dir -> no meaning *)
+				LedaFrames.DocToFrm(F, X, Y+H, x1, y1); INC(y1);	(* lower right; inside rectangle *)
+				LedaFrames.DocToFrm(F, X+W, Y, x2, y2); DEC(x2);	(* upper left; inside rectangle *)
+				dt := (d-1) DIV 2; DEC(x1, dt);
+				IF W = 0 THEN DEC(y1, dt); INC(y2, dt); x2 := x1 + d - 1
+				ELSE INC(y2, dt); INC(x2, dt); y1 := y2 - d + 1
+				END;	(* x1, y1 and x2, y2 -> outermost points of line [area to fill] *)
+				w := x2 - x1 + 1; h := y2 - y1 + 1;	(* adjust w/h*)
+				IF p.setClip THEN
+					Display.GetClip(clip.x, clip.y, clip.w, clip.h); Display.SetClip(F.X + F.margW, F.Y, F.W - F.margW, F.H)
+				END;
+				IF F.mask # NIL THEN	(* consider mask of frame *)
+					M := F.mask; REPEAT ReplArea(M, x1, y1, w, h, col, pNr, mode); M := M.next UNTIL M = NIL
+				ELSIF pNr < 0 THEN Display.ReplConst(col, x1, y1, w, h, mode)
+				ELSE Display.ReplPattern(col, LedaSys.scrPat[pNr], x1, y1, w, h, mode)
+				END;
+				IF p.setClip THEN Display.SetClip(clip.x, clip.y, clip.w, clip.h) END	(* reset clip *)
+			ELSE
+				IF dir >= 0 THEN	(* top_bottom drawing *)
+					LedaFrames.DocToFrm(F, X, Y, x1, y1); LedaFrames.DocToFrm(F, X+W, Y+H, x2, y2); DEC(x2); INC(y2);
+				ELSE	(* bottom_top drawing *)
+					LedaFrames.DocToFrm(F, X, Y+H, x1, y1); INC(y1); LedaFrames.DocToFrm(F, X+W, Y, x2, y2); DEC(x2)
+				END;	(* x1, y1 and x2, y2 -> end_points  of line *)
+				IF p.setClip THEN
+					Display.GetClip(clip.x, clip.y, clip.w, clip.h); Display.SetClip(F.X + F.margW, F.Y, F.W - F.margW, F.H)
+				END;
+				LedaSys.DrawLine(x1, y1, x2, y2, d, ScnStretch, pNr, col, mode);
+				IF p.setClip THEN Display.SetClip(clip.x, clip.y, clip.w, clip.h) END	(* reset clip *)
+			END;
+			F := F.visNext
+		END;
+		p.fadeMarks := FALSE
+	END OutLine;
+	
+	(*--- size of a block [LedaCtrl.Block]: 
+		_ blk.W is the document width and blk.w is the screen width
+		_ the screen width bD.w may be wider as the document width bD.W
+			but fits in the maximum line width
+		_ blk.W equals the line width for format modes blk.mode = "a" / "c" / "r"
+	---*)
+	
+	PROCEDURE GetMetrics(F: LedaFrames.Frame; blk: LedaCtrl.Block; VAR w, pxInc, pxNbr, dx: INTEGER);
+	(* calculates the metrics [w, pxInc, pxNbr] for the block blk *)
+		VAR s: INTEGER;
+	BEGIN
+		IF CAP(blk.mode) = "C" THEN
+			LedaFrames.DocToFrmLen(F, blk.W, w); pxInc := 0; pxNbr := 0; dx := (w - blk.w) DIV 2
+		ELSIF CAP(blk.mode) = "R" THEN
+			LedaFrames.DocToFrmLen(F, blk.W, w); pxInc := 0; pxNbr := 0; dx := w - blk.w
+		ELSIF (CAP(blk.mode) = "A") & (blk.gaps > 0) THEN
+			dx := 0; LedaFrames.DocToFrmLen(F, blk.W, w); s := w - blk.w;	(* s -> space to be distributed to gaps *)
+			IF s > 0 THEN pxInc := s DIV blk.gaps; pxNbr := s MOD blk.gaps	(* enlarge every gap *)
+			ELSE pxInc := -(-s DIV blk.gaps); pxNbr := -(-s MOD blk.gaps)	(* reduce every gap *)
+			END
+		ELSE
+			w := blk.w; pxInc := 0; pxNbr := 0; dx := 0
+		END
+	END GetMetrics;
+	
+	PROCEDURE *OutText(P: LedaSys.Port; X, Y: LONGINT;
+											VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block; mode: INTEGER);
+	(* displays block blk using mode mode; reader R is advanced about blk.len characters *)
+		VAR p: LedaFrames.Port;	F: LedaFrames.Frame;	ctrl: LedaBase.PieceCtrl;	pos: LONGINT;
+			x, y, w, h, i, pxInc, pxNbr, dx: INTEGER;	ch, sepKind: CHAR;	read: BOOLEAN;
+	BEGIN	(* X, Y -> lower left of block *)
+		IF PortNotOk(P) OR (blk.len = 0) THEN RETURN END;	(*###*)
+		p := P(LedaFrames.Port); F := p.begF; read := FALSE; pos := LedaCtrl.ReaderPos(R);
+		WHILE F # p.endF DO LedaFrames.outF := F;
+			IF read THEN LedaCtrl.SetReader(R, pos) END;	(* rewind *)
+			IF p.fadeMarks THEN Oberon.RemoveMarks(F.X, F.Y, F.W, F.H) END;
+			LedaFrames.DocToFrm(F, X, Y, x, y); LedaFrames.DocToFrmLen(F, blk.H, h);
+			IF (F.Y < y + h) & (y < F.Y + F.H) THEN		(* vertical inside *)
+				LedaFrames.DocToFrmLen(F, - blk.bH, h); INC(y, h);	(* y -> base line *)
+				GetMetrics(F, blk, w, pxInc, pxNbr, dx); INC(x, dx);
+				IF (x < F.X + F.W) & (x + w > F.X + F.margW) THEN 	(* horizontal inside *)
+					IF p.setClip THEN
+						Display.GetClip(clip.x, clip.y, clip.w, clip.h); Display.SetClip(F.X + F.margW, F.Y, F.W - F.margW, F.H)
+					END;
+					i := 0; read := TRUE;
+					LOOP
+						LedaCtrl.ReadChar(R, ch, ctrl); INC(i);
+						IF R.eot THEN EXIT END;	(*###*)
+						sepKind := 0X; ctrl.draw(ctrl, ch, y, mode, i=blk.len, x, sepKind);
+						(* draws character and increments writing position *)
+						IF (sepKind = LedaCtrl.GapSep) & (CAP(blk.mode) = "A") THEN
+							INC(x, pxInc);
+							IF pxNbr > 0 THEN DEC(pxNbr); INC(x) ELSIF pxNbr  < 0 THEN INC(pxNbr); DEC(x) END
+						END;
+						IF i = blk.len THEN EXIT END	(*###*)
+					END;
+					IF p.setClip THEN Display.SetClip(clip.x, clip.y, clip.w, clip.h) END	(* reset clip *)
+				END
+			END;
+			F := F.visNext
+		END;
+		IF ~ read THEN LedaCtrl.SetReader(R, LedaCtrl.ReaderPos(R) + blk.len) END;	(* advance rider *)
+		p.fadeMarks := FALSE; LedaFrames.outF := NIL
+	END OutText;
+	
+	PROCEDURE PosToCoord(F: LedaFrames.Frame; pos: LONGINT; VAR w: INTEGER; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block);
+	(* determines width w for given postion pos in block blk [pos: contained in block] *)
+	(* the reader R has to be set to the beginning of the block blk and remains unchanged *)
+		VAR ctrl: LedaBase.PieceCtrl;	org, chW: LONGINT;	i, chw, pxInc, pxNbr: INTEGER;	ch, sepKind: CHAR;
+	BEGIN
+		GetMetrics(F, blk, i, pxInc, pxNbr, w);
+		org := LedaCtrl.ReaderPos(R); i := SHORT(pos - org);
+		IF i < 0 THEN i := 0 ELSIF i > blk.len THEN i := blk.len END;
+		LOOP
+			IF i = 0 THEN EXIT END;	(*###*)
+			LedaCtrl.ReadChar(R, ch, ctrl); IF R.eot THEN EXIT END;	(*###*)
+			IF (ch = LedaCtrl.SoftSep) & (LedaCtrl.ReaderPos(R) - org = blk.len) THEN ch := LedaBase.Divis END;
+			sepKind := 0X; ctrl.width(ctrl, ch, NIL, chW, chw, sepKind);	(* get width of character *)
+			IF (CAP(blk.mode) = "A") & (sepKind = LedaCtrl.GapSep) & (LedaCtrl.ReaderPos(R) - org < blk.len) THEN
+				INC(chw, pxInc);
+				IF pxNbr > 0 THEN DEC(pxNbr); INC(chw) ELSIF pxNbr  < 0 THEN INC(pxNbr); DEC(chw) END
+			END;
+			DEC(i); INC(w, chw);
+		END;
+		LedaCtrl.SetReader(R, org)	(* original position *)
+	END PosToCoord;
+	
+	PROCEDURE CoordToPos(F: LedaFrames.Frame; w: INTEGER; VAR pos: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block);
+	(* determines position pos for the given width w *)
+	(* the reader R has to be set to the beginning of the block blk and remains unchanged *)
+		VAR ctrl: LedaBase.PieceCtrl;	chW: LONGINT;
+			i, len, chw, pxInc, pxNbr, dx: INTEGER;	ch, sepKind: CHAR;
+	BEGIN
+		GetMetrics(F, blk, len, pxInc, pxNbr, dx); DEC(w, dx);
+		i := 0; pos := LedaCtrl.ReaderPos(R);
+		len := blk.len; IF (blk.sepKind # LedaCtrl.NoSep) & (blk.next # NIL) THEN DEC(len) END;	(* omit separator at block end *)
+		IF len > 0 THEN	(* len > 0 -> visible characters *)
+			LOOP
+				LedaCtrl.ReadChar(R, ch, ctrl);
+				IF R.eot THEN EXIT END;	(*###*)
+				IF (i = len - 1) & (ch = LedaCtrl.SoftSep) & (blk.sepKind = LedaCtrl.NoSep) THEN ch := LedaBase.Divis END; 
+				sepKind := 0X; ctrl.width(ctrl, ch, NIL, chW, chw, sepKind);	(* get width of character *)
+				IF (CAP(blk.mode) = "A")  & (sepKind = LedaCtrl.GapSep) THEN
+					INC(chw, pxInc);
+					IF pxNbr > 0 THEN DEC(pxNbr); INC(chw) ELSIF pxNbr  < 0 THEN INC(pxNbr); DEC(chw) END
+				END;
+				IF w < chw THEN EXIT END;	(*###*)
+				INC(i); DEC(w, chw);
+				IF i = len THEN EXIT END	(*###*)
+			END;
+		END;
+		LedaCtrl.SetReader(R, pos);	(* original position *)
+		INC(pos, LONG(i))
+	END CoordToPos;
+	
+	PROCEDURE *OutPos(P: LedaSys.Port; in: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block): LONGINT;
+	(* returns for a relative coordinate in the according text position [index, absolute] *)
+	(* the reader R has to be set to the beginning of block blk and remains unchanged *)
+		VAR pos: LONGINT;	F: LedaFrames.Frame;	relW: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN -1 END;	(*###*)
+		F := P(LedaFrames.Port).begF; LedaFrames.DocToFrmLen(F, in, relW);
+		CoordToPos(F, relW, pos, R, blk); RETURN pos
+	END OutPos;
+	
+	PROCEDURE *OutWidth(P: LedaSys.Port; in: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block): LONGINT;
+	(* returns for a text position in [index, absolute] the according relative coordinate *)
+	(* the reader R has to be set to the beginning of block blk and remains unchanged *)
+		VAR dX: LONGINT;	F: LedaFrames.Frame;	relW: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN F := LedaFrames.editF ELSE F := P(LedaFrames.Port).begF END;
+		IF F = NIL THEN dX := -1
+		ELSE PosToCoord(F, in, relW, R, blk); LedaFrames.FrmToDocLen(F, relW, dX)
+		END;
+		RETURN dX
+	END OutWidth;
+	
+	PROCEDURE *OutCaret(P: LedaSys.Port; X, Y, pos: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block);
+	(* inverts the caret at position pos in block blk [fields caretX, caretY are relative to frame] *)
+	(* the reader R has to be set to the beginning of block blk and remains unchanged *)
+	(* pos = -1:  invert caret at previous position / pos = -2:  invert caret at coordinate X, Y *)
+		VAR p: LedaFrames.Port;	F: LedaFrames.Frame;	x, y, w: INTEGER;	drawn: BOOLEAN;
+		
+		PROCEDURE CaretFlipped(F: LedaFrames.Frame; x, y: INTEGER): BOOLEAN;
+		BEGIN	(* caret sizes: width = 12 / height = 12 *)
+			IF (x >= F.X + F.margW) & (x + 12 < F.X + F.W) & (y - 10 >= F.Y) & (y + 2 < F.Y + F.H) THEN
+				Display.CopyPattern(LedaSys.inv, Display.hook, x, y - 10, Display.invert); RETURN TRUE
+			ELSE RETURN FALSE
+			END
+		END CaretFlipped;
+		
+	BEGIN
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		p := P(LedaFrames.Port); F := p.begF;
+		WHILE (F # p.endF) & ~ F.focus DO F := F.visNext END;	(* search focus frame *)
+		IF F # p.endF THEN
+			IF pos = -2 THEN	(* invert caret at coordinate X, Y *)
+				LedaFrames.DocToFrm(F, X, Y, x, y); F.caretX := -1; F.caretY := -1;
+				IF CaretFlipped(F, x, y) THEN F.caretX := x - F.X; F.caretY := y - F.Y END	(* save caret position *)
+			ELSIF pos = -1 THEN	(* invert caret at previous position *)
+				IF F.caretX # -1 THEN drawn := CaretFlipped(F, F.X + F.caretX, F.Y + F.caretY) END
+			ELSE
+				LedaFrames.DocToFrm(F, X, Y, x, y); F.caretX := -1; F.caretY := -1;
+				PosToCoord(F, pos, w, R, blk);
+				IF CaretFlipped(F, x+w, y) THEN F.caretX := x + w - F.X; F.caretY := y - F.Y END	(* save caret position *)
+			END
+		END
+	END OutCaret;
+	
+	PROCEDURE InvertPart(F: LedaFrames.Frame; x, y, w, h: INTEGER; p: LedaFrames.Port);
+	BEGIN
+		IF w > 0 THEN
+			IF p.setClip THEN
+				Display.GetClip(clip.x, clip.y, clip.w, clip.h); Display.SetClip(F.X + F.margW, F.Y, F.W - F.margW, F.H)
+			END;
+			Display.ReplConst(LedaSys.inv, x, y, w, h, Display.invert);
+			IF p.setClip THEN Display.SetClip(clip.x, clip.y, clip.w, clip.h) END	(* reset clip *)
+		END
+	END InvertPart;
+	
+	PROCEDURE InvertChar(F: LedaFrames.Frame; x, y, h, bh: INTEGER; ctrl: LedaBase.PieceCtrl; ch: CHAR; p: LedaFrames.Port; VAR done: BOOLEAN);
+		VAR M: LedaBase.CtrlMsg;
+	BEGIN
+		M.id := LedaBase.InvertSepId; M.ch := ch; M.x := x; M.y := y; M.ctrlId := h; M.res := bh; M.s := {};
+		IF p.setClip THEN
+			Display.GetClip(clip.x, clip.y, clip.w, clip.h); Display.SetClip(F.X + F.margW, F.Y, F.W - F.margW, F.H)
+		END;
+		ctrl.doOp(ctrl, M); done := M.s = {LedaBase.InvertSepId};	(* to invert character *)
+		IF p.setClip THEN Display.SetClip(clip.x, clip.y, clip.w, clip.h) END	(* reset clip *)
+	END InvertChar;
+	
+	PROCEDURE InvertInBlock(F: LedaFrames.Frame; pos, len: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block;
+												x, y, h, bh: INTEGER; p: LedaFrames.Port);
+		VAR ctrl: LedaBase.PieceCtrl;	org, chW: LONGINT;	invert, done: BOOLEAN;
+			i, chw, pxInc, pxNbr, w, w0: INTEGER;	ch, sepKind: CHAR;
+	BEGIN
+		GetMetrics(F, blk, i, pxInc, pxNbr, w);
+		org := LedaCtrl.ReaderPos(R); i := SHORT(pos - org);
+		IF i < 0 THEN i := 0 ELSIF i > blk.len THEN i := blk.len END;
+		IF i + len > blk.len THEN len := blk.len - i END;
+		w0 := 9999; invert := FALSE;
+		LOOP
+			IF i = 0 THEN
+				IF invert THEN InvertPart(F, x + w0, y, w - w0, h, p); EXIT	(*###*)
+				ELSE invert := TRUE; i := SHORT(len); w0 := w
+				END
+			END;
+			LedaCtrl.ReadChar(R, ch, ctrl); DEC(i);
+			IF R.eot THEN InvertPart(F, x + w0, y, w - w0, h, p); EXIT END;	(*###*)
+			IF (ch = LedaCtrl.SoftSep) & (LedaCtrl.ReaderPos(R) - org = blk.len) THEN ch := LedaBase.Divis END;
+			sepKind := 0X; ctrl.width(ctrl, ch, NIL, chW, chw, sepKind);	(* get width of character *)
+			IF sepKind = LedaCtrl.GapSep THEN
+				IF (CAP(blk.mode) = "A") & (LedaCtrl.ReaderPos(R) - org < blk.len) THEN
+					INC(chw, pxInc);
+					IF pxNbr > 0 THEN DEC(pxNbr); INC(chw) ELSIF pxNbr  < 0 THEN INC(pxNbr); DEC(chw) END
+				END
+			END;
+			IF invert & ((sepKind # LedaCtrl.NoSep) OR ~ (ctrl IS LedaBase.Style)) THEN
+				InvertChar(F, x + w, y, h, bh, ctrl, ch, p, done);	(* ask control to invert *)
+				IF ~ done THEN INC(w, chw)	(* extend part for inversion *)
+				ELSE InvertPart(F, x + w0, y, w - w0, h, p); INC(w, chw); w0 := w
+				END
+			ELSE INC(w, chw)
+			END
+		END;
+		LedaCtrl.SetReader(R, org)	(* original position *)
+	END InvertInBlock;
+	
+	PROCEDURE *OutSelect(P: LedaSys.Port; X, Y, pos, len: LONGINT; VAR R: LedaCtrl.Reader; blk: LedaCtrl.Block);
+	(* inverts the text in block blk beginning at position pos for len characters *)
+	(* the reader R is set to the beginning of block blk and remains unchanged *)
+		VAR p: LedaFrames.Port;	F: LedaFrames.Frame;	x, y, h, bh: INTEGER;
+	BEGIN	(* X, Y -> lower left of text block *)
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		p := P(LedaFrames.Port); F := p.begF;
+		WHILE F # p.endF DO LedaFrames.outF := F;
+			IF p.fadeMarks THEN Oberon.RemoveMarks(F.X, F.Y, F.W, F.H) END;
+			LedaFrames.DocToFrm(F, X, Y, x, y);
+			LedaFrames.DocToFrmLen(F, blk.H, h); LedaFrames.DocToFrmLen(F, - blk.bH, bh);
+			InvertInBlock(F, pos, len, R, blk, x, y, h, bh, p);
+			F := F.visNext
+		END;
+		p.fadeMarks := FALSE; LedaFrames.outF := NIL
+	END OutSelect;
+
+	PROCEDURE ClearArea(M: LedaFrames.Mask; X, Y, W, H, clr: INTEGER);
+	(* clears the area resulting by cutting the area X, Y, W, H with the mask area M.X, M.Y, M.W, M.H *)
+		VAR lt, rt, lo, hi: INTEGER;
+	BEGIN
+		lt := Max(X, M.X); rt := Min(X + W, M.X + M.W);	(* range: [lt..rt[ *)
+		lo := Max(Y, M.Y); hi := Min(Y + H, M.Y + M.H);	(* range: [lo..hi[ *)
+		IF (lt < rt) & (lo < hi) THEN
+			Display.ReplConst(clr, lt, lo, rt - lt, hi - lo, Display.replace)
+		END
+	END ClearArea;
+	
+	PROCEDURE *OutUpdate(P: LedaSys.Port; X, Y, W, H: LONGINT; draw: LedaBase.DrawProc; box: LedaBase.Box);
+	(* updates the area X, Y, W, H by calling draw with box; the cliping is set to the specified area  *)
+	(* draw = nil or box = nil: document is called to update area *)
+	(* erase color number P.eraseCol only used on color displays *)
+		VAR p: LedaFrames.Port;	F, endF: LedaFrames.Frame;
+			M: LedaFrames.Mask;	x, y, w, h, clr: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		p := P(LedaFrames.Port); F := p.begF; endF := p.endF;
+		WHILE F # endF DO LedaFrames.outF := F;
+			IF F.X >= Display.ColLeft THEN clr := P.eraseCol ELSE clr := LedaSys.bg END;
+			IF W < 0 THEN LedaFrames.DocToFrmPointArea(F, x, y, w, h)
+			ELSE LedaFrames.DocToFrmArea(F, X, Y, W, H, x, y, w, h)	(* convert update area *)
+			END;
+			IF w > 0 THEN
+				Oberon.RemoveMarks(x, y, w, h);	(* fade system marks [Oberon.Mouse, Oberon.Pointer] *)
+				IF {LedaSys.NoClearFlag} * p.state = {} THEN	(* clear update area *)
+					IF F.mask = NIL THEN Display.ReplConst(clr, x, y, w, h, Display.replace)
+					ELSE	(* consider mask of frame *)
+						M := F.mask; REPEAT ClearArea(M, x, y, w, h, clr); M := M.next UNTIL M = NIL
+					END
+				END;
+				LedaFrames.UpdateArea(F, x, y, w, h, FALSE, FALSE, draw, box)
+			END;
+			F := F.visNext
+		END;
+		EXCL(p.state, LedaSys.NoClearFlag); P.eraseCol := LedaSys.bg;
+		LedaFrames.outF := NIL
+	END OutUpdate;
+	
+	PROCEDURE *OutErase(P: LedaSys.Port; X, Y, W, H: LONGINT);
+		VAR p: LedaFrames.Port;	F: LedaFrames.Frame;
+			M: LedaFrames.Mask;	x, y, w, h, clr: INTEGER;
+	BEGIN
+		IF PortNotOk(P) THEN RETURN END;	(*###*)
+		p := P(LedaFrames.Port); F := p.begF;
+		WHILE F # p.endF DO
+			IF F.X >= Display.ColLeft THEN clr := P.eraseCol ELSE clr := LedaSys.bg END;
+			IF p.fadeMarks THEN Oberon.RemoveMarks(F.X, F.Y, F.W, F.H) END;
+			LedaFrames.DocToFrmArea(F, X, Y, W, H, x, y, w, h);
+			IF w > 0 THEN
+				IF F.mask = NIL THEN Display.ReplConst(clr, x, y, w, h, Display.replace)
+				ELSE	(* consider mask of frame *)
+					M := F.mask; REPEAT ClearArea(M, x, y, w, h, clr); M := M.next UNTIL M = NIL
+				END
+			END;
+			F := F.visNext
+		END;
+		p.fadeMarks := FALSE; P.eraseCol := LedaSys.bg
+	END OutErase;
+
+	PROCEDURE *InMouse(P: LedaSys.Port; VAR keys: SET; VAR X, Y: LONGINT);
+		VAR x, y: INTEGER;
+	BEGIN
+		IF PortNotOk(P) OR (LedaFrames.editF = NIL) THEN keys := {}
+		ELSE
+			LedaSys.GetMouse(LedaFrames.editF, LedaFrames.editF.margW, keys, x, y);
+			LedaFrames.FrmToDoc(LedaFrames.editF, x, y, X, Y)
+		END
+	END InMouse;
+	
+	PROCEDURE *InMarker(P: LedaSys.Port; VAR doc: LedaBase.Box; VAR X, Y: LONGINT);
+		VAR F: LedaFrames.Frame;	x, y: INTEGER;
+	BEGIN
+		F := LedaFrames.Marked();
+		IF Oberon.Pointer.on & (F # NIL) THEN
+			doc := F.box; LedaFrames.FrmToDoc(F, Oberon.Pointer.X, Oberon.Pointer.Y, X, Y)
+		ELSE doc := NIL; X := -1; Y := -1
+		END
+	END InMarker;
+	
+	PROCEDURE *InWaitNoKeys(P: LedaSys.Port);
+		VAR x, y: INTEGER;	keys: SET;
+	BEGIN
+		IF PortNotOk(P) OR (LedaFrames.editF = NIL) THEN RETURN END;	(*###*)
+		REPEAT LedaSys.GetMouse(LedaFrames.editF, LedaFrames.editF.margW, keys, x, y) UNTIL keys = {}
+	END InWaitNoKeys;
+	
+	PROCEDURE TrackKeys*(P: LedaSys.Port; op1Key, op2Key: INTEGER; VAR op1, op2: BOOLEAN);
+		VAR keys: SET;	X, Y: LONGINT;
+	BEGIN
+		op1 := FALSE; op2 := FALSE; in.mouse(P, keys, X, Y);
+		WHILE keys # {} DO
+			IF op1Key IN keys THEN op1 := TRUE END;
+			IF op2Key IN keys THEN op2 := TRUE END;
+			in.mouse(P, keys, X, Y)
+		END
+	END TrackKeys;
+	
+	PROCEDURE FadeMarks*(P: LedaSys.Port);
+	BEGIN
+		IF P IS LedaFrames.Port THEN
+			P(LedaFrames.Port).fadeMarks := TRUE
+		END
+	END FadeMarks;
+		
+(*--- output and input ---*)
+
+	(*---
+		_ output is directed normally to the main output device;
+			the oberon screen is defined as main output device
+		_ during a single command the output may be directed
+			to another output device; this is done by a call to
+			SetOutDevice
+		_ the standard printer [module Printer] is a predefined
+			secondary output device; the output is directed to it
+			by a call of SetOutDevice("StdPrinter")
+		_ the output is redirected to the main device by a call to
+			SetOutDevice("Screen")
+		_ SetOutDevice calls all modules dealing with output that
+			they perform a specified action
+		_ modules dealing with output announce themselfs to
+			LedaBox by calling IsOutHandler
+		_ additional functionality can be added in a new module by
+			defining a new output record. The module has to call
+			IsOutHandler and implements the following commands:
+			_ Screen:  directs the output to the main device [=screen]
+			_ StdPrinter:  directs the output to the standard printer
+		_ to direct the output to a non standard device it is necessary
+			_ to use a special port [extension of LedaSys.Port]
+			_ to assign the appropriate output procedures for this device
+				in the output records
+		---*)
+		
+	PROCEDURE IsOutHandler*(modName: LedaSys.Name);
+	(** used to announce a module dealing with output *)
+		VAR m: Modules;
+	BEGIN
+		m := modHead.next;
+		WHILE (m # modHead) & (m.name # modName) DO m := m.next END;
+		IF m = modHead THEN	(* modName not yet in list *)
+			NEW(m); m.name := modName;
+			m.next := modHead.next; modHead.next := m
+		END
+	END IsOutHandler;
+	
+	PROCEDURE Screen;
+	(* directs the output to the screen [main output device] *)
+		VAR m: Modules;	cmd: ARRAY 12 OF CHAR;
+	BEGIN
+		out.define := OutDefine;
+		out.mask := OutMask;
+		out.erase := OutErase;
+		out.pattern := OutPattern;
+		out.rectangle := OutRect;
+		out.area := OutArea;
+		out.line := OutLine;
+		out.text := OutText;
+		out.pos := OutPos;
+		out.width := OutWidth;
+		out.caret := OutCaret;
+		out.select := OutSelect;
+		out.update := OutUpdate;
+		(* output procedures set to screen implementation *)
+		m := modHead.next; cmd := "Screen";
+		WHILE m # modHead DO
+			LedaSys.Execute(m.name, cmd);	(* call modules with additional output records *)
+			m := m.next
+		END
+	END Screen;
+	
+	PROCEDURE *Excpt(ex: LedaSys.Excpt);
+	(* called in an error case to reset output procedures to screen *)
+	(* exception runs only once *)
+	BEGIN
+		Screen;
+		IF resetOutput # NIL THEN
+			resetOutput.remove := TRUE; resetOutput := NIL
+		END
+	END Excpt;
+	
+	PROCEDURE SetOutDevice*(cmd: ARRAY OF CHAR);
+	(** directs the output to another output device *)
+	(** cmd specifies the action to be performed thereby *)
+		VAR m: Modules;
+	BEGIN
+		IF cmd = "Screen" THEN
+			Screen;
+			IF resetOutput # NIL THEN
+				resetOutput.remove := TRUE; resetOutput := NIL
+			END
+		ELSE
+			(*- install exception -*)
+			IF resetOutput # NIL THEN LedaSys.Halt(ProgErr) END;
+			NEW(resetOutput); resetOutput.remove := FALSE;
+			resetOutput.handle := Excpt;	(* Excpt -> executed in error case only *)
+			LedaSys.InstallExcpt(resetOutput);
+			(*- direct output to another device -*)
+			m := modHead.next;
+			WHILE m # modHead DO
+				LedaSys.Execute(m.name, cmd); m := m.next
+			END
+		END
+	END SetOutDevice;
+	
+	PROCEDURE SetInDevice*;
+	BEGIN
+		in.mouse := InMouse;
+		in.marker := InMarker;
+		in.waitNoKeys := InWaitNoKeys
+	END SetInDevice;
+	
+
+BEGIN
+	resetOutput := NIL;
+	NEW(modHead); modHead.name := ""; modHead.next := modHead;
+	scnUnit := LedaSys.scnUnit;	(* for efficency *)
+	Display.GetClip(clip.x, clip.y, clip.w, clip.h);	(* set clipping rectangle *)
+	Screen;
+	SetInDevice
+END LedaIO.

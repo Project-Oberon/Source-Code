@@ -1,0 +1,147 @@
+MODULE Backup; (*JG 26.8.90*)
+
+	IMPORT Diskette, Viewers, MenuViewers, Oberon, Texts, TextFrames;
+
+    CONST StandardMenu = "System.Close System.Copy System.Grow Edit.Search Edit.Store";
+
+	VAR T: Texts.Text; W: Texts.Writer; diroption: CHAR;
+
+	PROCEDURE Format*;
+	BEGIN
+		Texts.WriteString(W, "Backup.Format"); Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		Diskette.Format; Diskette.InitDir; Diskette.WriteDir
+	END Format;
+
+	PROCEDURE Init*;
+	BEGIN
+		Texts.WriteString(W, "Backup.Init"); Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		Diskette.InitDir; Diskette.WriteDir
+	END Init;
+
+    PROCEDURE List (name: ARRAY OF CHAR; date, time: LONGINT; size: LONGINT);
+    BEGIN
+	    Texts.WriteString(W, name);
+        IF diroption = "d" THEN
+	        Texts.WriteDate(W, time, date); Texts.Write(W, " "); Texts.WriteInt(W, size, 1)
+        END;
+	    Texts.WriteLn(W)
+    END List;
+
+	PROCEDURE Directory*;
+		VAR par: Oberon.ParList; R: Texts.Reader; V: Viewers.Viewer;
+          date, time: LONGINT; nofEntries, nofClusters, X, Y: INTEGER; ch: CHAR;
+	BEGIN
+		par := Oberon.Par;
+		Texts.OpenReader(R, par.text, par.pos); Texts.Read(R, ch);
+		WHILE ch = " " DO Texts.Read(R, ch) END;
+		IF ch = "/" THEN Texts.Read(R, diroption) ELSE diroption := 0X END;
+        T := TextFrames.Text("");
+		Oberon.AllocateSystemViewer(Oberon.Par.vwr.X, X, Y);
+		V := MenuViewers.New(
+          TextFrames.NewMenu("Backup.Directory", StandardMenu),
+          TextFrames.NewText(T, 0),
+          TextFrames.menuH,
+          X, Y);
+        Diskette.ReadDir; Diskette.GetData(date, time, nofEntries, nofClusters);
+        Texts.WriteInt(W, nofEntries, 1); Texts.WriteString(W, " entries/ ");
+        Texts.WriteInt(W, nofClusters, 1); Texts.WriteString(W, " clusters");
+        Texts.WriteLn(W);
+		Diskette.Enumerate(List);
+		Texts.Append(T, W.buf)
+	END Directory;
+
+	PROCEDURE ReadAll*;
+	BEGIN
+		Texts.WriteString(W, "Backup.ReadAll reading"); Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		Diskette.ReadAll
+	END ReadAll;
+
+    PROCEDURE ReadFile (VAR name: ARRAY OF CHAR);
+    BEGIN
+	    Texts.WriteString(W, name); Texts.WriteString(W, " reading");
+		Texts.Append(Oberon.Log, W.buf);
+        Diskette.ReadFile(name);
+        IF Diskette.res # 0 THEN Texts.WriteString(W, " failed") END;
+		Texts.WriteLn(W);
+        Texts.Append(Oberon.Log, W.buf)
+    END ReadFile;
+
+	PROCEDURE ReadFiles*;
+		VAR par: Oberon.ParList; S: Texts.Scanner; T: Texts.Text; beg, end, time: LONGINT;
+	BEGIN
+		par := Oberon.Par;
+		Texts.WriteString(W, "Backup.ReadFiles"); Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		Diskette.ReadDir;
+		par := Oberon.Par;
+		Texts.OpenScanner(S, par.text, par.pos); Texts.Scan(S);
+        WHILE S.class = Texts.Name DO ReadFile(S.s); Texts.Scan(S) END;
+        IF (S.class = Texts.Char) & (S.c = "^") THEN Oberon.GetSelection(T, beg, end, time);
+          IF time >= 0 THEN Texts.OpenScanner(S, T, beg); Texts.Scan(S);
+            IF S.class = Texts.Name THEN ReadFile(S.s) END
+          END
+        END
+	END ReadFiles;
+
+    PROCEDURE WriteFile (VAR name: ARRAY OF CHAR);
+    BEGIN
+		Texts.WriteString(W, name); Texts.WriteString(W, " writing");
+	    Texts.Append(Oberon.Log, W.buf);
+        Diskette.WriteFile(name);
+        IF Diskette.res # 0 THEN Texts.WriteString(W, " failed") END;
+		Texts.WriteLn(W);
+        Texts.Append(Oberon.Log, W.buf)
+    END WriteFile;
+
+	PROCEDURE WriteFiles*;
+		VAR par: Oberon.ParList; S: Texts.Scanner; T: Texts.Text; beg, end, time: LONGINT;
+	BEGIN
+		par := Oberon.Par;
+		Texts.WriteString(W, "Backup.WriteFiles"); Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		Diskette.ReadDir;
+		Texts.OpenScanner(S, par.text, par.pos); Texts.Scan(S);
+	    WHILE S.class = Texts.Name DO WriteFile(S.s); Texts.Scan(S) END;
+        IF (S.class = Texts.Char) & (S.c = "^") THEN Oberon.GetSelection(T, beg, end, time);
+          IF time >= 0 THEN Texts.OpenScanner(S, T, beg); Texts.Scan(S);
+            IF S.class = Texts.Name THEN WriteFile(S.s) END
+          END
+        END;
+		Diskette.WriteDir
+	END WriteFiles;
+
+    PROCEDURE DeleteFile (VAR name: ARRAY OF CHAR);
+    BEGIN
+		Texts.WriteString(W, name); Texts.WriteString(W, " deleting");
+		Texts.Append(Oberon.Log, W.buf);
+		Diskette.DeleteFile(name);
+        IF Diskette.res # 0 THEN Texts.WriteString(W, " failed") END;
+		Texts.WriteLn(W);
+        Texts.Append(Oberon.Log, W.buf)
+    END DeleteFile;
+
+	PROCEDURE DeleteFiles*;
+		VAR par: Oberon.ParList; S: Texts.Scanner; beg, end, time: LONGINT;
+	BEGIN
+		par := Oberon.Par;
+		Texts.WriteString(W, "Backup.DeleteFiles"); Texts.WriteLn(W);
+		Texts.Append(Oberon.Log, W.buf);
+		Diskette.ReadDir;
+		Texts.OpenScanner(S, par.text, par.pos); Texts.Scan(S);
+		WHILE S.class = Texts.Name DO DeleteFile(S.s); Texts.Scan(S) END;
+        IF (S.class = Texts.Char) & (S.c = "^") THEN Oberon.GetSelection(T, beg, end, time);
+          IF time >= 0 THEN Texts.OpenScanner(S, T, beg); Texts.Scan(S);
+            IF S.class = Texts.Name THEN DeleteFile(S.s) END
+          END
+        END;
+		Diskette.WriteDir
+	END DeleteFiles;
+
+BEGIN Texts.OpenWriter(W); Diskette.Reset
+END Backup.
+
+
+
