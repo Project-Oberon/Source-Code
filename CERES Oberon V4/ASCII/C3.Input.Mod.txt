@@ -1,0 +1,104 @@
+MODULE Input;   (*NW 5.10.89 / 31.8.90  Ceres-3*)
+	IMPORT SYSTEM, Kernel;
+
+	CONST N = 32; BufLen = 2048;
+		SCC = 0FFFFD000H;  UART = 0FFFFC000H; ICU = 0FFFF9000H;
+		RxCA = 0;  (*R0: Rx Char Available*)
+		RxOR = 5;  (*R1: Rx OverRun*)
+		CRC  = 6;  (*R1: CRC error*)
+		EOF  = 7;  (*R1: End Of Frame*)
+
+	VAR
+		MW, MH: INTEGER; (*mouse limits*)
+		Mx, My, Mstate: INTEGER; Mkeys: SET;
+		T: LONGINT;  (*time counter*)
+		i, n, in, out: INTEGER;
+		buf: ARRAY N OF CHAR;
+
+	PROCEDURE Available*(): INTEGER;
+	BEGIN RETURN n
+	END Available;
+
+	PROCEDURE Read*(VAR ch: CHAR);
+	BEGIN 
+		REPEAT UNTIL n > 0;
+		DEC(n); ch := buf[out]; out := (out+1) MOD N
+	END Read;
+
+	PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
+		VAR s: SHORTINT;
+	BEGIN
+		WHILE SYSTEM.BIT(SCC, 0) DO SYSTEM.GET(SCC+4, s);
+		  IF s < 0 THEN Mstate := 0; Mkeys := SYSTEM.VAL(SET, s)
+		  ELSIF Mstate = 0 THEN Mstate := 1;
+		    IF 4 IN Mkeys THEN Mx := (Mx + s) MOD MW
+              ELSE Mx := (Mx - s) MOD MW
+            END
+		  ELSIF Mstate = 1 THEN Mstate := 2;
+			IF 3 IN Mkeys THEN My := (My + s) MOD MH
+              ELSE My := (My - s) MOD MH
+            END
+		  END
+		END;
+		x := Mx; y := My; keys := Mkeys * {0..2}
+	END Mouse;
+
+	PROCEDURE SetMouseLimits*(w, h: INTEGER);
+	BEGIN MW := w; MH := h
+	END SetMouseLimits;
+
+	PROCEDURE Time*(): LONGINT;
+		VAR ch1, ch0: CHAR; t: LONGINT;
+	BEGIN
+		REPEAT SYSTEM.GET(UART+28, ch0); SYSTEM.GET(UART+24, ch1);
+			t := T - LONG(ORD(ch1))*100H - LONG(ORD(ch0));
+			SYSTEM.GET(UART+28, ch1)
+		UNTIL ch1 = ch0;
+		RETURN t
+	END Time;
+
+	PROCEDURE+ KBINT;
+		VAR ch: CHAR;
+	BEGIN SYSTEM.GET(UART+12, ch);  (*RHRA*)
+		IF ch = 0FFX THEN HALT(24) END ;
+		IF n < N THEN buf[in] := ch; in := (in+1) MOD N; INC(n) END
+	END KBINT;
+
+	PROCEDURE+ CTInt;
+		VAR dmy: SYSTEM.BYTE;
+	BEGIN SYSTEM.GET(UART+60, dmy); (*stop timer*)
+		INC(T, 0FFFFH); SYSTEM.GET(UART+56, dmy)
+	END CTInt;
+
+	PROCEDURE put(adr: SHORTINT; val: CHAR);
+	BEGIN SYSTEM.PUT(SCC, adr); SYSTEM.PUT(SCC, val)
+	END put;
+
+BEGIN SYSTEM.GET(SCC, n);
+	MW := 1024; MH := 800;
+	n := 0; in := 0; out := 0; T := 0FFFFH;
+	Kernel.InstallIP(KBINT, 4); Kernel.InstallIP(CTInt, 0);
+	SYSTEM.PUT(UART+16, 10X);  (*ACR*)
+	SYSTEM.PUT(UART+ 8, 15X);  (*CRA enable*)
+	SYSTEM.PUT(UART,    13X);  (*MR1A, RxRdy -Int, no parity, 8 bits*)
+	SYSTEM.PUT(UART,     7X);  (*MR2A  1 stop bit*)
+	SYSTEM.PUT(UART+ 4, 44X);  (*CSRA, rate = 300 bps*)
+	SYSTEM.PUT(UART+52, 14X);  (*OPCR  OP4 = KB and OP3 = C/T int*)
+	SYSTEM.PUT(UART+24,0FFX);  (*CTLR*)
+	SYSTEM.PUT(UART+28,0FFX);  (*CTUR*)
+	SYSTEM.GET(UART+56, buf[0]);  (*start timer*)
+	SYSTEM.PUT(ICU + 4, 18X);  (*clear ICU IMR and IRR bits 0*)
+	SYSTEM.PUT(ICU + 4, 1CX);  (*clear ICU IMR and IRR bits 4*)
+	put( 9, 040X); (*reset SCC B*)
+	put( 4,  44X); (*x16 clk, 1 stop bit*)
+	put( 3, 0C0X); (*Rx 8-bit bytes*)
+	put( 9,   2X);  (*no vector*)
+	put(11,  50X); (* Clk = BR gen *)
+	put(12, 16X); put(13, 0X); (*clk rate 4800 bps*)
+	put( 3, 0C1X); (*Rx enable*)
+	SYSTEM.PUT(SCC, 10X);
+	SYSTEM.PUT(SCC, 10X); (*reset ext/status*)
+	put( 9,   0EX);  (*int on, no vector*)
+	put( 1,   10X);  (*enable Rx int*)
+	put(14,   1X); (*BR gen enable*)
+END Input.

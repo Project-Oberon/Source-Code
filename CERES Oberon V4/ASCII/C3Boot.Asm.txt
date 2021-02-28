@@ -1,0 +1,44 @@
+* CERES-3 BOOT LOADER  NW 6.4.86 / 28.1.89 / bh 24.11.89 / ROM 17.9.90 / bh 2.2.92
+
+* Boot file format:
+*    file  = {block} zero startadr.
+*    block = count address {byte}.
+
+ROM       EQU     $F0000000
+RamDisk   EQU     $00200000
+RamEnd    EQU     $00400000
+Switch    EQU     $FFFFE000
+Prog      EQU     $E0500590
+DirLen    EQU     6*1024
+
+
+Start     JUMP    @ROM+6
+          MOVB    R0,@Prog         clear boot
+
+          LPRW   -4,$A03          CFG with FPU
+
+          MOVD    $200000,R0
+          TBITB   6,@Switch
+          BFC     L0
+          ADDD    R0,R0
+L0        ADDR    1024(R0),R2
+          TBITB   7,@Switch
+          BFS     L1
+          LSHD    1,R0
+L1        MOVQD   0,-4(R0)
+          ACBD    -4,R0,L1
+          BFS     L2
+          MOVD    DirLen,R0
+          MOVD    ROM+$200,R1
+          MOVSB   0
+L2        MOVD    ROM+$200+DirLen,R1
+
+L3        MOVD    0(R1),R0         count
+          ADDQD   4,R1
+          MOVD    0(R1),R2         address
+          ADDQD   4,R1
+          CMPQD   0,R0
+          BEQ     L4
+          MOVSB   0                load
+          BR      L3
+L4        JUMP    0(R2)

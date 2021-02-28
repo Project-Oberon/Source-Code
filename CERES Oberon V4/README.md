@@ -1,6 +1,6 @@
 # Ceres Oberon V4 Source Code
 
-Main developers, Niklaus Wirth and Jurg Gutknecht.
+Main developers, Niklaus Wirth and Jurg Gutknecht. CERES-3 sources provided by Heat Heeb on 03.03.2019.
 
 **Text**: Oberon Text files.
 

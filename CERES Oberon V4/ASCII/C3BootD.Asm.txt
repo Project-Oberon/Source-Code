@@ -1,0 +1,113 @@
+* CERES-3 BOOT LOADER  NW 6.4.86 / 28.1.89 / bus disk bh 4.11.92
+
+* Boot file format:
+*    file  = {block} zero startadr.
+*    block = count address {byte}.
+
+ROM       EQU     $F0000000
+RamDisk   EQU     $00400000
+Switch    EQU     $FFFFE000
+Prog      EQU     $E0500590
+DirLen    EQU     6*1024
+
+DiskBase  EQU     $F8000000
+Data      EQU     0
+Error     EQU     4
+SectorCnt EQU     8
+SectorNum EQU     12
+CylLow    EQU     16
+CylHigh   EQU     20
+SDH       EQU     24
+Status    EQU     28
+BSY       EQU     7
+RDY       EQU     6
+DRQ       EQU     3
+Command   EQU     28
+
+UART      EQU     $FFFFC000
+
+
+Start     JUMP    @ROM+6
+          MOVB    R0,@Prog         clear boot
+          LPRW    -4,$A03          CFG with FPU
+          LPRD    -7,1024          sp
+          MOVD    $100000,R0
+L1        MOVQD   0,-4(R0)         clear mem
+          ACBD    -4,R0,L1
+
+DBoot     MOVD    DiskBase,R0
+          MOVD    UART,R1
+          MOVB    $15,8(R1)        CRA
+          MOVB    $13,0(R1)        MR1A
+          MOVB    $07,0(R1)        MR2A
+          MOVB    $44,4(R1)        CSRA
+DB1       CMPB    $AC,12(R1)
+          BEQ     RBoot:W
+          TBITB   RDY,Status(R0)
+          BFC     DB1
+          TBITB   BSY,Status(R0)
+          BFS     DB1
+          MOVD    2048,R1          a = boot sector
+DB2       BSR     Get
+          ROTD    16,R3
+          BSR     Get
+          ROTD    16,R3
+          MOVD    R3,R5            len
+          BSR     Get
+          ROTD    16,R3
+          BSR     Get
+          ROTD    16,R3
+          MOVD    R3,R4            ad
+          CMPQD   0,R5
+          BEQ     DB4
+DB3       BSR     Get
+          MOVW    R3,0(R4)
+          ADDQD   2,R4
+          ACBD    -2,R5,DB3
+          BR      DB2
+DB4       JUMP    0(R4)
+
+Get       MOVD    R1,R7            a
+          ANDW    $1FF,R7
+          CMPQW   0,R7             a MOD 512 = 0 ?
+          BNE     G1
+G2        TBITB   BSY,Status(R0)
+          BFS     G2
+          MOVQB   1,SectorCnt(R0)
+          MOVD    R1,R7
+          LSHD    -9,R7
+          ANDB    $3F,R7
+          ADDQB   1,R7             a DIV 512 MOD 64 + 1
+          MOVB    R7,SectorNum(R0)
+          MOVD    R1,R7
+          LSHD		-15,R7           a DIV 512 DIV 64
+          MOVB    R7,SDH(R0)
+          MOVQB   0,CylLow(R0)
+          MOVQB   0,CylHigh(R0)
+          MOVB    $20,Command(R0)
+G1        TBITB   DRQ,Status(R0)
+          BFC     G1
+          MOVW    Data(R0),R3
+          ADDQD   2,R1
+          RET     0
+
+RBoot     MOVD    RamDisk+1024,R2
+          CMPD    $9B1EA38D,0(R2)
+          BNE     L5
+          TBITB   7,@Switch
+          BFS     L2
+L5        MOVD    DirLen,R0
+          MOVD    ROM+$200,R1
+          MOVSB   0
+L2        MOVD    ROM+$200+DirLen,R1
+
+L3        MOVD    0(R1),R0         count
+          ADDQD   4,R1
+          MOVD    0(R1),R2         address
+          ADDQD   4,R1
+          CMPQD   0,R0
+          BEQ     L4
+          MOVSB   0                load
+          BR      L3
+L4        JUMP    0(R2)
+

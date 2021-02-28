@@ -1,0 +1,832 @@
+MODULE  Kernel          NW 3.11.89 / 18.7.90  Ceres-3
+
+StkOrg0   EQU     $00001400       System stack
+MDorg     EQU     $00004000       Module descriptors
+MDlimit   EQU     $00008000       Limit of module descriptor area
+HeapOrg   EQU     $00010000
+FSOrg     EQU     $001E0000       Frame stack
+StkOrg1   EQU     $00200000       User stack
+DiskOrg   EQU     StkOrg1
+ICU       EQU     $FFFF9000
+RTClk     EQU     $FFFFA000
+DipSw     EQU     $FFFFE000
+
+maxSVC    EQU     19
+maxSecInx EQU     64
+MDsize    EQU     128             size of module descriptor
+
+MDSB      EQU     0               Module descriptor fields
+MDLB      EQU     4
+MDPB      EQU     8
+MDFB      EQU     12
+MDSize    EQU     16
+MDrfcnt   EQU     19
+MDlink    EQU     124
+
+ModList   SBLKD   1               ptr to module descriptor list @3E80H-4
+NofPages  SBLKD   1               no. of allocated pages
+NofSectors SBLKD  1               no. of allocated sectors
+allocated SBLKD   1               amount of allocated heap storage
+StackOrg  SBLKD   1
+SectNo    SBLKD   1
+pc        SBLKD   1
+sb        SBLKD   1
+fp        SBLKD   1
+sp0       SBLKD   1
+sp1       SBLKD   1
+mod       SBLKD   1
+fsr       SBLKD   1
+msr       SBLKD   1
+eia       SBLKD   1
+err       SBLKW   1
+pcr       SBLKW   1
+Mod       SBLKD   1
+
+HeapLimit SBLKD   1
+freeList  SBLKD   5               block sizes: k*128, 128, 64, 32, 16
+collected SBLKD   1
+					SBLKD   1
+dump      SBLKD   1
+FRootAdr  SBLKD   1
+lastfree  SBLKD   1               tail of free MD list
+          SBLKD   1
+          SBLKD   3               @3E00H
+					SBLKD   128             @3C00H
+DResTab   SBLKD   2560            disk reservation table  @1400H
+
+					SDOUBLE $00000013       type descriptors and array bounds @3E80H
+					SDOUBLE $00000027
+ModTag    SDOUBLE 0
+SecTag    SDOUBLE 0
+					SDOUBLE 0
+FSPtr     SDOUBLE 0               frame stack pointer, init by boot loader
+FreeMDPtr SDOUBLE 0               list of free module descriptors,  "
+FreeBlks  SDOUBLE 0               list of free module blocks
+					SDOUBLE 0
+
+					SDOUBLE $00800040
+TD0       SDOUBLE $01000100       descriptor of type Module
+					SDOUBLE 0,0,0,0,0,0,0
+					SDOUBLE $7C
+
+					SDOUBLE $00800040
+TD1       SDOUBLE $00000400       descriptor of type Sector
+					SDOUBLE 0,0,0,0,0,0,0,0
+
+* --------------------------------------------------------------
+
+Org       MOVD    MDorg,R0
+					LPRW   -1,R0            MOD
+					LPRD   -6,0(R0)         SB
+					LPRD   -7,StkOrg0       SP
+					ADDR    TD0,ModTag
+					ADDR    TD1,SecTag
+
+					MOVD    FreeMDPtr,R1    create free MD list
+					ADDR   -MDsize(R1),ModList
+					MOVQD   0,R3
+					MOVD    MDlimit-MDsize,R4
+					MOVD    R4,lastfree
+L0        MOVD    R3,MDlink(R4)
+					MOVD    R4,R3
+					SUBD    MDsize,R4
+					CMPD    R4,R1
+					BGE     L0
+					MOVD    R3,FreeMDPtr
+					MOVD    StkOrg1,StackOrg
+
+					MOVD    maxSecInx,R0
+L3        MOVQD  -1,DResTab-4[R0:D]
+					ACBD   -1,R0,L3
+					MOVQD   0,DResTab       reserve cylinder 0
+					MOVQD   0,DResTab+4
+
+					MOVD    FSPtr,R1
+					LSHD   -10,R1
+					MOVD    R1,NofPages
+					MOVD    HeapOrg,HeapLimit
+					MOVD    FSOrg,FSPtr
+
+					MOVB  15, @RTClk   JG
+					MOVB   @DipSw, R7   delay   JG
+					MOVQB 1, @RTClk + 4   JG
+
+					MOVD    ICU,R0
+					MOVQB   0,4(R0)         reset ICU
+					MOVB    $A5,4(R0)       enable ICU
+					MOVQB  -8,R1
+					MOVB    $E0,R2
+					MOVB    $10,R3
+L4        MOVB    R2,4(R0)        select response mem for loading
+					MOVB    R3,0(R0)        with 1 byte
+					ADDQB   1,R2
+					ADDQB   1,R3
+					ACBB    1,R1,L4
+					MOVB    $C0,4(R0)       select auto clear reg for loading
+					MOVB    $FF,0(R0)       enable auto clear mode
+					BR      Transfer:W
+
+* ========================================================
+* Frame storage management
+
+* PROCEDURE AssignFrame(VAR mod: Module; VAR base: LONGINT;
+*                 size: LONGINT; allocate: BOOLEAN)
+Assign    MOVD    12(R7),R1          size of block
+					ADDD    $3FF,R1
+					BICD    $3FF,R1
+					MOVD    16(R7),R6          adr of block
+					MOVD    20(R7),R2          adr of mod pointer
+					MOVD    FreeMDPtr,R3    pointer to free descriptor list
+					MOVD    R3,0(R2)
+					CMPQD   0,R3
+					BEQ     ass6:W
+					ADDR    FreeBlks,R4
+ass1      MOVD    0(R4),R0
+					CMPQD   0,R0
+					BEQ     ass2            no free blocks
+					CMPD    R1,4(R0)
+					BLE     ass3            free block found
+					MOVD    R0,R4
+					BR      ass1
+
+ass2      MOVD    FSPtr,R0
+					SUBD    R1,R0
+					CMPD    R0,HeapLimit
+					BLT     ass6            no space left
+					MOVD    R0,FSPtr
+					LSHD   -10,R1
+					ADDD    R1,NofPages
+					BR      ass5
+
+ass3      MOVD    0(R0),0(R4)     unlink block
+					MOVD    4(R0),R4
+ass4      MOVQD   0,-4(R0)[R4:B]  clear block
+					ACBD   -4,R4,ass4
+ass5      MOVD    R0,0(R6)        block adr
+					MOVD    MDlink(R3),FreeMDPtr
+					MOVD    ModList,MDlink(R3)
+					MOVD    R3,ModList
+					RETT    16
+
+ass6      MOVQD   0,0(R6)
+					RETT    16
+
+* PROCEDURE FreeFrame(mod: Module)
+Free      MOVD    8(R7),R2          mod
+					MOVD    ModList,R0
+					MOVD    lastfree,R3
+					CMPD    R0,R2
+					BNE     fmd0
+					MOVD    MDlink(R0),ModList
+					BR      fmd1
+
+fmd0      MOVD    R0,R1
+					MOVD    MDlink(R0),R0
+					CMPQD   0,R0
+					BEQ     fmd2:W
+					CMPD    R0,R2
+					BNE     fmd0
+					MOVD    MDlink(R0),MDlink(R1)
+
+fmd1      MOVD    R0,MDlink(R3)
+					MOVQD   0,MDlink(R0)
+					MOVQD   0,MDLB(R0)
+					MOVQD   0,MDPB(R0)
+					MOVD    R0,lastfree
+					MOVD    MDSize(R0),R1   free frame
+					ADDD    $3FF,R1
+					BICD    $3FF,R1
+					MOVD    MDFB(R0),R2
+					CMPD    R2,FSPtr
+					BEQ     fmd2            on top
+					MOVD    FreeBlks,0(R2)  link
+					MOVD    R1,4(R2)        size
+					MOVD    R2,FreeBlks
+					RETT    4
+
+fmd2      ADDD    R1,FSPtr
+					LSHD   -10,R1
+					SUBD    R1,NofPages
+					RETT    4
+
+* PROCEDURE CopyMD(VAR src: ModuleDescriptor; dest: Module)
+CopyMD    MOVD    8(R7),R2          dest adr
+					MOVD    12(R7),R1          source adr
+					MOVZBD  MDsize/4-1,R0
+					MOVSD   0
+					RETT    12
+
+* PROCEDURE State(mod: Module; VAR loaded: BOOLEAN)
+State     RETT    8
+
+* PROCEDURE AddRefCnt(mod: Module; k: INTEGER)
+AddRefCnt MOVD    12(R7),R0
+					ADDB    8(R7),MDrfcnt(R0)
+					RETT    8
+
+* PROCEDURE InstallSTP(P: TrapProc)
+InstSTP   RETT    4
+
+* --------------------------------------------------------
+* Block allocation and garbage collection
+
+findBlk   ADDR    freeList-4,R7     R4 = requested block size
+fB0       MOVD    4(R7),R5
+					CMPQD   0,R5
+					BNE     fB1:W
+					SAVE    [0,4]           no free block
+					ADDD    $3FF,R4
+					BICD    $3FF,R4         rounded-up size
+					MOVD    HeapLimit,R0    allocate heap page
+					ADDD    R4,R0
+					CMPD    R0,FSPtr
+					BGT     fB4:W           no space
+					MOVD    HeapLimit,R5    block adr
+					MOVD    R0,HeapLimit
+					MOVD    R4,0(R5)        block size
+					MOVQB  -1,3(R5)
+					ADDQD   4,R5
+					MOVQD   0,4(R5)
+					LSHD   -10,R4
+					ADDD    R4,NofPages
+					RESTORE [0,4]
+					MOVD    R5,4(R7)        link
+fB1       MOVD   -4(R5),R2        size
+					ANDD    $FFFFFF,R2
+					CMPD    R2,R4
+					BGE     fB2
+					MOVD    R5,R7           next
+					BR      fB0
+
+fB2       BEQ     fB3             exact match
+					SUBD    R4,R2
+					MOVD    R2,-4(R5)       new size
+					MOVQB  -1,-1(R5)
+					ADDD    R2,R5
+					RET     0
+
+fB3       MOVD    4(R5),4(R7)     unlink
+					RET     0
+
+fB4       RESTORE [0,4]
+					MOVQD   0,R5            NIL
+					MOVQD   0,R4
+					RET     0
+
+New       ANDD    $FFFFFF,R2      requested block size
+					MOVQD   4,R3            index to freeList
+					MOVZBD  16,R4           length of blocks in list
+N1        CMPD    R2,R4
+					BLE     N2              large enough size found
+					ADDD    R4,R4
+					ACBD   -1,R3,N1
+					MOVD    R2,R4
+					ADDD    $7F,R4          round up to mult of 128
+					ANDD    $7FFF80,R4
+					BSR     findBlk         in master list
+					ADDD    R4,allocated
+					RET     0
+
+N2        MOVD    freeList[R3:D],R5
+					ADDD    R4,allocated
+					CMPQD   0,R5
+					BNE     N5:W            block available
+					MOVD    R3,R6
+N3        ADDD    R4,R4           try next larger size
+					ACBD   -1,R3,N3a
+					BSR     findBlk
+					CMPQD   0,R5
+					BNE     N4
+					RET     0
+
+N3a       MOVD    freeList[R3:D],R5
+					CMPQD   0,R5
+					BEQ     N3
+					MOVD    4(R5),freeList[R3:D]  unlink
+
+N4        ADDQD   1,R3
+					LSHD   -1,R4
+					MOVQD   0,4(R5)
+					MOVD    R4,-4(R5)       size
+					MOVQB  -1,-1(R5)
+					MOVD    R5,freeList[R3:D]
+					ADDD    R4,R5
+					CMPD    R3,R6
+					BNE     N4              split to next smaller size
+					RET     0
+
+N5        MOVD    4(R5),freeList[R3:D]
+					RET     0
+
+* NEW(p)  R0 = adr of p, R1 = typetag
+
+New0      MOVD    0(R1),R2
+					BSR     New
+					CMPQD   0,R5
+					BEQ     N7
+N6        MOVQD   0,-8(R5)[R4:B]  zero allocated block
+					ACBD   -4,R4,N6
+					MOVD    R1,-4(R5)       typetag
+N7        MOVD    R5,0(R0)        adr of block
+					RETT    0
+
+* SYSTEM.NEW(p, n)  R0 = adr of p, R2 = n
+
+New1      ADDQD   4,R2
+					BSR     New
+					CMPQD   0,R5
+					BEQ     N8
+					SBITB   23,R4
+					MOVD    R4,-4(R5)
+N8        MOVD    R5,0(R0)        adr of block
+					RETT    0
+
+* Garbage collector 
+
+GC        MOVD    8(R7),TOS
+					MOVD    FRootAdr,R0
+gcf0      MOVD    0(R0),R1        unlink file descriptors
+					CMPQD   0,R1
+					BEQ     gcm0
+					NEGD    R1,0(R0)
+					MOVD    R1,R0
+					BR      gcf0
+
+gcm0      MOVD    ModList,R0      mark phase
+					MOVQD   0,collected
+gcm1      MOVD    MDSB(R0),R1
+					MOVD    MDFB(R0),R3
+					MOVD    0(R3),R2        RB
+
+gcm2      MOVD    MDFB(R0),R3
+					CMPW    R2,4(R3)        IB
+					BGE     gcm7:W
+					MOVXWD  0(R2),R3        offset
+					MOVD    0(R1)[R3:B],R3  pointer
+					CMPD    R3,HeapOrg
+					BLT     gcm6:W          NIL
+					CMPQB   0,-1(R3)
+					BLT     gcm6:W          already marked
+					MOVD    R3,R4           R3=p, R4=q
+gcm3      MOVZBD -1(R3),R6        R6=k
+					ADDQB   1,-1(R3)        mark
+					MOVD   -4(R3),R5
+					TBITB   23,R5
+					BFS     gcm4:W
+					ANDD    $FFFFFF,R5      typetag
+					SBITB   0,-1(R5)        mark type descriptor
+					CMPB    R6,3(R5)
+					BGE     gcm4
+					MOVZWD  32(R5)[R6:W],R6  ptr field offset
+					MOVD    0(R3)[R6:B],R7  R7=r
+					CMPD    R7,HeapOrg
+					BLT     gcm3            NIL
+					CMPQB   0,-1(R7)
+					BLT     gcm3            already marked
+					MOVD    R4,0(R3)[R6:B]
+					MOVD    R3,R4
+					MOVD    R7,R3
+					BR      gcm3
+
+gcm4      CMPD    R3,R4
+					BEQ     gcm6
+					MOVZBD -1(R4),R6        R6=k
+					MOVD   -4(R4),R5        typetag
+					ANDD    $FFFFFF,R5
+					MOVZWD  30(R5)[R6:W],R6
+					MOVD    0(R4)[R6:B],R7  R7=r
+					MOVD    R3,0(R4)[R6:B]
+					MOVD    R4,R3
+					MOVD    R7,R4
+					BR      gcm3
+
+gcm6      ADDQD   2,R2            next variable
+					BR      gcm2
+
+gcm7      MOVD    MDlink(R0),R0   next module
+					CMPQD   0,R0
+					BNE     gcm1
+
+					MOVD    FRootAdr,R0     restore file descriptor links
+gcf1      NEGD    0(R0),R1
+gcf2      CMPQD   0,R1
+					BEQ     gcs00
+					CMPQB   0,-1(R1)
+					BLT     gcf3            marked
+					NEGD    0(R1),R1
+					MOVD    R1,0(R0)
+					BR      gcf2
+gcf3      MOVD    R1,0(R0)
+					MOVD    R1,R0
+					BR      gcf1
+
+gcs00     MOVQD   5,R0
+gcs0      MOVQD   0,freeList-4[R0:D]
+					ACBD   -1,R0,gcs0
+
+					MOVD    HeapOrg+4,R0    scan phase
+gcs0a     MOVD    R0,R2
+gcs1      CMPD    R0,HeapLimit
+					BGE     gcs9:W
+					MOVD   -4(R0),R1        typetag or size
+					ANDD    $FFFFFF,R1
+					CMPQB   0,-1(R0)
+					BGT     gcs1a           free
+					TBITB   23,R1
+					BFS     gcs1b
+					MOVD    0(R1),R1        type descriptor
+gcs1b     ANDD    $7FFFFF,R1      size
+					CMPQB   0,-1(R0)
+					BLT     gcs2            marked
+					ADDD    R1,collected
+gcs1a     ADDD    R1,R0
+					BR      gcs1
+
+gcs2      MOVQB   0,-1(R0)        unmark
+					CMPD    R2,R0
+					BGE     gcs7:W
+gcs2a     MOVD    R0,R3           collect [R2 .. R0)
+					SUBD    R2,R3           R3 = size of block to be collected
+					TBITB   4,R3
+					BFC     gcs3
+					MOVD    freeList+16,4(R2) insert block of size 16
+					MOVD    $FF000010,-4(R2)
+					MOVD    R2,freeList+16
+					ADDD    16,R2
+					CBITB   4,R3
+gcs3      TBITB   5,R3
+					BFC     gcs4
+					MOVD    freeList+12,4(R2) insert block of size 32
+					MOVD    $FF000020,-4(R2)
+					MOVD    R2,freeList+12
+					ADDD    32,R2
+					CBITB   5,R3
+gcs4      CMPQD   0,R3
+					BEQ     gcs7:W
+					TBITB   6,R3
+					BFC     gcs5
+					MOVD    freeList+8,4(R2)  insert block of size 64
+					MOVD    $FF000040,-4(R2)
+					MOVD    R2,freeList+8
+					ADDD    64,R2
+					CBITB   6,R3
+gcs5      CMPQD   0,R3
+					BEQ     gcs7
+					CMPD    128,R3
+					BNE     gcs6
+					MOVD    freeList+4,4(R2)  insert block of size 128
+					MOVD    $FF000080,-4(R2)
+					MOVD    R2,freeList+4
+					BR      gcs7
+
+gcs6      MOVD    freeList,4(R2)    insert block
+					ORD     $FF000000,R3
+					MOVD    R3,-4(R2)
+					MOVD    R2,freeList
+
+gcs7      ADDD    R1,R0
+					BR      gcs0a
+
+gcs9      MOVQD   0,R1
+					CMPD    R0,R2
+					BNE     gcs2a
+					MOVD    TOS,R0
+					MOVD    collected,0(R0)
+					SUBD    collected,allocated
+					RETT    4
+
+instFiles MOVD    8(R7),FRootAdr
+					RETT    4
+
+* --------------------------------------------------------
+* "Disk" storage management
+
+* PROCEDURE AllocSector(hint: LONGINT; VAR sec: LONGINT)
+AllocSec  MOVD    8(R7),R2          adr of result
+					MOVD    12(R7),R0          hint
+					DIVD    29,R0
+					MOVD    R0,R1
+					LSHD    -5,R0           dblwrd index
+					ANDD    $1F,R1          bit index
+					MOVD    R0,R3
+adp0      FFSD    DResTab[R0:D],R1
+					BFC     adp2
+					ADDQD   1,R0
+					CMPD    R0,maxSecInx
+					BLT     adp1
+					MOVQD   0,R0
+adp1      CMPD    R0,R3
+					BNE     adp0
+					MOVW    22,R0
+					BR      Trap:W          error 22: no space
+
+adp2      CBITD   R1,DResTab[R0:D]  mark sector reserved
+					ADDQD   1,NofSectors
+					LSHD    5,R0
+					ORD     R1,R0
+					MULD    29,R0
+					MOVD    R0,0(R2)        adr of reserved sector
+					RETT    8
+
+* PROCEDURE MarkSector(sec: LONGINT)
+MarkSec   MOVD    8(R7),R0
+					DIVD    29,R0
+					CBITD   R0,DResTab
+					SFCW    err
+					ADDQD   1,NofSectors
+					RETT    4
+
+* PROCEDURE FreeSector(sec: LONGINT)
+FreeSec   MOVD    8(R7),R0
+					MOVQD   0,R1
+					DEID    29,R0
+					CMPQD   0,R0            remainder = 0?
+					BNE     fsec0
+					SBITD   R1,DResTab      mark sector free
+					ADDQD  -1,NofSectors
+fsec0     RETT    4
+
+* PROCEDURE GetSector(src: LONGINT; VAR dest: SectorBuffer)
+GetSec    MOVD    8(R7),R2          dest adr
+					MOVD    16(R7),R0          src secno
+					MOVD    R0,SectNo
+					MOVQD   0,R1
+					DEID    29,R0
+					CMPQD   0,R0
+					BNE     err21:W
+					LSHD    10,R1
+					ADDD    DiskOrg,R1
+					MOVD    $100,R0         length
+					MOVSD   0
+					RETT 12
+
+* PROCEDURE PutSector(dest: LONGINT; VAR src: SectorBuffer)
+PutSec    MOVD    8(R7),R1          src adr
+					MOVD    16(R7),R2          dest secno
+					MOVD    R2,SectNo
+					MOVQD   0,R3
+					DEID    29,R2
+					CMPQD   0,R2
+					BNE     err21
+					MOVD    R3,R2
+					LSHD    10,R2
+					ADDD    DiskOrg,R2
+					MOVD    $100,R0         length
+					MOVSD   0
+					RETT 12
+
+err21     MOVW    21,R0
+					BR      Trap:W
+
+ResetDisk RETT    0
+
+* ------------------------------------------------------------
+* PROCEDURE InstallIP(P: IntProc; n: INTEGER)
+InstIP    BR     InstIP1:W
+
+* PROCEDURE InstallDump(P: IntProc)
+InstDump  MOVD    8(R7),dump
+					RETT    4
+
+* PROCEDURE SetICU(n: LONGINT)
+SetICU    BICPSRW $800
+					MOVB    8(R7),@ICU+4
+					RETT    4
+
+* PROCEDURE Service(a: LONGINT; VAR b: LONGINT)
+Service   MOVD    8(R7),R0
+					MOVB    0(R0),6(SP)   PSR
+					RETT    8
+
+* ==============================================================
+
+TrNVI     RETT    0
+
+TrNMI     MOVQW   1,R0
+					BR      Trap:W
+
+TrABT     MOVQW   2,R0
+					BR      Trap:W
+
+TrFPU     MOVQW   3,R0
+					SFSR    fsr
+					BR      Trap:W
+
+TrILL     MOVQW   4,R0
+					BR      Trap:W
+
+TrSVCX    MOVQW   5,R0
+					BR      Trap:W
+
+TrDVZ     MOVQW   6,R0
+					BR      Trap:W
+
+TrFLG     MOVQW   7,R0
+					BR      Trap:W
+
+TrBPT     MOVXBW  1(0(SP)),R0
+					BR      Trap:W
+
+TrTRC     MOVW    9,R0
+					BR      Trap:W
+
+TrUND     MOVW    10,R0
+					BR      Trap:W
+
+TrRBE     MOVW    11,R0
+					BR      Trap
+
+TrNBE     MOVW    12,R0
+					BR      Trap
+
+TrOVF     MOVW    13,R0
+					BR      Trap
+
+TrDBG     MOVW    14,R0
+					BR      Trap
+
+VEC       RETT    0
+
+range     SWORD   maxSVC
+TrSVC     CHECKB  R6,range,1(0(SP))
+					BFS     TrSVCX
+					ADDQD   2,0(SP)
+					TBITB   25,4(SP)    which stack?
+					BFS     svc0
+					SPRD   -7,R7      SP
+					BR      Pbase
+svc0      SPRD   -5,R7      USP
+					ADDQD  -8,R7      parameter address
+Pbase     CASEW   range+2[R6:W]
+
+SVCTab    SWORD   New0-Pbase         0
+					SWORD   New1-Pbase         1
+					SWORD   Assign-Pbase       2
+					SWORD   Free-Pbase         3
+					SWORD   CopyMD-Pbase       4
+					SWORD   State-Pbase        5
+					SWORD   AddRefCnt-Pbase    6
+					SWORD   InstSTP-Pbase      7
+					SWORD   GC-Pbase           8
+					SWORD   instFiles-Pbase    9
+					SWORD   AllocSec-Pbase    10
+					SWORD   MarkSec-Pbase     11
+					SWORD   FreeSec-Pbase     12
+					SWORD   GetSec-Pbase      13
+					SWORD   PutSec-Pbase      14
+					SWORD   ResetDisk-Pbase    15
+					SWORD   InstIP-Pbase      16
+					SWORD   InstDump-Pbase    17
+					SWORD   SetICU-Pbase      18
+					SWORD   Service-Pbase      19
+
+IntTab    SWORD   MDorg,TrNVI-Org
+					SWORD   MDorg,TrNMI-Org
+					SWORD   MDorg,TrABT-Org
+					SWORD   MDorg,TrFPU-Org
+					SWORD   MDorg,TrILL-Org
+					SWORD   MDorg,TrSVC-Org
+					SWORD   MDorg,TrDVZ-Org
+					SWORD   MDorg,TrFLG-Org
+					SWORD   MDorg,TrBPT-Org
+					SWORD   MDorg,TrTRC-Org
+					SWORD   MDorg,TrUND-Org
+					SWORD   MDorg,TrRBE-Org
+					SWORD   MDorg,TrNBE-Org
+					SWORD   MDorg,TrOVF-Org
+					SWORD   MDorg,TrDBG-Org
+					SWORD   0,0
+					SWORD   MDorg,VEC-Org
+					SWORD   MDorg,VEC-Org
+					SWORD   MDorg,VEC-Org
+					SWORD   MDorg,VEC-Org
+					SWORD   MDorg,VEC-Org
+					SWORD   MDorg,VEC-Org
+					SWORD   MDorg,VEC-Org
+					SWORD   MDorg,VEC-Org
+
+Trap      MOVD    TOS,R1          deposit registers in status record
+					MOVD    TOS,R2          MOD/PSR
+					MOVD    R1,pc
+					MOVD    R2,mod
+					MOVW    R0,err
+					MOVZWD  R2,R2
+					MOVD    R2,Mod
+					MOVD    0(R2),sb
+					SUBD    8(R2),R1
+					MOVW    R1,pcr
+					SPRD   -8,fp            FP
+					SPRD   -7,sp0           SP
+					SPRD   -5,sp1           USP
+					CMPQD   0,dump
+					BEQ     Transfer
+					CXPD    dump
+
+Transfer  ADDR    IntTab,R0
+					LPRD   -2,R0            INTBASE
+					MOVD    MDorg+MDsize,R0 to module #1
+					LPRW   -1,R0            MOD
+					MOVD    StackOrg,R3
+					MOVD    MDSB(R0),R1
+					MOVD    MDPB(R0),R2
+					LPRD   -6,R1            SB
+					LPRD   -7,StkOrg0       SP
+					LPRD   -5,R3            USP
+					LPRD   -8,R3            FP
+					LPRW   -3,$B10          PSR [I,S,U,V]
+					JUMP    0(R2)
+
+InstIP1   MOVD    8(R7),R0
+					MOVD    12(R7),IntTab+$40[R0:D]
+					RETT    8
+
+* ============================================================
+* Real time clock routines
+
+GetClk    MOVB    R1,0(R0)
+					MOVB    4(R0),R3
+					MOVB    R3,R4
+					LSHB   -4,R3
+					ANDB    $F,R4
+					MULB    10,R3
+					ADDB    R4,R3
+					RET     0
+
+PutClk    MOVQB   0,R5
+					DEIB    10,R4     R5=quo, R4=rem
+					MOVB    R1,0(R0)
+					LSHB    4,R5
+					ADDB    R5,R4
+					MOVB    R4,4(R0)
+					RET     0
+
+* PROCEDURE GetClock(VAR time, date: LONGINT)
+GetClock   MOVD    RTClk,R0
+					MOVB    0(R0),R1
+					CMPQB  -1,R1
+					BEQ     GetClock
+					MOVQB   5,R1            year
+					BSR     GetClk
+					MOVZBD  R3,R2
+					MOVQB   4,R1            month
+					BSR     GetClk
+					LSHD    4,R2
+					ORB     R3,R2
+					MOVQB   3,R1            day
+					BSR     GetClk
+					LSHD    5,R2
+					ORB     R3,R2
+					MOVD    R2,0(8(SP))
+					MOVQB   2,R1            hour
+					BSR     GetClk
+					MOVZBD  R3,R2
+					MOVQB   1,R1            minute
+					BSR     GetClk
+					LSHD    6,R2
+					ORB     R3,R2
+					MOVQB   0,R1            second
+					BSR     GetClk
+					LSHD    6,R2
+					ORB     R3,R2
+					MOVD    R2,0(12(SP))
+					RXP     8
+
+* PROCEDURE SetClock(time, date: LONGINT)
+SetClock  MOVD    RTClk,R0
+					MOVB    0(R0),R1
+					CMPQB  -1,R1
+					BEQ     SetClock
+					MOVD    12(SP),R2
+					MOVQB  -1,R1    | R15
+					MOVQB   1,R4
+					BSR     PutClk
+					MOVQB   0,R1
+					MOVB    R2,R4
+					ANDB    $3F,R4
+					BSR     PutClk       second
+					MOVQB   1,R1
+					LSHD   -6,R2
+					MOVB    R2,R4
+					ANDB    $3F,R4
+					BSR     PutClk       minute
+					MOVQB   2,R1
+					LSHD   -6,R2
+					MOVB    R2,R4
+					ANDB    $1F,R4
+					BSR     PutClk       hour
+					MOVD    8(SP),R2    date
+					MOVQB   3,R1
+					MOVB    R2,R4
+					ANDB    $1F,R4
+					BSR     PutClk       day
+					MOVQB   4,R1
+					LSHD   -5,R2
+					MOVB    R2,R4
+					ANDB    $F,R4
+					BSR     PutClk       month
+					MOVQB   5,R1
+					LSHD   -4,R2
+					MOVB    R2,R4
+					ANDB    $7F,R4
+					BSR     PutClk       year
+					RXP     8
